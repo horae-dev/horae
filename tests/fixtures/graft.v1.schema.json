@@ -1,0 +1,291 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/mmornati/graft/main/schema/graft.v1.schema.json",
+  "title": "graft.yaml v1",
+  "description": "Generated from src/policy/schema.ts (pnpm graft policy schema --write). Rules a JSON Schema cannot express: approve: auto may use only risk, only_paths and size (not author, agent, labels or paths); size: min is not above max; rule names are unique; globs use only letters, digits and _ . - / * ? [ ] @ + = ~ # % , and space, with no .. or empty segment, at most 4 ** segments, at most 3 * per segment, at most 200 characters, at most 48 characters other than * in a segment and 96 in a glob, no / inside [ ], no run of three stars and no ]+; a path over 1,024 characters or 128 segments is treated as matching every sensitive and require rule and no approve rule; at most 500 globs in the file.",
+  "type": "object",
+  "properties": {
+    "version": {
+      "type": "number",
+      "const": 1
+    },
+    "sensitive_paths": {
+      "minItems": 1,
+      "maxItems": 50,
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "default": {
+      "type": "object",
+      "properties": {
+        "require": {
+          "type": "object",
+          "properties": {
+            "humans": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10
+            },
+            "team": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "pattern": "^[a-z0-9][a-z0-9_-]{0,99}$"
+                },
+                {
+                  "minItems": 1,
+                  "maxItems": 10,
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "pattern": "^[a-z0-9][a-z0-9_-]{0,99}$"
+                  }
+                }
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "minProperties": 1
+        }
+      },
+      "required": [
+        "require"
+      ],
+      "additionalProperties": false
+    },
+    "rules": {
+      "maxItems": 200,
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9 _.:-]{0,79}$"
+          },
+          "match": {
+            "type": "object",
+            "properties": {
+              "risk": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "enum": [
+                      "trivial",
+                      "logic",
+                      "sensitive"
+                    ]
+                  },
+                  {
+                    "minItems": 1,
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "enum": [
+                        "trivial",
+                        "logic",
+                        "sensitive"
+                      ]
+                    }
+                  }
+                ]
+              },
+              "paths": {
+                "minItems": 1,
+                "maxItems": 50,
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "only_paths": {
+                "minItems": 1,
+                "maxItems": 50,
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "author": {
+                "type": "string",
+                "enum": [
+                  "agent",
+                  "human"
+                ]
+              },
+              "agent": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9 ._:/@+()-]{0,99}$"
+                  },
+                  {
+                    "minItems": 1,
+                    "maxItems": 20,
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "pattern": "^[A-Za-z0-9][A-Za-z0-9 ._:/@+()-]{0,99}$"
+                    }
+                  }
+                ]
+              },
+              "labels": {
+                "minItems": 1,
+                "maxItems": 20,
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "pattern": "^[^\\p{Cc}]{1,50}$"
+                }
+              },
+              "size": {
+                "type": "object",
+                "properties": {
+                  "min_lines": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 1000000
+                  },
+                  "max_lines": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 1000000
+                  },
+                  "min_files": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 1000000
+                  },
+                  "max_files": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 1000000
+                  }
+                },
+                "additionalProperties": false,
+                "minProperties": 1
+              }
+            },
+            "additionalProperties": false,
+            "minProperties": 1
+          },
+          "approve": {
+            "type": "string",
+            "const": "auto"
+          },
+          "require": {
+            "type": "object",
+            "properties": {
+              "humans": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10
+              },
+              "team": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "pattern": "^[a-z0-9][a-z0-9_-]{0,99}$"
+                  },
+                  {
+                    "minItems": 1,
+                    "maxItems": 10,
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "pattern": "^[a-z0-9][a-z0-9_-]{0,99}$"
+                    }
+                  }
+                ]
+              }
+            },
+            "additionalProperties": false,
+            "minProperties": 1
+          },
+          "block": {
+            "type": "boolean",
+            "const": true
+          }
+        },
+        "required": [
+          "match"
+        ],
+        "additionalProperties": false,
+        "oneOf": [
+          {
+            "required": [
+              "approve"
+            ]
+          },
+          {
+            "required": [
+              "require"
+            ]
+          },
+          {
+            "required": [
+              "block"
+            ]
+          }
+        ]
+      }
+    },
+    "guard": {
+      "type": "object",
+      "properties": {
+        "checks": {
+          "minItems": 1,
+          "maxItems": 50,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[^\\p{Cc}]{1,200}$"
+          }
+        },
+        "auto_merge_reverts": {
+          "minItems": 1,
+          "maxItems": 2,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "trivial",
+              "logic"
+            ]
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "report": {
+      "type": "object",
+      "properties": {
+        "language": {
+          "type": "string",
+          "enum": [
+            "en",
+            "fr",
+            "de",
+            "es",
+            "it",
+            "pt",
+            "nl",
+            "pl",
+            "sv",
+            "ja",
+            "ko",
+            "zh"
+          ]
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "version"
+  ],
+  "additionalProperties": false
+}
