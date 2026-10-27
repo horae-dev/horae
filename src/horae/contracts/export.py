@@ -5,6 +5,9 @@ The models are the source of truth. Regenerate after changing them::
 
     uv run python -m horae.contracts.export            # write schemas/
     uv run python -m horae.contracts.export --check    # exit 1 if schemas/ is stale
+
+The output depends on the pydantic version in ``uv.lock``: a pydantic upgrade may change the
+bytes, and the drift test then asks for a regeneration.
 """
 
 import argparse
@@ -15,6 +18,8 @@ from pathlib import Path
 from typing import Any
 
 from pydantic import TypeAdapter
+from pydantic.json_schema import GenerateJsonSchema, JsonSchemaMode, JsonSchemaValue
+from pydantic_core import CoreSchema
 
 from horae.contracts.intents import INTENT_MODELS, Intent
 from horae.contracts.lockfile import Lockfile
@@ -23,8 +28,40 @@ from horae.contracts.plugin import PluginManifest
 from horae.contracts.run import RunRecord
 
 DIALECT = "https://json-schema.org/draft/2020-12/schema"
-BASE_ID = "https://horae.dev/schemas"
-"""Base of every ``$id``. An identifier only: nothing is served there (yet)."""
+BASE_ID = "https://raw.githubusercontent.com/horae-dev/horae/main/schemas"
+"""Base of every ``$id``: the raw file on the default branch of this repository."""
+
+EXAMPLES = "examples"
+"""Directory under ``schemas/`` that holds examples, not generated schemas."""
+
+
+def _postprocess(node: Any) -> Any:
+    """Make the pydantic output plain, self-contained draft 2020-12.
+
+    - Drop the OpenAPI ``discriminator`` keyword; ``oneOf`` with ``const`` tags remains.
+    - A map whose keys have a pattern (``patternProperties``) rejects other keys, as the
+      models do: pydantic leaves ``additionalProperties`` open there.
+    """
+    if isinstance(node, dict):
+        out = {
+            key: _postprocess(value)
+            for key, value in node.items()
+            if not (key == "discriminator" and "oneOf" in node)
+        }
+        if "patternProperties" in out and "additionalProperties" not in out:
+            out["additionalProperties"] = False
+        return out
+    if isinstance(node, list):
+        return [_postprocess(item) for item in node]
+    return node
+
+
+class HoraeJsonSchema(GenerateJsonSchema):
+    """Plain draft 2020-12 output: no OpenAPI-only keywords."""
+
+    def generate(self, schema: CoreSchema, mode: JsonSchemaMode = "validation") -> JsonSchemaValue:
+        result: JsonSchemaValue = _postprocess(super().generate(schema, mode=mode))
+        return result
 
 
 @dataclass(frozen=True)
@@ -47,12 +84,14 @@ class SchemaSpec:
         return Path(self.name) / f"v{self.version}.json"
 
     def schema(self) -> dict[str, Any]:
-        body = TypeAdapter(self.target).json_schema(mode="validation")
+        body = TypeAdapter(self.target).json_schema(
+            mode="validation", schema_generator=HoraeJsonSchema
+        )
         body["title"] = self.title
         return {"$schema": DIALECT, "$id": self.id, **body}
 
-    def render(self) -> str:
-        return json.dumps(self.schema(), indent=2, ensure_ascii=False) + "\n"
+    def render(self) -> bytes:
+        return (json.dumps(self.schema(), indent=2, ensure_ascii=False) + "\n").encode("utf-8")
 
 
 SCHEMAS: tuple[SchemaSpec, ...] = (
@@ -68,29 +107,47 @@ SCHEMAS: tuple[SchemaSpec, ...] = (
 )
 
 
-def generate() -> dict[Path, str]:
+def generate() -> dict[Path, bytes]:
     """Every schema file, by path relative to ``schemas/``."""
     return {spec.path: spec.render() for spec in SCHEMAS}
 
 
 def stale(out_dir: Path) -> list[Path]:
-    """Files under ``out_dir`` that are missing, differ from the models, or are orphaned."""
+    """Files under ``out_dir`` that are missing, differ from the models, or are orphaned.
+
+    Every ``*.json`` file outside ``examples/`` is expected to be a generated schema."""
     expected = generate()
-    problems = [p for p, text in expected.items() if _read(out_dir / p) != text]
-    orphans = {p.relative_to(out_dir) for p in out_dir.glob("**/v*.json")} - expected.keys()
-    return sorted([*problems, *orphans])
+    problems = [p for p, data in expected.items() if _read(out_dir / p) != data]
+    present = {
+        p.relative_to(out_dir)
+        for p in out_dir.rglob("*.json")
+        if p.relative_to(out_dir).parts[0] != EXAMPLES
+    }
+    return sorted([*problems, *(present - expected.keys())])
 
 
-def _read(path: Path) -> str | None:
-    return path.read_text(encoding="utf-8") if path.is_file() else None
+def _read(path: Path) -> bytes | None:
+    return path.read_bytes() if path.is_file() else None
+
+
+def default_out() -> Path | None:
+    """``schemas/`` of the source checkout this module lives in, if any (not the CWD)."""
+    root = Path(__file__).resolve().parents[3]
+    if (root / "pyproject.toml").is_file() and (root / "schemas").is_dir():
+        return root / "schemas"
+    return None
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0] if __doc__ else None)
-    parser.add_argument("--out", type=Path, default=Path("schemas"), help="default: schemas")
+    parser.add_argument(
+        "--out", type=Path, default=None, help="default: schemas/ at the repository root"
+    )
     parser.add_argument("--check", action="store_true", help="fail if the files are stale")
     args = parser.parse_args(argv)
-    out: Path = args.out
+    out: Path | None = args.out or default_out()
+    if out is None:
+        parser.error("--out is required outside a source checkout")
     if args.check:
         bad = stale(out)
         for path in bad:
@@ -98,10 +155,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         if bad:
             print("run: uv run python -m horae.contracts.export")
         return 1 if bad else 0
-    for path, text in generate().items():
+    for path, data in generate().items():
         target = out / path
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(text, encoding="utf-8")
+        target.write_bytes(data)
     return 0
 
 

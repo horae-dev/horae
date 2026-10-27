@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://horae.dev/schemas/lockfile/v1.json",
+  "$id": "https://raw.githubusercontent.com/horae-dev/horae/main/schemas/lockfile/v1.json",
   "$defs": {
     "LockedPlugin": {
       "additionalProperties": false,
@@ -8,13 +8,25 @@
       "properties": {
         "version": {
           "description": "Installed plugin version.",
+          "maxLength": 128,
           "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?(\\+[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$",
           "title": "Version",
           "type": "string"
         },
         "repo": {
           "description": "Git URL the plugin was cloned from.",
-          "minLength": 1,
+          "maxLength": 512,
+          "not": {
+            "anyOf": [
+              {
+                "pattern": "/\\.\\.?(/|$)"
+              },
+              {
+                "pattern": "^https://([^/]*\\.)?localhost/"
+              }
+            ]
+          },
+          "pattern": "^https://([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)*[a-z]([a-z0-9-]{0,61}[a-z0-9])?(/[A-Za-z0-9._-]+)+$",
           "title": "Repo",
           "type": "string"
         },
@@ -26,7 +38,7 @@
         },
         "permissions": {
           "$ref": "#/$defs/Permissions",
-          "description": "The permissions the user approved at install or upgrade time."
+          "description": "The permissions the user approved at install or upgrade time (sorted when written)."
         }
       },
       "required": [
@@ -43,21 +55,31 @@
       "description": "Filesystem access. Empty means no filesystem access.",
       "properties": {
         "read": {
-          "description": "Paths the plugin may read.",
+          "description": "Paths the plugin may read (normalised absolute paths).",
           "items": {
-            "minLength": 1,
+            "maxLength": 1024,
+            "not": {
+              "pattern": "/\\.\\.?(/|$)"
+            },
+            "pattern": "^(/[^/\\\\\\x00-\\x1f\\x7f]{1,255})+$",
             "type": "string"
           },
+          "maxItems": 256,
           "title": "Read",
           "type": "array",
           "uniqueItems": true
         },
         "write": {
-          "description": "Paths the plugin may read and write.",
+          "description": "Paths the plugin may read and write (normalised absolute paths).",
           "items": {
-            "minLength": 1,
+            "maxLength": 1024,
+            "not": {
+              "pattern": "/\\.\\.?(/|$)"
+            },
+            "pattern": "^(/[^/\\\\\\x00-\\x1f\\x7f]{1,255})+$",
             "type": "string"
           },
+          "maxItems": 256,
           "title": "Write",
           "type": "array",
           "uniqueItems": true
@@ -74,9 +96,13 @@
           "description": "Hosts the plugin may connect to.",
           "items": {
             "maxLength": 253,
-            "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$",
+            "not": {
+              "pattern": "(^|\\.)localhost$"
+            },
+            "pattern": "^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)*[a-z]([a-z0-9-]{0,61}[a-z0-9])?$",
             "type": "string"
           },
+          "maxItems": 256,
           "title": "Network",
           "type": "array",
           "uniqueItems": true
@@ -85,9 +111,13 @@
           "description": "Secrets injected (only) into this plugin's environment.",
           "items": {
             "maxLength": 128,
-            "pattern": "^[A-Z_][A-Z0-9_]*$",
+            "not": {
+              "pattern": "^(HORAE(_|$)|LD_|DYLD_|PYTHON|PATH$|HOME$)"
+            },
+            "pattern": "^[A-Z][A-Z0-9_]*$",
             "type": "string"
           },
+          "maxItems": 256,
           "title": "Secrets",
           "type": "array",
           "uniqueItems": true
@@ -97,7 +127,7 @@
           "description": "Filesystem paths."
         },
         "intents": {
-          "description": "Intents the plugin may propose. Empty means a pure source.",
+          "description": "Intents the plugin may propose or, for a sink, apply. Empty means a pure source.",
           "items": {
             "enum": [
               "note.create",
@@ -110,6 +140,7 @@
             ],
             "type": "string"
           },
+          "maxItems": 256,
           "title": "Intents",
           "type": "array",
           "uniqueItems": true
@@ -129,7 +160,8 @@
       "type": "integer"
     },
     "plugins": {
-      "description": "Installed plugins, by name.",
+      "description": "Installed plugins, by name (sorted when written).",
+      "maxProperties": 256,
       "patternProperties": {
         "^[a-z][a-z0-9-]*$": {
           "$ref": "#/$defs/LockedPlugin"
@@ -139,7 +171,8 @@
         "maxLength": 64
       },
       "title": "Plugins",
-      "type": "object"
+      "type": "object",
+      "additionalProperties": false
     }
   },
   "required": [

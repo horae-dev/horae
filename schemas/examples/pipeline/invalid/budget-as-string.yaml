@@ -1,0 +1,4 @@
+# No type coercion: a budget is a number, not a string.
+name: daily-brief
+steps:
+  - llm: { skill: daily-brief/rank-and-word, model: default, budget: { usd: "0.05", tokens_out: 2000 } }

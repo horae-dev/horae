@@ -1,39 +1,54 @@
 # SPDX-License-Identifier: Apache-2.0
 """Pipeline definition (PLAN.md §3.1, §3.2).
 
-A pipeline is a trigger followed by a declared sequence of steps. Control flow is never
-decided by an LLM: the step list is the program.
+A pipeline is an optional trigger followed by a declared sequence of steps. Control flow is
+never decided by an LLM: the step list is the program.
 """
 
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Self
 
-from pydantic import Field, StringConstraints
+from pydantic import Field, Strict, StringConstraints, model_validator
 
-from horae.contracts._base import (
+from horae.contracts.types import (
+    MAX_ITEMS,
     Contract,
-    NonEmptyStr,
+    IanaTimezone,
     PipelineName,
     PluginRef,
     SkillRef,
+    StrictFloat,
+    StrictInt,
+    Token,
 )
 
 CallWithParams = Annotated[
     dict[PluginRef, dict[str, Any]],
     Field(min_length=1, max_length=1, json_schema_extra={"additionalProperties": False}),
 ]
-"""`{<plugin>.<tool>: {params}}`: one plugin tool with its parameters."""
+"""`{<namespace>.<tool>: {params}}`: one plugin tool with its parameters."""
 
 PluginCall = PluginRef | CallWithParams
 """A plugin tool, either bare (`tasks.normalize`) or with parameters."""
 
-CallList = Annotated[list[PluginCall], Field(min_length=1)]
+CallList = Annotated[list[PluginCall], Field(min_length=1, max_length=MAX_ITEMS)]
+
+_CRON_FIELD = r"[0-9A-Za-z*/,-]+"
+
+CronExpression = Annotated[
+    str,
+    Strict(),
+    StringConstraints(pattern=rf"^{_CRON_FIELD}( {_CRON_FIELD}){{4}}$", max_length=128),
+]
+"""Five cron fields separated by single spaces, e.g. `30 5 * * *`. No `@daily` macros."""
 
 
 class Trigger(Contract):
     """When the built-in scheduler runs the pipeline."""
 
-    cron: Annotated[str, StringConstraints(pattern=r"^\s*\S+(\s+\S+){4}\s*$")]
+    cron: CronExpression
     """A five-field cron expression, e.g. `30 5 * * *`."""
+    timezone: IanaTimezone | None = None
+    """IANA time zone the expression is evaluated in. When omitted, the instance's."""
 
 
 class CollectStep(Contract):
@@ -51,9 +66,9 @@ class TransformStep(Contract):
 class Budget(Contract):
     """Cost and token ceiling for one LLM step."""
 
-    usd: Annotated[float, Field(gt=0)]
+    usd: Annotated[StrictFloat, Field(gt=0)]
     """Maximum spend for the step, in US dollars."""
-    tokens_out: Annotated[int, Field(ge=1)]
+    tokens_out: Annotated[StrictInt, Field(ge=1)]
     """Maximum output tokens for the step."""
 
 
@@ -61,14 +76,14 @@ class LlmSpec(Contract):
     """The bounded LLM step: a typed function with no tools (PLAN.md §2.1.2, §3.4)."""
 
     skill: SkillRef
-    """The skill (prompt and output schema), `<plugin>/<skill>`."""
-    model: NonEmptyStr
+    """The skill (prompt and output schema), `<namespace>/<skill>`."""
+    model: Token
     """A model alias, resolved in `horae.yaml`."""
     budget: Budget
     on_unchanged_input: Literal["skip"] = "skip"
     """What to do when the input hash is unchanged since the last run: `skip` makes no LLM
     call (the $0 path)."""
-    timeout_s: Annotated[float, Field(gt=0)] | None = None
+    timeout_s: Annotated[StrictFloat, Field(gt=0)] | None = None
     """Timeout in seconds. When omitted, the core default applies."""
 
 
@@ -79,7 +94,8 @@ class LlmStep(Contract):
 
 
 class ActStep(Contract):
-    """Sinks that turn the results into intents, which the core validates and applies."""
+    """Sinks, which apply the intents. The core first validates every intent against the
+    proposing plugin's `permissions.intents`, shows it in a dry run and journals it."""
 
     act: CallList
 
@@ -99,6 +115,24 @@ class Pipeline(Contract):
 
     name: PipelineName
     """Pipeline name, used by `horae run <name>`."""
-    trigger: Trigger
-    steps: Annotated[list[Step], Field(min_length=1)]
-    """Steps, run in order."""
+    trigger: Trigger | None = None
+    """When omitted, the pipeline runs only from external triggers (`horae run <name>`)."""
+    steps: Annotated[
+        list[Step],
+        Field(
+            min_length=1,
+            max_length=MAX_ITEMS,
+            json_schema_extra={
+                "contains": {"required": ["llm"]},
+                "minContains": 0,
+                "maxContains": 1,
+            },
+        ),
+    ]
+    """Steps, run in order. At most one `llm` step."""
+
+    @model_validator(mode="after")
+    def _one_llm_step(self) -> Self:
+        if sum(isinstance(step, LlmStep) for step in self.steps) > 1:
+            raise ValueError("a pipeline has at most one `llm` step")
+        return self

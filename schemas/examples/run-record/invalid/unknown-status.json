@@ -2,6 +2,12 @@
   "schema_version": 1,
   "id": "run-1",
   "pipeline": "daily-brief",
+  "pipeline_digest": "9b2e4f6a8c0d1e3f5a7b9c1d3e5f7a9b1c3d5e7f9a1b3c5d7e9f1a3b5c7d9e1f",
+  "context": {
+    "now": "2026-10-27T11:30:00Z",
+    "timezone": "UTC",
+    "vars": {}
+  },
   "dry_run": false,
   "started_at": "2026-10-27T11:30:00Z",
   "finished_at": "2026-10-27T11:30:01Z",
@@ -12,5 +18,9 @@
   "llm": [],
   "intents": [],
   "changes": [],
-  "cost": {"tokens_in": 0, "tokens_out": 0, "usd": 0}
+  "cost": {
+    "tokens_in": 0,
+    "tokens_out": 0,
+    "usd": 0
+  }
 }

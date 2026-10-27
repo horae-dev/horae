@@ -2,16 +2,31 @@
 """Intents: the closed set of writes a plugin may propose (PLAN.md §2.1.3, §3.3).
 
 A plugin never writes directly. It returns intents; the core validates them against the
-plugin's declared `permissions.intents`, shows a dry-run diff, journals and applies them
-through a sink.
+plugin's declared `permissions.intents`, shows a dry-run diff, journals them, and a sink
+applies them.
+
+Text fields are data, never markup the sink may interpret: a sink must escape what its
+target format treats specially, e.g. the Obsidian Tasks emoji signifiers (`📅`, `⏰`, `✅`…)
+in a task title.
 """
 
-import datetime
-from typing import Annotated, Any, Literal, get_args
+from typing import Annotated, Any, Literal, Self, get_args
 
-from pydantic import Field, StringConstraints, TypeAdapter
+from pydantic import ConfigDict, Field, Strict, StringConstraints, TypeAdapter, model_validator
 
-from horae.contracts._base import Contract, HttpUrl, NonEmptyStr
+from horae.contracts.types import (
+    BlockId,
+    Content,
+    Contract,
+    Fingerprint,
+    Heading,
+    HttpsUrl,
+    IsoDate,
+    Message,
+    NotePath,
+    Timestamp,
+    Title,
+)
 
 IntentType = Literal[
     "note.create",
@@ -26,8 +41,15 @@ IntentType = Literal[
 
 INTENT_TYPES: tuple[IntentType, ...] = get_args(IntentType)
 
-NotePath = Annotated[str, StringConstraints(min_length=1, max_length=1024)]
-"""A note path relative to the sink's root (for example the vault), e.g. `Daily/x.md`."""
+ClockTime = Annotated[str, Strict(), StringConstraints(pattern=r"^([01][0-9]|2[0-3]):[0-5][0-9]$")]
+"""A time of day, `HH:MM` (24 h)."""
+
+NotifyLink = Annotated[
+    str,
+    Strict(),
+    StringConstraints(pattern=r"^(https|obsidian)://[^\x00-\x20\x7f]+$", max_length=2048),
+]
+"""An `https://` or `obsidian://` link, with no whitespace or control characters."""
 
 
 class NoteCreate(Contract):
@@ -36,8 +58,8 @@ class NoteCreate(Contract):
     type: Literal["note.create"]
     path: NotePath
     """Note path, relative to the sink's root."""
-    content: str
-    """Full note content (Markdown)."""
+    content: Content
+    """Full note content (Markdown), at most 1 MiB."""
 
 
 class NoteAppendSection(Contract):
@@ -46,10 +68,10 @@ class NoteAppendSection(Contract):
     type: Literal["note.append_section"]
     path: NotePath
     """Note path, relative to the sink's root."""
-    heading: NonEmptyStr
+    heading: Heading
     """Heading of the appended section, without the leading `#` characters."""
-    content: str
-    """Section body (Markdown)."""
+    content: Content
+    """Section body (Markdown), at most 1 MiB."""
 
 
 class NoteReplaceOwnedBlock(Contract):
@@ -58,56 +80,86 @@ class NoteReplaceOwnedBlock(Contract):
     type: Literal["note.replace_owned_block"]
     path: NotePath
     """Note path, relative to the sink's root."""
-    block: NonEmptyStr
+    block: BlockId
     """Identifier of the owned block to replace."""
-    content: str
-    """New block content (Markdown)."""
+    content: Content
+    """New block content (Markdown), at most 1 MiB."""
 
 
 class TaskCreate(Contract):
     """Create a task."""
 
-    type: Literal["task.create"]
-    title: NonEmptyStr
-    """Task text."""
-    due: datetime.date | None = None
-    """Due date (ISO 8601 `YYYY-MM-DD`)."""
-    time: Annotated[str, StringConstraints(pattern=r"^([01][0-9]|2[0-3]):[0-5][0-9]$")] | None = (
-        None
+    model_config = ConfigDict(
+        json_schema_extra={
+            "if": {"required": ["time"], "properties": {"time": {"type": "string"}}},
+            "then": {"required": ["due"], "properties": {"due": {"type": "string"}}},
+        }
     )
-    """Reminder time on the due date, `HH:MM` (24 h)."""
-    fingerprint: NonEmptyStr | None = None
+
+    type: Literal["task.create"]
+    title: Title
+    """Task text: one line, at most 500 characters."""
+    fingerprint: Fingerprint
     """Stable identity used to deduplicate tasks across runs and sources."""
+    due: IsoDate | None = None
+    """Due date (ISO 8601 `YYYY-MM-DD`)."""
+    time: ClockTime | None = None
+    """Reminder time on the due date, `HH:MM` (24 h). Requires `due`."""
+
+    @model_validator(mode="after")
+    def _time_needs_due(self) -> Self:
+        if self.time is not None and self.due is None:
+            raise ValueError("`time` requires `due`")
+        return self
 
 
 class TaskUpdateStatus(Contract):
     """Change the status of an existing task."""
 
+    model_config = ConfigDict(
+        json_schema_extra={
+            "if": {"required": ["status"], "properties": {"status": {"const": "snoozed"}}},
+            "then": {"required": ["until"], "properties": {"until": {"not": {"type": "null"}}}},
+            "else": {"properties": {"until": {"type": "null"}}},
+        }
+    )
+
     type: Literal["task.update_status"]
-    task: NonEmptyStr
+    task: Fingerprint
     """The task's fingerprint."""
-    status: Literal["todo", "done", "cancelled"]
+    status: Literal["todo", "done", "cancelled", "snoozed"]
     """New status."""
+    until: IsoDate | Timestamp | None = None
+    """For `snoozed` only (and then required): when the task comes back."""
+
+    @model_validator(mode="after")
+    def _until_iff_snoozed(self) -> Self:
+        if (self.status == "snoozed") != (self.until is not None):
+            raise ValueError("`until` is required for `snoozed` and only allowed there")
+        return self
 
 
 class NotifyPush(Contract):
     """Send a push notification."""
 
     type: Literal["notify.push"]
-    title: NonEmptyStr | None = None
-    """Optional notification title."""
-    body: NonEmptyStr
-    """Notification text."""
-    link: Annotated[str, StringConstraints(min_length=1, max_length=2048)] | None = None
-    """Optional link opened when the notification is tapped (e.g. an `obsidian://` link)."""
+    title: Title | None = None
+    """Optional notification title: one line, at most 500 characters."""
+    body: Message
+    """Notification text, at most 4096 characters."""
+    link: NotifyLink | None = None
+    """Optional `https://` or `obsidian://` link opened when the notification is tapped."""
 
 
 class HttpPost(Contract):
-    """POST a JSON body to a URL. The host must be declared in `permissions.network`."""
+    """POST a JSON body to an https URL.
+
+    The runtime must check `url_host(url)` against the plugin's `permissions.network`, using
+    exactly that parsed host, and caps the serialized body size."""
 
     type: Literal["http.post"]
-    url: HttpUrl
-    """Target URL."""
+    url: HttpsUrl
+    """Target URL: https only, a host name (no IP literal), optional port."""
     body: Any
     """JSON request body."""
 

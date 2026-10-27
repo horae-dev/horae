@@ -1,10 +1,10 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://horae.dev/schemas/pipeline/v1.json",
+  "$id": "https://raw.githubusercontent.com/horae-dev/horae/main/schemas/pipeline/v1.json",
   "$defs": {
     "ActStep": {
       "additionalProperties": false,
-      "description": "Sinks that turn the results into intents, which the core validates and applies.",
+      "description": "Sinks, which apply the intents. The core first validates every intent against the\nproposing plugin's `permissions.intents`, shows it in a dry run and journals it.",
       "properties": {
         "act": {
           "items": {
@@ -31,6 +31,7 @@
               }
             ]
           },
+          "maxItems": 256,
           "minItems": 1,
           "title": "Act",
           "type": "array"
@@ -95,6 +96,7 @@
               }
             ]
           },
+          "maxItems": 256,
           "minItems": 1,
           "title": "Collect",
           "type": "array"
@@ -111,7 +113,7 @@
       "description": "The bounded LLM step: a typed function with no tools (PLAN.md §2.1.2, §3.4).",
       "properties": {
         "skill": {
-          "description": "The skill (prompt and output schema), `<plugin>/<skill>`.",
+          "description": "The skill (prompt and output schema), `<namespace>/<skill>`.",
           "maxLength": 128,
           "pattern": "^[a-z][a-z0-9-]*/[a-z][a-z0-9_-]*$",
           "title": "Skill",
@@ -119,7 +121,8 @@
         },
         "model": {
           "description": "A model alias, resolved in `horae.yaml`.",
-          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[^\\x00-\\x20\\x7f]+$",
           "title": "Model",
           "type": "string"
         },
@@ -199,6 +202,7 @@
               }
             ]
           },
+          "maxItems": 256,
           "minItems": 1,
           "title": "Notify",
           "type": "array"
@@ -239,6 +243,7 @@
               }
             ]
           },
+          "maxItems": 256,
           "minItems": 1,
           "title": "Transform",
           "type": "array"
@@ -256,9 +261,25 @@
       "properties": {
         "cron": {
           "description": "A five-field cron expression, e.g. `30 5 * * *`.",
-          "pattern": "^\\s*\\S+(\\s+\\S+){4}\\s*$",
+          "maxLength": 128,
+          "pattern": "^[0-9A-Za-z*/,-]+( [0-9A-Za-z*/,-]+){4}$",
           "title": "Cron",
           "type": "string"
+        },
+        "timezone": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "pattern": "^[A-Za-z][A-Za-z0-9_+-]{0,63}(/[A-Za-z0-9_+-]{1,64}){0,3}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "IANA time zone the expression is evaluated in. When omitted, the instance's.",
+          "title": "Timezone"
         }
       },
       "required": [
@@ -279,10 +300,24 @@
       "type": "string"
     },
     "trigger": {
-      "$ref": "#/$defs/Trigger"
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Trigger"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "When omitted, the pipeline runs only from external triggers (`horae run <name>`)."
     },
     "steps": {
-      "description": "Steps, run in order.",
+      "contains": {
+        "required": [
+          "llm"
+        ]
+      },
+      "description": "Steps, run in order. At most one `llm` step.",
       "items": {
         "anyOf": [
           {
@@ -302,6 +337,9 @@
           }
         ]
       },
+      "maxContains": 1,
+      "maxItems": 256,
+      "minContains": 0,
       "minItems": 1,
       "title": "Steps",
       "type": "array"
@@ -309,7 +347,6 @@
   },
   "required": [
     "name",
-    "trigger",
     "steps"
   ],
   "title": "Horae pipeline",

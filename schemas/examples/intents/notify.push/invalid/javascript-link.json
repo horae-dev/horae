@@ -1,0 +1,1 @@
+{"type": "notify.push", "body": "Tap me", "link": "javascript:alert(1)"}

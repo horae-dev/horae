@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://horae.dev/schemas/intents/http.post/v1.json",
+  "$id": "https://raw.githubusercontent.com/horae-dev/horae/main/schemas/intents/http.post/v1.json",
   "additionalProperties": false,
-  "description": "POST a JSON body to a URL. The host must be declared in `permissions.network`.",
+  "description": "POST a JSON body to an https URL.\n\nThe runtime must check `url_host(url)` against the plugin's `permissions.network`, using\nexactly that parsed host, and caps the serialized body size.",
   "properties": {
     "type": {
       "const": "http.post",
@@ -10,9 +10,12 @@
       "type": "string"
     },
     "url": {
-      "description": "Target URL.",
+      "description": "Target URL: https only, a host name (no IP literal), optional port.",
       "maxLength": 2048,
-      "pattern": "^https?://[^\\s]+$",
+      "not": {
+        "pattern": "^https://([^/?:]*\\.)?localhost([:/?]|$)"
+      },
+      "pattern": "^https://([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)*[a-z]([a-z0-9-]{0,61}[a-z0-9])?(:(6553[0-5]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|[1-5][0-9]{4}|[1-9][0-9]{0,3}))?([/?][^\\x00-\\x20\\x7f\\\\#]*)?$",
       "title": "Url",
       "type": "string"
     },

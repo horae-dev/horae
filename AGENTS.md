@@ -25,7 +25,6 @@ uv run mypy                       # types (strict)
 uv run pytest                     # tests
 uv run pytest --cov               # tests + coverage gate (85%)
 uv run pre-commit run --all-files # ruff + gitleaks (CI also runs mypy, pytest and CodeQL)
-uv run python -m horae.contracts.export  # regenerate schemas/ from src/horae/contracts/
 ```
 CI runs the same checks; the aggregate **CI OK** check must be green before merge.
 

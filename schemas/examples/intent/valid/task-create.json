@@ -1,1 +1,1 @@
-{"type": "task.create", "title": "Renew the library card", "due": "2026-11-02"}
+{"type": "task.create", "title": "Renew the library card", "fingerprint": "manual:library-card", "due": "2026-11-02"}

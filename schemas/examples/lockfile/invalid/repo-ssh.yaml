@@ -1,0 +1,8 @@
+# Plugins are cloned over https only.
+schema_version: 1
+plugins:
+  github:
+    version: 0.1.0
+    repo: git@github.com:horae-dev/plugin-github.git
+    commit: 3f2c9e1a7b4d5c6e8f9012345678abcdef012345
+    permissions: {}

@@ -1,0 +1,5 @@
+# At most one LLM step per pipeline (PLAN.md §2.1.2).
+name: daily-brief
+steps:
+  - llm: { skill: daily-brief/rank-and-word, model: default, budget: { usd: 0.05, tokens_out: 2000 } }
+  - llm: { skill: daily-brief/rank-and-word, model: default, budget: { usd: 0.05, tokens_out: 2000 } }

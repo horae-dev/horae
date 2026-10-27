@@ -1,8 +1,25 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://horae.dev/schemas/intents/task.update_status/v1.json",
+  "$id": "https://raw.githubusercontent.com/horae-dev/horae/main/schemas/intents/task.update_status/v1.json",
   "additionalProperties": false,
   "description": "Change the status of an existing task.",
+  "else": {
+    "properties": {
+      "until": {
+        "type": "null"
+      }
+    }
+  },
+  "if": {
+    "properties": {
+      "status": {
+        "const": "snoozed"
+      }
+    },
+    "required": [
+      "status"
+    ]
+  },
   "properties": {
     "type": {
       "const": "task.update_status",
@@ -11,7 +28,8 @@
     },
     "task": {
       "description": "The task's fingerprint.",
-      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._:-]{1,128}$",
       "title": "Task",
       "type": "string"
     },
@@ -20,10 +38,31 @@
       "enum": [
         "todo",
         "done",
-        "cancelled"
+        "cancelled",
+        "snoozed"
       ],
       "title": "Status",
       "type": "string"
+    },
+    "until": {
+      "anyOf": [
+        {
+          "format": "date",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+          "type": "string"
+        },
+        {
+          "format": "date-time",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,6})?(Z|[+-][0-9]{2}:[0-9]{2})$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "For `snoozed` only (and then required): when the task comes back.",
+      "title": "Until"
     }
   },
   "required": [
@@ -31,6 +70,18 @@
     "task",
     "status"
   ],
+  "then": {
+    "properties": {
+      "until": {
+        "not": {
+          "type": "null"
+        }
+      }
+    },
+    "required": [
+      "until"
+    ]
+  },
   "title": "Horae intent task.update_status",
   "type": "object"
 }
