@@ -1,0 +1,91 @@
+# ADR 0002: Plugins return intents; the core applies them
+
+- **Status:** Proposed
+- **Date:** 2026-10-27
+
+## Context
+
+Horae reads untrusted content (mail, notes, web pages) and writes to things the user cares about
+(the vault, notifications, remote services). If plugins or the LLM could write directly, a buggy or
+compromised plugin, or a prompt injection, could change anything, and there would be no reliable
+dry run, journal or undo.
+
+PLAN.md makes four tenets of this ([§2.1](../PLAN.md#21-design-tenets) tenets 3–5) and three
+guarantees ([§2.2](../PLAN.md#22-measurable-guarantees-tested-in-ci)): `--dry-run` writes
+nothing, schema-invalid LLM output is never applied, and `horae undo <run-id>` restores every file
+the run touched.
+
+## Decision
+
+1. **Plugins never write.** They return **intents**: typed requests for a change. The core
+   validates each intent, checks it against the proposing plugin's declared
+   `permissions.intents`, shows a dry-run diff, journals it, and only then has a sink apply it
+   ([§3.3](../PLAN.md#33-plugin-manifest-and-permissions)).
+2. **Intents are a closed set with schemas:** `note.create`, `note.append_section`,
+   `note.replace_owned_block`, `task.create`, `task.update_status`, `notify.push`, `http.post`
+   (`http.post` only to declared hosts).
+3. **Untrusted content stays data.** It can fill schema fields, but it can never choose an action,
+   a recipient or a URL that was not already in the input set
+   ([§2.1](../PLAN.md#21-design-tenets) tenet 5).
+4. **Every applied change is journalled per run**, which is what makes undo possible
+   ([§3.1](../PLAN.md#31-concepts)).
+
+The contracts:
+
+- [`schemas/intent/v1.json`](../../schemas/intent/v1.json): one intent, `oneOf` tagged by `type`;
+  one file per intent in [`schemas/intents/`](../../schemas/intents/) (e.g.
+  [`intents/http.post/v1.json`](../../schemas/intents/http.post/v1.json)), generated from
+  [`src/horae/contracts/intents.py`](../../src/horae/contracts/intents.py).
+- `permissions.intents` in [`schemas/plugin-manifest/v1.json`](../../schemas/plugin-manifest/v1.json);
+  empty means a pure source.
+- The run record ([`schemas/run-record/v1.json`](../../schemas/run-record/v1.json)) keeps
+  `intents[]` (each with `step` and `proposed_by`) and `changes[]` (applied changes, each an index
+  into `intents`). A dry run has no `changes`.
+
+The contracts constrain shape (safe note paths, `https`-only URLs, one-line titles, size limits);
+the runtime still checks meaning, e.g. the `http.post` host against `permissions.network`
+([schemas README](../../schemas/README.md#strings-that-reach-the-outside-world)).
+
+## Consequences
+
+### Positive
+
+- One choke point for all writes: validation, permission checks, dry run, journal and undo are
+  implemented once in the core, not in every plugin.
+- `--dry-run` is trustworthy because there is no other write path.
+- A compromised source plugin can at most propose intents it declared, and the user approved those
+  at install ([ADR 0004](0004-git-marketplace-with-sha-pinning.md)).
+
+### Negative
+
+- A new kind of write needs a new intent type and a schema change in the core; plugins cannot
+  extend the set.
+- Sinks must be written so their effects can be diffed and undone, which rules out some
+  integrations (and costly targets are read-only by policy, [§2.3](../PLAN.md#23-non-goals-v0x)).
+- `notify.push` and `http.post` reach the outside world and cannot be undone by the journal;
+  `undo` restores files only.
+
+### Open questions
+
+- §2.1 names intents `create_task`, `append_note`, `notify`; §3.3 lists the closed set above. The
+  v1 contract uses the §3.3 names ([schemas decision 1](../../schemas/README.md#decisions-provisional-maintainer-to-confirm)).
+- `permissions.intents` covers both "may propose" and "may apply" (sinks); whether these should be
+  two lists is open (decision 12).
+- Untrusted-content tagging is not part of the v1 run record (decision 21); how the core tracks
+  provenance so that untrusted data cannot pick a URL or recipient is left to the M2 guards.
+
+## Alternatives considered
+
+- **Plugins write directly, with permissions.** Simpler plugins, but no global dry run or journal,
+  and enforcement would rely on every plugin being correct.
+- **LLM tool calls perform writes.** Rejected by [ADR 0001](0001-pipelines-not-agent-loops.md).
+- **An open, plugin-defined intent vocabulary.** Extensible, but the core could not validate,
+  diff or journal intents it does not understand.
+
+## References
+
+- [PLAN.md §2.1](../PLAN.md#21-design-tenets), [§2.2](../PLAN.md#22-measurable-guarantees-tested-in-ci),
+  [§3.1](../PLAN.md#31-concepts), [§3.3](../PLAN.md#33-plugin-manifest-and-permissions)
+- [`schemas/intent/v1.json`](../../schemas/intent/v1.json), [`schemas/intents/`](../../schemas/intents/),
+  [`schemas/run-record/v1.json`](../../schemas/run-record/v1.json)
+- [`schemas/README.md`](../../schemas/README.md#decisions-provisional-maintainer-to-confirm) (decisions 1, 2, 12, 21)
