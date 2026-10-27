@@ -17,3 +17,7 @@ state/
 *.sqlite-wal
 *.sqlite-shm
 .DS_Store
+
+# Planning tooling: local IDs and generated repo trees
+tools/planning/state.json
+tools/planning/repos/
