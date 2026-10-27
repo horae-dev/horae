@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://horae.dev/schemas/intents/notify.push/v1.json",
+  "additionalProperties": false,
+  "description": "Send a push notification.",
+  "properties": {
+    "type": {
+      "const": "notify.push",
+      "title": "Type",
+      "type": "string"
+    },
+    "title": {
+      "anyOf": [
+        {
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Optional notification title.",
+      "title": "Title"
+    },
+    "body": {
+      "description": "Notification text.",
+      "minLength": 1,
+      "title": "Body",
+      "type": "string"
+    },
+    "link": {
+      "anyOf": [
+        {
+          "maxLength": 2048,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Optional link opened when the notification is tapped (e.g. an `obsidian://` link).",
+      "title": "Link"
+    }
+  },
+  "required": [
+    "type",
+    "body"
+  ],
+  "title": "Horae intent notify.push",
+  "type": "object"
+}

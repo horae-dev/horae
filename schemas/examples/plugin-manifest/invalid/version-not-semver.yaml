@@ -1,0 +1,5 @@
+name: github
+version: "0.1"
+horae: ">=0.1,<0.2"
+provides: {}
+permissions: {}

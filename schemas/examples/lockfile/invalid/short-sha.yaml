@@ -1,0 +1,8 @@
+# Plugins are pinned to a full commit id, not an abbreviation or a tag.
+schema_version: 1
+plugins:
+  github:
+    version: 0.1.0
+    repo: https://github.com/horae-dev/plugin-github
+    commit: 3f2c9e1
+    permissions: {}

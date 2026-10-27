@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://horae.dev/schemas/intents/note.create/v1.json",
+  "additionalProperties": false,
+  "description": "Create a note with the given content.",
+  "properties": {
+    "type": {
+      "const": "note.create",
+      "title": "Type",
+      "type": "string"
+    },
+    "path": {
+      "description": "Note path, relative to the sink's root.",
+      "maxLength": 1024,
+      "minLength": 1,
+      "title": "Path",
+      "type": "string"
+    },
+    "content": {
+      "description": "Full note content (Markdown).",
+      "title": "Content",
+      "type": "string"
+    }
+  },
+  "required": [
+    "type",
+    "path",
+    "content"
+  ],
+  "title": "Horae intent note.create",
+  "type": "object"
+}

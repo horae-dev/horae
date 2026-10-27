@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://horae.dev/schemas/intents/note.append_section/v1.json",
+  "additionalProperties": false,
+  "description": "Append a section, under a heading, to an existing note.",
+  "properties": {
+    "type": {
+      "const": "note.append_section",
+      "title": "Type",
+      "type": "string"
+    },
+    "path": {
+      "description": "Note path, relative to the sink's root.",
+      "maxLength": 1024,
+      "minLength": 1,
+      "title": "Path",
+      "type": "string"
+    },
+    "heading": {
+      "description": "Heading of the appended section, without the leading `#` characters.",
+      "minLength": 1,
+      "title": "Heading",
+      "type": "string"
+    },
+    "content": {
+      "description": "Section body (Markdown).",
+      "title": "Content",
+      "type": "string"
+    }
+  },
+  "required": [
+    "type",
+    "path",
+    "heading",
+    "content"
+  ],
+  "title": "Horae intent note.append_section",
+  "type": "object"
+}

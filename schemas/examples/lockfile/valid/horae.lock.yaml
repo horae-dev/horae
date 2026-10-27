@@ -1,0 +1,12 @@
+# horae.lock as written by `horae plugin add github@0.1.0` (synthetic commit).
+schema_version: 1
+plugins:
+  github:
+    version: 0.1.0
+    repo: https://github.com/horae-dev/plugin-github
+    commit: 3f2c9e1a7b4d5c6e8f9012345678abcdef012345
+    permissions:
+      network: [api.github.com]
+      secrets: [GITHUB_TOKEN]
+      paths: {}
+      intents: []

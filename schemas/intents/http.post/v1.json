@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://horae.dev/schemas/intents/http.post/v1.json",
+  "additionalProperties": false,
+  "description": "POST a JSON body to a URL. The host must be declared in `permissions.network`.",
+  "properties": {
+    "type": {
+      "const": "http.post",
+      "title": "Type",
+      "type": "string"
+    },
+    "url": {
+      "description": "Target URL.",
+      "maxLength": 2048,
+      "pattern": "^https?://[^\\s]+$",
+      "title": "Url",
+      "type": "string"
+    },
+    "body": {
+      "description": "JSON request body.",
+      "title": "Body"
+    }
+  },
+  "required": [
+    "type",
+    "url",
+    "body"
+  ],
+  "title": "Horae intent http.post",
+  "type": "object"
+}

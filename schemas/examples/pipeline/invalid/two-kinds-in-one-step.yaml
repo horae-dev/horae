@@ -1,0 +1,6 @@
+# A step has exactly one kind.
+name: daily-brief
+trigger: { cron: "30 5 * * *" }
+steps:
+  - collect: [github.review_requests]
+    transform: [tasks.normalize]

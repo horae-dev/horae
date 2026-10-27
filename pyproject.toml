@@ -6,7 +6,10 @@ readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.12"
-dependencies = ["typer>=0.27"]
+dependencies = [
+    "pydantic>=2.14",
+    "typer>=0.27",
+]
 
 [project.scripts]
 horae = "horae.cli:app"

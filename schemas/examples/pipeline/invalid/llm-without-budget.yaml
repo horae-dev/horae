@@ -1,0 +1,7 @@
+# Every LLM step has a token and cost ceiling (PLAN.md §2.1.2).
+name: daily-brief
+trigger: { cron: "30 5 * * *" }
+steps:
+  - llm:
+      skill: daily-brief/rank-and-word
+      model: default

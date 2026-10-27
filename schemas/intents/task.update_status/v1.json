@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://horae.dev/schemas/intents/task.update_status/v1.json",
+  "additionalProperties": false,
+  "description": "Change the status of an existing task.",
+  "properties": {
+    "type": {
+      "const": "task.update_status",
+      "title": "Type",
+      "type": "string"
+    },
+    "task": {
+      "description": "The task's fingerprint.",
+      "minLength": 1,
+      "title": "Task",
+      "type": "string"
+    },
+    "status": {
+      "description": "New status.",
+      "enum": [
+        "todo",
+        "done",
+        "cancelled"
+      ],
+      "title": "Status",
+      "type": "string"
+    }
+  },
+  "required": [
+    "type",
+    "task",
+    "status"
+  ],
+  "title": "Horae intent task.update_status",
+  "type": "object"
+}

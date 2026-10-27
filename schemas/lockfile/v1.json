@@ -1,0 +1,150 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://horae.dev/schemas/lockfile/v1.json",
+  "$defs": {
+    "LockedPlugin": {
+      "additionalProperties": false,
+      "description": "One installed plugin, pinned to a commit.",
+      "properties": {
+        "version": {
+          "description": "Installed plugin version.",
+          "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?(\\+[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$",
+          "title": "Version",
+          "type": "string"
+        },
+        "repo": {
+          "description": "Git URL the plugin was cloned from.",
+          "minLength": 1,
+          "title": "Repo",
+          "type": "string"
+        },
+        "commit": {
+          "description": "The commit checked out; the tag for `version` must point to it.",
+          "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$",
+          "title": "Commit",
+          "type": "string"
+        },
+        "permissions": {
+          "$ref": "#/$defs/Permissions",
+          "description": "The permissions the user approved at install or upgrade time."
+        }
+      },
+      "required": [
+        "version",
+        "repo",
+        "commit",
+        "permissions"
+      ],
+      "title": "LockedPlugin",
+      "type": "object"
+    },
+    "PathPermissions": {
+      "additionalProperties": false,
+      "description": "Filesystem access. Empty means no filesystem access.",
+      "properties": {
+        "read": {
+          "description": "Paths the plugin may read.",
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Read",
+          "type": "array",
+          "uniqueItems": true
+        },
+        "write": {
+          "description": "Paths the plugin may read and write.",
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Write",
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "title": "PathPermissions",
+      "type": "object"
+    },
+    "Permissions": {
+      "additionalProperties": false,
+      "description": "Everything the plugin may touch. Undeclared access is a bug, blocked from M5.",
+      "properties": {
+        "network": {
+          "description": "Hosts the plugin may connect to.",
+          "items": {
+            "maxLength": 253,
+            "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$",
+            "type": "string"
+          },
+          "title": "Network",
+          "type": "array",
+          "uniqueItems": true
+        },
+        "secrets": {
+          "description": "Secrets injected (only) into this plugin's environment.",
+          "items": {
+            "maxLength": 128,
+            "pattern": "^[A-Z_][A-Z0-9_]*$",
+            "type": "string"
+          },
+          "title": "Secrets",
+          "type": "array",
+          "uniqueItems": true
+        },
+        "paths": {
+          "$ref": "#/$defs/PathPermissions",
+          "description": "Filesystem paths."
+        },
+        "intents": {
+          "description": "Intents the plugin may propose. Empty means a pure source.",
+          "items": {
+            "enum": [
+              "note.create",
+              "note.append_section",
+              "note.replace_owned_block",
+              "task.create",
+              "task.update_status",
+              "notify.push",
+              "http.post"
+            ],
+            "type": "string"
+          },
+          "title": "Intents",
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "title": "Permissions",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "The `horae.lock` file of an instance.",
+  "properties": {
+    "schema_version": {
+      "const": 1,
+      "description": "Version of this lockfile format.",
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "plugins": {
+      "description": "Installed plugins, by name.",
+      "patternProperties": {
+        "^[a-z][a-z0-9-]*$": {
+          "$ref": "#/$defs/LockedPlugin"
+        }
+      },
+      "propertyNames": {
+        "maxLength": 64
+      },
+      "title": "Plugins",
+      "type": "object"
+    }
+  },
+  "required": [
+    "schema_version"
+  ],
+  "title": "Horae lockfile (horae.lock)",
+  "type": "object"
+}

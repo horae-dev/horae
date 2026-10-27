@@ -1,0 +1,326 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://horae.dev/schemas/intent/v1.json",
+  "$defs": {
+    "HttpPost": {
+      "additionalProperties": false,
+      "description": "POST a JSON body to a URL. The host must be declared in `permissions.network`.",
+      "properties": {
+        "type": {
+          "const": "http.post",
+          "title": "Type",
+          "type": "string"
+        },
+        "url": {
+          "description": "Target URL.",
+          "maxLength": 2048,
+          "pattern": "^https?://[^\\s]+$",
+          "title": "Url",
+          "type": "string"
+        },
+        "body": {
+          "description": "JSON request body.",
+          "title": "Body"
+        }
+      },
+      "required": [
+        "type",
+        "url",
+        "body"
+      ],
+      "title": "HttpPost",
+      "type": "object"
+    },
+    "NoteAppendSection": {
+      "additionalProperties": false,
+      "description": "Append a section, under a heading, to an existing note.",
+      "properties": {
+        "type": {
+          "const": "note.append_section",
+          "title": "Type",
+          "type": "string"
+        },
+        "path": {
+          "description": "Note path, relative to the sink's root.",
+          "maxLength": 1024,
+          "minLength": 1,
+          "title": "Path",
+          "type": "string"
+        },
+        "heading": {
+          "description": "Heading of the appended section, without the leading `#` characters.",
+          "minLength": 1,
+          "title": "Heading",
+          "type": "string"
+        },
+        "content": {
+          "description": "Section body (Markdown).",
+          "title": "Content",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "path",
+        "heading",
+        "content"
+      ],
+      "title": "NoteAppendSection",
+      "type": "object"
+    },
+    "NoteCreate": {
+      "additionalProperties": false,
+      "description": "Create a note with the given content.",
+      "properties": {
+        "type": {
+          "const": "note.create",
+          "title": "Type",
+          "type": "string"
+        },
+        "path": {
+          "description": "Note path, relative to the sink's root.",
+          "maxLength": 1024,
+          "minLength": 1,
+          "title": "Path",
+          "type": "string"
+        },
+        "content": {
+          "description": "Full note content (Markdown).",
+          "title": "Content",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "path",
+        "content"
+      ],
+      "title": "NoteCreate",
+      "type": "object"
+    },
+    "NoteReplaceOwnedBlock": {
+      "additionalProperties": false,
+      "description": "Replace the content of a block that Horae owns inside a note.",
+      "properties": {
+        "type": {
+          "const": "note.replace_owned_block",
+          "title": "Type",
+          "type": "string"
+        },
+        "path": {
+          "description": "Note path, relative to the sink's root.",
+          "maxLength": 1024,
+          "minLength": 1,
+          "title": "Path",
+          "type": "string"
+        },
+        "block": {
+          "description": "Identifier of the owned block to replace.",
+          "minLength": 1,
+          "title": "Block",
+          "type": "string"
+        },
+        "content": {
+          "description": "New block content (Markdown).",
+          "title": "Content",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "path",
+        "block",
+        "content"
+      ],
+      "title": "NoteReplaceOwnedBlock",
+      "type": "object"
+    },
+    "NotifyPush": {
+      "additionalProperties": false,
+      "description": "Send a push notification.",
+      "properties": {
+        "type": {
+          "const": "notify.push",
+          "title": "Type",
+          "type": "string"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional notification title.",
+          "title": "Title"
+        },
+        "body": {
+          "description": "Notification text.",
+          "minLength": 1,
+          "title": "Body",
+          "type": "string"
+        },
+        "link": {
+          "anyOf": [
+            {
+              "maxLength": 2048,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional link opened when the notification is tapped (e.g. an `obsidian://` link).",
+          "title": "Link"
+        }
+      },
+      "required": [
+        "type",
+        "body"
+      ],
+      "title": "NotifyPush",
+      "type": "object"
+    },
+    "TaskCreate": {
+      "additionalProperties": false,
+      "description": "Create a task.",
+      "properties": {
+        "type": {
+          "const": "task.create",
+          "title": "Type",
+          "type": "string"
+        },
+        "title": {
+          "description": "Task text.",
+          "minLength": 1,
+          "title": "Title",
+          "type": "string"
+        },
+        "due": {
+          "anyOf": [
+            {
+              "format": "date",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Due date (ISO 8601 `YYYY-MM-DD`).",
+          "title": "Due"
+        },
+        "time": {
+          "anyOf": [
+            {
+              "pattern": "^([01][0-9]|2[0-3]):[0-5][0-9]$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Reminder time on the due date, `HH:MM` (24 h).",
+          "title": "Time"
+        },
+        "fingerprint": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Stable identity used to deduplicate tasks across runs and sources.",
+          "title": "Fingerprint"
+        }
+      },
+      "required": [
+        "type",
+        "title"
+      ],
+      "title": "TaskCreate",
+      "type": "object"
+    },
+    "TaskUpdateStatus": {
+      "additionalProperties": false,
+      "description": "Change the status of an existing task.",
+      "properties": {
+        "type": {
+          "const": "task.update_status",
+          "title": "Type",
+          "type": "string"
+        },
+        "task": {
+          "description": "The task's fingerprint.",
+          "minLength": 1,
+          "title": "Task",
+          "type": "string"
+        },
+        "status": {
+          "description": "New status.",
+          "enum": [
+            "todo",
+            "done",
+            "cancelled"
+          ],
+          "title": "Status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "task",
+        "status"
+      ],
+      "title": "TaskUpdateStatus",
+      "type": "object"
+    }
+  },
+  "discriminator": {
+    "mapping": {
+      "http.post": "#/$defs/HttpPost",
+      "note.append_section": "#/$defs/NoteAppendSection",
+      "note.create": "#/$defs/NoteCreate",
+      "note.replace_owned_block": "#/$defs/NoteReplaceOwnedBlock",
+      "notify.push": "#/$defs/NotifyPush",
+      "task.create": "#/$defs/TaskCreate",
+      "task.update_status": "#/$defs/TaskUpdateStatus"
+    },
+    "propertyName": "type"
+  },
+  "oneOf": [
+    {
+      "$ref": "#/$defs/NoteCreate"
+    },
+    {
+      "$ref": "#/$defs/NoteAppendSection"
+    },
+    {
+      "$ref": "#/$defs/NoteReplaceOwnedBlock"
+    },
+    {
+      "$ref": "#/$defs/TaskCreate"
+    },
+    {
+      "$ref": "#/$defs/TaskUpdateStatus"
+    },
+    {
+      "$ref": "#/$defs/NotifyPush"
+    },
+    {
+      "$ref": "#/$defs/HttpPost"
+    }
+  ],
+  "title": "Horae intent (any)"
+}

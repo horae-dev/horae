@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://horae.dev/schemas/intents/note.replace_owned_block/v1.json",
+  "additionalProperties": false,
+  "description": "Replace the content of a block that Horae owns inside a note.",
+  "properties": {
+    "type": {
+      "const": "note.replace_owned_block",
+      "title": "Type",
+      "type": "string"
+    },
+    "path": {
+      "description": "Note path, relative to the sink's root.",
+      "maxLength": 1024,
+      "minLength": 1,
+      "title": "Path",
+      "type": "string"
+    },
+    "block": {
+      "description": "Identifier of the owned block to replace.",
+      "minLength": 1,
+      "title": "Block",
+      "type": "string"
+    },
+    "content": {
+      "description": "New block content (Markdown).",
+      "title": "Content",
+      "type": "string"
+    }
+  },
+  "required": [
+    "type",
+    "path",
+    "block",
+    "content"
+  ],
+  "title": "Horae intent note.replace_owned_block",
+  "type": "object"
+}

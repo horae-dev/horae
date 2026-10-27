@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "id": "2026-10-27T05:30:00Z-daily-brief-01",
+  "pipeline": "daily-brief",
+  "dry_run": false,
+  "started_at": "2026-10-27T05:30:00Z",
+  "finished_at": "2026-10-27T05:30:12+00:00",
+  "status": "ok",
+  "plugins": {
+    "github": {"version": "0.1.0", "commit": "3f2c9e1a7b4d5c6e8f9012345678abcdef012345"},
+    "obsidian": {"version": "0.1.0"}
+  },
+  "inputs": [
+    {"step": 0, "source": "github.review_requests", "params": {}, "data": [{"title": "Fix the parser", "number": 42}]}
+  ],
+  "steps": [
+    {"kind": "collect", "status": "ok"},
+    {"kind": "llm", "status": "ok", "output": {"items": ["Review PR 42"]}},
+    {"kind": "act", "status": "ok"}
+  ],
+  "llm": [
+    {
+      "step": 1,
+      "skill": "daily-brief/rank-and-word",
+      "skill_version": "1",
+      "backend": "anthropic",
+      "model": "example-model",
+      "cached": false,
+      "request": {"input": [{"title": "Fix the parser", "number": 42}]},
+      "response": {"items": ["Review PR 42"]},
+      "usage": {"tokens_in": 812, "tokens_out": 64, "usd": 0.004}
+    }
+  ],
+  "intents": [
+    {
+      "step": 2,
+      "proposed_by": "obsidian.write_note",
+      "intent": {"type": "note.create", "path": "Daily/2026-10-27.assistant.md", "content": "- [ ] Review PR 42\n"}
+    }
+  ],
+  "changes": [{"intent": 0, "target": "Daily/2026-10-27.assistant.md"}],
+  "cost": {"tokens_in": 812, "tokens_out": 64, "usd": 0.004}
+}

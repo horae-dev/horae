@@ -1,0 +1,12 @@
+# plugin.yaml
+name: github
+version: 0.1.0
+horae: ">=0.1,<0.2"
+provides:
+  sources: [github.review_requests, github.assigned, github.mentions]
+permissions:
+  network: [api.github.com]
+  secrets: [GITHUB_TOKEN]          # injected only into this plugin
+  paths: {}                        # no filesystem access
+  intents: []                      # a pure source: may not propose writes
+runtime: { protocol: mcp-stdio, command: ["python", "-m", "horae_github"] }

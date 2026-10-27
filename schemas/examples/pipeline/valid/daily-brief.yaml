@@ -1,0 +1,19 @@
+# pipelines/daily-brief.yaml
+name: daily-brief
+trigger: { cron: "30 5 * * *" }          # or run by Coolify / external cron: `horae run daily-brief`
+steps:
+  - collect:
+      - github.review_requests: {}
+      - calendar.events: { days: 2 }
+      - coach.brief: { endpoints: [finance, running] }   # MCP `brief` of existing services
+      - obsidian.open_tasks: {}                          # read back what you already ticked
+  - transform: [tasks.normalize, tasks.dedupe_fingerprint, calendar.prep_tasks]
+  - llm:
+      skill: daily-brief/rank-and-word      # from a plugin; prompt + output schema
+      model: default                        # alias resolved in horae.yaml
+      budget: { usd: 0.05, tokens_out: 2000 }
+      on_unchanged_input: skip              # $0 path
+  - act:
+      - obsidian.write_note: { path: "Daily/{{date}}.assistant.md", mode: replace-owned }
+  - notify:
+      - ntfy.digest: { when: "07:30", only_if: due_today_or_overdue }

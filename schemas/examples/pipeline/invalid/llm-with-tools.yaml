@@ -1,0 +1,9 @@
+# The LLM step has no tools (PLAN.md §2.1.2): unknown keys are rejected.
+name: daily-brief
+trigger: { cron: "30 5 * * *" }
+steps:
+  - llm:
+      skill: daily-brief/rank-and-word
+      model: default
+      budget: { usd: 0.05, tokens_out: 2000 }
+      tools: [obsidian.write_note]
