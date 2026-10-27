@@ -11,7 +11,7 @@ This repository is built mostly by **AI coding agents** (Claude Code and others)
 
 ## Working rules
 - Branch: `story/<issue-number>-<short-slug>`. One PR per issue; keep it under ~400 changed lines when possible.
-- Python 3.12+, managed with **uv**. Style: ruff, mypy strict, pytest. (Commands are added by the scaffolding story; until then the repo has no code.)
+- Python 3.12+, managed with **uv**. Style: ruff, mypy strict, pytest. Commands: `uv sync`, `uv run pre-commit install`, `uv run ruff check`, `uv run ruff format --check`, `uv run mypy`, `uv run pytest`, `uv run pre-commit run --all-files`.
 - **Tests first** for behaviour: every acceptance criterion maps to at least one test.
 - Never add a network host, secret, path, intent or LLM call that is not declared and justified in the PR.
 - Never commit secrets, tokens, personal data or real hostnames. Fixtures must be synthetic.
