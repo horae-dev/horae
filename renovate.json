@@ -4,6 +4,17 @@
   "enabledManagers": ["pep621", "github-actions", "pre-commit", "pyenv"],
   "pre-commit": { "enabled": true },
   "lockFileMaintenance": { "enabled": true },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Tool versions pinned in the CI workflow (gitleaks, uv)",
+      "managerFilePatterns": ["/^\\.github/workflows/ci\\.yml$/"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>[a-z-]+) depName=(?<depName>[^\\s]+)\\n\\s*[A-Z_]+_VERSION: (?<currentValue>[\\w.-]+)"
+      ],
+      "extractVersionTemplate": "^v?(?<version>.+)$"
+    }
+  ],
   "packageRules": [
     {
       "groupName": "ruff",

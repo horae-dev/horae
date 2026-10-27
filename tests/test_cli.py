@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import re
 import runpy
 import shutil
 import subprocess
@@ -14,23 +15,28 @@ from horae.cli import app
 runner = CliRunner()
 
 
+def _plain(s: str) -> str:
+    """Strip ANSI colour codes (typer forces rich output when GITHUB_ACTIONS is set)."""
+    return re.sub(r"\x1b\[[0-9;]*m", "", s)
+
+
 def test_help() -> None:
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
-    assert "Usage" in result.output
-    assert "--version" in result.output
+    assert "Usage" in _plain(result.output)
+    assert "--version" in _plain(result.output)
 
 
 def test_version() -> None:
     result = runner.invoke(app, ["--version"])
     assert result.exit_code == 0
-    assert result.output.strip() == f"horae {__version__}"
+    assert _plain(result.output).strip() == f"horae {__version__}"
 
 
 def test_no_args_shows_usage() -> None:
     result = runner.invoke(app, [])
     assert result.exit_code == 2
-    assert "Usage" in result.output
+    assert "Usage" in _plain(result.output)
 
 
 def test_python_dash_m_help() -> None:
@@ -41,7 +47,7 @@ def test_python_dash_m_help() -> None:
         check=False,
     )
     assert result.returncode == 0
-    assert "Usage" in result.stdout
+    assert "Usage" in _plain(result.stdout)
 
 
 def test_console_script_help() -> None:
@@ -50,7 +56,7 @@ def test_console_script_help() -> None:
         pytest.skip("horae console script not installed")
     result = subprocess.run([exe, "--help"], capture_output=True, text=True, check=False)  # noqa: S603
     assert result.returncode == 0
-    assert "Usage" in result.stdout
+    assert "Usage" in _plain(result.stdout)
 
 
 def test_main_module_runs_app(monkeypatch: pytest.MonkeyPatch) -> None:
