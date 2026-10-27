@@ -1,0 +1,46 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/mmornati/graft/main/schema/graft.v1.schema.json
+# Review policy for agent-written pull requests (https://github.com/mmornati/graft).
+# Agents review and approve low-risk changes; the maintainer is pulled in only when needed.
+version: 1
+
+# Paths that always raise the risk to `sensitive`.
+sensitive_paths:
+  - "src/horae/permissions/**"
+  - "src/horae/plugins/host/**"
+  - "src/horae/sandbox/**"
+  - "src/horae/marketplace/**"
+  - "src/horae/api/act/**"
+  - "src/horae/llm/backends/**"
+  - "src/horae/secrets/**"
+  - "schemas/**"
+  - ".github/workflows/**"
+  - "Dockerfile"
+  - "deploy/**"
+
+# When nothing else matches: one human.
+default:
+  require: { humans: 1 }
+
+rules:
+  - name: docs-only
+    match: { risk: trivial, only_paths: ["docs/**", "*.md"] }
+    approve: auto
+
+  - name: trivial
+    match: { risk: trivial }
+    approve: auto
+
+  - name: small-logic
+    match: { risk: logic, size: { max_lines: 150 } }
+    approve: auto
+
+  - name: sensitive
+    match: { risk: sensitive }
+    require: { humans: 1 }
+
+  - name: big-change
+    match: { size: { min_lines: 800 } }
+    require: { humans: 1 }
+
+report:
+  language: en
