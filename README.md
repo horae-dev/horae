@@ -35,6 +35,10 @@ Read the [plan](docs/PLAN.md), the [roadmap](docs/ROADMAP.md) and the [estimatio
 
 Stories, estimates and acceptance criteria are in this repository's [issues](../../issues) and on the [roadmap project](https://github.com/orgs/horae-dev/projects/1).
 
+## CI
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every PR and push to `main`: lockfile check, ruff, mypy, pytest with coverage, gitleaks (full history) and CodeQL (python, actions). Python comes from `.python-version`. The coverage gate is `fail_under` in `[tool.coverage.report]` of `pyproject.toml` (85); change it there. Actions are pinned to commit SHAs (Renovate keeps them current).
+
 ## Contributing
 
 This project is developed mostly by AI coding agents supervised by a human maintainer. Read [AGENTS.md](AGENTS.md) for the workflow (it applies to humans too), and the organization's [contributing guide](https://github.com/horae-dev/.github/blob/main/CONTRIBUTING.md) and [security policy](https://github.com/horae-dev/.github/blob/main/SECURITY.md).
