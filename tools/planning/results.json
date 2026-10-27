@@ -1,0 +1,2024 @@
+{
+ "params": {
+  "optimistic": {
+   "p": {
+    "XS": 0.95,
+    "S": 0.85,
+    "M": 0.7,
+    "L": 0.5
+   },
+   "rho": 0.08,
+   "W": 0.5,
+   "t_take": 0.4,
+   "F": 0.1,
+   "b_ai": 0.2,
+   "o_h": 0.2,
+   "b_int": 0.1,
+   "f": 0.75
+  },
+  "likely": {
+   "p": {
+    "XS": 0.85,
+    "S": 0.7,
+    "M": 0.5,
+    "L": 0.3
+   },
+   "rho": 0.15,
+   "W": 1.0,
+   "t_take": 0.6,
+   "F": 0.15,
+   "b_ai": 0.25,
+   "o_h": 0.3,
+   "b_int": 0.15,
+   "f": 0.65
+  },
+  "pessimistic": {
+   "p": {
+    "XS": 0.7,
+    "S": 0.5,
+    "M": 0.3,
+    "L": 0.15
+   },
+   "rho": 0.3,
+   "W": 1.5,
+   "t_take": 1.0,
+   "F": 0.2,
+   "b_ai": 0.35,
+   "o_h": 0.45,
+   "b_int": 0.25,
+   "f": 0.55
+  }
+ },
+ "scenarios": {
+  "optimistic": {
+   "human_ideal_days": 145.83333333333334,
+   "human_person_days": 192.50000000000003,
+   "human_person_days_p85": 196.0251167810443,
+   "human_team_calendar_days": 85.55555555555557,
+   "human_team_weeks": 17.111111111111114,
+   "supervision_hours": 677.5144626,
+   "supervision_person_days": 112.9190771,
+   "agent_hours": 134.108439375,
+   "compression": 0.43994445623376616,
+   "solo_human_weeks": 51.333333333333336,
+   "ai_weeks::part-time maintainer (15 h/week)": 45.16763084,
+   "ai_weeks::full-time supervisor (30 h/week)": 22.58381542
+  },
+  "likely": {
+   "human_ideal_days": 145.83333333333334,
+   "human_person_days": 218.02083333333331,
+   "human_person_days_p85": 222.01329514216755,
+   "human_team_calendar_days": 111.80555555555553,
+   "human_team_weeks": 22.361111111111107,
+   "supervision_hours": 1134.3032372083333,
+   "supervision_person_days": 189.05053953472222,
+   "agent_hours": 324.546671875,
+   "compression": 0.6503410820114668,
+   "solo_human_weeks": 67.08333333333333,
+   "ai_weeks::part-time maintainer (15 h/week)": 75.62021581388889,
+   "ai_weeks::full-time supervisor (30 h/week)": 37.810107906944445
+  },
+  "pessimistic": {
+   "human_ideal_days": 145.83333333333334,
+   "human_person_days": 264.3229166666667,
+   "human_person_days_p85": 269.1632758830627,
+   "human_team_calendar_days": 160.19570707070707,
+   "human_team_weeks": 32.03914141414141,
+   "supervision_hours": 2317.1374887750003,
+   "supervision_person_days": 386.18958146250003,
+   "agent_hours": 616.41598640625,
+   "compression": 1.0957891572532021,
+   "solo_human_weeks": 96.11742424242424,
+   "ai_weeks::part-time maintainer (15 h/week)": 154.475832585,
+   "ai_weeks::full-time supervisor (30 h/week)": 77.2379162925
+  }
+ },
+ "stories": [
+  {
+   "title": "Scaffold the uv project and quality tooling",
+   "epic": "E-core-found",
+   "repo": "horae",
+   "milestone": "M0",
+   "size": "S",
+   "category": "docs",
+   "risk_label": "Docs/CI",
+   "executor": "Agent",
+   "human_days": 1.3,
+   "pert": [
+    0.5,
+    1,
+    1.5
+   ],
+   "ai_agent_hours": 0.9,
+   "supervision_hours": 2.0,
+   "first_pass": 80
+  },
+  {
+   "title": "CI pipeline with lint, types, tests and security scans",
+   "epic": "E-core-found",
+   "repo": "horae",
+   "milestone": "M0",
+   "size": "S",
+   "category": "docs",
+   "risk_label": "Docs/CI",
+   "executor": "Agent",
+   "human_days": 1.3,
+   "pert": [
+    0.5,
+    1,
+    1.5
+   ],
+   "ai_agent_hours": 0.9,
+   "supervision_hours": 2.0,
+   "first_pass": 80
+  },
+  {
+   "title": "Write ADRs 0001-0006",
+   "epic": "E-core-found",
+   "repo": "horae",
+   "milestone": "M0",
+   "size": "M",
+   "category": "spec",
+   "risk_label": "Design/prompt",
+   "executor": "Agent + human check",
+   "human_days": 2.1,
+   "pert": [
+    1,
+    1.5,
+    2.5
+   ],
+   "ai_agent_hours": 4.2,
+   "supervision_hours": 7.5,
+   "first_pass": 28
+  },
+  {
+   "title": "JSON Schemas for pipeline, plugin manifest, intents, lockfile and run record",
+   "epic": "E-core-found",
+   "repo": "horae",
+   "milestone": "M0",
+   "size": "M",
+   "category": "contract",
+   "risk_label": "Core contract",
+   "executor": "Agent",
+   "human_days": 2.6,
+   "pert": [
+    1,
+    2,
+    3
+   ],
+   "ai_agent_hours": 3.7,
+   "supervision_hours": 7.7,
+   "first_pass": 40
+  },
+  {
+   "title": "Threat model (docs/security.md)",
+   "epic": "E-core-found",
+   "repo": "horae",
+   "milestone": "M0",
+   "size": "M",
+   "category": "sec",
+   "risk_label": "Security",
+   "executor": "Human-led",
+   "human_days": 2.2,
+   "pert": [
+    1,
+    1.5,
+    3
+   ],
+   "ai_agent_hours": 4.3,
+   "supervision_hours": 15.8,
+   "first_pass": 25
+  },
+  {
+   "title": "Agent workflow: AGENTS.md, Graft trailers and definition of done",
+   "epic": "E-core-found",
+   "repo": "horae",
+   "milestone": "M0",
+   "size": "XS",
+   "category": "docs",
+   "risk_label": "Docs/CI",
+   "executor": "Agent",
+   "human_days": 0.8,
+   "pert": [
+    0.5,
+    0.5,
+    1
+   ],
+   "ai_agent_hours": 0.3,
+   "supervision_hours": 1.0,
+   "first_pass": 95
+  },
+  {
+   "title": "Instance and configuration loader",
+   "epic": "E-core-engine",
+   "repo": "horae",
+   "milestone": "M1",
+   "size": "M",
+   "category": "normal",
+   "risk_label": "Normal",
+   "executor": "Agent",
+   "human_days": 2.1,
+   "pert": [
+    1,
+    1.5,
+    2.5
+   ],
+   "ai_agent_hours": 3.3,
+   "supervision_hours": 4.5,
+   "first_pass": 50
+  },
+  {
+   "title": "Pipeline model and step execution",
+   "epic": "E-core-engine",
+   "repo": "horae",
+   "milestone": "M1",
+   "size": "M",
+   "category": "contract",
+   "risk_label": "Core contract",
+   "executor": "Agent",
+   "human_days": 3.4,
+   "pert": [
+    1.5,
+    2.5,
+    4
+   ],
+   "ai_agent_hours": 3.7,
+   "supervision_hours": 9.6,
+   "first_pass": 40
+  },
+  {
+   "title": "SQLite store with migrations",
+   "epic": "E-core-engine",
+   "repo": "horae",
+   "milestone": "M1",
+   "size": "M",
+   "category": "normal",
+   "risk_label": "Normal",
+   "executor": "Agent",
+   "human_days": 2.6,
+   "pert": [
+    1,
+    2,
+    3
+   ],
+   "ai_agent_hours": 3.3,
+   "supervision_hours": 5.4,
+   "first_pass": 50
+  },
+  {
+   "title": "Run lifecycle, locking and statuses",
+   "epic": "E-core-engine",
+   "repo": "horae",
+   "milestone": "M1",
+   "size": "M",
+   "category": "contract",
+   "risk_label": "Core contract",
+   "executor": "Agent",
+   "human_days": 2.6,
+   "pert": [
+    1,
+    2,
+    3
+   ],
+   "ai_agent_hours": 3.7,
+   "supervision_hours": 7.7,
+   "first_pass": 40
+  },
+  {
+   "title": "Intent model and validation",
+   "epic": "E-core-engine",
+   "repo": "horae",
+   "milestone": "M1",
+   "size": "M",
+   "category": "contract",
+   "risk_label": "Core contract",
+   "executor": "Agent",
+   "human_days": 2.6,
+   "pert": [
+    1,
+    2,
+    3
+   ],
+   "ai_agent_hours": 3.7,
+   "supervision_hours": 7.7,
+   "first_pass": 40
+  },
+  {
+   "title": "Dry-run diff",
+   "epic": "E-core-engine",
+   "repo": "horae",
+   "milestone": "M1",
+   "size": "M",
+   "category": "normal",
+   "risk_label": "Normal",
+   "executor": "Agent",
+   "human_days": 2.1,
+   "pert": [
+    1,
+    1.5,
+    2.5
+   ],
+   "ai_agent_hours": 3.3,
+   "supervision_hours": 4.5,
+   "first_pass": 50
+  },
+  {
+   "title": "Journal and undo",
+   "epic": "E-core-engine",
+   "repo": "horae",
+   "milestone": "M1",
+   "size": "M",
+   "category": "contract",
+   "risk_label": "Core contract",
+   "executor": "Agent",
+   "human_days": 2.6,
+   "pert": [
+    1,
+    2,
+    3
+   ],
+   "ai_agent_hours": 3.7,
+   "supervision_hours": 7.7,
+   "first_pass": 40
+  },
+  {
+   "title": "Replay from recorded inputs",
+   "epic": "E-core-engine",
+   "repo": "horae",
+   "milestone": "M1",
+   "size": "M",
+   "category": "normal",
+   "risk_label": "Normal",
+   "executor": "Agent",
+   "human_days": 2.2,
+   "pert": [
+    1,
+    1.5,
+    3
+   ],
+   "ai_agent_hours": 3.3,
+   "supervision_hours": 4.7,
+   "first_pass": 50
+  },
+  {
+   "title": "Plugin host v1 (MCP stdio, declared secrets only)",
+   "epic": "E-core-engine",
+   "repo": "horae",
+   "milestone": "M1",
+   "size": "M",
+   "category": "sec",
+   "risk_label": "Security",
+   "executor": "Human-led",
+   "human_days": 4.1,
+   "pert": [
+    2,
+    3,
+    5
+   ],
+   "ai_agent_hours": 4.3,
+   "supervision_hours": 28.2,
+   "first_pass": 25
+  },
+  {
+   "title": "Built-in fixture plugins and end-to-end test",
+   "epic": "E-core-engine",
+   "repo": "horae",
+   "milestone": "M1",
+   "size": "S",
+   "category": "normal",
+   "risk_label": "Normal",
+   "executor": "Agent",
+   "human_days": 1.3,
+   "pert": [
+    0.5,
+    1,
+    1.5
+   ],
+   "ai_agent_hours": 1.0,
+   "supervision_hours": 2.1,
+   "first_pass": 70
+  },
+  {
+   "title": "CLI commands",
+   "epic": "E-core-engine",
+   "repo": "horae",
+   "milestone": "M1",
+   "size": "M",
+   "category": "normal",
+   "risk_label": "Normal",
+   "executor": "Agent",
+   "human_days": 2.6,
+   "pert": [
+    1,
+    2,
+    3
+   ],
+   "ai_agent_hours": 3.3,
+   "supervision_hours": 5.4,
+   "first_pass": 50
+  },
+  {
+   "title": "Skill format and loader",
+   "epic": "E-core-llm",
+   "repo": "horae",
+   "milestone": "M2",
+   "size": "M",
+   "category": "spec",
+   "risk_label": "Design/prompt",
+   "executor": "Agent + human check",
+   "human_days": 2.1,
+   "pert": [
+    1,
+    1.5,
+    2.5
+   ],
+   "ai_agent_hours": 4.2,
+   "supervision_hours": 7.5,
+   "first_pass": 28
+  },
+  {
+   "title": "Backend interface and anthropic backend",
+   "epic": "E-core-llm",
+   "repo": "horae",
+   "milestone": "M2",
+   "size": "M",
+   "category": "normal",
+   "risk_label": "Normal",
+   "executor": "Agent",
+   "human_days": 2.1,
+   "pert": [
+    1,
+    1.5,
+    2.5
+   ],
+   "ai_agent_hours": 3.3,
+   "supervision_hours": 4.5,
+   "first_pass": 50
+  },
+  {
+   "title": "claude-cli backend with isolation",
+   "epic": "E-core-llm",
+   "repo": "horae",
+   "milestone": "M2",
+   "size": "M",
+   "category": "sec",
+   "risk_label": "Security",
+   "executor": "Human-led",
+   "human_days": 2.6,
+   "pert": [
+    1,
+    2,
+    3
+   ],
+   "ai_agent_hours": 4.3,
+   "supervision_hours": 18.6,
+   "first_pass": 25
+  },
+  {
+   "title": "openai-compatible and ollama backends",
+   "epic": "E-core-llm",
+   "repo": "horae",
+   "milestone": "M2",
+   "size": "M",
+   "category": "normal",
+   "risk_label": "Normal",
+   "executor": "Agent",
+   "human_days": 2.0,
+   "pert": [
+    1,
+    1.5,
+    2
+   ],
+   "ai_agent_hours": 3.3,
+   "supervision_hours": 4.3,
+   "first_pass": 50
+  },
+  {
+   "title": "Schema-validated output with one repair retry",
+   "epic": "E-core-llm",
+   "repo": "horae",
+   "milestone": "M2",
+   "size": "S",
+   "category": "contract",
+   "risk_label": "Core contract",
+   "executor": "Agent",
+   "human_days": 1.4,
+   "pert": [
+    0.5,
+    1,
+    2
+   ],
+   "ai_agent_hours": 1.2,
+   "supervision_hours": 3.3,
+   "first_pass": 56
+  },
+  {
+   "title": "Input-hash cache and the $0 path",
+   "epic": "E-core-llm",
+   "repo": "horae",
+   "milestone": "M2",
+   "size": "M",
+   "category": "contract",
+   "risk_label": "Core contract",
+   "executor": "Agent",
+   "human_days": 2.1,
+   "pert": [
+    1,
+    1.5,
+    2.5
+   ],
+   "ai_agent_hours": 3.7,
+   "supervision_hours": 6.3,
+   "first_pass": 40
+  },
+  {
+   "title": "Budgets and usage ledger",
+   "epic": "E-core-llm",
+   "repo": "horae",
+   "milestone": "M2",
+   "size": "M",
+   "category": "normal",
+   "risk_label": "Normal",
+   "executor": "Agent",
+   "human_days": 2.0,
+   "pert": [
+    1,
+    1.5,
+    2
+   ],
+   "ai_agent_hours": 3.3,
+   "supervision_hours": 4.3,
+   "first_pass": 50
+  },
+  {
+   "title": "De-identification transform",
+   "epic": "E-core-llm",
+   "repo": "horae",
+   "milestone": "M2",
+   "size": "M",
+   "category": "sec",
+   "risk_label": "Security",
+   "executor": "Human-led",
+   "human_days": 2.6,
+   "pert": [
+    1,
+    2,
+    3
+   ],
+   "ai_agent_hours": 4.3,
+   "supervision_hours": 18.6,
+   "first_pass": 25
+  },
+  {
+   "title": "Untrusted-content tagging and action guard",
+   "epic": "E-core-llm",
+   "repo": "horae",
+   "milestone": "M2",
+   "size": "M",
+   "category": "sec",
+   "risk_label": "Security",
+   "executor": "Human-led",
+   "human_days": 2.9,
+   "pert": [
+    1.5,
+    2,
+    4
+   ],
+   "ai_agent_hours": 4.3,
+   "supervision_hours": 20.6,
+   "first_pass": 25
+  },
+  {
+   "title": "Skill evaluation harness",
+   "epic": "E-core-llm",
+   "repo": "horae",
+   "milestone": "M2",
+   "size": "M",
+   "category": "normal",
+   "risk_label": "Normal",
+   "executor": "Agent",
+   "human_days": 2.1,
+   "pert": [
+    1,
+    1.5,
+    2.5
+   ],
+   "ai_agent_hours": 3.3,
+   "supervision_hours": 4.5,
+   "first_pass": 50
+  },
+  {
+   "title": "HTTP API: /healthz and /runs",
+   "epic": "E-core-runtime",
+   "repo": "horae",
+   "milestone": "M3",
+   "size": "S",
+   "category": "normal",
+   "risk_label": "Normal",
+   "executor": "Agent",
+   "human_days": 1.3,
+   "pert": [
+    0.5,
+    1,
+    1.5
+   ],
+   "ai_agent_hours": 1.0,
+   "supervision_hours": 2.1,
+   "first_pass": 70
+  },
+  {
+   "title": "Signed single-use action links (/act)",
+   "epic": "E-core-runtime",
+   "repo": "horae",
+   "milestone": "M3",
+   "size": "M",
+   "category": "sec",
+   "risk_label": "Security",
+   "executor": "Human-led",
+   "human_days": 2.1,
+   "pert": [
+    1,
+    1.5,
+    2.5
+   ],
+   "ai_agent_hours": 4.3,
+   "supervision_hours": 15.1,
+   "first_pass": 25
+  },
+  {
+   "title": "Scheduler and external triggers",
+   "epic": "E-core-runtime",
+   "repo": "horae",
+   "milestone": "M3",
+   "size": "M",
+   "category": "normal",
+   "risk_label": "Normal",
+   "executor": "Agent",
+   "human_days": 2.1,
+   "pert": [
+    1,
+    1.5,
+    2.5
+   ],
+   "ai_agent_hours": 3.3,
+   "supervision_hours": 4.5,
+   "first_pass": 50
+  },
+  {
+   "title": "Container image and GHCR publishing",
+   "epic": "E-core-runtime",
+   "repo": "horae",
+   "milestone": "M3",
+   "size": "S",
+   "category": "docs",
+   "risk_label": "Docs/CI",
+   "executor": "Agent",
+   "human_days": 1.3,
+   "pert": [
+    0.5,
+    1,
+    1.5
+   ],
+   "ai_agent_hours": 0.9,
+   "supervision_hours": 2.0,
+   "first_pass": 80
+  },
+  {
+   "title": "Coolify template and plain compose",
+   "epic": "E-core-runtime",
+   "repo": "horae",
+   "milestone": "M3",
+   "size": "M",
+   "category": "integ",
+   "risk_label": "Integration",
+   "executor": "Agent + human check",
+   "human_days": 2.1,
+   "pert": [
+    1,
+    1.5,
+    2.5
+   ],
+   "ai_agent_hours": 4.1,
+   "supervision_hours": 8.7,
+   "first_pass": 30
+  },
+  {
+   "title": "Plugin SDK (Python)",
+   "epic": "E-core-runtime",
+   "repo": "horae",
+   "milestone": "M3",
+   "size": "M",
+   "category": "contract",
+   "risk_label": "Core contract",
+   "executor": "Agent",
+   "human_days": 3.4,
+   "pert": [
+    1.5,
+    2.5,
+    4
+   ],
+   "ai_agent_hours": 3.7,
+   "supervision_hours": 9.6,
+   "first_pass": 40
+  },
+  {
+   "title": "Marketplace resolution",
+   "epic": "E-core-market",
+   "repo": "horae",
+   "milestone": "M4",
+   "size": "M",
+   "category": "normal",
+   "risk_label": "Normal",
+   "executor": "Agent",
+   "human_days": 2.0,
+   "pert": [
+    1,
+    1.5,
+    2
+   ],
+   "ai_agent_hours": 3.3,
+   "supervision_hours": 4.3,
+   "first_pass": 50
+  },
+  {
+   "title": "Install from git with pinned commit",
+   "epic": "E-core-market",
+   "repo": "horae",
+   "milestone": "M4",
+   "size": "M",
+   "category": "sec",
+   "risk_label": "Security",
+   "executor": "Human-led",
+   "human_days": 2.1,
+   "pert": [
+    1,
+    1.5,
+    2.5
+   ],
+   "ai_agent_hours": 4.3,
+   "supervision_hours": 15.1,
+   "first_pass": 25
+  },
+  {
+   "title": "Per-plugin virtual environments",
+   "epic": "E-core-market",
+   "repo": "horae",
+   "milestone": "M4",
+   "size": "M",
+   "category": "normal",
+   "risk_label": "Normal",
+   "executor": "Agent",
+   "human_days": 2.1,
+   "pert": [
+    1,
+    1.5,
+    2.5
+   ],
+   "ai_agent_hours": 3.3,
+   "supervision_hours": 4.5,
+   "first_pass": 50
+  },
+  {
+   "title": "Permission approval and lockfile",
+   "epic": "E-core-market",
+   "repo": "horae",
+   "milestone": "M4",
+   "size": "M",
+   "category": "sec",
+   "risk_label": "Security",
+   "executor": "Human-led",
+   "human_days": 2.0,
+   "pert": [
+    1,
+    1.5,
+    2
+   ],
+   "ai_agent_hours": 4.3,
+   "supervision_hours": 14.4,
+   "first_pass": 25
+  },
+  {
+   "title": "Upgrade with permission diff, remove and audit",
+   "epic": "E-core-market",
+   "repo": "horae",
+   "milestone": "M4",
+   "size": "M",
+   "category": "sec",
+   "risk_label": "Security",
+   "executor": "Human-led",
+   "human_days": 2.6,
+   "pert": [
+    1,
+    2,
+    3
+   ],
+   "ai_agent_hours": 4.3,
+   "supervision_hours": 18.6,
+   "first_pass": 25
+  },
+  {
+   "title": "Direct install from a git URL",
+   "epic": "E-core-market",
+   "repo": "horae",
+   "milestone": "M4",
+   "size": "XS",
+   "category": "normal",
+   "risk_label": "Normal",
+   "executor": "Agent",
+   "human_days": 0.8,
+   "pert": [
+    0.5,
+    0.5,
+    1
+   ],
+   "ai_agent_hours": 0.3,
+   "supervision_hours": 1.1,
+   "first_pass": 85
+  },
+  {
+   "title": "Per-plugin container runtime",
+   "epic": "E-core-isolation",
+   "repo": "horae",
+   "milestone": "M5",
+   "size": "M",
+   "category": "sec",
+   "risk_label": "Security",
+   "executor": "Human-led",
+   "human_days": 4.1,
+   "pert": [
+    2,
+    3,
+    5
+   ],
+   "ai_agent_hours": 4.3,
+   "supervision_hours": 28.2,
+   "first_pass": 25
+  },
+  {
+   "title": "Egress allow-list proxy",
+   "epic": "E-core-isolation",
+   "repo": "horae",
+   "milestone": "M5",
+   "size": "M",
+   "category": "sec",
+   "risk_label": "Security",
+   "executor": "Human-led",
+   "human_days": 4.1,
+   "pert": [
+    2,
+    3,
+    5
+   ],
+   "ai_agent_hours": 4.3,
+   "supervision_hours": 28.2,
+   "first_pass": 25
+  },
+  {
+   "title": "Declared mounts and resource limits",
+   "epic": "E-core-isolation",
+   "repo": "horae",
+   "milestone": "M5",
+   "size": "M",
+   "category": "sec",
+   "risk_label": "Security",
+   "executor": "Human-led",
+   "human_days": 2.1,
+   "pert": [
+    1,
+    1.5,
+    2.5
+   ],
+   "ai_agent_hours": 4.3,
+   "supervision_hours": 15.1,
+   "first_pass": 25
+  },
+  {
+   "title": "Malicious-plugin test suite",
+   "epic": "E-core-isolation",
+   "repo": "horae",
+   "milestone": "M5",
+   "size": "M",
+   "category": "sec",
+   "risk_label": "Security",
+   "executor": "Human-led",
+   "human_days": 3.9,
+   "pert": [
+    2,
+    3,
+    4
+   ],
+   "ai_agent_hours": 4.3,
+   "supervision_hours": 26.8,
+   "first_pass": 25
+  },
+  {
+   "title": "Secret redaction in logs and run records",
+   "epic": "E-core-isolation",
+   "repo": "horae",
+   "milestone": "M5",
+   "size": "S",
+   "category": "sec",
+   "risk_label": "Security",
+   "executor": "Human-led",
+   "human_days": 1.3,
+   "pert": [
+    0.5,
+    1,
+    1.5
+   ],
+   "ai_agent_hours": 1.5,
+   "supervision_hours": 8.3,
+   "first_pass": 35
+  },
+  {
+   "title": "Read-only MCP tools",
+   "epic": "E-core-mcp",
+   "repo": "horae",
+   "milestone": "M5",
+   "size": "M",
+   "category": "normal",
+   "risk_label": "Normal",
+   "executor": "Agent",
+   "human_days": 2.0,
+   "pert": [
+    1,
+    1.5,
+    2
+   ],
+   "ai_agent_hours": 3.3,
+   "supervision_hours": 4.3,
+   "first_pass": 50
+  },
+  {
+   "title": "Approval-gated pipeline.run",
+   "epic": "E-core-mcp",
+   "repo": "horae",
+   "milestone": "M5",
+   "size": "M",
+   "category": "sec",
+   "risk_label": "Security",
+   "executor": "Human-led",
+   "human_days": 2.1,
+   "pert": [
+    1,
+    1.5,
+    2.5
+   ],
+   "ai_agent_hours": 4.3,
+   "supervision_hours": 15.1,
+   "first_pass": 25
+  },
+  {
+   "title": "MCP server authentication",
+   "epic": "E-core-mcp",
+   "repo": "horae",
+   "milestone": "M5",
+   "size": "S",
+   "category": "sec",
+   "risk_label": "Security",
+   "executor": "Human-led",
+   "human_days": 1.3,
+   "pert": [
+    0.5,
+    1,
+    1.5
+   ],
+   "ai_agent_hours": 1.5,
+   "supervision_hours": 8.3,
+   "first_pass": 35
+  },
+  {
+   "title": "Docs site",
+   "epic": "E-core-release",
+   "repo": "horae",
+   "milestone": "M8",
+   "size": "M",
+   "category": "docs",
+   "risk_label": "Docs/CI",
+   "executor": "Agent",
+   "human_days": 3.4,
+   "pert": [
+    1.5,
+    2.5,
+    4
+   ],
+   "ai_agent_hours": 3.0,
+   "supervision_hours": 6.0,
+   "first_pass": 57
+  },
+  {
+   "title": "Release automation and signed artifacts",
+   "epic": "E-core-release",
+   "repo": "horae",
+   "milestone": "M8",
+   "size": "M",
+   "category": "docs",
+   "risk_label": "Docs/CI",
+   "executor": "Agent",
+   "human_days": 2.0,
+   "pert": [
+    1,
+    1.5,
+    2
+   ],
+   "ai_agent_hours": 3.0,
+   "supervision_hours": 3.9,
+   "first_pass": 57
+  },
+  {
+   "title": "Propose the Coolify one-click template upstream",
+   "epic": "E-core-release",
+   "repo": "horae",
+   "milestone": "M8",
+   "size": "S",
+   "category": "integ",
+   "risk_label": "Integration",
+   "executor": "Agent + human check",
+   "human_days": 1.4,
+   "pert": [
+    0.5,
+    1,
+    2
+   ],
+   "ai_agent_hours": 1.4,
+   "supervision_hours": 4.7,
+   "first_pass": 42
+  },
+  {
+   "title": "v0.1 release",
+   "epic": "E-core-release",
+   "repo": "horae",
+   "milestone": "M8",
+   "size": "S",
+   "category": "human",
+   "risk_label": "Human-only",
+   "executor": "Human-only",
+   "human_days": 1.3,
+   "pert": [
+    0.5,
+    1,
+    1.5
+   ],
+   "ai_agent_hours": 0.0,
+   "supervision_hours": 8.0,
+   "first_pass": 0
+  },
+  {
+   "title": "Install the Graft GitHub App on horae-dev",
+   "epic": "E-human-ops",
+   "repo": "horae",
+   "milestone": "M0",
+   "size": "XS",
+   "category": "human",
+   "risk_label": "Human-only",
+   "executor": "Human-only",
+   "human_days": 0.7,
+   "pert": [
+    0.25,
+    0.5,
+    1
+   ],
+   "ai_agent_hours": 0.0,
+   "supervision_hours": 4.3,
+   "first_pass": 0
+  },
+  {
+   "title": "Organization security settings",
+   "epic": "E-human-ops",
+   "repo": "horae",
+   "milestone": "M0",
+   "size": "XS",
+   "category": "human",
+   "risk_label": "Human-only",
+   "executor": "Human-only",
+   "human_days": 0.4,
+   "pert": [
+    0.25,
+    0.25,
+    0.5
+   ],
+   "ai_agent_hours": 0.0,
+   "supervision_hours": 2.3,
+   "first_pass": 0
+  },
+  {
+   "title": "Model provider keys and spend limits",
+   "epic": "E-human-ops",
+   "repo": "horae",
+   "milestone": "M2",
+   "size": "XS",
+   "category": "human",
+   "risk_label": "Human-only",
+   "executor": "Human-only",
+   "human_days": 0.4,
+   "pert": [
+    0.25,
+    0.25,
+    0.5
+   ],
+   "ai_agent_hours": 0.0,
+   "supervision_hours": 2.3,
+   "first_pass": 0
+  },
+  {
+   "title": "Reference server: Coolify resources",
+   "epic": "E-human-ops",
+   "repo": "horae",
+   "milestone": "M3",
+   "size": "S",
+   "category": "human",
+   "risk_label": "Human-only",
+   "executor": "Human-only",
+   "human_days": 1.4,
+   "pert": [
+    0.5,
+    1,
+    2
+   ],
+   "ai_agent_hours": 0.0,
+   "supervision_hours": 8.7,
+   "first_pass": 0
+  },
+  {
+   "title": "Device tests: Obsidian LiveSync and ntfy on iPhone",
+   "epic": "E-human-ops",
+   "repo": "horae",
+   "milestone": "M3",
+   "size": "S",
+   "category": "human",
+   "risk_label": "Human-only",
+   "executor": "Human-only",
+   "human_days": 1.4,
+   "pert": [
+    0.5,
+    1,
+    2
+   ],
+   "ai_agent_hours": 0.0,
+   "supervision_hours": 8.7,
+   "first_pass": 0
+  },
+  {
+   "title": "PyPI and GHCR publishing setup",
+   "epic": "E-human-ops",
+   "repo": "horae",
+   "milestone": "M8",
+   "size": "XS",
+   "category": "human",
+   "risk_label": "Human-only",
+   "executor": "Human-only",
+   "human_days": 0.7,
+   "pert": [
+    0.25,
+    0.5,
+    1
+   ],
+   "ai_agent_hours": 0.0,
+   "supervision_hours": 4.3,
+   "first_pass": 0
+  },
+  {
+   "title": "marketplace.json schema and initial entries",
+   "epic": "E-market",
+   "repo": "marketplace",
+   "milestone": "M4",
+   "size": "XS",
+   "category": "docs",
+   "risk_label": "Docs/CI",
+   "executor": "Agent",
+   "human_days": 0.8,
+   "pert": [
+    0.5,
+    0.5,
+    1
+   ],
+   "ai_agent_hours": 0.3,
+   "supervision_hours": 1.0,
+   "first_pass": 95
+  },
+  {
+   "title": "Verification CI for every entry",
+   "epic": "E-market",
+   "repo": "marketplace",
+   "milestone": "M4",
+   "size": "M",
+   "category": "integ",
+   "risk_label": "Integration",
+   "executor": "Agent + human check",
+   "human_days": 2.6,
+   "pert": [
+    1,
+    2,
+    3
+   ],
+   "ai_agent_hours": 4.1,
+   "supervision_hours": 10.6,
+   "first_pass": 30
+  },
+  {
+   "title": "Contribution guide and review policy for third-party plugins",
+   "epic": "E-market",
+   "repo": "marketplace",
+   "milestone": "M4",
+   "size": "S",
+   "category": "docs",
+   "risk_label": "Docs/CI",
+   "executor": "Agent",
+   "human_days": 1.3,
+   "pert": [
+    0.5,
+    1,
+    1.5
+   ],
+   "ai_agent_hours": 0.9,
+   "supervision_hours": 2.0,
+   "first_pass": 80
+  },
+  {
+   "title": "Template repository",
+   "epic": "E-template",
+   "repo": "template-plugin",
+   "milestone": "M3",
+   "size": "M",
+   "category": "normal",
+   "risk_label": "Normal",
+   "executor": "Agent",
+   "human_days": 2.0,
+   "pert": [
+    1,
+    1.5,
+    2
+   ],
+   "ai_agent_hours": 3.3,
+   "supervision_hours": 4.3,
+   "first_pass": 50
+  },
+  {
+   "title": "Plugin authoring checklist",
+   "epic": "E-template",
+   "repo": "template-plugin",
+   "milestone": "M3",
+   "size": "XS",
+   "category": "docs",
+   "risk_label": "Docs/CI",
+   "executor": "Agent",
+   "human_days": 0.6,
+   "pert": [
+    0.25,
+    0.5,
+    0.5
+   ],
+   "ai_agent_hours": 0.3,
+   "supervision_hours": 0.8,
+   "first_pass": 95
+  },
+  {
+   "title": "Parse Obsidian Tasks syntax from the vault",
+   "epic": "E-obsidian",
+   "repo": "plugin-obsidian",
+   "milestone": "M3",
+   "size": "M",
+   "category": "normal",
+   "risk_label": "Normal",
+   "executor": "Agent",
+   "human_days": 2.1,
+   "pert": [
+    1,
+    1.5,
+    2.5
+   ],
+   "ai_agent_hours": 3.3,
+   "supervision_hours": 4.5,
+   "first_pass": 50
+  },
+  {
+   "title": "Owned files and blocks writer",
+   "epic": "E-obsidian",
+   "repo": "plugin-obsidian",
+   "milestone": "M3",
+   "size": "M",
+   "category": "contract",
+   "risk_label": "Core contract",
+   "executor": "Agent",
+   "human_days": 2.1,
+   "pert": [
+    1,
+    1.5,
+    2.5
+   ],
+   "ai_agent_hours": 3.7,
+   "supervision_hours": 6.3,
+   "first_pass": 40
+  },
+  {
+   "title": "open_tasks source and task status sink",
+   "epic": "E-obsidian",
+   "repo": "plugin-obsidian",
+   "milestone": "M3",
+   "size": "S",
+   "category": "normal",
+   "risk_label": "Normal",
+   "executor": "Agent",
+   "human_days": 1.3,
+   "pert": [
+    0.5,
+    1,
+    1.5
+   ],
+   "ai_agent_hours": 1.0,
+   "supervision_hours": 2.1,
+   "first_pass": 70
+  },
+  {
+   "title": "Daily note rendering templates",
+   "epic": "E-obsidian",
+   "repo": "plugin-obsidian",
+   "milestone": "M3",
+   "size": "S",
+   "category": "spec",
+   "risk_label": "Design/prompt",
+   "executor": "Agent + human check",
+   "human_days": 1.3,
+   "pert": [
+    0.5,
+    1,
+    1.5
+   ],
+   "ai_agent_hours": 1.4,
+   "supervision_hours": 3.8,
+   "first_pass": 38
+  },
+  {
+   "title": "livesync-cli daemon sidecar",
+   "epic": "E-livesync",
+   "repo": "plugin-livesync",
+   "milestone": "M3",
+   "size": "M",
+   "category": "ext",
+   "risk_label": "External API",
+   "executor": "Agent + human check",
+   "human_days": 2.6,
+   "pert": [
+    1,
+    2,
+    3
+   ],
+   "ai_agent_hours": 4.3,
+   "supervision_hours": 13.5,
+   "first_pass": 25
+  },
+  {
+   "title": "E2EE parity check with the Obsidian plugin",
+   "epic": "E-livesync",
+   "repo": "plugin-livesync",
+   "milestone": "M3",
+   "size": "M",
+   "category": "ext",
+   "risk_label": "External API",
+   "executor": "Agent + human check",
+   "human_days": 2.2,
+   "pert": [
+    1,
+    1.5,
+    3
+   ],
+   "ai_agent_hours": 4.3,
+   "supervision_hours": 11.8,
+   "first_pass": 25
+  },
+  {
+   "title": "Nightly git snapshot of the vault",
+   "epic": "E-livesync",
+   "repo": "plugin-livesync",
+   "milestone": "M3",
+   "size": "S",
+   "category": "normal",
+   "risk_label": "Normal",
+   "executor": "Agent",
+   "human_days": 1.3,
+   "pert": [
+    0.5,
+    1,
+    1.5
+   ],
+   "ai_agent_hours": 1.0,
+   "supervision_hours": 2.1,
+   "first_pass": 70
+  },
+  {
+   "title": "Setup and recovery docs",
+   "epic": "E-livesync",
+   "repo": "plugin-livesync",
+   "milestone": "M3",
+   "size": "S",
+   "category": "docs",
+   "risk_label": "Docs/CI",
+   "executor": "Agent",
+   "human_days": 1.3,
+   "pert": [
+    0.5,
+    1,
+    1.5
+   ],
+   "ai_agent_hours": 0.9,
+   "supervision_hours": 2.0,
+   "first_pass": 80
+  },
+  {
+   "title": "notify.push notifier",
+   "epic": "E-ntfy",
+   "repo": "plugin-ntfy",
+   "milestone": "M3",
+   "size": "M",
+   "category": "normal",
+   "risk_label": "Normal",
+   "executor": "Agent",
+   "human_days": 2.0,
+   "pert": [
+    1,
+    1.5,
+    2
+   ],
+   "ai_agent_hours": 3.3,
+   "supervision_hours": 4.3,
+   "first_pass": 50
+  },
+  {
+   "title": "Reminder state and deduplication",
+   "epic": "E-ntfy",
+   "repo": "plugin-ntfy",
+   "milestone": "M3",
+   "size": "S",
+   "category": "normal",
+   "risk_label": "Normal",
+   "executor": "Agent",
+   "human_days": 1.3,
+   "pert": [
+    0.5,
+    1,
+    1.5
+   ],
+   "ai_agent_hours": 1.0,
+   "supervision_hours": 2.1,
+   "first_pass": 70
+  },
+  {
+   "title": "Deep links and action buttons",
+   "epic": "E-ntfy",
+   "repo": "plugin-ntfy",
+   "milestone": "M3",
+   "size": "M",
+   "category": "integ",
+   "risk_label": "Integration",
+   "executor": "Agent + human check",
+   "human_days": 2.1,
+   "pert": [
+    1,
+    1.5,
+    2.5
+   ],
+   "ai_agent_hours": 4.1,
+   "supervision_hours": 8.7,
+   "first_pass": 30
+  },
+  {
+   "title": "Review requests, assignments and mentions",
+   "epic": "E-github",
+   "repo": "plugin-github",
+   "milestone": "M3",
+   "size": "M",
+   "category": "normal",
+   "risk_label": "Normal",
+   "executor": "Agent",
+   "human_days": 2.0,
+   "pert": [
+    1,
+    1.5,
+    2
+   ],
+   "ai_agent_hours": 3.3,
+   "supervision_hours": 4.3,
+   "first_pass": 50
+  },
+  {
+   "title": "Participating notifications",
+   "epic": "E-github",
+   "repo": "plugin-github",
+   "milestone": "M3",
+   "size": "S",
+   "category": "normal",
+   "risk_label": "Normal",
+   "executor": "Agent",
+   "human_days": 1.3,
+   "pert": [
+    0.5,
+    1,
+    1.5
+   ],
+   "ai_agent_hours": 1.0,
+   "supervision_hours": 2.1,
+   "first_pass": 70
+  },
+  {
+   "title": "Docs and permissions",
+   "epic": "E-github",
+   "repo": "plugin-github",
+   "milestone": "M3",
+   "size": "XS",
+   "category": "docs",
+   "risk_label": "Docs/CI",
+   "executor": "Agent",
+   "human_days": 0.7,
+   "pert": [
+    0.25,
+    0.5,
+    1
+   ],
+   "ai_agent_hours": 0.3,
+   "supervision_hours": 0.9,
+   "first_pass": 95
+  },
+  {
+   "title": "ICS URL source",
+   "epic": "E-calendar",
+   "repo": "plugin-calendar",
+   "milestone": "M3",
+   "size": "M",
+   "category": "normal",
+   "risk_label": "Normal",
+   "executor": "Agent",
+   "human_days": 2.0,
+   "pert": [
+    1,
+    1.5,
+    2
+   ],
+   "ai_agent_hours": 3.3,
+   "supervision_hours": 4.3,
+   "first_pass": 50
+  },
+  {
+   "title": "CalDAV source",
+   "epic": "E-calendar",
+   "repo": "plugin-calendar",
+   "milestone": "M3",
+   "size": "M",
+   "category": "ext",
+   "risk_label": "External API",
+   "executor": "Agent + human check",
+   "human_days": 2.1,
+   "pert": [
+    1,
+    1.5,
+    2.5
+   ],
+   "ai_agent_hours": 4.3,
+   "supervision_hours": 11.4,
+   "first_pass": 25
+  },
+  {
+   "title": "Google Calendar API source",
+   "epic": "E-calendar",
+   "repo": "plugin-calendar",
+   "milestone": "M3",
+   "size": "M",
+   "category": "ext",
+   "risk_label": "External API",
+   "executor": "Agent + human check",
+   "human_days": 2.1,
+   "pert": [
+    1,
+    1.5,
+    2.5
+   ],
+   "ai_agent_hours": 4.3,
+   "supervision_hours": 11.4,
+   "first_pass": 25
+  },
+  {
+   "title": "Preparation tasks transform",
+   "epic": "E-calendar",
+   "repo": "plugin-calendar",
+   "milestone": "M3",
+   "size": "S",
+   "category": "normal",
+   "risk_label": "Normal",
+   "executor": "Agent",
+   "human_days": 1.3,
+   "pert": [
+    0.5,
+    1,
+    1.5
+   ],
+   "ai_agent_hours": 1.0,
+   "supervision_hours": 2.1,
+   "first_pass": 70
+  },
+  {
+   "title": "Daily brief pipeline and rank-and-word skill",
+   "epic": "E-brief",
+   "repo": "pack-daily-brief",
+   "milestone": "M3",
+   "size": "M",
+   "category": "spec",
+   "risk_label": "Design/prompt",
+   "executor": "Agent + human check",
+   "human_days": 2.1,
+   "pert": [
+    1,
+    1.5,
+    2.5
+   ],
+   "ai_agent_hours": 4.2,
+   "supervision_hours": 7.5,
+   "first_pass": 28
+  },
+  {
+   "title": "Golden tests and evals",
+   "epic": "E-brief",
+   "repo": "pack-daily-brief",
+   "milestone": "M3",
+   "size": "S",
+   "category": "normal",
+   "risk_label": "Normal",
+   "executor": "Agent",
+   "human_days": 1.5,
+   "pert": [
+    1,
+    1,
+    2
+   ],
+   "ai_agent_hours": 1.0,
+   "supervision_hours": 2.4,
+   "first_pass": 70
+  },
+  {
+   "title": "Reminder pipeline",
+   "epic": "E-remind",
+   "repo": "pack-reminders",
+   "milestone": "M3",
+   "size": "M",
+   "category": "normal",
+   "risk_label": "Normal",
+   "executor": "Agent",
+   "human_days": 2.1,
+   "pert": [
+    1,
+    1.5,
+    2.5
+   ],
+   "ai_agent_hours": 3.3,
+   "supervision_hours": 4.5,
+   "first_pass": 50
+  },
+  {
+   "title": "Reminder tests",
+   "epic": "E-remind",
+   "repo": "pack-reminders",
+   "milestone": "M3",
+   "size": "S",
+   "category": "normal",
+   "risk_label": "Normal",
+   "executor": "Agent",
+   "human_days": 1.3,
+   "pert": [
+    0.5,
+    1,
+    1.5
+   ],
+   "ai_agent_hours": 1.0,
+   "supervision_hours": 2.1,
+   "first_pass": 70
+  },
+  {
+   "title": "brief() contract",
+   "epic": "E-mcpbrief",
+   "repo": "plugin-mcp-brief",
+   "milestone": "M6",
+   "size": "S",
+   "category": "spec",
+   "risk_label": "Design/prompt",
+   "executor": "Agent + human check",
+   "human_days": 1.3,
+   "pert": [
+    0.5,
+    1,
+    1.5
+   ],
+   "ai_agent_hours": 1.4,
+   "supervision_hours": 3.8,
+   "first_pass": 38
+  },
+  {
+   "title": "MCP brief client source",
+   "epic": "E-mcpbrief",
+   "repo": "plugin-mcp-brief",
+   "milestone": "M6",
+   "size": "M",
+   "category": "integ",
+   "risk_label": "Integration",
+   "executor": "Agent + human check",
+   "human_days": 2.1,
+   "pert": [
+    1,
+    1.5,
+    2.5
+   ],
+   "ai_agent_hours": 4.1,
+   "supervision_hours": 8.7,
+   "first_pass": 30
+  },
+  {
+   "title": "Reference integrations",
+   "epic": "E-mcpbrief",
+   "repo": "plugin-mcp-brief",
+   "milestone": "M6",
+   "size": "M",
+   "category": "integ",
+   "risk_label": "Integration",
+   "executor": "Agent + human check",
+   "human_days": 2.6,
+   "pert": [
+    1,
+    2,
+    3
+   ],
+   "ai_agent_hours": 4.1,
+   "supervision_hours": 10.6,
+   "first_pass": 30
+  },
+  {
+   "title": "Generic IMAP source",
+   "epic": "E-imap",
+   "repo": "plugin-imap",
+   "milestone": "M7",
+   "size": "M",
+   "category": "normal",
+   "risk_label": "Normal",
+   "executor": "Agent",
+   "human_days": 2.1,
+   "pert": [
+    1,
+    1.5,
+    2.5
+   ],
+   "ai_agent_hours": 3.3,
+   "supervision_hours": 4.5,
+   "first_pass": 50
+  },
+  {
+   "title": "Proton Mail Bridge recipe",
+   "epic": "E-imap",
+   "repo": "plugin-imap",
+   "milestone": "M7",
+   "size": "S",
+   "category": "ext",
+   "risk_label": "External API",
+   "executor": "Agent + human check",
+   "human_days": 1.4,
+   "pert": [
+    0.5,
+    1,
+    2
+   ],
+   "ai_agent_hours": 1.5,
+   "supervision_hours": 7.2,
+   "first_pass": 35
+  },
+  {
+   "title": "Gmail OAuth and token lifecycle",
+   "epic": "E-gmail",
+   "repo": "plugin-gmail",
+   "milestone": "M7",
+   "size": "M",
+   "category": "ext",
+   "risk_label": "External API",
+   "executor": "Agent + human check",
+   "human_days": 2.2,
+   "pert": [
+    1,
+    1.5,
+    3
+   ],
+   "ai_agent_hours": 4.3,
+   "supervision_hours": 11.8,
+   "first_pass": 25
+  },
+  {
+   "title": "Rules-first triage into tasks",
+   "epic": "E-gmail",
+   "repo": "plugin-gmail",
+   "milestone": "M7",
+   "size": "M",
+   "category": "normal",
+   "risk_label": "Normal",
+   "executor": "Agent",
+   "human_days": 3.4,
+   "pert": [
+    1.5,
+    2.5,
+    4
+   ],
+   "ai_agent_hours": 3.3,
+   "supervision_hours": 6.7,
+   "first_pass": 50
+  },
+  {
+   "title": "PRONOTE source",
+   "epic": "E-school",
+   "repo": "plugin-school-fr",
+   "milestone": "M7",
+   "size": "M",
+   "category": "ext",
+   "risk_label": "External API",
+   "executor": "Agent + human check",
+   "human_days": 3.4,
+   "pert": [
+    1.5,
+    2.5,
+    4
+   ],
+   "ai_agent_hours": 4.3,
+   "supervision_hours": 16.4,
+   "first_pass": 25
+  },
+  {
+   "title": "\u00c9coleDirecte source",
+   "epic": "E-school",
+   "repo": "plugin-school-fr",
+   "milestone": "M7",
+   "size": "M",
+   "category": "ext",
+   "risk_label": "External API",
+   "executor": "Agent + human check",
+   "human_days": 3.4,
+   "pert": [
+    1.5,
+    2.5,
+    4
+   ],
+   "ai_agent_hours": 4.3,
+   "supervision_hours": 16.4,
+   "first_pass": 25
+  },
+  {
+   "title": "Normalization and de-identification",
+   "epic": "E-school",
+   "repo": "plugin-school-fr",
+   "milestone": "M7",
+   "size": "S",
+   "category": "normal",
+   "risk_label": "Normal",
+   "executor": "Agent",
+   "human_days": 1.3,
+   "pert": [
+    0.5,
+    1,
+    1.5
+   ],
+   "ai_agent_hours": 1.0,
+   "supervision_hours": 2.1,
+   "first_pass": 70
+  },
+  {
+   "title": "Lockout-safe scheduling",
+   "epic": "E-school",
+   "repo": "plugin-school-fr",
+   "milestone": "M7",
+   "size": "S",
+   "category": "normal",
+   "risk_label": "Normal",
+   "executor": "Agent",
+   "human_days": 1.3,
+   "pert": [
+    0.5,
+    1,
+    1.5
+   ],
+   "ai_agent_hours": 1.0,
+   "supervision_hours": 2.1,
+   "first_pass": 70
+  },
+  {
+   "title": "Home Assistant notifier",
+   "epic": "E-ha",
+   "repo": "plugin-homeassistant",
+   "milestone": "M7",
+   "size": "S",
+   "category": "normal",
+   "risk_label": "Normal",
+   "executor": "Agent",
+   "human_days": 1.3,
+   "pert": [
+    0.5,
+    1,
+    1.5
+   ],
+   "ai_agent_hours": 1.0,
+   "supervision_hours": 2.1,
+   "first_pass": 70
+  },
+  {
+   "title": "Household reminders source",
+   "epic": "E-ha",
+   "repo": "plugin-homeassistant",
+   "milestone": "M7",
+   "size": "M",
+   "category": "normal",
+   "risk_label": "Normal",
+   "executor": "Agent",
+   "human_days": 2.0,
+   "pert": [
+    1,
+    1.5,
+    2
+   ],
+   "ai_agent_hours": 3.3,
+   "supervision_hours": 4.3,
+   "first_pass": 50
+  }
+ ],
+ "milestones": {
+  "M0": {
+   "start": "2026-11-02",
+   "end": "2026-12-02",
+   "weeks": 4.4,
+   "supervision_hours": 66.0,
+   "agent_hours": 17.9,
+   "human_person_days": 13.1,
+   "human_team_weeks": 1.3
+  },
+  "M1": {
+   "start": "2026-12-03",
+   "end": "2027-02-03",
+   "weeks": 9.0,
+   "supervision_hours": 135.3,
+   "agent_hours": 45.7,
+   "human_person_days": 32.4,
+   "human_team_weeks": 3.3
+  },
+  "M2": {
+   "start": "2027-02-04",
+   "end": "2027-04-12",
+   "weeks": 9.8,
+   "supervision_hours": 146.7,
+   "agent_hours": 44.0,
+   "human_person_days": 25.6,
+   "human_team_weeks": 2.6
+  },
+  "M3": {
+   "start": "2027-04-13",
+   "end": "2027-08-19",
+   "weeks": 18.4,
+   "supervision_hours": 276.4,
+   "agent_hours": 95.3,
+   "human_person_days": 64.2,
+   "human_team_weeks": 6.6
+  },
+  "M4": {
+   "start": "2027-08-20",
+   "end": "2027-10-10",
+   "weeks": 7.4,
+   "supervision_hours": 110.6,
+   "agent_hours": 31.4,
+   "human_person_days": 18.7,
+   "human_team_weeks": 1.9
+  },
+  "M5": {
+   "start": "2027-10-11",
+   "end": "2028-01-15",
+   "weeks": 13.9,
+   "supervision_hours": 208.1,
+   "agent_hours": 34.8,
+   "human_person_days": 24.0,
+   "human_team_weeks": 2.5
+  },
+  "M6": {
+   "start": "2028-01-16",
+   "end": "2028-02-01",
+   "weeks": 2.4,
+   "supervision_hours": 35.6,
+   "agent_hours": 12.0,
+   "human_person_days": 6.9,
+   "human_team_weeks": 0.7
+  },
+  "M7": {
+   "start": "2028-02-02",
+   "end": "2028-03-25",
+   "weeks": 7.6,
+   "supervision_hours": 113.9,
+   "agent_hours": 34.2,
+   "human_person_days": 25.1,
+   "human_team_weeks": 2.6
+  },
+  "M8": {
+   "start": "2028-03-26",
+   "end": "2028-04-13",
+   "weeks": 2.8,
+   "supervision_hours": 41.7,
+   "agent_hours": 9.3,
+   "human_person_days": 10.1,
+   "human_team_weeks": 1.0
+  }
+ }
+}
