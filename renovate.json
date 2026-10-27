@@ -3,6 +3,8 @@
   "extends": ["config:recommended", "helpers:pinGitHubActionDigests"],
   "enabledManagers": ["pep621", "github-actions", "pre-commit", "pyenv"],
   "pre-commit": { "enabled": true },
+  "minimumReleaseAge": "7 days",
+  "internalChecksFilter": "strict",
   "lockFileMaintenance": { "enabled": true },
   "customManagers": [
     {
@@ -18,7 +20,7 @@
   "packageRules": [
     {
       "groupName": "ruff",
-      "matchPackageNames": ["ruff", "astral-sh/ruff-pre-commit"]
+      "matchPackageNames": ["ruff"]
     }
   ]
 }

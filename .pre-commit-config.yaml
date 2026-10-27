@@ -1,21 +1,30 @@
+default_stages: [pre-commit]
+default_install_hook_types: [pre-commit, commit-msg]
 repos:
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.17.3
-    hooks:
-      - id: ruff-check
-        args: [--fix]
-        exclude: ^tools/
-      - id: ruff-format
-        exclude: ^tools/
   - repo: https://github.com/gitleaks/gitleaks
     rev: v8.30.1
     hooks:
       - id: gitleaks
   - repo: local
     hooks:
+      # ruff runs from the uv environment so uv.lock is the single version source
+      - id: ruff-check
+        name: ruff check
+        entry: uv run --frozen ruff check --fix
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+        exclude: ^tools/
+      - id: ruff-format
+        name: ruff format
+        entry: uv run --frozen ruff format
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+        exclude: ^tools/
       - id: graft-trailers
         name: Graft provenance trailers
-        entry: python3 scripts/graft_trailers.py
-        language: system
-        stages: [prepare-commit-msg]
+        entry: python scripts/graft_trailers.py
+        language: python
+        stages: [commit-msg]
         always_run: true

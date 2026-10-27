@@ -34,6 +34,8 @@ dev = [
     "pyyaml>=6",
     "types-pyyaml>=6",
     "types-jsonschema>=4.23",
+    "regex>=2024.11",
+    "types-regex>=2024.11",
     "ruff>=0.17",
 ]
 

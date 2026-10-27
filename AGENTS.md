@@ -13,8 +13,9 @@ This repository is built mostly by **AI coding agents** (Claude Code and others)
 ```
 # install uv: https://docs.astral.sh/uv/getting-started/installation/
 uv sync
-uv run pre-commit install --hook-type pre-commit --hook-type prepare-commit-msg
+uv run pre-commit install   # installs pre-commit and commit-msg hooks (see default_install_hook_types)
 ```
+In a git worktree, `pre-commit install` writes to the **shared** hooks directory of the main checkout, so install hooks from the main checkout only, not from a worktree.
 
 ## Commands
 ```
@@ -23,7 +24,7 @@ uv run ruff format --check        # formatting (drop --check to fix)
 uv run mypy                       # types (strict)
 uv run pytest                     # tests
 uv run pytest --cov               # tests + coverage gate (85%)
-uv run pre-commit run --all-files # everything above plus gitleaks
+uv run pre-commit run --all-files # ruff + gitleaks (CI also runs mypy, pytest and CodeQL)
 ```
 CI runs the same checks; the aggregate **CI OK** check must be green before merge.
 
@@ -44,7 +45,7 @@ Graft-Model: <model id>
 Graft-Task: #<issue number>
 ```
 
-Set `GRAFT_AGENT`, `GRAFT_MODEL` and `GRAFT_TASK` (e.g. `15` or `#15`) before committing. The `prepare-commit-msg` hook (`scripts/graft_trailers.py`, installed by the Setup step) then adds the trailers to the existing trailer block; it does nothing if a variable is unset. Without the hook, add them yourself (`git commit --trailer ...`).
+Set `GRAFT_AGENT`, `GRAFT_MODEL` and `GRAFT_TASK` (e.g. `15` or `#15`) before committing. The `commit-msg` hook (`scripts/graft_trailers.py`, installed by the Setup step) then adds the trailers to the existing trailer block once the message is final (also in the editor flow); it does nothing if a variable is unset. Existing `Graft-*` trailers are kept as written (per key, `doNothing`), merge and squash commits get no trailers, and an empty or aborted message is left alone. The hook fails open: an unexpected error prints a warning and never blocks a commit. Without the hook, add them yourself (`git commit --trailer ...`).
 
 ## Review
 - Graft posts an intent card and applies [`graft.yaml`](graft.yaml).
