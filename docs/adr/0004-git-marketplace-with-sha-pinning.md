@@ -13,6 +13,9 @@ service ([§2.3](../PLAN.md#23-non-goals-v0x)), so it should not depend on runni
 
 ## Decision
 
+Horae distributes plugins through git-based marketplaces and installs each one pinned to a commit
+SHA; there is no central registry.
+
 1. **No central registry.** A marketplace is a git repository with a `marketplace.json` that maps a
    plugin name to its repo, its versions (each pinned to a commit SHA) and a tier. The official one
    is `horae-dev/marketplace`; any git URL can be configured, so anyone can run their own
@@ -20,7 +23,9 @@ service ([§2.3](../PLAN.md#23-non-goals-v0x)), so it should not depend on runni
 2. **`horae plugin add <name>@<version>`**:
    1. resolves the name in the configured marketplaces;
    2. `git clone`s the repo and checks out the pinned **commit SHA**, refusing if the tag and the
-      SHA disagree;
+      SHA disagree. The clone runs as `git clone -- <repo>` with `protocol.allow` restricted to
+      `https`
+      ([schemas README](../../schemas/README.md#strings-that-reach-the-outside-world));
    3. shows the requested permissions and asks for approval;
    4. writes `horae.lock` (name, version, SHA, approved permissions);
    5. installs the plugin's dependencies in **its own venv** with `uv`.
@@ -35,7 +40,7 @@ from [`src/horae/contracts/lockfile.py`](../../src/horae/contracts/lockfile.py):
 `version`, `repo` (`https://` only), `commit` (a full 40- or 64-hex commit id, never a short SHA or
 a tag) and the approved `permissions`. It has a `schema_version`, and its canonical form sorts
 plugins and permission lists so that a lockfile diff shows only real changes. Run records carry the
-`commit` of each plugin used and an optional `lock_digest`
+`commit` of each plugin used (when installed from git) and an optional `lock_digest`
 ([`schemas/run-record/v1.json`](../../schemas/run-record/v1.json)).
 
 ## Consequences
@@ -63,15 +68,15 @@ plugins and permission lists so that a lockfile diff shows only real changes. Ru
 - `marketplace.json` has no schema yet; only `horae.lock` is specified in M0.
 - The lockfile syntax is not given in PLAN.md (the example is YAML); the schema validates the
   parsed document and adds `repo`, which PLAN's list (name, version, SHA, approved permissions)
-  does not mention ([schemas decision 20](../../schemas/README.md#decisions-provisional-maintainer-to-confirm)).
+  does not mention ([schemas decision
+  20](../../schemas/README.md#decisions-provisional-maintainer-to-confirm)).
 - Signed tags (gitsign or sigstore) and a "tests pass on horae X.Y" badge are "later" in §4.
-- The runtime must clone with `git clone -- <repo>` and `protocol.allow` restricted to `https`
-  ([schemas README](../../schemas/README.md#strings-that-reach-the-outside-world)).
 
 ## Alternatives considered
 
-- **PyPI or another package index.** Ready-made tooling, but Python-only, and versions are
-  mutable by the publisher until yanked; Horae wants plugins in any language, pinned to a commit.
+- **PyPI or another package index.** Ready-made tooling, but Python-only, and a version is a name
+  the publisher controls, not a commit of the source; Horae wants plugins in any language, pinned
+  to a commit ([§1](../PLAN.md#1-why-horae-the-gap), [§4](../PLAN.md#4-marketplace-git-only)).
 - **A hosted Horae registry.** Better discovery, but a service to run and a single point of
   compromise, at odds with a self-hosted, non-commercial project.
 - **Pin to tags only.** Readable, but tags can move; the SHA is the identity, the tag is checked

@@ -18,7 +18,9 @@ alternatives considered. All ADRs use the same [template](0000-template.md).
 - A new ADR starts as **Proposed**. The maintainer sets it to **Accepted** when merging the review.
 - An accepted ADR is not rewritten. To change a decision, write a new ADR that supersedes it and
   set the old one to **Superseded by ADR NNNN**, linking the new ADR.
-- The machine-readable contracts in [`schemas/`](../../schemas/README.md), generated from
-  [`src/horae/contracts/`](../../src/horae/contracts/), are the normative form of many of these
-  decisions. When an ADR and a contract disagree, that is a bug in one of them: fix it in the
+- **Deprecated** means the decision no longer applies and nothing replaces it (for example the
+  feature was removed); the ADR is kept for history.
+- The contracts in [`src/horae/contracts/`](../../src/horae/contracts/) (exported to
+  [`schemas/`](../../schemas/README.md)) are the normative form of many of these decisions. When an
+  ADR and a contract disagree, that is a bug in one of them: fix it in the
   same PR or open an issue.

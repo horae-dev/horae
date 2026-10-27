@@ -6,26 +6,33 @@
 ## Context
 
 Horae's purpose is an assistant you can "trust the way I trust a cron job"
-([PLAN.md §1](../PLAN.md#1-why-horae-the-gap)). The agents it is an alternative to (Hermes,
-OpenClaw) run the LLM as a planner in a loop with tools: the model decides which actions run, every
-run is a conversation that costs money, and behaviour is hard to test or replay.
+([PLAN.md §1](../PLAN.md#1-why-horae-the-gap)). In PLAN's comparison
+([§1](../PLAN.md#1-why-horae-the-gap)), the agents it is an alternative to (Hermes, OpenClaw) have
+the LLM decide the actions as a planner with tools in a loop, every run is a conversation, and
+testing is hard.
 
 Horae's users need the opposite properties, listed as tenets in
 [§2.1](../PLAN.md#21-design-tenets) and as CI-tested guarantees in
 [§2.2](../PLAN.md#22-measurable-guarantees-tested-in-ci): no LLM call when inputs did not change,
-a dry run that writes nothing, schema-invalid output never applied, and exact replays.
+a dry run that writes nothing, and schema-invalid output never applied. Tenet 6 adds exact
+replays.
 
 ## Decision
 
-1. **Control flow is declared, never decided by an LLM.** A pipeline is a YAML document with an
-   optional trigger and an ordered list of steps
+Horae runs declared pipelines: the core owns the control flow, and an LLM is only a bounded,
+tool-less function inside one step.
+
+1. **Control flow is declared, never decided by an LLM.** A pipeline is a YAML document with a
+   trigger (optional in the v1 contract, [schemas decision
+   13](../../schemas/README.md#decisions-provisional-maintainer-to-confirm); PLAN says "a trigger,
+   then steps") and an ordered list of steps
    ([§3.1](../PLAN.md#31-concepts), [§3.2](../PLAN.md#32-a-pipeline-example-the-morning-note)).
-   Step kinds are `collect`, `transform`, `llm`, `act` and `notify`, run in order. Each step lists
-   explicit plugin calls; the core calls them, there is no tool selection by a model.
+   Step kinds are `collect`, `transform`, `llm`, `act` and `notify`, run in order. Each non-`llm`
+   step lists explicit plugin calls; the core calls them, there is no tool selection by a model.
 2. **One bounded LLM step.** The `llm` step is a typed function: a skill (prompt and output JSON
    Schema), a model alias, a budget (`usd` and `tokens_out`), a timeout, and **no tools**.
-3. **Unchanged input costs nothing.** `on_unchanged_input: skip` makes no LLM call when the input
-   hash is the same as the last run (the $0 path).
+3. **Unchanged input costs nothing.** `on_unchanged_input` defaults to `skip`, which makes no LLM
+   call when the input hash is the same as the last run (the $0 path).
 4. **LLM output is data.** It is validated against the skill's schema, with one repair retry; output
    that still fails is never applied and the run is marked `degraded`.
 
@@ -62,19 +69,22 @@ The run record ([`schemas/run-record/v1.json`](../../schemas/run-record/v1.json)
 ### Open questions
 
 - PLAN.md says one LLM step "by default"; the v1 contract enforces at most one. A later opt-out
-  would be an explicit key ([schemas decision 14](../../schemas/README.md#decisions-provisional-maintainer-to-confirm)).
+  would be an explicit key ([schemas decision
+  14](../../schemas/README.md#decisions-provisional-maintainer-to-confirm)).
 - The per-day budget and the usage ledger ([§3.4](../PLAN.md#34-llm-step-and-backends)) are not in
   the pipeline contract; they belong to instance configuration, which has no schema yet.
 - The canonical form of the pipeline for `pipeline_digest` (e.g. RFC 8785) is for the engine to fix.
 
 ## Alternatives considered
 
-- **LLM planner with tools (Hermes, OpenClaw).** Flexible, but the model decides actions, runs cost
-  money every time and are hard to test; it contradicts the core promise.
-- **A general workflow engine (n8n, Windmill, Kestra).** Declared flows, but no enforced plugin
-  permissions, no intent model and no git marketplace ([§1](../PLAN.md#1-why-horae-the-gap)).
-- **A graph library (LangGraph, PydanticAI).** Control flow is your code, so every user writes a
-  program; Horae wants declared YAML that a non-programmer can read and diff.
+- **LLM planner with tools (Hermes, OpenClaw).** In PLAN's comparison
+  ([§1](../PLAN.md#1-why-horae-the-gap)): flexible, but the LLM decides the actions, every run is a
+  conversation and testing is hard; it contradicts the core promise.
+- **A general workflow engine (n8n, Windmill, Kestra).** Per PLAN's comparison
+  ([§1](../PLAN.md#1-why-horae-the-gap)): community nodes for plugins and partial undo, and no
+  project combines a fixed pipeline, bounded LLM steps, enforced permissions and a git marketplace.
+- **A graph library (LangGraph, PydanticAI).** Control flow is your code (a graph); Horae wants the
+  flow declared in data, so the core can validate, dry-run and replay it.
 
 ## References
 

@@ -8,10 +8,13 @@
 Plugins provide sources, sinks, notifiers, skills, transforms and pipeline packs
 ([§3.1](../PLAN.md#31-concepts)). They must be able to run as separate processes (so that each gets
 only its declared secrets, and later its own container), be written in any language, and reuse the
-existing personal services that already speak MCP ([§3.3](../PLAN.md#33-plugin-manifest-and-permissions),
+existing personal services that already speak MCP
+([§3.3](../PLAN.md#33-plugin-manifest-and-permissions),
 [§6](../PLAN.md#6-repositories)).
 
 ## Decision
+
+Horae plugins are MCP servers, and the core calls their tools explicitly from pipeline steps.
 
 1. **The plugin protocol is MCP**, using the official `mcp` SDK
    ([§3.6](../PLAN.md#36-stack)):
@@ -32,7 +35,8 @@ existing personal services that already speak MCP ([§3.3](../PLAN.md#33-plugin-
 The contract is [`schemas/plugin-manifest/v1.json`](../../schemas/plugin-manifest/v1.json),
 generated from [`src/horae/contracts/plugin.py`](../../src/horae/contracts/plugin.py):
 
-- `runtime` is `{ protocol: mcp-stdio, command: [...] }` or `{ protocol: mcp-http, url: https://… }`,
+- `runtime` is `{ protocol: mcp-stdio, command: [...] }` or `{ protocol: mcp-http, url: https://…
+  }`,
   and is optional for plugins that only ship skills or pipelines;
 - for `mcp-http`, the URL host must be in `permissions.network` (checked by the model only);
 - permissions default to empty: no access.
@@ -45,7 +49,8 @@ generated from [`src/horae/contracts/plugin.py`](../../src/horae/contracts/plugi
   `plugin-mcp-brief` without being rewritten ([§5](../PLAN.md#5-plugin-catalogue)).
 - Process boundaries make secret scoping possible from M1 and container isolation possible in M5
   without changing the protocol.
-- The same protocol serves Horae's own read-only MCP server ([§3.5](../PLAN.md#35-interfaces)).
+- The same protocol serves Horae's own read-only MCP server (with approval-gated `pipeline.run`,
+  [§3.5](../PLAN.md#35-interfaces)).
 
 ### Negative
 
@@ -58,18 +63,22 @@ generated from [`src/horae/contracts/plugin.py`](../../src/horae/contracts/plugi
 ### Open questions
 
 - The v1 contract accepts only `https` for `mcp-http`, including internal Docker or Coolify service
-  names (decision 6 in the [schemas README](../../schemas/README.md#decisions-provisional-maintainer-to-confirm)).
+  names (decision 6 in the [schemas
+  README](../../schemas/README.md#decisions-provisional-maintainer-to-confirm)).
   Existing services joined over a Docker network ([§7](../PLAN.md#7-reference-deployment-coolify))
   therefore need TLS; whether that is practical is unverified. Container-name stability across
   Coolify redeploys is a ⚠️ spike in §7.
-- What `permissions.paths` are relative to (container, instance root, vault mount) is open (decision 9).
-- How a tool namespace (`coach.brief`) resolves to a plugin is for the engine to define (decision 11).
+- What `permissions.paths` are relative to (container, instance root, vault mount) is open (decision
+  9).
+- How a tool namespace (`coach.brief`) resolves to a plugin is for the engine to define (decision
+  11).
 - Default runtime after M5 (containers for third-party plugins only, or all) is open
   ([§11](../PLAN.md#11-open-decisions) item 2).
 
 ## Alternatives considered
 
-- **Python packages loaded in-process** (the pip-package model of [§1](../PLAN.md#1-why-horae-the-gap)).
+- **Python packages loaded in-process** (the pip-package model of
+  [§1](../PLAN.md#1-why-horae-the-gap)).
   Simplest to call, but Python-only and no process boundary for secrets or isolation.
 - **A custom JSON-RPC or HTTP protocol.** Full control, but no ecosystem; existing services would
   need adapters.
