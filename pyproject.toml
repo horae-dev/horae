@@ -1,29 +1,36 @@
 [project]
 name = "horae"
-version = "0.0.0"
+dynamic = ["version"]
 description = "Core runtime, CLI, HTTP API, MCP server and SDK for Horae, a predictable self-hosted personal agent."
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.12"
-dependencies = ["typer>=0.12"]
+dependencies = ["typer>=0.27"]
 
 [project.scripts]
 horae = "horae.cli:app"
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/horae/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/horae"]
 
+[tool.hatch.build.targets.sdist]
+include = ["/src/horae", "/tests", "/README.md", "/LICENSE"]
+
 [dependency-groups]
 dev = [
-    "mypy>=1.10",
-    "pre-commit>=3.7",
-    "pytest>=8.2",
-    "ruff>=0.5",
+    "mypy>=2.4",
+    "pre-commit>=4.7",
+    "pytest>=9.1",
+    "pytest-cov>=7",
+    "ruff>=0.17",
 ]
 
 [tool.ruff]
@@ -33,13 +40,29 @@ src = ["src", "tests"]
 extend-exclude = ["tools"]
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "S", "PT"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]
 
 [tool.mypy]
 strict = true
 files = ["src", "tests"]
 python_version = "3.12"
+warn_unreachable = true
+enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra --strict-markers"
+addopts = "-ra --strict-config --strict-markers"
+xfail_strict = true
+filterwarnings = ["error"]
+
+[tool.coverage.run]
+source = ["horae"]
+branch = true
+
+[tool.coverage.report]
+fail_under = 85
+show_missing = true
+exclude_also = ["if TYPE_CHECKING:"]
