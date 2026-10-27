@@ -37,7 +37,13 @@ Stories, estimates and acceptance criteria are in this repository's [issues](../
 
 ## CI
 
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every PR and push to `main`: lockfile check, ruff, mypy, pytest with coverage, gitleaks (full history) and CodeQL (python, actions). Python comes from `.python-version`. The coverage gate is `fail_under` in `[tool.coverage.report]` of `pyproject.toml` (85); change it there. Actions are pinned to commit SHAs (Renovate keeps them current).
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every PR and push to `main`: lockfile check, ruff, mypy, pytest with coverage, gitleaks (history of the checked-out ref) and CodeQL (python, actions). The aggregate job **CI OK** (`ci-ok`) fails if any other job failed, was cancelled or skipped; mark it as the single required status check in branch protection.
+
+- Python comes from `.python-version`, installed by uv itself (`UV_PYTHON_PREFERENCE=only-managed`, cached via setup-uv `cache-python`). uv is pinned to an exact version in the workflow (`UV_VERSION`) and `[tool.uv] required-version` in `pyproject.toml` sets the minimum for local use. `UV_LOCKED=1` makes every `uv` command fail if `uv.lock` is out of date.
+- The coverage gate is `fail_under` in `[tool.coverage.report]` of `pyproject.toml` (85); change it there.
+- Actions are pinned to commit SHAs. Renovate keeps them current, and also bumps `UV_VERSION` and `GITLEAKS_VERSION` through regex custom managers (the `# renovate:` marker comments in the workflow).
+- **Bumping gitleaks:** Renovate only updates the version. In the Renovate PR, update `GITLEAKS_SHA256` by hand with the `gitleaks_<version>_linux_x64.tar.gz` entry of the upstream `gitleaks_<version>_checksums.txt` release asset, otherwise the checksum step fails.
+- **Historical leak:** if gitleaks flags a commit that is already in history (for example a revoked, synthetic or false-positive value), first revoke the secret if it was real. Then add the finding's fingerprint, printed as `Fingerprint: <commit>:<file>:<rule>:<line>` in the job output, as one line to `.gitleaksignore` at the repository root, with a comment explaining why. History is not rewritten.
 
 ## Contributing
 
