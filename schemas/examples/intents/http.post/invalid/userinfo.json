@@ -1,0 +1,1 @@
+{"type": "http.post", "url": "https://user:pass@hooks.example.org/horae", "body": {}}

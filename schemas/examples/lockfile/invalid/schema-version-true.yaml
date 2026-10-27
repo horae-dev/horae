@@ -1,0 +1,3 @@
+# schema_version is the integer 1, not a boolean.
+schema_version: true
+plugins: {}

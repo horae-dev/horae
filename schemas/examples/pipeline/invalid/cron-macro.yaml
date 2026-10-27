@@ -1,0 +1,5 @@
+# Five cron fields only: no macros.
+name: remind
+trigger: { cron: "@daily" }
+steps:
+  - collect: [obsidian.open_tasks]

@@ -1,0 +1,9 @@
+# Remote runtimes use https.
+name: coach
+version: 1.2.3
+horae: ">=0.1"
+provides:
+  sources: [coach.brief]
+permissions:
+  network: [coach.example.org]
+runtime: { protocol: mcp-http, url: "http://coach.example.org/mcp" }

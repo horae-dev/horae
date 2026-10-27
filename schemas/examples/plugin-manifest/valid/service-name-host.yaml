@@ -1,0 +1,9 @@
+# A remote MCP service reached by its single-label Docker service name (synthetic).
+name: mcp-brief
+version: 0.1.0
+horae: ">=0.1"
+provides:
+  sources: [coach.brief]
+permissions:
+  network: [coach]
+runtime: { protocol: mcp-http, url: "https://coach:8443/mcp" }

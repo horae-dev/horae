@@ -1,0 +1,8 @@
+# An mcp-stdio runtime needs a command.
+name: github
+version: 0.1.0
+horae: ">=0.1,<0.2"
+provides:
+  sources: [github.review_requests]
+permissions: {}
+runtime: { protocol: mcp-stdio }

@@ -1,0 +1,8 @@
+# A pipeline pack with a skill: no runtime needed (synthetic).
+name: daily-brief
+version: 0.1.0
+horae: ">=0.1,<0.2"
+provides:
+  skills: [daily-brief/rank-and-word]
+  pipelines: [daily-brief]
+permissions: {}

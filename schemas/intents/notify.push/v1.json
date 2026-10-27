@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/horae-dev/horae/main/schemas/intents/notify.push/v1.json",
+  "additionalProperties": false,
+  "description": "Send a push notification.",
+  "properties": {
+    "type": {
+      "const": "notify.push",
+      "title": "Type",
+      "type": "string"
+    },
+    "title": {
+      "anyOf": [
+        {
+          "maxLength": 500,
+          "pattern": "^[^\\x00-\\x1f\\x7f]+$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Optional notification title: one line, at most 500 characters.",
+      "title": "Title"
+    },
+    "body": {
+      "description": "Notification text, at most 4096 characters.",
+      "maxLength": 4096,
+      "minLength": 1,
+      "title": "Body",
+      "type": "string"
+    },
+    "link": {
+      "anyOf": [
+        {
+          "maxLength": 2048,
+          "pattern": "^(https|obsidian)://[^\\x00-\\x20\\x7f]+$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Optional `https://` or `obsidian://` link opened when the notification is tapped.",
+      "title": "Link"
+    }
+  },
+  "required": [
+    "type",
+    "body"
+  ],
+  "title": "Horae intent notify.push",
+  "type": "object"
+}

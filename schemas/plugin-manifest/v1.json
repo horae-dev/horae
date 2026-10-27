@@ -1,0 +1,349 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/horae-dev/horae/main/schemas/plugin-manifest/v1.json",
+  "$defs": {
+    "HttpRuntime": {
+      "additionalProperties": false,
+      "description": "A remote service speaking MCP over streamable HTTP.",
+      "properties": {
+        "protocol": {
+          "const": "mcp-http",
+          "title": "Protocol",
+          "type": "string"
+        },
+        "url": {
+          "description": "The MCP endpoint (https only). Its host must be listed in `permissions.network`.",
+          "maxLength": 2048,
+          "not": {
+            "pattern": "^https://([^/?:]*\\.)?localhost([:/?]|$)"
+          },
+          "pattern": "^https://([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)*[a-z]([a-z0-9-]{0,61}[a-z0-9])?(:(6553[0-5]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|[1-5][0-9]{4}|[1-9][0-9]{0,3}))?([/?][^\\x00-\\x20\\x7f\\\\#]*)?$",
+          "title": "Url",
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocol",
+        "url"
+      ],
+      "title": "HttpRuntime",
+      "type": "object"
+    },
+    "PathPermissions": {
+      "additionalProperties": false,
+      "description": "Filesystem access. Empty means no filesystem access.",
+      "properties": {
+        "read": {
+          "description": "Paths the plugin may read (normalised absolute paths).",
+          "items": {
+            "maxLength": 1024,
+            "not": {
+              "pattern": "/\\.\\.?(/|$)"
+            },
+            "pattern": "^(/[^/\\\\\\x00-\\x1f\\x7f]{1,255})+$",
+            "type": "string"
+          },
+          "maxItems": 256,
+          "title": "Read",
+          "type": "array",
+          "uniqueItems": true
+        },
+        "write": {
+          "description": "Paths the plugin may read and write (normalised absolute paths).",
+          "items": {
+            "maxLength": 1024,
+            "not": {
+              "pattern": "/\\.\\.?(/|$)"
+            },
+            "pattern": "^(/[^/\\\\\\x00-\\x1f\\x7f]{1,255})+$",
+            "type": "string"
+          },
+          "maxItems": 256,
+          "title": "Write",
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "title": "PathPermissions",
+      "type": "object"
+    },
+    "Permissions": {
+      "additionalProperties": false,
+      "description": "Everything the plugin may touch. Undeclared access is a bug, blocked from M5.",
+      "properties": {
+        "network": {
+          "description": "Hosts the plugin may connect to.",
+          "items": {
+            "maxLength": 253,
+            "not": {
+              "pattern": "(^|\\.)localhost$"
+            },
+            "pattern": "^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)*[a-z]([a-z0-9-]{0,61}[a-z0-9])?$",
+            "type": "string"
+          },
+          "maxItems": 256,
+          "title": "Network",
+          "type": "array",
+          "uniqueItems": true
+        },
+        "secrets": {
+          "description": "Secrets injected (only) into this plugin's environment.",
+          "items": {
+            "maxLength": 128,
+            "not": {
+              "pattern": "^(HORAE(_|$)|LD_|DYLD_|PYTHON|PATH$|HOME$)"
+            },
+            "pattern": "^[A-Z][A-Z0-9_]*$",
+            "type": "string"
+          },
+          "maxItems": 256,
+          "title": "Secrets",
+          "type": "array",
+          "uniqueItems": true
+        },
+        "paths": {
+          "$ref": "#/$defs/PathPermissions",
+          "description": "Filesystem paths."
+        },
+        "intents": {
+          "description": "Intents the plugin may propose or, for a sink, apply. Empty means a pure source.",
+          "items": {
+            "enum": [
+              "note.create",
+              "note.append_section",
+              "note.replace_owned_block",
+              "task.create",
+              "task.update_status",
+              "notify.push",
+              "http.post"
+            ],
+            "type": "string"
+          },
+          "maxItems": 256,
+          "title": "Intents",
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "title": "Permissions",
+      "type": "object"
+    },
+    "Provides": {
+      "additionalProperties": false,
+      "description": "What the plugin provides. Tools are `<namespace>.<tool>`; see `PluginRef` for how a\nnamespace relates to the plugin name.",
+      "properties": {
+        "sources": {
+          "description": "Tools that read data (used in `collect` steps).",
+          "items": {
+            "maxLength": 128,
+            "pattern": "^[a-z][a-z0-9-]*\\.[a-z][a-z0-9_]*$",
+            "type": "string"
+          },
+          "maxItems": 256,
+          "title": "Sources",
+          "type": "array",
+          "uniqueItems": true
+        },
+        "transforms": {
+          "description": "Deterministic transforms (used in `transform` steps).",
+          "items": {
+            "maxLength": 128,
+            "pattern": "^[a-z][a-z0-9-]*\\.[a-z][a-z0-9_]*$",
+            "type": "string"
+          },
+          "maxItems": 256,
+          "title": "Transforms",
+          "type": "array",
+          "uniqueItems": true
+        },
+        "sinks": {
+          "description": "Tools that apply intents (used in `act` steps).",
+          "items": {
+            "maxLength": 128,
+            "pattern": "^[a-z][a-z0-9-]*\\.[a-z][a-z0-9_]*$",
+            "type": "string"
+          },
+          "maxItems": 256,
+          "title": "Sinks",
+          "type": "array",
+          "uniqueItems": true
+        },
+        "notifiers": {
+          "description": "Notification tools (used in `notify` steps).",
+          "items": {
+            "maxLength": 128,
+            "pattern": "^[a-z][a-z0-9-]*\\.[a-z][a-z0-9_]*$",
+            "type": "string"
+          },
+          "maxItems": 256,
+          "title": "Notifiers",
+          "type": "array",
+          "uniqueItems": true
+        },
+        "skills": {
+          "description": "Skills for LLM steps: a prompt and an output schema.",
+          "items": {
+            "maxLength": 128,
+            "pattern": "^[a-z][a-z0-9-]*/[a-z][a-z0-9_-]*$",
+            "type": "string"
+          },
+          "maxItems": 256,
+          "title": "Skills",
+          "type": "array",
+          "uniqueItems": true
+        },
+        "pipelines": {
+          "description": "Ready-made pipelines (a pipeline pack).",
+          "items": {
+            "maxLength": 64,
+            "pattern": "^[a-z][a-z0-9-]*$",
+            "type": "string"
+          },
+          "maxItems": 256,
+          "title": "Pipelines",
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "title": "Provides",
+      "type": "object"
+    },
+    "StdioRuntime": {
+      "additionalProperties": false,
+      "description": "A local plugin, started as a subprocess speaking MCP over stdio.",
+      "properties": {
+        "protocol": {
+          "const": "mcp-stdio",
+          "title": "Protocol",
+          "type": "string"
+        },
+        "command": {
+          "description": "Command line, as an argument list (no shell).",
+          "items": {
+            "maxLength": 4096,
+            "pattern": "^[^\\x00]+$",
+            "type": "string"
+          },
+          "maxItems": 256,
+          "minItems": 1,
+          "title": "Command",
+          "type": "array"
+        }
+      },
+      "required": [
+        "protocol",
+        "command"
+      ],
+      "title": "StdioRuntime",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "A plugin's `plugin.yaml`.",
+  "properties": {
+    "name": {
+      "description": "Plugin name, e.g. `github`.",
+      "maxLength": 64,
+      "pattern": "^[a-z][a-z0-9-]*$",
+      "title": "Name",
+      "type": "string"
+    },
+    "version": {
+      "description": "Plugin version.",
+      "maxLength": 128,
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?(\\+[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$",
+      "title": "Version",
+      "type": "string"
+    },
+    "horae": {
+      "description": "Compatible Horae core versions, e.g. `>=0.1,<0.2`.",
+      "maxLength": 128,
+      "pattern": "^ *(==|!=|>=|<=|~=|>|<) *[0-9]+(\\.[0-9]+)*( *, *(==|!=|>=|<=|~=|>|<) *[0-9]+(\\.[0-9]+)*)* *$",
+      "title": "Horae",
+      "type": "string"
+    },
+    "description": {
+      "anyOf": [
+        {
+          "maxLength": 500,
+          "pattern": "^[^\\x00-\\x1f\\x7f]+$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "One-line description, at most 500 characters.",
+      "title": "Description"
+    },
+    "license": {
+      "anyOf": [
+        {
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9.+:() -]*$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "SPDX license expression, e.g. `Apache-2.0`.",
+      "title": "License"
+    },
+    "homepage": {
+      "anyOf": [
+        {
+          "maxLength": 2048,
+          "not": {
+            "pattern": "^https://([^/?:]*\\.)?localhost([:/?]|$)"
+          },
+          "pattern": "^https://([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)*[a-z]([a-z0-9-]{0,61}[a-z0-9])?(:(6553[0-5]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|[1-5][0-9]{4}|[1-9][0-9]{0,3}))?([/?][^\\x00-\\x20\\x7f\\\\#]*)?$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Project page (https).",
+      "title": "Homepage"
+    },
+    "provides": {
+      "$ref": "#/$defs/Provides"
+    },
+    "permissions": {
+      "$ref": "#/$defs/Permissions"
+    },
+    "runtime": {
+      "anyOf": [
+        {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/StdioRuntime"
+            },
+            {
+              "$ref": "#/$defs/HttpRuntime"
+            }
+          ]
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "How to start or reach the plugin. Omitted for plugins that only ship skills or\npipelines.",
+      "title": "Runtime"
+    }
+  },
+  "required": [
+    "name",
+    "version",
+    "horae",
+    "provides",
+    "permissions"
+  ],
+  "title": "Horae plugin manifest (plugin.yaml)",
+  "type": "object"
+}

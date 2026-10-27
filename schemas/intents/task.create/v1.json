@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/horae-dev/horae/main/schemas/intents/task.create/v1.json",
+  "additionalProperties": false,
+  "description": "Create a task.",
+  "if": {
+    "properties": {
+      "time": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "time"
+    ]
+  },
+  "properties": {
+    "type": {
+      "const": "task.create",
+      "title": "Type",
+      "type": "string"
+    },
+    "title": {
+      "description": "Task text: one line, at most 500 characters.",
+      "maxLength": 500,
+      "pattern": "^[^\\x00-\\x1f\\x7f]+$",
+      "title": "Title",
+      "type": "string"
+    },
+    "fingerprint": {
+      "description": "Stable identity used to deduplicate tasks across runs and sources.",
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._:-]{1,128}$",
+      "title": "Fingerprint",
+      "type": "string"
+    },
+    "due": {
+      "anyOf": [
+        {
+          "format": "date",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Due date (ISO 8601 `YYYY-MM-DD`).",
+      "title": "Due"
+    },
+    "time": {
+      "anyOf": [
+        {
+          "pattern": "^([01][0-9]|2[0-3]):[0-5][0-9]$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Reminder time on the due date, `HH:MM` (24 h). Requires `due`.",
+      "title": "Time"
+    }
+  },
+  "required": [
+    "type",
+    "title",
+    "fingerprint"
+  ],
+  "then": {
+    "properties": {
+      "due": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "due"
+    ]
+  },
+  "title": "Horae intent task.create",
+  "type": "object"
+}

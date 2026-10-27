@@ -1,0 +1,1049 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/horae-dev/horae/main/schemas/run-record/v1.json",
+  "$defs": {
+    "AppliedChange": {
+      "additionalProperties": false,
+      "description": "A change that was applied. Details for undo are kept in the journal.",
+      "properties": {
+        "intent": {
+          "description": "Index into `intents` (checked by the pydantic model only).",
+          "minimum": 0,
+          "title": "Intent",
+          "type": "integer"
+        },
+        "target": {
+          "description": "What was changed, e.g. a note path or a URL.",
+          "maxLength": 2048,
+          "pattern": "^[^\\x00-\\x1f\\x7f]+$",
+          "title": "Target",
+          "type": "string"
+        }
+      },
+      "required": [
+        "intent",
+        "target"
+      ],
+      "title": "AppliedChange",
+      "type": "object"
+    },
+    "HttpPost": {
+      "additionalProperties": false,
+      "description": "POST a JSON body to an https URL.\n\nThe runtime must check `url_host(url)` against the plugin's `permissions.network`, using\nexactly that parsed host, and caps the serialized body size.",
+      "properties": {
+        "type": {
+          "const": "http.post",
+          "title": "Type",
+          "type": "string"
+        },
+        "url": {
+          "description": "Target URL: https only, a host name (no IP literal), optional port.",
+          "maxLength": 2048,
+          "not": {
+            "pattern": "^https://([^/?:]*\\.)?localhost([:/?]|$)"
+          },
+          "pattern": "^https://([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)*[a-z]([a-z0-9-]{0,61}[a-z0-9])?(:(6553[0-5]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|[1-5][0-9]{4}|[1-9][0-9]{0,3}))?([/?][^\\x00-\\x20\\x7f\\\\#]*)?$",
+          "title": "Url",
+          "type": "string"
+        },
+        "body": {
+          "description": "JSON request body.",
+          "title": "Body"
+        }
+      },
+      "required": [
+        "type",
+        "url",
+        "body"
+      ],
+      "title": "HttpPost",
+      "type": "object"
+    },
+    "InputSnapshot": {
+      "additionalProperties": false,
+      "description": "What one source returned, recorded so that the run can be replayed.",
+      "properties": {
+        "step": {
+          "description": "Index of the `collect` step in the pipeline.",
+          "minimum": 0,
+          "title": "Step",
+          "type": "integer"
+        },
+        "source": {
+          "maxLength": 128,
+          "pattern": "^[a-z][a-z0-9-]*\\.[a-z][a-z0-9_]*$",
+          "title": "Source",
+          "type": "string"
+        },
+        "params": {
+          "additionalProperties": true,
+          "title": "Params",
+          "type": "object"
+        },
+        "data": {
+          "description": "The source's output, as returned.",
+          "title": "Data"
+        }
+      },
+      "required": [
+        "step",
+        "source",
+        "params",
+        "data"
+      ],
+      "title": "InputSnapshot",
+      "type": "object"
+    },
+    "LlmCall": {
+      "additionalProperties": false,
+      "description": "One LLM request and its response.",
+      "properties": {
+        "step": {
+          "description": "Index of the `llm` step in the pipeline.",
+          "minimum": 0,
+          "title": "Step",
+          "type": "integer"
+        },
+        "skill": {
+          "maxLength": 128,
+          "pattern": "^[a-z][a-z0-9-]*/[a-z][a-z0-9_-]*$",
+          "title": "Skill",
+          "type": "string"
+        },
+        "skill_version": {
+          "description": "Version of the skill (part of the cache key).",
+          "maxLength": 128,
+          "pattern": "^[^\\x00-\\x20\\x7f]+$",
+          "title": "Skill Version",
+          "type": "string"
+        },
+        "backend": {
+          "enum": [
+            "claude-cli",
+            "anthropic",
+            "openai-compatible",
+            "ollama"
+          ],
+          "title": "Backend",
+          "type": "string"
+        },
+        "model": {
+          "description": "The concrete model the alias resolved to.",
+          "maxLength": 128,
+          "pattern": "^[^\\x00-\\x20\\x7f]+$",
+          "title": "Model",
+          "type": "string"
+        },
+        "cached": {
+          "description": "True when the response came from the cache (no call was made).",
+          "title": "Cached",
+          "type": "boolean"
+        },
+        "attempt": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "1 for the first call, 2 for the repair retry.",
+          "title": "Attempt"
+        },
+        "schema_valid": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Whether the response validated against the skill's output schema.",
+          "title": "Schema Valid"
+        },
+        "request": {
+          "title": "Request"
+        },
+        "response": {
+          "title": "Response"
+        },
+        "usage": {
+          "$ref": "#/$defs/Usage"
+        }
+      },
+      "required": [
+        "step",
+        "skill",
+        "skill_version",
+        "backend",
+        "model",
+        "cached",
+        "request",
+        "response",
+        "usage"
+      ],
+      "title": "LlmCall",
+      "type": "object"
+    },
+    "NoteAppendSection": {
+      "additionalProperties": false,
+      "description": "Append a section, under a heading, to an existing note.",
+      "properties": {
+        "type": {
+          "const": "note.append_section",
+          "title": "Type",
+          "type": "string"
+        },
+        "path": {
+          "description": "Note path, relative to the sink's root.",
+          "maxLength": 1024,
+          "pattern": "^[^/\\\\\\x00-\\x1f\\x7f.][^/\\\\\\x00-\\x1f\\x7f]{0,254}(/[^/\\\\\\x00-\\x1f\\x7f.][^/\\\\\\x00-\\x1f\\x7f]{0,254})*$",
+          "title": "Path",
+          "type": "string"
+        },
+        "heading": {
+          "description": "Heading of the appended section, without the leading `#` characters.",
+          "maxLength": 200,
+          "pattern": "^[^\\x00-\\x1f\\x7f]+$",
+          "title": "Heading",
+          "type": "string"
+        },
+        "content": {
+          "description": "Section body (Markdown), at most 1 MiB.",
+          "maxLength": 1048576,
+          "title": "Content",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "path",
+        "heading",
+        "content"
+      ],
+      "title": "NoteAppendSection",
+      "type": "object"
+    },
+    "NoteCreate": {
+      "additionalProperties": false,
+      "description": "Create a note with the given content.",
+      "properties": {
+        "type": {
+          "const": "note.create",
+          "title": "Type",
+          "type": "string"
+        },
+        "path": {
+          "description": "Note path, relative to the sink's root.",
+          "maxLength": 1024,
+          "pattern": "^[^/\\\\\\x00-\\x1f\\x7f.][^/\\\\\\x00-\\x1f\\x7f]{0,254}(/[^/\\\\\\x00-\\x1f\\x7f.][^/\\\\\\x00-\\x1f\\x7f]{0,254})*$",
+          "title": "Path",
+          "type": "string"
+        },
+        "content": {
+          "description": "Full note content (Markdown), at most 1 MiB.",
+          "maxLength": 1048576,
+          "title": "Content",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "path",
+        "content"
+      ],
+      "title": "NoteCreate",
+      "type": "object"
+    },
+    "NoteReplaceOwnedBlock": {
+      "additionalProperties": false,
+      "description": "Replace the content of a block that Horae owns inside a note.",
+      "properties": {
+        "type": {
+          "const": "note.replace_owned_block",
+          "title": "Type",
+          "type": "string"
+        },
+        "path": {
+          "description": "Note path, relative to the sink's root.",
+          "maxLength": 1024,
+          "pattern": "^[^/\\\\\\x00-\\x1f\\x7f.][^/\\\\\\x00-\\x1f\\x7f]{0,254}(/[^/\\\\\\x00-\\x1f\\x7f.][^/\\\\\\x00-\\x1f\\x7f]{0,254})*$",
+          "title": "Path",
+          "type": "string"
+        },
+        "block": {
+          "description": "Identifier of the owned block to replace.",
+          "pattern": "^[a-z0-9][a-z0-9-]{0,63}$",
+          "title": "Block",
+          "type": "string"
+        },
+        "content": {
+          "description": "New block content (Markdown), at most 1 MiB.",
+          "maxLength": 1048576,
+          "title": "Content",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "path",
+        "block",
+        "content"
+      ],
+      "title": "NoteReplaceOwnedBlock",
+      "type": "object"
+    },
+    "NotifyPush": {
+      "additionalProperties": false,
+      "description": "Send a push notification.",
+      "properties": {
+        "type": {
+          "const": "notify.push",
+          "title": "Type",
+          "type": "string"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "maxLength": 500,
+              "pattern": "^[^\\x00-\\x1f\\x7f]+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional notification title: one line, at most 500 characters.",
+          "title": "Title"
+        },
+        "body": {
+          "description": "Notification text, at most 4096 characters.",
+          "maxLength": 4096,
+          "minLength": 1,
+          "title": "Body",
+          "type": "string"
+        },
+        "link": {
+          "anyOf": [
+            {
+              "maxLength": 2048,
+              "pattern": "^(https|obsidian)://[^\\x00-\\x20\\x7f]+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional `https://` or `obsidian://` link opened when the notification is tapped.",
+          "title": "Link"
+        }
+      },
+      "required": [
+        "type",
+        "body"
+      ],
+      "title": "NotifyPush",
+      "type": "object"
+    },
+    "PluginVersion": {
+      "additionalProperties": false,
+      "description": "The version of a plugin used by the run.",
+      "properties": {
+        "version": {
+          "maxLength": 128,
+          "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?(\\+[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$",
+          "title": "Version",
+          "type": "string"
+        },
+        "commit": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Pinned commit, for plugins installed from git.",
+          "title": "Commit"
+        }
+      },
+      "required": [
+        "version"
+      ],
+      "title": "PluginVersion",
+      "type": "object"
+    },
+    "ProposedIntent": {
+      "additionalProperties": false,
+      "description": "An intent proposed during the run, with where it came from.",
+      "properties": {
+        "step": {
+          "description": "Index of the step that proposed it.",
+          "minimum": 0,
+          "title": "Step",
+          "type": "integer"
+        },
+        "proposed_by": {
+          "maxLength": 128,
+          "pattern": "^[a-z][a-z0-9-]*\\.[a-z][a-z0-9_]*$",
+          "title": "Proposed By",
+          "type": "string"
+        },
+        "intent": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/NoteCreate"
+            },
+            {
+              "$ref": "#/$defs/NoteAppendSection"
+            },
+            {
+              "$ref": "#/$defs/NoteReplaceOwnedBlock"
+            },
+            {
+              "$ref": "#/$defs/TaskCreate"
+            },
+            {
+              "$ref": "#/$defs/TaskUpdateStatus"
+            },
+            {
+              "$ref": "#/$defs/NotifyPush"
+            },
+            {
+              "$ref": "#/$defs/HttpPost"
+            }
+          ],
+          "title": "Intent"
+        }
+      },
+      "required": [
+        "step",
+        "proposed_by",
+        "intent"
+      ],
+      "title": "ProposedIntent",
+      "type": "object"
+    },
+    "RunContext": {
+      "additionalProperties": false,
+      "description": "The template context the pipeline was rendered with, so a replay renders the same.",
+      "properties": {
+        "now": {
+          "description": "The run's notion of \"now\".",
+          "format": "date-time",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,6})?(Z|[+-][0-9]{2}:[0-9]{2})$",
+          "title": "Now",
+          "type": "string"
+        },
+        "timezone": {
+          "description": "IANA time zone used for dates in templates, e.g. `Europe/Paris`.",
+          "maxLength": 128,
+          "pattern": "^[A-Za-z][A-Za-z0-9_+-]{0,63}(/[A-Za-z0-9_+-]{1,64}){0,3}$",
+          "title": "Timezone",
+          "type": "string"
+        },
+        "vars": {
+          "description": "Rendered template variables, e.g. `{\"date\": \"2026-10-27\"}`.",
+          "maxProperties": 256,
+          "patternProperties": {
+            "^[A-Za-z_][A-Za-z0-9_]{0,63}$": {
+              "maxLength": 4096,
+              "type": "string"
+            }
+          },
+          "title": "Vars",
+          "type": "object",
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "now",
+        "timezone",
+        "vars"
+      ],
+      "title": "RunContext",
+      "type": "object"
+    },
+    "StepError": {
+      "additionalProperties": false,
+      "description": "Why a step failed or degraded.",
+      "properties": {
+        "kind": {
+          "pattern": "^[a-z][a-z0-9_.-]{0,63}$",
+          "title": "Kind",
+          "type": "string"
+        },
+        "message": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "title": "Message",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "message"
+      ],
+      "title": "StepError",
+      "type": "object"
+    },
+    "StepRecord": {
+      "additionalProperties": false,
+      "description": "The outcome of one step.",
+      "properties": {
+        "kind": {
+          "enum": [
+            "collect",
+            "transform",
+            "llm",
+            "act",
+            "notify"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "ok",
+            "skipped",
+            "degraded",
+            "failed"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "output": {
+          "default": null,
+          "description": "The step's output, when it has one worth recording.",
+          "title": "Output"
+        },
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StepError"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "started_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,6})?(Z|[+-][0-9]{2}:[0-9]{2})$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Started At"
+        },
+        "finished_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,6})?(Z|[+-][0-9]{2}:[0-9]{2})$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Finished At"
+        },
+        "duration_ms": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Duration Ms"
+        },
+        "stderr": {
+          "anyOf": [
+            {
+              "maxLength": 65536,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Standard error of the plugins the step called, capped at 64 KiB.",
+          "title": "Stderr"
+        }
+      },
+      "required": [
+        "kind",
+        "status"
+      ],
+      "title": "StepRecord",
+      "type": "object"
+    },
+    "TaskCreate": {
+      "additionalProperties": false,
+      "description": "Create a task.",
+      "if": {
+        "properties": {
+          "time": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "time"
+        ]
+      },
+      "properties": {
+        "type": {
+          "const": "task.create",
+          "title": "Type",
+          "type": "string"
+        },
+        "title": {
+          "description": "Task text: one line, at most 500 characters.",
+          "maxLength": 500,
+          "pattern": "^[^\\x00-\\x1f\\x7f]+$",
+          "title": "Title",
+          "type": "string"
+        },
+        "fingerprint": {
+          "description": "Stable identity used to deduplicate tasks across runs and sources.",
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9._:-]{1,128}$",
+          "title": "Fingerprint",
+          "type": "string"
+        },
+        "due": {
+          "anyOf": [
+            {
+              "format": "date",
+              "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Due date (ISO 8601 `YYYY-MM-DD`).",
+          "title": "Due"
+        },
+        "time": {
+          "anyOf": [
+            {
+              "pattern": "^([01][0-9]|2[0-3]):[0-5][0-9]$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Reminder time on the due date, `HH:MM` (24 h). Requires `due`.",
+          "title": "Time"
+        }
+      },
+      "required": [
+        "type",
+        "title",
+        "fingerprint"
+      ],
+      "then": {
+        "properties": {
+          "due": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "due"
+        ]
+      },
+      "title": "TaskCreate",
+      "type": "object"
+    },
+    "TaskUpdateStatus": {
+      "additionalProperties": false,
+      "description": "Change the status of an existing task.",
+      "else": {
+        "properties": {
+          "until": {
+            "type": "null"
+          }
+        }
+      },
+      "if": {
+        "properties": {
+          "status": {
+            "const": "snoozed"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "properties": {
+        "type": {
+          "const": "task.update_status",
+          "title": "Type",
+          "type": "string"
+        },
+        "task": {
+          "description": "The task's fingerprint.",
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9._:-]{1,128}$",
+          "title": "Task",
+          "type": "string"
+        },
+        "status": {
+          "description": "New status.",
+          "enum": [
+            "todo",
+            "done",
+            "cancelled",
+            "snoozed"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "until": {
+          "anyOf": [
+            {
+              "format": "date",
+              "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+              "type": "string"
+            },
+            {
+              "format": "date-time",
+              "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,6})?(Z|[+-][0-9]{2}:[0-9]{2})$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "For `snoozed` only (and then required): when the task comes back.",
+          "title": "Until"
+        }
+      },
+      "required": [
+        "type",
+        "task",
+        "status"
+      ],
+      "then": {
+        "properties": {
+          "until": {
+            "not": {
+              "type": "null"
+            }
+          }
+        },
+        "required": [
+          "until"
+        ]
+      },
+      "title": "TaskUpdateStatus",
+      "type": "object"
+    },
+    "Usage": {
+      "additionalProperties": false,
+      "description": "Tokens and money spent.",
+      "properties": {
+        "tokens_in": {
+          "minimum": 0,
+          "title": "Tokens In",
+          "type": "integer"
+        },
+        "tokens_out": {
+          "minimum": 0,
+          "title": "Tokens Out",
+          "type": "integer"
+        },
+        "usd": {
+          "minimum": 0,
+          "title": "Usd",
+          "type": "number"
+        }
+      },
+      "required": [
+        "tokens_in",
+        "tokens_out",
+        "usd"
+      ],
+      "title": "Usage",
+      "type": "object"
+    },
+    "Violation": {
+      "additionalProperties": false,
+      "description": "Access that was blocked or flagged during the run.",
+      "properties": {
+        "kind": {
+          "enum": [
+            "egress_blocked",
+            "guard",
+            "undeclared_secret",
+            "undeclared_path"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "detail": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "title": "Detail",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "detail"
+      ],
+      "title": "Violation",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "One execution of a pipeline.",
+  "if": {
+    "properties": {
+      "dry_run": {
+        "const": true
+      }
+    },
+    "required": [
+      "dry_run"
+    ]
+  },
+  "properties": {
+    "schema_version": {
+      "const": 1,
+      "description": "Version of this record format.",
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "id": {
+      "description": "Run id, as used by `horae replay` and `horae undo`.",
+      "pattern": "^[A-Za-z0-9._-]{1,128}$",
+      "title": "Id",
+      "type": "string"
+    },
+    "pipeline": {
+      "maxLength": 64,
+      "pattern": "^[a-z][a-z0-9-]*$",
+      "title": "Pipeline",
+      "type": "string"
+    },
+    "pipeline_digest": {
+      "description": "SHA-256 of the canonical pipeline definition that ran.",
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Pipeline Digest",
+      "type": "string"
+    },
+    "context": {
+      "$ref": "#/$defs/RunContext"
+    },
+    "lock_digest": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "SHA-256 of `horae.lock` at run time.",
+      "title": "Lock Digest"
+    },
+    "config_digest": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "SHA-256 of the effective `horae.yaml` at run time.",
+      "title": "Config Digest"
+    },
+    "input_hash": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Hash of the normalised LLM input, used for the unchanged-input skip.",
+      "title": "Input Hash"
+    },
+    "dry_run": {
+      "description": "A dry run applies nothing: `changes` is empty.",
+      "title": "Dry Run",
+      "type": "boolean"
+    },
+    "started_at": {
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,6})?(Z|[+-][0-9]{2}:[0-9]{2})$",
+      "title": "Started At",
+      "type": "string"
+    },
+    "finished_at": {
+      "description": "Not before `started_at` (checked by the pydantic model only).",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,6})?(Z|[+-][0-9]{2}:[0-9]{2})$",
+      "title": "Finished At",
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "ok",
+        "noop",
+        "degraded",
+        "failed",
+        "undone"
+      ],
+      "title": "Status",
+      "type": "string"
+    },
+    "plugins": {
+      "description": "Plugin versions used by the run.",
+      "maxProperties": 256,
+      "patternProperties": {
+        "^[a-z][a-z0-9-]*$": {
+          "$ref": "#/$defs/PluginVersion"
+        }
+      },
+      "propertyNames": {
+        "maxLength": 64
+      },
+      "title": "Plugins",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "inputs": {
+      "items": {
+        "$ref": "#/$defs/InputSnapshot"
+      },
+      "maxItems": 256,
+      "title": "Inputs",
+      "type": "array"
+    },
+    "steps": {
+      "description": "One record per pipeline step, in order.",
+      "items": {
+        "$ref": "#/$defs/StepRecord"
+      },
+      "maxItems": 256,
+      "title": "Steps",
+      "type": "array"
+    },
+    "llm": {
+      "items": {
+        "$ref": "#/$defs/LlmCall"
+      },
+      "maxItems": 256,
+      "title": "Llm",
+      "type": "array"
+    },
+    "intents": {
+      "items": {
+        "$ref": "#/$defs/ProposedIntent"
+      },
+      "maxItems": 256,
+      "title": "Intents",
+      "type": "array"
+    },
+    "changes": {
+      "items": {
+        "$ref": "#/$defs/AppliedChange"
+      },
+      "maxItems": 256,
+      "title": "Changes",
+      "type": "array"
+    },
+    "violations": {
+      "items": {
+        "$ref": "#/$defs/Violation"
+      },
+      "maxItems": 256,
+      "title": "Violations",
+      "type": "array"
+    },
+    "cost": {
+      "$ref": "#/$defs/Usage",
+      "description": "Total for the run."
+    },
+    "error": {
+      "anyOf": [
+        {
+          "maxLength": 4096,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Why the run is `degraded` or `failed`.",
+      "title": "Error"
+    }
+  },
+  "required": [
+    "schema_version",
+    "id",
+    "pipeline",
+    "pipeline_digest",
+    "context",
+    "dry_run",
+    "started_at",
+    "finished_at",
+    "status",
+    "plugins",
+    "inputs",
+    "steps",
+    "llm",
+    "intents",
+    "changes",
+    "cost"
+  ],
+  "then": {
+    "properties": {
+      "changes": {
+        "maxItems": 0
+      }
+    }
+  },
+  "title": "Horae run record",
+  "type": "object"
+}

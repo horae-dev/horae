@@ -1,0 +1,354 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/horae-dev/horae/main/schemas/pipeline/v1.json",
+  "$defs": {
+    "ActStep": {
+      "additionalProperties": false,
+      "description": "Sinks, which apply the intents. The core first validates every intent against the\nproposing plugin's `permissions.intents`, shows it in a dry run and journals it.",
+      "properties": {
+        "act": {
+          "items": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "pattern": "^[a-z][a-z0-9-]*\\.[a-z][a-z0-9_]*$",
+                "type": "string"
+              },
+              {
+                "additionalProperties": false,
+                "maxProperties": 1,
+                "minProperties": 1,
+                "patternProperties": {
+                  "^[a-z][a-z0-9-]*\\.[a-z][a-z0-9_]*$": {
+                    "additionalProperties": true,
+                    "type": "object"
+                  }
+                },
+                "propertyNames": {
+                  "maxLength": 128
+                },
+                "type": "object"
+              }
+            ]
+          },
+          "maxItems": 256,
+          "minItems": 1,
+          "title": "Act",
+          "type": "array"
+        }
+      },
+      "required": [
+        "act"
+      ],
+      "title": "ActStep",
+      "type": "object"
+    },
+    "Budget": {
+      "additionalProperties": false,
+      "description": "Cost and token ceiling for one LLM step.",
+      "properties": {
+        "usd": {
+          "description": "Maximum spend for the step, in US dollars.",
+          "exclusiveMinimum": 0,
+          "title": "Usd",
+          "type": "number"
+        },
+        "tokens_out": {
+          "description": "Maximum output tokens for the step.",
+          "minimum": 1,
+          "title": "Tokens Out",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "usd",
+        "tokens_out"
+      ],
+      "title": "Budget",
+      "type": "object"
+    },
+    "CollectStep": {
+      "additionalProperties": false,
+      "description": "Read from sources.",
+      "properties": {
+        "collect": {
+          "items": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "pattern": "^[a-z][a-z0-9-]*\\.[a-z][a-z0-9_]*$",
+                "type": "string"
+              },
+              {
+                "additionalProperties": false,
+                "maxProperties": 1,
+                "minProperties": 1,
+                "patternProperties": {
+                  "^[a-z][a-z0-9-]*\\.[a-z][a-z0-9_]*$": {
+                    "additionalProperties": true,
+                    "type": "object"
+                  }
+                },
+                "propertyNames": {
+                  "maxLength": 128
+                },
+                "type": "object"
+              }
+            ]
+          },
+          "maxItems": 256,
+          "minItems": 1,
+          "title": "Collect",
+          "type": "array"
+        }
+      },
+      "required": [
+        "collect"
+      ],
+      "title": "CollectStep",
+      "type": "object"
+    },
+    "LlmSpec": {
+      "additionalProperties": false,
+      "description": "The bounded LLM step: a typed function with no tools (PLAN.md §2.1.2, §3.4).",
+      "properties": {
+        "skill": {
+          "description": "The skill (prompt and output schema), `<namespace>/<skill>`.",
+          "maxLength": 128,
+          "pattern": "^[a-z][a-z0-9-]*/[a-z][a-z0-9_-]*$",
+          "title": "Skill",
+          "type": "string"
+        },
+        "model": {
+          "description": "A model alias, resolved in `horae.yaml`.",
+          "maxLength": 128,
+          "pattern": "^[^\\x00-\\x20\\x7f]+$",
+          "title": "Model",
+          "type": "string"
+        },
+        "budget": {
+          "$ref": "#/$defs/Budget"
+        },
+        "on_unchanged_input": {
+          "const": "skip",
+          "default": "skip",
+          "description": "What to do when the input hash is unchanged since the last run: `skip` makes no LLM\ncall (the $0 path).",
+          "title": "On Unchanged Input",
+          "type": "string"
+        },
+        "timeout_s": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Timeout in seconds. When omitted, the core default applies.",
+          "title": "Timeout S"
+        }
+      },
+      "required": [
+        "skill",
+        "model",
+        "budget"
+      ],
+      "title": "LlmSpec",
+      "type": "object"
+    },
+    "LlmStep": {
+      "additionalProperties": false,
+      "description": "One bounded LLM call.",
+      "properties": {
+        "llm": {
+          "$ref": "#/$defs/LlmSpec"
+        }
+      },
+      "required": [
+        "llm"
+      ],
+      "title": "LlmStep",
+      "type": "object"
+    },
+    "NotifyStep": {
+      "additionalProperties": false,
+      "description": "Notifiers.",
+      "properties": {
+        "notify": {
+          "items": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "pattern": "^[a-z][a-z0-9-]*\\.[a-z][a-z0-9_]*$",
+                "type": "string"
+              },
+              {
+                "additionalProperties": false,
+                "maxProperties": 1,
+                "minProperties": 1,
+                "patternProperties": {
+                  "^[a-z][a-z0-9-]*\\.[a-z][a-z0-9_]*$": {
+                    "additionalProperties": true,
+                    "type": "object"
+                  }
+                },
+                "propertyNames": {
+                  "maxLength": 128
+                },
+                "type": "object"
+              }
+            ]
+          },
+          "maxItems": 256,
+          "minItems": 1,
+          "title": "Notify",
+          "type": "array"
+        }
+      },
+      "required": [
+        "notify"
+      ],
+      "title": "NotifyStep",
+      "type": "object"
+    },
+    "TransformStep": {
+      "additionalProperties": false,
+      "description": "Deterministic transforms over the collected data.",
+      "properties": {
+        "transform": {
+          "items": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "pattern": "^[a-z][a-z0-9-]*\\.[a-z][a-z0-9_]*$",
+                "type": "string"
+              },
+              {
+                "additionalProperties": false,
+                "maxProperties": 1,
+                "minProperties": 1,
+                "patternProperties": {
+                  "^[a-z][a-z0-9-]*\\.[a-z][a-z0-9_]*$": {
+                    "additionalProperties": true,
+                    "type": "object"
+                  }
+                },
+                "propertyNames": {
+                  "maxLength": 128
+                },
+                "type": "object"
+              }
+            ]
+          },
+          "maxItems": 256,
+          "minItems": 1,
+          "title": "Transform",
+          "type": "array"
+        }
+      },
+      "required": [
+        "transform"
+      ],
+      "title": "TransformStep",
+      "type": "object"
+    },
+    "Trigger": {
+      "additionalProperties": false,
+      "description": "When the built-in scheduler runs the pipeline.",
+      "properties": {
+        "cron": {
+          "description": "A five-field cron expression, e.g. `30 5 * * *`.",
+          "maxLength": 128,
+          "pattern": "^[0-9A-Za-z*/,-]+( [0-9A-Za-z*/,-]+){4}$",
+          "title": "Cron",
+          "type": "string"
+        },
+        "timezone": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "pattern": "^[A-Za-z][A-Za-z0-9_+-]{0,63}(/[A-Za-z0-9_+-]{1,64}){0,3}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "IANA time zone the expression is evaluated in. When omitted, the instance's.",
+          "title": "Timezone"
+        }
+      },
+      "required": [
+        "cron"
+      ],
+      "title": "Trigger",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "A pipeline definition, e.g. `pipelines/daily-brief.yaml`.",
+  "properties": {
+    "name": {
+      "description": "Pipeline name, used by `horae run <name>`.",
+      "maxLength": 64,
+      "pattern": "^[a-z][a-z0-9-]*$",
+      "title": "Name",
+      "type": "string"
+    },
+    "trigger": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Trigger"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "When omitted, the pipeline runs only from external triggers (`horae run <name>`)."
+    },
+    "steps": {
+      "contains": {
+        "required": [
+          "llm"
+        ]
+      },
+      "description": "Steps, run in order. At most one `llm` step.",
+      "items": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/CollectStep"
+          },
+          {
+            "$ref": "#/$defs/TransformStep"
+          },
+          {
+            "$ref": "#/$defs/LlmStep"
+          },
+          {
+            "$ref": "#/$defs/ActStep"
+          },
+          {
+            "$ref": "#/$defs/NotifyStep"
+          }
+        ]
+      },
+      "maxContains": 1,
+      "maxItems": 256,
+      "minContains": 0,
+      "minItems": 1,
+      "title": "Steps",
+      "type": "array"
+    }
+  },
+  "required": [
+    "name",
+    "steps"
+  ],
+  "title": "Horae pipeline",
+  "type": "object"
+}

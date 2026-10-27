@@ -1,0 +1,8 @@
+# No git remote helpers or other transports.
+schema_version: 1
+plugins:
+  github:
+    version: 0.1.0
+    repo: "ext::sh -c touch% /tmp/pwned"
+    commit: 3f2c9e1a7b4d5c6e8f9012345678abcdef012345
+    permissions: {}

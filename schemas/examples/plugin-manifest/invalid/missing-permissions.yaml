@@ -1,0 +1,7 @@
+# Everything is declared (PLAN.md §2.1.4): the permissions block is required.
+name: github
+version: 0.1.0
+horae: ">=0.1,<0.2"
+provides:
+  sources: [github.review_requests]
+runtime: { protocol: mcp-stdio, command: ["python", "-m", "horae_github"] }

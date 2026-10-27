@@ -1,0 +1,1 @@
+{"type": "http.post", "url": "https://hooks.example.org:8443/horae?source=daily-brief", "body": {"ok": true}}

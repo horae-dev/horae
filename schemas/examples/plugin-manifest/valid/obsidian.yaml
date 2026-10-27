@@ -1,0 +1,16 @@
+# A source and sink with filesystem access and intents (synthetic).
+name: obsidian
+version: 0.1.0
+horae: ">=0.1,<0.2"
+description: Reads and writes Obsidian Tasks in a vault folder.
+license: Apache-2.0
+homepage: https://github.com/horae-dev/plugin-obsidian
+provides:
+  sources: [obsidian.open_tasks]
+  sinks: [obsidian.write_note]
+permissions:
+  paths:
+    read: [/vault]
+    write: [/vault/Daily]
+  intents: [note.create, note.replace_owned_block, task.create, task.update_status]
+runtime: { protocol: mcp-stdio, command: ["python", "-m", "horae_obsidian"] }

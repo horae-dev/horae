@@ -1,0 +1,5 @@
+# Step kinds are collect, transform, llm, act and notify.
+name: daily-brief
+trigger: { cron: "30 5 * * *" }
+steps:
+  - loop: [github.review_requests]

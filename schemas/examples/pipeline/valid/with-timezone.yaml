@@ -1,0 +1,6 @@
+# A cron trigger evaluated in an explicit IANA time zone (synthetic).
+name: remind
+trigger: { cron: "0 7 * * 1-5", timezone: Europe/Paris }
+steps:
+  - collect: [obsidian.open_tasks]
+  - notify: [ntfy.reminders]

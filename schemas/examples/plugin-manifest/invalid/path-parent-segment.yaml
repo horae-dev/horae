@@ -1,0 +1,9 @@
+# No `..` segments.
+name: github
+version: 0.1.0
+horae: ">=0.1,<0.2"
+provides:
+  sources: [github.review_requests]
+permissions:
+  paths: { write: [/vault/../etc] }
+runtime: { protocol: mcp-stdio, command: ["python", "-m", "horae_github"] }

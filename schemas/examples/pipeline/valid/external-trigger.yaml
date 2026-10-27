@@ -1,0 +1,5 @@
+# No trigger: run only by an external scheduler (`horae run weekly-review`).
+name: weekly-review
+steps:
+  - collect: [obsidian.open_tasks]
+  - notify: [ntfy.digest]

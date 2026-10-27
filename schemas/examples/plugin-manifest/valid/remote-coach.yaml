@@ -1,0 +1,9 @@
+# A remote MCP service over streamable HTTP (synthetic host).
+name: coach
+version: 1.2.3
+horae: ">=0.1"
+provides:
+  sources: [coach.brief]
+permissions:
+  network: [coach.example.org]
+runtime: { protocol: mcp-http, url: "https://coach.example.org/mcp" }
