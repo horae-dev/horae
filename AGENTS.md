@@ -9,9 +9,27 @@ This repository is built mostly by **AI coding agents** (Claude Code and others)
 2. Read the issue's **acceptance criteria**, the linked epic, and the relevant section of the [plan](https://github.com/horae-dev/horae/blob/main/docs/PLAN.md).
 3. If anything is ambiguous, **ask in the issue** instead of guessing. Unclear specs are the top cause of wasted agent work.
 
+## Setup
+```
+# install uv: https://docs.astral.sh/uv/getting-started/installation/
+uv sync
+uv run pre-commit install --hook-type pre-commit --hook-type prepare-commit-msg
+```
+
+## Commands
+```
+uv run ruff check                 # lint
+uv run ruff format --check        # formatting (drop --check to fix)
+uv run mypy                       # types (strict)
+uv run pytest                     # tests
+uv run pytest --cov               # tests + coverage gate (85%)
+uv run pre-commit run --all-files # everything above plus gitleaks
+```
+CI runs the same checks; the aggregate **CI OK** check must be green before merge.
+
 ## Working rules
 - Branch: `story/<issue-number>-<short-slug>`. One PR per issue; keep it under ~400 changed lines when possible.
-- Python 3.12+, managed with **uv**. Style: ruff, mypy strict, pytest. Commands: `uv sync`, `uv run pre-commit install`, `uv run ruff check`, `uv run ruff format --check`, `uv run mypy`, `uv run pytest`, `uv run pre-commit run --all-files`.
+- Python 3.12+, managed with **uv**. Style: ruff, mypy strict, pytest. See [Setup](#setup) and [Commands](#commands).
 - **Tests first** for behaviour: every acceptance criterion maps to at least one test.
 - Never add a network host, secret, path, intent or LLM call that is not declared and justified in the PR.
 - Never commit secrets, tokens, personal data or real hostnames. Fixtures must be synthetic.
@@ -26,7 +44,7 @@ Graft-Model: <model id>
 Graft-Task: #<issue number>
 ```
 
-Set `GRAFT_AGENT`, `GRAFT_MODEL` and `GRAFT_TASK` and use Graft's `prepare-commit-msg` hook, or add the trailers yourself (`git commit --trailer ...`).
+Set `GRAFT_AGENT`, `GRAFT_MODEL` and `GRAFT_TASK` (e.g. `15` or `#15`) before committing. The `prepare-commit-msg` hook (`scripts/graft_trailers.py`, installed by the Setup step) then adds the trailers to the existing trailer block; it does nothing if a variable is unset. Without the hook, add them yourself (`git commit --trailer ...`).
 
 ## Review
 - Graft posts an intent card and applies [`graft.yaml`](graft.yaml).
@@ -36,7 +54,9 @@ Set `GRAFT_AGENT`, `GRAFT_MODEL` and `GRAFT_TASK` and use Graft's `prepare-commi
 
 ## Definition of done
 - [ ] All acceptance criteria met and checked in the PR description
-- [ ] CI green (lint, types, tests, security scans)
+- [ ] CI green: the **CI OK** check (lint, types, tests, security scans)
+- [ ] Commits carry the Graft trailers
+- [ ] `uv run pre-commit run --all-files` passes locally
 - [ ] Docs and examples updated if behaviour changed
 - [ ] No new undeclared permissions, secrets or LLM calls
 - [ ] On the issue, record **actuals**: agent attempts, wall-clock time, whether a human took over. These feed the [estimation](https://github.com/horae-dev/horae/blob/main/docs/ESTIMATION.md) recalibration.

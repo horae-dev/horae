@@ -35,6 +35,10 @@ Read the [plan](docs/PLAN.md), the [roadmap](docs/ROADMAP.md) and the [estimatio
 
 Stories, estimates and acceptance criteria are in this repository's [issues](../../issues) and on the [roadmap project](https://github.com/orgs/horae-dev/projects/1).
 
+## Development
+
+Setup, commands, conventions and the definition of done are in [AGENTS.md](AGENTS.md). Provenance trailers are added by `scripts/graft_trailers.py` (pre-commit `prepare-commit-msg`). `graft.yaml` is validated in tests against a vendored schema (`tests/fixtures/graft.v1.schema.json`, from mmornati/graft@3f40dd1).
+
 ## CI
 
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every PR and push to `main`: lockfile check, ruff, mypy, pytest with coverage, gitleaks (history of the checked-out ref) and CodeQL (python, actions). The aggregate job **CI OK** (`ci-ok`) fails if any other job failed, was cancelled or skipped; mark it as the single required status check in branch protection.
