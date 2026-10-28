@@ -591,3 +591,64 @@ def test_intents_in_the_reserved_output_property_are_routed(pack: Path, tmp_path
     assert [(i.intent.type, i.applied_by) for i in record.intents] == [
         ("note.create", "obsidian.write_note")
     ]
+
+
+# --- #53: a skill holding a resolved secret is refused while planning --------------------------
+
+PLANTED = "Sentinel-Skill-Value-0123456789"  # synthetic
+
+
+def _resolve_secret(tmp_path: Path) -> None:
+    folder = tmp_path / "secret-files"
+    folder.mkdir()
+    (folder / "SKILL_TOKEN").write_text(PLANTED, encoding="utf-8")
+    SecretResolver({}, folder).resolve("SKILL_TOKEN")
+
+
+def _secret_in_prompt(folder: Path) -> None:
+    prompt = folder / "prompt.md"
+    prompt.write_text(prompt.read_text() + f"\nUse {PLANTED}.\n")
+
+
+def _secret_in_schema(folder: Path) -> None:
+    schema = json.loads((folder / "output.schema.json").read_text())
+    schema["properties"]["summary"]["description"] = PLANTED
+    (folder / "output.schema.json").write_text(json.dumps(schema))
+
+
+@pytest.mark.parametrize("plant", [_secret_in_prompt, _secret_in_schema])
+def test_a_skill_holding_a_secret_fails_before_any_step_runs(
+    pack: Path, tmp_path: Path, plant: Any
+) -> None:
+    _resolve_secret(tmp_path)
+    plant(skill_dir(pack, SKILL))
+    plugins = _plugins()
+    llm = _llm()
+    record = _run(plugins, llm, _skills(pack))
+    assert record.status == "failed"
+    assert [s.status for s in record.steps] == ["skipped", "skipped", "failed", "skipped"]
+    error = record.steps[2].error
+    assert error is not None
+    assert error.kind == "params_invalid"
+    assert error.message == (
+        f"{SKILL}: the prompt or output schema holds secret SKILL_TOKEN (never a parameter)"
+    )
+    assert PLANTED not in record.model_dump_json()
+    assert plugins.calls == []
+    assert llm.requests == []
+
+
+def test_a_skill_source_failing_on_the_prompt_is_contained(pack: Path) -> None:
+    class _Broken:
+        def __init__(self, skill: Skill) -> None:
+            self._skill = skill
+
+        def __getattr__(self, name: str) -> Any:
+            if name == "prompt":
+                raise RuntimeError("secret detail")
+            return getattr(self._skill, name)
+
+    record = _run(_plugins(), FakeLlm(), _Source(_Broken(_skill(pack))))
+    error = record.steps[2].error
+    assert error is not None
+    assert (error.kind, error.message) == ("host_error", "unexpected RuntimeError")

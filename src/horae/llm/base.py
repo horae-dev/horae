@@ -54,12 +54,11 @@ process resolved, the alias' key included once its backend resolved it) before i
 error with no `__cause__` / `__context__`), and the response's output, intents, schema
 errors and request summary. A secret found there is logged (`horae.llm`, names only). A
 skill's prompt or output schema holding a secret (in a string, an object key or as a
-number's whole value) is refused by `prepare` with `params_invalid`, naming the secret only,
-before anything is rendered, reserved or sent (a secret is never a trusted parameter). This
-check runs when the `llm` step prepares its request, **not at plan time**: until #27's skill
-loader gives the engine the prompt before the run starts, the steps before the `llm` step have
-already run when it refuses (the run then fails at that step, nothing is sent to the model);
-with the loader the check moves to the engine's `_plan`, before any step runs.
+number's whole value) is refused with `params_invalid`, naming the secret only (a secret is
+never a trusted parameter): by the engine's `_plan`, which loads the skill through its
+`SkillSource` before any step runs (schemas decision 43 D), and again by `prepare`, as a
+backstop, before anything is rendered, reserved or sent (an engine given no `SkillSource`,
+a `PromptSource` other than the skill loader).
 
 **Retries.** None here: the engine owns the single repair retry (`attempt` 2). Provider
 backends disable their SDK's own retries.

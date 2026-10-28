@@ -1548,11 +1548,13 @@ loosened later without breaking a valid file.
       before any call, `params_invalid` naming the secret only, when a template variable
       (`horae run --var`) or a rendered parameter holds the value (or a known encoding) of a
       resolved secret, in a string, an object key or as a number's whole value; the variable
-      is redacted in the record's `context`. A skill's prompt or output schema holding one is
-      refused by `ModelBackends.prepare` (`params_invalid`, before rendering, reserving or
-      sending). That check is **not** at plan time yet: #27's skill loader is not on `main`,
-      so the engine does not have the prompt before the run; the steps before the `llm` step
-      have run when it refuses. With the loader the check moves to `_plan`.
+      is redacted in the record's `context`. A skill's prompt or output schema holding one
+      (in a string, an object key or as a number's whole value) is refused at plan time too:
+      `_plan` loads the skill through the engine's `SkillSource` (#27, decision 39) and fails
+      the run with `params_invalid` (`<skill>: the prompt or output schema holds secret
+      <NAME>`) before any step runs. `ModelBackends.prepare` keeps the same check as a
+      backstop (an engine given no `SkillSource`, a `PromptSource` that reads other files),
+      before rendering, reserving or sending.
       `params_invalid` releases a ledger reservation;
     - **E. logs, warnings, uncaught exceptions (provisional).** `horae.secrets.logs.install()`
       (the CLI entry point, `Runner.run`, an opening `PluginHost`; idempotent) wraps the log

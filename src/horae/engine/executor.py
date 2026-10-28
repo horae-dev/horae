@@ -39,7 +39,8 @@ and every other step `skipped`, when:
   encoding) of a secret this process resolved, in a string, an object key or as a number's
   whole value (`pin: 12345678`) (`params_invalid`, naming the secret only, #53, schemas
   decision 43 D): a secret is never a trusted parameter. The variable's value is redacted in
-  the record's `context`;
+  the record's `context`. The same holds for an `llm` step's skill: a prompt or output
+  schema (loaded through the `SkillSource`) holding a secret is `params_invalid`;
 - an `act` entry has no valid `mode`, or its binding parameters (or a `notify` entry's
   `link_prefix`) are invalid (`params_invalid`, see below);
 - the pipeline has more than `MAX_ITEMS` `collect` calls in all, or uses more than
@@ -741,6 +742,16 @@ def _load_skill(skills: SkillSource, ref: str, plugin: ResolvedPlugin) -> Loaded
     ):
         message = f"{ref}: the skill's intent limits do not match its intents"
         return StepError(kind="skill_invalid", message=_cap(message))
+    # #53 (schemas decision 43 D): a secret in the prompt or output schema refuses the run
+    # here, before any step runs; `ModelBackends.prepare` keeps the same check as a backstop.
+    try:
+        held = current_redactor().find([skill.prompt, dict(skill.output_schema)])
+    except Exception as error:  # a port bug must not crash the run
+        return StepError(kind="host_error", message=f"unexpected {type(error).__name__}")
+    if held:
+        names = ", ".join(sorted(held))
+        message = f"{ref}: the prompt or output schema holds secret {names} (never a parameter)"
+        return StepError(kind="params_invalid", message=_cap(message))
     return skill
 
 
