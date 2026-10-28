@@ -1,11 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
-"""`horae run <pipeline> [--dry-run]` (#26): one run through the plugin host.
+"""`horae run <pipeline> [--dry-run] [--no-cache]` (#26): one run through the plugin host.
 
 The instance is loaded and its plugins checked (`<instance>/plugins`, `horae.cli_host`)
 before anything starts; then `open_ports` starts the plugin host and the runner
 (`horae.runner.Runner`) runs the pipeline: lock, recovery, execute, apply through the
 plugins' sinks (`McpSinks`, prepared by the core), persist. A dry run applies nothing and
 shows the change set it would apply (`plan_changes`, rendered like `horae diff`).
+
+**LLM cache** (#32, schemas decision 45). An `llm` step whose cache key (skill, version and
+digest, plugin, model, viewed input) matches a live entry of the store's LLM cache reuses that
+output without calling the model (`$0`). `--no-cache` skips the lookup, for debugging: the
+model is called, and its accepted output still replaces the entry. A dry run reads the cache
+but never writes it.
 
 **Signals.** SIGINT (Ctrl-C) and SIGTERM cancel the run cooperatively and the command exits
 128 + the signal (130, 143), naming the run. During the engine phase the runner saves its
@@ -165,13 +171,23 @@ class _Run:
 
 
 async def _execute(
-    instance: Instance, name: str, dry_run: bool, vars: dict[str, str], out: _Run
+    instance: Instance,
+    name: str,
+    dry_run: bool,
+    vars: dict[str, str],
+    out: _Run,
+    cache: bool = True,
 ) -> RunRecord:
     async with live_ports(instance) as live:
         with Store.open(instance.store_path) as store:
             runner = Runner(instance, store, live.ports)
             record = await runner.run(
-                name, dry_run=dry_run, vars=vars, on_record=out.saved.append, on_begin=out.begin
+                name,
+                dry_run=dry_run,
+                vars=vars,
+                on_record=out.saved.append,
+                on_begin=out.begin,
+                cache=cache,
             )
             if dry_run:
 
@@ -316,6 +332,7 @@ def _run(
     var: list[str],
     json_output: bool,
     runner: Callable[[Coroutine[Any, Any, RunRecord]], RunRecord],
+    cache: bool = True,
 ) -> int:
     vars = parse_vars(var)
     instance = load(instance_dir)
@@ -326,7 +343,7 @@ def _run(
         )
     out = _Run()
     try:
-        record = runner(cancel_on_signals(_execute(instance, name, dry_run, vars, out)))
+        record = runner(cancel_on_signals(_execute(instance, name, dry_run, vars, out, cache)))
     except Interrupted as stop:
         _emit(json_output, *_interrupted(instance, out, stop.signum))
         return 128 + stop.signum
@@ -391,6 +408,13 @@ def run(
         list[str] | None,
         typer.Option("--var", help="A template variable, KEY=VALUE (repeatable)."),
     ] = None,
+    no_cache: Annotated[
+        bool,
+        typer.Option(
+            "--no-cache",
+            help="Call the LLM even on unchanged input (skip the cache lookup; for debugging).",
+        ),
+    ] = False,
     json_output: Annotated[bool, typer.Option("--json", help="Print the result as JSON.")] = False,
 ) -> None:
     """Run a pipeline once through the instance's plugins, and apply its intents.
@@ -400,7 +424,8 @@ def run(
     second signal is ignored): before the apply its partial record is saved failed; during
     the apply, the apply finishes and the record is saved before the run is reported
     interrupted. An llm step calls the backend of its model alias (horae.yaml models), with
-    the API key from the alias' declared secret.
+    the API key from the alias' declared secret. On unchanged input it reuses the cached
+    output instead (no call, $0); --no-cache skips that lookup.
 
     Exit codes: 0 ok, noop or degraded (dry run: planned without problems), 1 configuration,
     plugin, store or runtime problem (the run failed or timed out; a dry run whose plan
@@ -411,7 +436,9 @@ def run(
     run_command(
         "run",
         json_output,
-        lambda: _run(instance, pipeline, dry_run, var or [], json_output, asyncio.run),
+        lambda: _run(
+            instance, pipeline, dry_run, var or [], json_output, asyncio.run, not no_cache
+        ),
     )
 
 

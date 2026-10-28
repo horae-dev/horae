@@ -1598,3 +1598,57 @@ loosened later without breaking a valid file.
       process resolved (primed from the instance); an 8-byte secret still matches inside
       unrelated text that contains it (the reason identifiers are flagged, not rewritten);
       a secret in an identifier is in the store (flagged), but not in the logs nor the CLI.
+
+### Provisional decisions (#32, pending maintainer review)
+
+45. **The LLM cache and the $0 path (#32).** (44 is taken by #31.) A compatible v1 addition to
+    `horae.yaml` and the rules of `horae.runner._cache`, the engine and `horae run`:
+    - **contract change** (optional): `horae.yaml` `cache: {ttl_s?, max_entries?}`, integers;
+      `ttl_s` 60 to 31622400 (366 days), default 604800 (7 days); `max_entries` 1 to 100000,
+      default 1000. Not part of `config_digest` (decision 33 D3): it changes what is reused,
+      never what a replay computes;
+    - **(A) one source.** The store's `llm_cache` table (migration 2, unchanged) is the single
+      source of reusable outputs for live runs; the runner no longer reads
+      `Store.last_accepted_llm` (D2, decision 30), which stays for tools and tests. The key is
+      unchanged: the engine's cache key, `RunRecord.input_hash` (SHA-256 of the canonical
+      JSON of the skill, the skill plugin's name, version and commit, the resolved model, the
+      viewed input, and with a loaded skill its `skill_version` and `skill_digest`, decision
+      39). So any earlier accepted output is reused, not only the last run's (input A, B, then
+      A again makes two calls), across processes, and across pipelines that run the same
+      skill, model and viewed input. The entry's `response` is `{output, intents, backend,
+      model, skill_version}`; its `tokens_*` and `cost_usd` are what producing it cost (both
+      attempts), for information. A store upgraded from before #32 starts with an empty cache:
+      its first run per input calls the model once;
+    - **(B) the engine reads, the runner writes.** `execute(cache=LlmCache)`: the engine calls
+      `cache.lookup(key)` when `previous` does not match the key; a hit is reused exactly as
+      D2 (no backend call, `LlmCall` with `cached=True`, zero usage and the
+      `reused_input_hash` request marker, intents validated and routed again, a reuse whose
+      intents no longer route is a miss, the same step and run statuses: `noop` when nothing
+      is proposed). No backend call means no ledger row: a cached output is charged zero
+      (decision 41). An exception from `lookup`, or an entry for another key, is a miss.
+      `StoreLlmCache.remember` writes after the record is saved, only an **accepted** output:
+      not a dry run, not a `failed` run, the `llm` step `ok`, its last call schema-valid with
+      recorded intents and no call of the step a reuse (#31's repair rules decide what
+      "schema-valid" means; the cache follows the step status). `Store.cache_put_safe`
+      refuses an entry holding a resolved secret (decision 43): it is not cached. A store
+      error while reading, writing or purging is logged (type only) and never fails the run;
+    - **(C) expiry by policy.** An entry is live for `ttl_s` from when it was produced (its
+      `expires_at`, and also `created_at` against the current `ttl_s` at lookup, so lowering
+      it applies at once). A hit does not extend it: an unchanged input asks the model again
+      at most once per `ttl_s` (PLAN.md §2.2's "no LLM call when inputs unchanged" holds
+      within that window). At the start of every non-dry run, entries past `ttl_s` or their
+      `expires_at` are deleted, then the oldest beyond `max_entries` (`Store.cache_trim`),
+      best effort;
+    - **(D) dry runs read, never write.** A dry run reuses a live entry (a preview costs
+      nothing on unchanged input) but neither stores its output nor purges: a preview must
+      not change what later real runs do;
+    - **(E) `horae run --no-cache`** (debugging) skips the lookup: the model is called even on
+      unchanged input, and its accepted output still replaces the entry (a fresh answer is a
+      valid answer). `Runner.run(cache=False)` is the same;
+    - **(F) replay stays exact.** Replay never reads the store's cache: a run that reused an
+      entry is replayed with that output as `previous` (`recorded_previous`, decision 33), so
+      the replay takes the same path; a run that called the model is replayed from its tape;
+    - **(G) undo.** An undone run's entry stays: running the same input again reuses it and
+      re-applies the same intents. Use `--no-cache` to ask the model again;
+    - **follow-ups**: a `horae cache purge` command (the store API exists: `cache_purge`,
+      `cache_purge_expired`, `cache_trim`); a per-skill `ttl_s`.

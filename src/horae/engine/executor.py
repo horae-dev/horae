@@ -154,13 +154,16 @@ the skill's `intents`, at most its `intent_limits` of each type (`intent_rejecte
 input of `null` (the input does not have the view's shape) degrades the step without calling
 the LLM (`input_invalid`). The skill is loaded before the backend is checked, so an invalid
 skill is `skill_invalid` even without a backend.
-When `previous` (the last accepted output, `PreviousLlm`) has the same key, no LLM
-call is made: its output and intents are reused (validated and routed again), recorded as an
-`LlmCall` with `cached=True` and zero usage, and the run continues. If the reused intents no
-longer validate or route (e.g. an explicit target bound to `{{date}}` moved to a new day), it
-is a cache miss: nothing of `previous` is recorded and the LLM is called. Without a usable
-`previous` the LLM is called. A reused run re-proposes the same intents, including
-`notify.push`: appliers must deduplicate notifications (e.g. by `input_hash` and intent).
+When `previous` (an accepted output, `PreviousLlm`, e.g. the one a replayed run reused) has the
+same key, or else the `cache` (`LlmCache`, the store's `llm_cache` table under the runner, #32)
+holds an entry for the key, no LLM call is made: its output and intents are reused (validated
+and routed again), recorded as an `LlmCall` with `cached=True` and zero usage, and the run
+continues. If the reused intents no longer validate or route (e.g. an explicit target bound to
+`{{date}}` moved to a new day), it is a cache miss: nothing of the entry is recorded and the
+LLM is called. Without a usable entry (or when `cache.lookup` raises: a miss) the LLM is
+called; no backend is called, so no usage is reserved or charged (schemas decision 45). A
+reused run re-proposes the same intents, including `notify.push`: appliers must deduplicate
+notifications (e.g. by `input_hash` and intent).
 `timeout_s` (default `DEFAULT_LLM_TIMEOUT_S`) is one deadline for both attempts. The budget
 counts what every attempt cost, including the `usage` of a failed attempt (`LlmError.usage`);
 a backend's cached response costs nothing and counts towards neither the cost nor the budget.
@@ -247,6 +250,7 @@ from horae.engine.canonical import canonical_json, canonical_pipeline, pipeline_
 from horae.engine.ports import (
     EngineCallError,
     LlmBackend,
+    LlmCache,
     LlmError,
     LlmRequest,
     LlmResponse,
@@ -801,6 +805,7 @@ class _Run:
     tools: ToolCaller
     llm: LlmBackend | None
     previous: PreviousLlm | None
+    cache: LlmCache | None
     models: Mapping[str, str]
     entries: tuple[_Entry, ...]
     monotonic: Callable[[], float]
@@ -1182,9 +1187,15 @@ def _reuse(
     key: str,
     viewed: Any,
 ) -> _Outcome | None:
-    """The previous accepted output, reused; `None` if it cannot be (then the LLM is called)."""
+    """An accepted output for `key`, reused; `None` if there is none or it cannot be reused
+    (then the LLM is called)."""
     previous = run.previous
-    if previous is None or previous.input_hash != key:
+    if (previous is None or previous.input_hash != key) and run.cache is not None:
+        try:
+            previous = run.cache.lookup(key)
+        except Exception:  # a broken cache is a miss, never a failed run
+            previous = None
+    if not isinstance(previous, PreviousLlm) or previous.input_hash != key:
         return None
     try:
         output = _json_copy(previous.output, "previous LLM output")
@@ -1381,6 +1392,7 @@ async def execute(
     skills: SkillSource | None = None,
     dry_run: bool = False,
     previous: PreviousLlm | None = None,
+    cache: LlmCache | None = None,
     models: Mapping[str, str] | None = None,
     lock_digest: str | None = None,
     config_digest: str | None = None,
@@ -1399,9 +1411,10 @@ async def execute(
       its prompt, output schema and version go into each `LlmRequest`, its input view
       restricts what the model sees, and its version and digest join the cache key. Without
       it (fakes and older callers) the request carries the whole input and no prompt.
-    - `previous`: the last accepted LLM output (`Store.last_accepted_llm`), for the
-      unchanged-input path. `models`: model alias to concrete model (`horae.yaml`), part of
-      the LLM cache key.
+    - `previous`: an accepted LLM output for the unchanged-input path (replay gives the one
+      the recorded run reused); `cache`: looked up by the step's cache key when `previous`
+      does not match (the runner's `StoreLlmCache`, #32). `models`: model alias to concrete
+      model (`horae.yaml`), part of the LLM cache key.
     - `models` (when given), `lock_digest` and `config_digest` (`horae.config.Instance`) are
       recorded as given, for replays; an invalid value raises `ValueError` before anything
       runs. The canonical pipeline definition is recorded too (`pipeline_definition`), unless
@@ -1446,6 +1459,7 @@ async def execute(
         tools=tools,
         llm=llm,
         previous=previous,
+        cache=cache,
         models=dict(models or {}),
         entries=tuple(entry for p in plan for entry in p.entries),
         monotonic=monotonic,
