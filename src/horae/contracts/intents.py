@@ -154,8 +154,10 @@ class NotifyPush(Contract):
 class HttpPost(Contract):
     """POST a JSON body to an https URL.
 
-    The runtime must check `url_host(url)` against the plugin's `permissions.network`, using
-    exactly that parsed host, and caps the serialized body size."""
+    The core checks `url_host(url)` against the proposer's `permissions.network`, using
+    exactly that parsed host (any port is allowed on a declared host), and caps the compact
+    JSON body at 1 MiB (`horae.intents`). The sink must never follow redirects, or must
+    re-check the host of every hop with `url_host` against the same list."""
 
     type: Literal["http.post"]
     url: HttpsUrl

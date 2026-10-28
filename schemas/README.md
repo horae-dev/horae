@@ -82,9 +82,15 @@ pydantic may change them; the drift test then fails in CI and the fix is to rege
 
 Contracts constrain shape, not meaning. The runtime still has to:
 
-- check `http.post` and `mcp-http` hosts against `permissions.network` (#20) using **the same parsed
-  host** (`horae.contracts.url_host`), never a second URL parser, and resolve names through the
-  egress proxy so that a declared name cannot reach private or link-local addresses;
+- check `http.post` and `mcp-http` hosts against `permissions.network` using **the same parsed
+  host** (`horae.contracts.url_host`), never a second URL parser (`horae.intents` does this for
+  `http.post`, #20), and resolve names through the egress proxy so that a declared name cannot
+  reach private or link-local addresses;
+- **never follow redirects** in a sink that makes a request (`http.post`, `mcp-http`), or re-check
+  the host of every hop with `url_host` against the same `permissions.network`: a declared host
+  must not be able to bounce a request to an undeclared one;
+- keep the run-wide number of proposed intents within `RunRecord.intents`'s bound,
+  `horae.contracts.MAX_RUN_INTENTS` (256): `horae.intents.MAX_INTENTS` bounds one step only;
 - escape text before it reaches a format that interprets it: sinks writing Obsidian Tasks must
   escape the emoji signifiers (`📅`, `⏰`, `✅`, `🔁`…) in titles, not only Markdown;
 - install plugins with `git clone -- <repo>` and `protocol.allow` restricted to `https`, even
@@ -97,6 +103,11 @@ JSON Schema cannot express these; the models enforce them and the tests pin the 
 - `run-record`: `changes[].intent` is an index into `intents`; `finished_at` is not before
   `started_at` (run and step records).
 - `plugin-manifest`: the host of an `mcp-http` `runtime.url` is listed in `permissions.network`.
+- Hosts (`permissions.network`, every `https` URL): a label starting with `xn--` must be a valid
+  IDNA A-label. It must round-trip through Python's `idna` codec (IDNA2003, so no runtime
+  dependency) and decode to letters, marks, digits and `-` only. The second rule rejects what
+  IDNA2003 allows but IDNA2008 does not, such as emoji (`xn--ls8h`) and symbols (`xn--g6h`); it
+  approximates IDNA2008 rather than implementing RFC 5892 exactly.
 
 ### Known validator differences
 
@@ -139,7 +150,10 @@ conservative option, so loosening one later is a compatible change.
    `task.update_status` uses the fingerprint as task id and the statuses `todo`, `done`,
    `cancelled`, `snoozed` (`until`, a date or date-time, is required for `snoozed` and only
    allowed there); `notify.push` has `body`, optional `title` and `link`; `http.post` has `url` and
-   a JSON `body` (no headers; the runtime caps the serialized body size).
+   a JSON `body` (no headers). The core (`horae.intents`) accepts only plain JSON data in
+   `body` (string keys, finite numbers, nesting at most 64 deep) and caps its compact
+   serialization (`json.dumps(body, allow_nan=False, separators=(",", ":"))`) at 1 MiB of UTF-8
+   (`horae.contracts.types.MAX_BODY`).
 3. **Fingerprint alphabet** `A-Z a-z 0-9 . _ : -`, 1–128 characters (fits `source:id` keys).
 4. **Note paths** reject every segment starting with `.`, not only `.obsidian/`: hidden files and
    folders are never written by intents.
@@ -154,7 +168,9 @@ conservative option, so loosening one later is a compatible change.
 9. **`permissions.paths`** is `{ read: [...], write: [...] }` of absolute paths. What they are
    relative to (the container's filesystem, the instance root, a vault mount) is open for #20/#51.
 10. **`permissions.network`** takes bare host names (single-label names allowed): no port, scheme
-    or wildcard.
+    or wildcard. **Any port on a declared host is allowed**: `http.post` to
+    `https://hooks.example.org:8443/` passes when `hooks.example.org` is declared. Ports are not
+    part of the permission; restricting them would need a new, explicit `host:port` form.
 11. **Namespace prefix.** Tools are `<namespace>.<tool>` and skills `<namespace>/<skill>`. The
     namespace is **not** required to equal the plugin name, because PLAN.md uses prefixes that are
     not plugin names (`coach.brief` from `plugin-mcp-brief`). How a namespace resolves to a plugin

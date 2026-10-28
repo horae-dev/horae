@@ -37,6 +37,12 @@ StepStatus = Literal["ok", "skipped", "degraded", "failed"]
 StepKind = Literal["collect", "transform", "llm", "act", "notify"]
 StepIndex = Annotated[int, Strict(), Field(ge=0)]
 
+MAX_RUN_INTENTS = MAX_ITEMS
+"""Upper bound on the intents of one run (`RunRecord.intents`), summed over all its steps.
+
+`horae.intents.MAX_INTENTS` bounds one step's proposals only; the engine must also keep the
+run-wide total within this bound."""
+
 RunId = Annotated[str, Strict(), StringConstraints(pattern=r"^[A-Za-z0-9._-]{1,128}$")]
 """A run id, e.g. `20261027T053000Z-daily-brief-01`."""
 
@@ -207,7 +213,8 @@ class RunRecord(Contract):
     steps: BoundedList[StepRecord]
     """One record per pipeline step, in order."""
     llm: BoundedList[LlmCall]
-    intents: BoundedList[ProposedIntent]
+    intents: Annotated[list[ProposedIntent], Field(max_length=MAX_RUN_INTENTS)]
+    """Intents proposed and accepted during the run, at most `MAX_RUN_INTENTS` in all."""
     changes: BoundedList[AppliedChange]
     violations: BoundedList[Violation] = Field(default_factory=list)
     cost: Usage
