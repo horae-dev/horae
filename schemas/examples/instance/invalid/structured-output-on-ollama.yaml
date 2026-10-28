@@ -1,0 +1,8 @@
+# `structured_output` is an `openai-compatible` setting (decision 40); ollama always sends
+# the schema as `format`.
+models:
+  local:
+    backend: ollama
+    model: llama3
+    base_url: "http://ollama:11434"
+    structured_output: json_object

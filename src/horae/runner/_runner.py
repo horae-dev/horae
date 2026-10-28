@@ -23,6 +23,9 @@
    finished step is persisted (`on_step` → `Store.record_step`), and a heartbeat
    (`Store.heartbeat`) is written every `heartbeat_s` seconds. Heartbeats are for
    observability (`horae runs`); the lock, not the heartbeat, decides whether a run is alive.
+   The LLM backend is wrapped in `LedgerLlm` (`horae.runner._budget`, #33): the daily
+   budgets of `horae.yaml` and the usage ledger, one reserved then settled row per call;
+   a dry run is charged too (it calls the model; decision 41 E).
 5. **Apply** (#22, provisional): when the run is not a dry run, finished `ok`, `noop` or
    `degraded` within its timeout, and `Ports.sinks` is set, its routed intents are planned
    (`horae.apply.plan_changes`, with the notifications already sent) and applied
@@ -79,6 +82,11 @@ heartbeat, step write or the final save notices: the run is stopped and `RunLost
 loop's monotonic clock. Since liveness is the lock's, a wall-clock step only shifts recorded
 times (and may reorder run ids started across the step); it cannot make a live run look dead.
 
+**Redaction** (#53). `run` installs the log record scrubber (`horae.secrets.logs`) and
+resolves every secret the instance names (`Instance.prime_redaction`) before it takes the
+lock, so the store's secret gate, the engine's plan-time refusal of a secret in a `--var` or
+a parameter, the LLM layer and the logs know them all from the start.
+
 **The CLI.** `horae run` (`horae.cli_run`, #26) cancels the run on SIGINT and SIGTERM, as
 above, and exits 130 / 143; `on_begin(run_id)` tells it the run's id as soon as the row
 exists, so it can name the run whatever happens next.
@@ -119,7 +127,9 @@ from horae.engine import (
     make_context,
     pipeline_digest,
 )
+from horae.runner._budget import LedgerLlm
 from horae.runner._lock import PipelineLock, try_acquire_apply_lock
+from horae.secrets import logs
 from horae.store import (
     MAX_LIST_RUNS,
     InvalidRow,
@@ -403,6 +413,10 @@ class Runner:
         `RunLost`, `OSError` (the lock file cannot be created), or what crashed the run (it is
         then abandoned)."""
         pipeline = self._pipeline(name)
+        # Redaction first (#53): the log scrubber, and every secret the instance names
+        # known to the process registry before anything is run, stored or logged.
+        logs.install()
+        self.instance.prime_redaction()
         lock = await self._lock(name)
         try:
             self._recover(name)
@@ -605,6 +619,23 @@ class Runner:
             raise RunLost(state.run_id)
         return result.record
 
+    def _ledger_llm(self, pipeline: Pipeline, run_id: str) -> LlmBackend | None:
+        """The run's LLM backend behind the daily budgets and the usage ledger (#33)."""
+        step = next((i for i, s in enumerate(pipeline.steps) if isinstance(s, LlmStep)), None)
+        if self.ports.llm is None or step is None:
+            return self.ports.llm
+        config = self.instance.config
+        return LedgerLlm(
+            self.ports.llm,
+            self.store,
+            run_id,
+            pipeline.name,
+            step,
+            config.budgets,
+            config.timezone,
+            self.clock,
+        )
+
     async def _drive(
         self,
         pipeline: Pipeline,
@@ -625,6 +656,7 @@ class Runner:
                 raise RunLost(run_id) from None
 
         models = {alias: spec.model for alias, spec in self.instance.config.models.items()}
+        llm = self._ledger_llm(pipeline, run_id)
         task = asyncio.create_task(
             execute(
                 pipeline,
@@ -633,7 +665,7 @@ class Runner:
                 started_at=started_at,
                 plugins=self.ports.plugins,
                 tools=self.ports.tools,
-                llm=self.ports.llm,
+                llm=llm,
                 skills=self.ports.skills,
                 dry_run=dry_run,
                 previous=previous,

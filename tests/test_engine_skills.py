@@ -552,6 +552,7 @@ class _Provider:
     """A provider backend that answers with the skill's output, intents included."""
 
     name: Literal["anthropic"] = "anthropic"
+    may_write_cache: bool = False
 
     def __init__(self, output: Any) -> None:
         self.output = output

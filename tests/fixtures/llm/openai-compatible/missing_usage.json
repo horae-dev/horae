@@ -1,0 +1,20 @@
+{
+  "status": 200,
+  "body": {
+    "id": "chatcmpl-synthetic0001",
+    "object": "chat.completion",
+    "created": 1767225600,
+    "model": "fixture-model-1",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "{\"items\": [\"Review PR 42\"], \"summary\": \"One review is waiting.\"}",
+          "refusal": null
+        },
+        "finish_reason": "stop"
+      }
+    ]
+  }
+}

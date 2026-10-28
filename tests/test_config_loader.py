@@ -305,3 +305,24 @@ def test_schema_version_is_optional_and_only_1(instance_dir: Path) -> None:
     assert load_instance(instance_dir).config.schema_version == 1
     _edit(config, "schema_version: 1", "schema_version: 2")
     assert _errors(instance_dir) == [f"{config}:2:17: schema_version: Input should be 1"]
+
+
+def test_daily_budgets_load_and_name_known_pipelines(instance_dir: Path) -> None:
+    config = instance_dir / "horae.yaml"
+    with config.open("a", encoding="utf-8") as out:
+        out.write(
+            "budgets:\n  daily: {usd: 1.5}\n"
+            "  pipelines:\n    daily-brief: {daily: {tokens_out: 900}}\n"
+        )
+    budgets = load_instance(instance_dir).config.budgets
+    assert budgets.daily is not None
+    assert budgets.daily.usd == 1.5
+    assert budgets.pipelines["daily-brief"].daily.tokens_out == 900
+
+
+def test_daily_budget_for_an_unknown_pipeline(instance_dir: Path) -> None:
+    config = instance_dir / "horae.yaml"
+    with config.open("a", encoding="utf-8") as out:
+        out.write("budgets:\n  pipelines:\n    nope: {daily: {usd: 1}}\n")
+    [error] = _errors(instance_dir)
+    assert error == f"{config}:15:5: budget for unknown pipeline 'nope'"

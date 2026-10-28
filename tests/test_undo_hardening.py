@@ -559,7 +559,7 @@ def test_a_v2_database_with_a_journal_migrates_to_v3(tmp_path: Path) -> None:
             "'Inbox.assistant.md', ?, 1, 1, '2026-10-27T05:30:30.000000Z')",
             (digest,),
         )
-        assert migrate(conn) == 3
+        assert migrate(conn, target=3) == 3
         row = conn.execute(
             "SELECT applied_by, sink_identity, actual_after_sha256, undo_overwrote_sha256 "
             "FROM journal"

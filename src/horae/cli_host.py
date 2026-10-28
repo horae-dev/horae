@@ -50,13 +50,16 @@ def uses_host(root: Path, vault: Path | None) -> bool:
 
 
 def load(root: Path) -> Instance:
-    """The instance, or `CommandFailed(config_invalid)` listing its problems."""
+    """The instance, or `CommandFailed(config_invalid)` listing its problems. Every secret
+    it names is resolved for redaction (`Instance.prime_redaction`, #53)."""
     try:
-        return load_instance(root)
+        instance = load_instance(root)
     except InstanceError as exc:
         found = plural(len(exc.problems), "problem") + " found"
         message = "; ".join([*map(str, exc.problems), found])
         raise CommandFailed(EXIT_PROBLEMS, "config_invalid", message) from None
+    instance.prime_redaction()
+    return instance
 
 
 def check_plugins(instance: Instance) -> None:
@@ -128,16 +131,19 @@ def _command_problems(registry: HostRegistry) -> list[Problem]:
     return problems
 
 
-CLOUD_BACKENDS = frozenset({"anthropic"})
-"""Backends billed per token, whose aliases `horae doctor` expects to have a `price`."""
+CLOUD_BACKENDS = frozenset({"anthropic", "openai-compatible"})
+"""Backends billed per token, whose aliases `horae doctor` expects to have a `price`. `ollama`
+is local (no warning); an `openai-compatible` alias is treated as cloud even when it points
+at a local server (a warning, which does not fail the check; schemas decision 40)."""
 
 
 def _backend_problems(instance: Instance) -> list[Problem]:
     """For each model alias used by an `llm` step: an error when its backend is not
-    implemented in this Horae (`horae.llm.backends.FACTORIES`), and a warning when it is a
+    implemented in this Horae (`horae.llm.backends.FACTORIES`), a warning when it is a
     cloud backend without a `price` (its calls are then recorded at `usd: 0` and the step's
-    `usd` budget does not bound them; schemas decision 38 A). Aliases no pipeline uses are
-    not checked."""
+    `usd` budget does not bound them; schemas decision 38 A), and a warning when it sends a
+    `secret` to an `http://` `base_url` (the key crosses the LAN in clear; decision 40).
+    Aliases no pipeline uses are not checked."""
     used = sorted(
         {
             step.llm.model
@@ -174,6 +180,61 @@ def _backend_problems(instance: Instance) -> list[Problem]:
                     severity="warning",
                 )
             )
+        if (
+            spec.backend in FACTORIES
+            and spec.secret is not None
+            and spec.base_url is not None
+            and spec.base_url.startswith("http://")
+        ):
+            problems.append(
+                Problem(
+                    CONFIG_FILE,
+                    None,
+                    None,
+                    f"models.{alias}.secret: model alias {alias!r} sends its key in clear "
+                    "text over http:// (anyone on the local network path can read it); use "
+                    "an https:// base_url, or drop the secret if the server needs none",
+                    severity="warning",
+                )
+            )
+    return problems
+
+
+def _budget_problems(instance: Instance) -> list[Problem]:
+    """A warning for each `usd` daily ceiling (`budgets.daily`, `budgets.pipelines.<name>`)
+    that covers a pipeline whose `llm` step uses an alias without `price` (schemas decision
+    41 B): that alias' calls are recorded at `usd: 0`, so the ceiling does not bound their
+    dollars (only `tokens_out` does)."""
+    budgets = instance.config.budgets
+    problems: list[Problem] = []
+    for pipeline in sorted(instance.pipelines.values(), key=lambda p: p.name):
+        aliases = sorted({s.llm.model for s in pipeline.steps if isinstance(s, LlmStep)})
+        unpriced = [
+            alias
+            for alias in aliases
+            if (spec := instance.config.models.get(alias)) is not None and spec.price is None
+        ]
+        if not unpriced:
+            continue
+        own = budgets.pipelines.get(pipeline.name)
+        ceilings = []
+        if budgets.daily is not None and budgets.daily.usd is not None:
+            ceilings.append("budgets.daily.usd")
+        if own is not None and own.daily.usd is not None:
+            ceilings.append(f"budgets.pipelines.{pipeline.name}.daily.usd")
+        for where in ceilings:
+            for alias in unpriced:
+                problems.append(
+                    Problem(
+                        CONFIG_FILE,
+                        None,
+                        None,
+                        f"{where}: pipeline {pipeline.name!r} uses model alias {alias!r}, "
+                        "which has no price: the usd ceiling does not bound its calls "
+                        "(only tokens_out does)",
+                        severity="warning",
+                    )
+                )
     return problems
 
 
@@ -208,10 +269,11 @@ def instance_problems(instance: Instance) -> list[Problem]:
     """What `horae doctor` checks beyond the configuration (`check_instance`): the lock's
     paths exist, the instance's own `vault/` is the one the lock writes to, each model alias
     an `llm` step uses has an available backend (and, for a cloud backend, a `price`, else a
-    warning), and, when the instance has a `plugins/` directory, the plugins are installed
-    as the lock pins them (`check_plugins`), each command (its interpreter) exists and is
-    executable, and every skill an `llm` step uses loads (`horae.skills.load_skill`)."""
-    problems = _path_problems(instance) + _backend_problems(instance)
+    warning; a warning too for a `usd` daily ceiling over such an unpriced alias), and,
+    when the instance has a `plugins/` directory, the plugins are installed as the lock
+    pins them (`check_plugins`), each command (its interpreter) exists and is executable,
+    and every skill an `llm` step uses loads (`horae.skills.load_skill`)."""
+    problems = _path_problems(instance) + _backend_problems(instance) + _budget_problems(instance)
     if plugins_dir(instance.root).is_dir():
         try:
             registry = _registry(instance)

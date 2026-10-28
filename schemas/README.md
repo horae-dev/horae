@@ -732,12 +732,16 @@ loosened later without breaking a valid file.
       or straddle `: `), then the body of the redacted `<ref>: <message>` is also matched
       as a whole value.
       The host logs a warning (name only) for each secret under 8 bytes it redacts, since its
-      encodings are not redacted. Object keys
+      encodings are not redacted. *Superseded for short secrets by decision 43 H (#53): a
+      secret under 8 bytes is now refused when it is resolved, so the bounded raw-value
+      matching and this warning are gone; the rest of D (keys, messages, overlaps, numbers)
+      stands.* Object keys
       are never rewritten: a key holding a secret fails the call with `output_invalid` and
       nothing is stored. When the matches of two secrets overlap, only the leftmost one is
       replaced (documented limit). A JSON number whose `json.dumps` is a secret becomes the
       token string; the SDK's own log records (`mcp.*`, `client`, `server`) are scrubbed when
-      created: message redacted, arguments, traceback and stack dropped;
+      created: message redacted, arguments, traceback and stack dropped (every logger since
+      decision 43 E);
     - **E. umask.** Every plugin process starts with umask `0o077`;
     - **F. Stderr window.** The per-call stderr window keeps its quiet-window heuristic
       (stderr and stdout are separate pipes, so nothing orders them); tests wait for a
@@ -1238,3 +1242,357 @@ loosened later without breaking a valid file.
       `LockRegistry`). A skill edited since the run replays as different, by design; when
       both records carry `llm[].skill_digest`, the report adds the note "skill <name> changed
       since the run" and an `llm.<skill>.skill_digest` summary field.
+
+### Provisional decisions (#30, pending maintainer review)
+
+40. **The `openai-compatible` and `ollama` backends (#30).** Two compatible v1 additions and
+    the rules of `horae.llm.backends.openai_compatible` and `horae.llm.backends.ollama`, which
+    keep every rule of decision 38 (render/send, the key only from the declared secret,
+    rebuilt headers, the explicit network path, quiet loggers, strict JSON, the pre-flight
+    budget, clean error chains, the summary recorded as `LlmCall.request`, reserved
+    `intents`) and share its code (`horae.llm.backends._shared`):
+    - **contract change** (optional): `models.<alias>.structured_output`, `json_schema`
+      (the default when unset), `json_object` or `none`, accepted for `backend:
+      openai-compatible` only (the model and the JSON Schema both refuse it on another
+      backend). It is the fallback for a server that lacks JSON Schema structured output;
+    - **contract change** (optional): `models.<alias>.max_tokens_field`, `max_tokens` (the
+      default when unset) or `max_completion_tokens`, `openai-compatible` only (refused on
+      another backend by the model and the JSON Schema), for OpenAI's reasoning models,
+      which refuse `max_tokens`. There the limit also bounds the hidden reasoning tokens, so
+      a low `tokens_out` can end in `length` with no visible output (an `output_invalid`
+      truncation, charged); the payload keys follow the field, so a payload rendered for one
+      field is refused by an alias set to the other;
+    - **A. no SDK**: both talk to their API with a direct `httpx2` client (one JSON `POST`).
+      The `openai` SDK would add a dependency and what the `anthropic` backend has to
+      neutralise (`OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_ORG_ID` /
+      `OPENAI_PROJECT_ID`, its own retries, platform headers and debug logging); the
+      `ollama` client reads `OLLAMA_HOST`. Nothing here reads the environment. The posted
+      bytes are the canonical JSON of the rendered payload, so they equal
+      `RenderedRequest.body()` byte for byte;
+    - **B. what `base_url` means**: for `openai-compatible` it is the API root **with** its
+      version prefix, as the OpenAI SDKs take it (`https://openrouter.ai/api/v1`,
+      `https://api.mistral.ai/v1`, `http://vllm:8000/v1`), and the only request is `POST
+      <base_url>/chat/completions`; for `ollama` it is the server root (`http://ollama:11434`)
+      and the only request is `POST <base_url>/api/chat`. A request to any other origin,
+      path or query is refused (`host_error`). `http://` follows decision 24 (loopback,
+      private and single-label hosts only);
+    - **C. the key is optional**: `secret` is optional for both; when declared it is sent as
+      `Authorization: Bearer <key>` (for `ollama`, to a proxy in front of it), else no
+      `Authorization` header is sent. The headers are exactly `host`, `accept`,
+      `content-type`, `content-length`, `accept-encoding: identity`, `user-agent: horae`
+      and that one (`anthropic` sends `accept-encoding: identity` too);
+    - **D. `openai-compatible` request**: `model`, `max_tokens`, `stream: false` and two
+      messages (`system`: the preamble, then the skill's prompt; `user`: the tagged input and
+      schema errors of decision 38). `json_schema` sends `response_format: {type:
+      json_schema, json_schema: {name: horae_output, schema, strict: false}}`: `strict:
+      false` because OpenAI's strict mode refuses schemas that do not mark every property
+      required or that use keywords it lacks (`maxLength`, `pattern`), and the #31 validator
+      checks the full schema anyway (decision 38 G). `json_object` sends `{type:
+      json_object}` and `none` no `response_format`; both append the schema to the system
+      prompt. With `json_schema` the schema is **not** also put in the prompt: it is in
+      `response_format`, and repeating it would make the request larger and give the model
+      two copies to reconcile; the trade-off is that a server which silently ignores
+      `response_format` gets no schema text (the #31 validator still refuses its output;
+      such a server should use `json_object` or `none`). `strict: false` is recorded here
+      as the decision (see above). `max_tokens` by default (what the compatible servers
+      take; `max_tokens_field` above for reasoning models). OpenRouter's `provider` routing
+      fields (`order`, `allow_fallbacks`, `data_collection`...) are not sent and cannot be
+      configured: a later per-alias option, since routing decides which company sees the
+      data;
+    - **E. `openai-compatible` response**: exactly one choice, `finish_reason: stop`, and
+      `message.content` one JSON value. `length` / `model_length` (truncation), a non-empty
+      `message.refusal` or `content_filter` (refusal), `tool_calls` / `function_call` and any
+      other finish reason are `output_invalid` with the usage. Usage is `prompt_tokens` /
+      `completion_tokens`; a reported `prompt_tokens_details.cached_tokens` (at most
+      `prompt_tokens`) becomes `cache_read_tokens` and is taken out of `tokens_in`. An error
+      status carries the API's error `type` when it is a short identifier;
+    - **F. `ollama` request and response**: `model`, `stream: false`, `format` (the output
+      schema: Ollama's structured outputs, Ollama 0.5 or later), `options.num_predict` (the
+      `max_tokens`) and the same two messages. `done` must be `true`; `done_reason: length` is
+      a truncation, tool calls and any reason but `stop` (or none, as older servers send) are
+      `output_invalid`. Usage is `prompt_eval_count` / `eval_count`; Ollama may omit
+      `prompt_eval_count` for a cached prompt, and a missing count is charged conservatively
+      (decision 38). Ollama's `error` text is never shown: the message has the status only
+      (a missing model is HTTP 404, `invalid_request`);
+    - **G. cost and `horae doctor`**: without a `price` a call costs `usd: 0` (`priced:
+      false`), as for every backend. `horae doctor` treats `ollama` as local (no price
+      warning) and `openai-compatible` as cloud (the warning of decision 38 A, which never
+      fails the check), even when its `base_url` is a local vLLM: the backend name is the
+      only signal kept simple here. The #34 design note proposes an explicit `local:` flag
+      per alias; when it lands it replaces this rule;
+    - **H. shared conformance suite**: `tests/test_llm_backends_shared.py` runs the same
+      tests over `anthropic`, `openai-compatible` and `ollama` with recorded synthetic
+      responses (`tests/fixtures/llm/<backend>/`: success, truncation, refusal where the API
+      has one, tool call, 401, 429, 5xx, malformed JSON, missing usage); a new backend joins
+      it by adding a `Kind` in `tests/llm_backend_kinds.py`;
+    - **I. the response is bounded** (every backend, `anthropic` included, through
+      `_shared.BoundedTransport` around the client's transport): `accept-encoding: identity`
+      is sent; the cap of a call is `response_cap(max_tokens) = min(8 MiB, max(1 MiB, 64 ×
+      max_tokens))` bytes of decoded body (64 bytes a token: a token is a few bytes of text,
+      which JSON may escape up to 6 bytes a character, inside the provider's envelope). A
+      success whose `content-length` exceeds it is refused before its body is read; one that
+      grows past it while read (chunked) is refused at the cap. A server that compresses
+      anyway is inflated by Horae (`gzip`, `deflate`), at most one byte past the cap per step,
+      so a gzip bomb (305 KB inflating to 300 MiB) is refused with about one cap in memory;
+      any other `content-encoding` (or a list of them) and corrupt compressed data are
+      refused. All of these are `output_invalid` with the conservative usage (decision 38:
+      the input bound and the whole `max_tokens`), since the provider may have billed the
+      call. An error body is cut at 64 KiB (its status still maps the error);
+    - **J. the body is read strictly**: decoded as UTF-8 only (`bytes.decode("utf-8")`, no
+      charset sniffing: UTF-16, a stray `0xff` or an encoded surrogate are refused), then
+      parsed by the strict JSON parser of decision 38; it must be one JSON object. `anthropic`
+      now reads the raw response itself the same way (the SDK posts the canonical bytes with
+      `cast_to=httpx2.Response` and still maps HTTP and connection errors; no SDK model is
+      built from the response). Any exception other than an `LlmError` while reading the
+      result is `output_invalid` with the conservative usage, never a crash. An error body
+      that is not UTF-8 gives the status only;
+    - **K. reported usage is untrusted**: a token count must be an integer from 0 to `10**12`
+      (`10**400` or `10**308`, which would overflow the cost to infinity, are unusable: the
+      call is charged conservatively). A usable report is then floored: `tokens_in` (with the
+      cache tokens) at least `ceil(request bytes / 4)` and `tokens_out` at least `ceil(UTF-8
+      bytes of the output text / 4)`, the latter capped at `max_tokens` (what a provider
+      honouring the request may bill). The larger value is the one recorded, priced and
+      charged to the budget; the reported value is not kept separately (kept simple: one
+      `Usage`). A server that reports `0 / 0` is still charged for what it plainly sent;
+    - **L. `http://` is checked at connect time** (decision 24 limits the *host name*; this
+      limits where it *resolves*): for an `http://` `base_url` the transport's network backend
+      (`_shared.LanOnlyNetwork`) resolves the host when it opens a connection and refuses
+      unless **every** address is loopback (`127/8`, `::1`), RFC 1918 (`10/8`, `172.16/12`,
+      `192.168/16`) or IPv6 ULA (`fc00::/7`), an IPv4-mapped address being checked as IPv4;
+      link-local (`169.254/16`, `fe80::/10`, where cloud metadata services answer) and CGNAT
+      (`100.64/10`) are refused. It then connects to the checked address itself, so a second
+      lookup cannot rebind the name. A refusal is `host_error` ("request refused: an http
+      endpoint that resolves to a public address"), like every other refused request, and
+      nothing is sent; a failed lookup is a connection error (`host_error`, or `timeout`
+      within the step's timeout). `https://` endpoints are not restricted (TLS
+      authenticates the host);
+    - **M. `horae doctor` warns about a key over `http://`**: an alias used by a pipeline
+      with a `secret` and an `http://` `base_url` gets a warning (never a failure): the key
+      crosses the local network in clear, readable by anyone on the path;
+    - **N. the `base_url` path cannot traverse**: besides decision 24, a `base_url` whose
+      path has a `.` or `..` segment or an encoded `/`, `.` or `\` (`%2F`, `%2E`, `%5C`, any
+      case) is refused, since a server or proxy may decode it into a path the guard never
+      compared (`https://h/%2e%2e/v1`, `https://h/a%2Fb`, `https://h/v1/../x`).
+
+### Provisional decisions (#33, pending maintainer review)
+
+41. **Budgets per day and the usage ledger (#33).** (39 and 40 are taken by #27 and #30.)
+    A compatible v1 addition and the rules of `horae.runner._budget`, the store and `horae
+    usage`:
+    - **contract change** (optional): `horae.yaml` `budgets: {daily?, pipelines?}`, where
+      `daily` is `{usd?, tokens_out?}` (at least one, and not `null`: each `anyOf` branch of
+      the JSON Schema requires its property as a number; `usd > 0`, `tokens_out >= 1`) for every
+      pipeline together, and `pipelines.<name>.daily` the same for one pipeline (a name that
+      is not a pipeline of the instance is a loader problem). Both apply; the lower
+      allowance wins. The day is the instance's `timezone` day (not a trigger's). `usd`
+      bounds only priced aliases (an alias without `price` records `usd: 0`, decision 38 A);
+      `tokens_out` bounds every call. The step's own `budget` is unchanged and still bounds
+      both attempts together;
+    - **reservation**: before every LLM attempt, the runner first prepares the request
+      outside any lock (`ModelBackends.prepare`: the alias, the skill's prompt from the
+      `PromptSource`, which may read files, the provider backend and the input bound); then,
+      in one store transaction (`BEGIN IMMEDIATE`, so the processes of other runs wait for
+      it), it reads the day's spend from the ledger (settled calls at their cost, unsettled
+      ones at their reservation), caps the attempt's budget with what is left of each
+      ceiling (see A for a refusal), renders the request with that budget
+      (`ModelBackends.render(capped, prepared)`: pure sizing and payload, no I/O; its
+      pre-flight of decision 38 B may refuse it too) and reserves the most it can cost
+      (`ModelBackends.worst_case`: the input bound at the input price, or at the cache write
+      price for a provider backend that `may_write_cache`, plus `max_tokens` at the output
+      price: the bound `max_tokens` already keeps within the budget). Another `LlmBackend` (a
+      test fake) reserves the capped budget itself. Two runs of different pipelines
+      therefore never both spend the last of a ceiling (`tests/test_budgets.py` has a
+      two-process test whose `day_spend` waits between the read and the reservation: it
+      fails with a deferred transaction). Not the apply lock: an LLM call can take minutes
+      and must not block other runs' applies;
+    - **settling, right after the call** (not with the step record: failed attempts cost
+      money too and have no `LlmCall`): the reported usage (also of a failed call,
+      `LlmError.usage`; zero for a backend's cached response; a cost above the reservation
+      is logged, amounts only, and the row marked `over_reservation`); a refusal that reports no
+      usage and means the provider processed nothing (`budget_exceeded`,
+      `backend_unavailable`, `skill_unavailable`, `invalid_request`, `auth_failed`,
+      `rate_limited`, `overloaded`) releases the reservation; any other failure without
+      usage (a timeout, a lost connection, a cancellation) keeps the reservation as an
+      `estimated` cost. **Crash consistency**: a process that dies between reserving and
+      settling leaves its `reserved` row, which keeps counting for its day: a crash can
+      over-count, never under-count (until the run is abandoned or recovered, see D). A store failure while reserving refuses the call
+      (`host_error`); while settling it is logged (type only) and the reservation stays;
+    - **the ledger** is the `llm_usage` table (migration 4): per attempt `run_id`,
+      `pipeline`, `step`, `attempt`, `alias`, `backend`, `model`, `state` (`reserved` or
+      `settled`), tokens in and out, cache read and write tokens, `usd`, `priced`,
+      `estimated`, `over_reservation`, `at` (UTC) and `day` (local). The ledger outlives its
+      runs (C);
+    - **`horae usage [--pipeline P] [--since DATE] [--until DATE] [--by day|pipeline|model]
+      [--json]`** groups the ledger by day and pipeline (or by day, pipeline, or backend and
+      model), oldest first, with a `TOTAL` row; dates are local days, inclusive. Cells of
+      calls of an unpriced alias are flagged `*`, calls in flight `+`, calls settled at
+      their reservation `~` and calls that cost more than reserved `!`, with a footnote
+      each; a cost under a ten-thousandth of a dollar shows as `<$0.0001`. `--by model`
+      groups by backend, model and alias: a call that reached no provider has a `null`
+      backend and model (`-` in the table). The store is opened read-only (decision 31 E: a missing store
+      lists nothing, an older schema exits 1). Exit codes as decision 37: `0` listed, `1`
+      configuration or store problem, `2` usage error (a malformed date, `--since` after
+      `--until`, an unknown `--by`), `70` internal. `--json` prints `{schema_version: 1,
+      instance, by, pipeline, since, until, rows: [{<by keys>, calls, tokens_in, tokens_out,
+      cache_read_tokens, cache_write_tokens, usd, unpriced_calls, in_flight_calls,
+      estimated_calls, over_reservation_calls}], total}`;
+    - **(A) a minimum useful output**: a call is refused (`budget_exceeded`, no request,
+      nothing reserved) when what a daily ceiling leaves cannot buy
+      `MIN_OUTPUT_TOKENS = 256` output tokens, or fewer when the step's own budget buys
+      fewer (`min(256, what the step alone allows)`): an answer cut short is worse than
+      none. The refusal names the daily ceiling (`the instance daily budget leaves ...`),
+      also when the pre-flight of decision 38 B refuses only because of it; a step whose own
+      budget is too small is refused in the step's own words, as before;
+    - **(B) `horae doctor`** warns when a `usd` ceiling (`budgets.daily` or
+      `budgets.pipelines.<name>`) covers a pipeline whose `llm` alias has no `price`: its
+      dollars are then unbounded, only `tokens_out` bounds it;
+    - **(C) the ledger lives independently of runs**: `run_id` is nullable, `ON DELETE SET
+      NULL`, so `prune_runs` never changes a day's totals; the ledger's own retention is
+      `Store.prune_usage(older_than)` (settled rows of earlier local days; reserved rows are
+      kept);
+    - **(D) abandon and recovery**: `abandon_run` (the stale-run recovery calls it too, a
+      compare-and-set on the run's status) turns the run's `reserved` rows into `settled`
+      ones at their reservation, `estimated = 1`; `horae usage` tells calls in flight (`+`,
+      `in_flight_calls`) from settled estimates (`~`, `estimated_calls`);
+    - **(E) dry runs are charged**: they call the model. PLAN.md's "a dry run writes
+      nothing" is about user data (decision 32 D5): Horae's own state, the run record and
+      the usage ledger, is written;
+    - **(F) the day is stored at reservation time**: a later `timezone` change does not
+      rewrite history (past rows keep their day); local midnight and DST transitions follow
+      the instance's time zone (a 23- or 25-hour day is one day);
+    - **provider prompt caches**: a `ProviderBackend` declares `may_write_cache` (default
+      `False`; `anthropic` is `False`, since Horae sends no `cache_control`; `claude-cli`
+      #29 is expected to be `True`). For such a backend the input bound is priced at the
+      cache write price (`cache_write_per_mtok`, else twice the input price) in both
+      `max_tokens` and `worst_case`, so a settled call never exceeds its reservation; a
+      backend without it that reports cache writes beyond the bound is flagged
+      `over_reservation` (and logged);
+    - **untrusted usage (decision 40 K)**: a backend's floored usage (input at least a
+      quarter of the request bytes, output at least a quarter of the output bytes but at
+      most `max_tokens`) and its conservative charge (`input_bound` of the payload sent plus
+      the whole `max_tokens`) stay within the reservation: `ModelBackends.prepare` sizes the
+      input bound on the payload at the largest `max_tokens` the request allows (its
+      `tokens_out`, capped by the alias' `max_output_tokens`), so the payload actually sent,
+      with a `max_tokens` no larger, is never bigger. A count a provider reports above the
+      bound but under `10**12` is kept (decision 40) and flagged `over_reservation`;
+    - **follow-ups**: a monthly ceiling; provider-side spend limits (#63); calling
+      `prune_usage` from a retention setting.
+
+
+### Provisional decisions (#53, pending maintainer review)
+
+43. **Secret redaction in logs and run records (#53, design note and maintainer answers on
+    #100; security review findings and maintainer decisions on #106).** (39 and 42 are taken
+    by #27 and #29.) Contract change: none; a store migration (`0005_secret_flags`). The
+    store's findings reuse the `secret_in_output` violation of decision 35 (so a replay leaves
+    them out of the compared violations, as it does for the host's). **Maintainer
+    decisions** (binding, on #106): the journalled `after` / `actual_after` bytes are exempt
+    and flagged only for a secret new compared to `before` (C), and secrets under 8 bytes are
+    refused (H). **Provisional**, pending maintainer review: B (identifiers exempt and
+    flagged), E (every logger, warnings, exception hooks), F (`secure_delete`), G (key
+    collisions). Rules of `horae.secrets`, the store, the engine, the LLM layer and the CLI:
+    - **A. one shared redactor and a process registry.** `Redactor`, `token`, `SecretInKey`
+      and the encodings of decision 35 C moved to `horae.secrets.redact` (re-exported by
+      `horae.plugins.host.redact`); the log scrubber to `horae.secrets.logs` (re-exported by
+      `horae.plugins.host.logs`). Every `SecretResolver.resolve` adds the secret to a
+      process registry (`remember`; `current()` is a `Redactor` of every secret this process
+      resolved, rebuilt when the set grows; it only grows, so a rotated value stays
+      redacted). `Instance.prime_redaction()` resolves, for redaction only, every secret the
+      instance names (`secrets.refs`, the secrets `horae.lock` grants, the model aliases'
+      `secret`), skipping one that cannot be resolved; `Runner.run` and the CLI commands that
+      read the instance call it first; those that read `horae.yaml` alone (`runs`, `diff`,
+      `usage`, `undo`) prime the same names (`horae.config.loader.redaction_names(config,
+      lock)`, shared with the instance), reading `horae.lock` best effort (an absent or
+      invalid lock adds nothing). A provider backend still resolves its own key lazily,
+      through its own resolver. A JSON number whose `json.dumps` is a secret's value is a
+      **numeric match** (`pin: 12345678`): the checks that refuse see it (`Redactor.find`),
+      the host and the CLI redact it, the store flags it without changing its type;
+    - **B. what is redacted, and identifiers (provisional).** Only **free text** is
+      rewritten. **Identifiers the system needs are exempt and flagged** (kept as written,
+      neither refused nor rewritten; a hit is a `secret_in_output` violation): run ids,
+      pipeline names, timestamps, statuses, kinds, plugin names and refs, tokens, digests,
+      the journal's `target`, `applied_by` and `sink_identity`, a task's `fingerprint`,
+      `source` and `target`, notification keys, the usage ledger's `alias`, `backend` and
+      `model`, a run's `host`, the pipeline definition. Rewriting them made the record
+      invalid (a run refused for a secret that happened to equal a word of its own
+      structure), broke undo (a redacted journal target no longer names the note) and
+      replay. Only the LLM cache refuses. The free-text allowlist (`horae.store._gate`): step
+      `output`, `error.message`, `stderr`, call `params` and `intents`; input `params`,
+      `data` and `intents`; the intent payload fields `content`, `heading`, `title`, `body`;
+      `context.vars` values; LLM `request`, `response`, `intents`, `repair`,
+      `schema_errors`; violation details; the run's `error`; a task's `title`; an abandoned
+      run's `error`. A pipeline definition holding a secret's value is not copied into the
+      record (`pipeline_definition` is `None`; its parameters refuse the run at plan time);
+    - **C. the store's secret gate (answers 1–3), fail safe.** Every table, just before
+      writing, with the registry's redactor: free text redacted (JSON: string leaves and
+      object keys), identifiers and numeric matches flagged (B). **Refused**
+      (`SecretRefused`, an `InvalidRow`, nothing written, name only): an LLM cache entry
+      holding a secret in any string, key or number (answer 3; callers treat it as "do not
+      cache", `Store.cache_put_safe`, for #32), and, as a residual, a record or step that
+      would no longer validate once its free text is redacted (a token longer than the room
+      its field has left). **The journalled `after` bytes and a sink's `actual_after`
+      bytes: exempt, and flagged only when the secret is new** (maintainer decision on
+      #106): kept byte for byte (apply's mismatch check and undo depend on them); a hit is
+      recorded only when the secret occurs more often than in the journalled `before` ("the
+      store found secret X in the content Horae wrote to <target>, not in the note before"),
+      so a secret the user already had in their note is not flagged. **Exempt** (answer 2):
+      the journalled `before` bytes and the bytes a forced undo `overwrote`, the user's own
+      note, which undo restores byte for byte (docs/security.md T09). Every finding is logged
+      (`horae.store`, names only) and kept in the `secret_flags` table, in the same
+      transaction as the row that held it; `save_run` turns a run's findings (and those in
+      the record itself) into `secret_in_output` violations, then deletes them, so a record
+      saved by another `Store` or process still gets them; `abandon_run` deletes them (no
+      record); when the violations would pass `MAX_ITEMS`, the rest is aggregated into one
+      violation;
+    - **D. trusted inputs are refused (answer 4).** The engine fails the run at plan time,
+      before any call, `params_invalid` naming the secret only, when a template variable
+      (`horae run --var`) or a rendered parameter holds the value (or a known encoding) of a
+      resolved secret, in a string, an object key or as a number's whole value; the variable
+      is redacted in the record's `context`. A skill's prompt or output schema holding one is
+      refused by `ModelBackends.prepare` (`params_invalid`, before rendering, reserving or
+      sending). That check is **not** at plan time yet: #27's skill loader is not on `main`,
+      so the engine does not have the prompt before the run; the steps before the `llm` step
+      have run when it refuses. With the loader the check moves to `_plan`.
+      `params_invalid` releases a ledger reservation;
+    - **E. logs, warnings, uncaught exceptions (provisional).** `horae.secrets.logs.install()`
+      (the CLI entry point, `Runner.run`, an opening `PluginHost`; idempotent) wraps the log
+      record factory: **every** record of every logger (the root, `asyncio`, `urllib3`,
+      `py.warnings`, `uvicorn`, `openai`, `mcp`... not a list of prefixes any more) is
+      redacted when it is created (message formatted and redacted with the registry and every
+      open host, `args` dropped, `exc_info` and `stack_info` replaced by the exception's type
+      name), whatever handler sees it. It also calls `logging.captureWarnings(True)` and sets
+      `sys.excepthook` and `threading.excepthook` to hooks that redact the report they print.
+      The HTTP loggers are pinned to `WARNING`. The LLM layer: `ModelBackends.send` redacts
+      what a provider backend returns (an `LlmError`'s message and stderr, raised again as a
+      new error with no `__cause__` / `__context__`; the output, intents and schema errors;
+      logged by name); the engine redacts an `LlmError` message from any `LlmBackend` before
+      recording it. The pipeline digest and the cache key are computed on the real values
+      (they are hashes);
+    - **F. deleted bytes (provisional).** Every writable store connection (the main one and
+      the heartbeat's) sets `PRAGMA secure_delete = FAST`, so a deleted or replaced row is
+      zeroed where SQLite rewrites its page anyway. A database written before #53 can hold
+      unredacted values in rows and free pages: docs/operations/retention-and-backups.md
+      documents a one-off `VACUUM`;
+    - **G. key collisions (provisional).** When redacting two keys of one JSON object gives
+      the same text, the later one is renamed `[REDACTED:NAME]#2` (`#3`...) and a violation
+      says so: nothing is lost silently;
+    - **H. short secrets (maintainer decision on #106; supersedes decision 35 D).** A
+      declared secret shorter than 8 bytes of UTF-8 (`MIN_SECRET_BYTES`) is **refused when it
+      is resolved**: `SecretError` "... is too short for reliable redaction (min 8 bytes)",
+      never echoing the value. `horae doctor` reports it as an error; a plugin that declares
+      it fails with `secret_missing`, a model alias with its backend's secret error (the run
+      needing it is refused); priming skips it with a warning naming it (`horae.secrets`).
+      The redactor has no short-secret case any more (`Redactor` raises `ValueError` if it is
+      handed one), and the host no longer warns about one;
+    - **I. CLI output.** Every command prints through `horae.cli_output.echo`, which redacts
+      the text; `to_json` scrubs the document as data first (numbers too, so the JSON stays
+      valid). `horae.apply.render.safe` redacts **before** it escapes control and invisible
+      characters, and text is redacted before it is cut (an HTTP body at 200 characters, a
+      run's error at 4096), so neither a secret holding such a character nor a secret cut in
+      half slips through. An identifier holding a secret is printed redacted (B keeps it in
+      the store, not on the terminal);
+    - **limits**: unknown encodings are not recognised and only the leftmost match of two
+      overlapping secrets is replaced (decision 35); the gate knows only the secrets this
+      process resolved (primed from the instance); an 8-byte secret still matches inside
+      unrelated text that contains it (the reason identifiers are flagged, not rewritten);
+      a secret in an identifier is in the store (flagged), but not in the logs nor the CLI.

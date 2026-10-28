@@ -18,6 +18,7 @@ directory, [ADR 0006](../adr/0006-sqlite-as-the-store.md)). Horae creates the st
 | `journal`, `blobs` | every applied change, with the note's bytes before and after | `Store.prune_runs` (with its runs; a blob is kept while any journal entry refers to it) |
 | `llm_cache` | LLM responses keyed on the input hash | `Store.cache_purge`, `Store.cache_purge_expired` |
 | `tasks`, `notifications` | task titles and statuses, notification dedupe keys | not pruned (they lose their run link when the run is pruned) |
+| `secret_flags` | names of secrets the store's secret gate found while a run was running, and where (never a value, #53) | turned into violations of the run's record when it is saved, deleted when the run is abandoned or pruned |
 
 **Pruning a run removes its undo.** `horae undo` needs the journal; once a run is pruned it can no
 longer be undone. Pick a retention longer than the time you would still want to undo a run.
@@ -42,13 +43,23 @@ with Store.open("state/horae.db") as store:
 EOF
 ```
 
-`prune_runs` never deletes a `running` run. Deleted rows can survive in free pages of the database
-file: to reclaim them, stop Horae and run `VACUUM`, or rely on your backups' own retention to age
-them out:
+`prune_runs` never deletes a `running` run. Since #53 every connection Horae opens for writing
+sets `PRAGMA secure_delete = FAST`, so a deleted or replaced row is overwritten with zeros where
+it lived (in the pages SQLite already rewrites; FAST skips the extra I/O of `ON` for pages only
+the freelist touches). Rows deleted **before** #53, and records stored before the store redacted
+secrets, can still sit in free pages of the database file: to reclaim them, stop Horae and run
+`VACUUM` once (and again whenever you want the file compacted), or rely on your backups' own
+retention to age them out:
 
 ```sh
 python3 -c "import sqlite3; sqlite3.connect('state/horae.db').execute('VACUUM')"
 ```
+
+**One-off `VACUUM` after upgrading past #53.** A database written by an earlier Horae may hold
+unredacted secret values in run records, step rows, task titles or usage rows (#53 redacts what
+is written from then on, not what is already there) and in free pages. Prune or delete the runs
+you do not need, then stop Horae and run the `VACUUM` above once; a backup taken before that
+still holds them (see below).
 
 A Coolify Scheduled Task (weekly) is a good place for this, next to the pipeline triggers of
 [PLAN §7](../PLAN.md#7-reference-deployment-coolify).

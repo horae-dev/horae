@@ -9,12 +9,56 @@ past the timeout the store raises `StoreBusy`.
 
 Errors: every failure is a `StoreError` subclass (see `horae.store._errors`); `ValueError` is
 raised only for programming errors, i.e. arguments that are wrong whatever the database holds.
+
+**The secret gate** (#53, schemas decision 43 B and C): the store is the last line of
+defence against a producer that forgot to redact. Every value it writes passes the redactor of
+every secret this process resolved (`horae.secrets.redact.current()`) just before the
+`INSERT` / `UPDATE`, in every table, and is treated by what it is:
+
+- **free text: redacted and flagged.** The free-text fields of the run record and of the step
+  rows (the allowlist of `horae.store._gate`: step output, parameters, `error.message`,
+  stderr, input data, intent payload fields, `context.vars` values, LLM requests, responses,
+  repair and schema errors, violation details, the run's `error`), a task's `title` and an
+  abandoned run's `error`. A match becomes `[REDACTED:<NAME>]`; inside JSON, string leaves and
+  object keys are redacted (a key that becomes equal to another key of its object is renamed
+  `[REDACTED:<NAME>]#2`, and that is flagged too: nothing is lost silently);
+- **identifiers and numbers: exempt and flagged** (kept as written, a rewrite would make the
+  row invalid or break undo, replay or the run's own id): run ids, pipeline names,
+  timestamps, statuses, kinds, plugin names and refs, tokens, digests, the pipeline
+  definition, the journal's `target`, `applied_by` and `sink_identity`, a task's
+  `fingerprint`, `source` and `target`, notification keys, the usage ledger's `alias`,
+  `backend` and `model`, a run's `host`, and a JSON number whose text is a secret's value
+  (its type never changes);
+- **refused** (`SecretRefused`, nothing written): an LLM cache entry holding a secret, in any
+  string, key or number (a cache hit would replay it into later runs; callers treat the
+  refusal as "do not cache": `cache_put_safe`), and, as a residual, a record or step that would
+  no longer validate once its free text is redacted (a token longer than a text field allows);
+- **the journalled `after` bytes and a sink's `actual_after` bytes: exempt and flagged when
+  new** (maintainer decision, schemas decision 43): the note as Horae wrote it, kept byte for
+  byte (apply's mismatch check and undo depend on it). A secret there is flagged only when it
+  is **new compared to the journalled `before`** (it occurs more often than in `before`): a
+  secret the user already had in their note is not flagged;
+- **exempt**: the journalled `before` bytes and the bytes a forced undo `overwrote` (the
+  user's own note as it was in the vault: undo restores it byte for byte).
+
+Every finding is logged (`horae.store`, names only) and, for a run, written to the
+`secret_flags` table in the same transaction as the row that held it; `save_run` turns the
+run's findings (and those in the record itself) into `secret_in_output` violations of the
+record (when the record's violations would pass `MAX_ITEMS`, the rest is aggregated into one
+violation), then deletes them; `abandon_run` deletes them (the run gets no record). So a
+record saved by another `Store` or process still gets them.
+
+Every writable connection sets `PRAGMA secure_delete = FAST`, so a deleted or overwritten row
+(a pruned run, a replaced record) is zeroed in the database pages it leaves rather than kept
+as free-page garbage. A database written before #53 can still hold unredacted bytes in its
+free pages: see docs/operations/retention-and-backups.md for the one-off `VACUUM`.
 """
 
 import fcntl
 import functools
 import hashlib
 import json
+import logging
 import os
 import random
 import re
@@ -37,6 +81,7 @@ from horae.contracts import RunRecord, StepRecord, Usage
 from horae.contracts.intents import INTENT_TYPES, ClockTime, IntentType
 from horae.contracts.run import RunId, Target
 from horae.contracts.types import (
+    MAX_ITEMS,
     Contract,
     Fingerprint,
     IanaTimezone,
@@ -46,6 +91,7 @@ from horae.contracts.types import (
     Title,
 )
 from horae.engine.ports import PreviousLlm
+from horae.secrets.redact import current as current_redactor
 from horae.store._errors import (
     InvalidRow,
     JournalTooLarge,
@@ -55,6 +101,7 @@ from horae.store._errors import (
     RunNotStale,
     SchemaTooNewError,
     SchemaTooOldError,
+    SecretRefused,
     StoreBusy,
     StoreError,
     UnknownJournalEntry,
@@ -64,7 +111,10 @@ from horae.store._errors import (
     is_busy,
     translate,
 )
+from horae.store._gate import Findings, scrub_record, scrub_step
 from horae.store._schema import SCHEMA_VERSION, migrate, user_version
+
+_log = logging.getLogger("horae.store")
 
 StoreRunStatus = Literal["running", "ok", "noop", "degraded", "failed", "undone"]
 """A run record's status, plus `running` while the run has no record yet."""
@@ -237,6 +287,58 @@ class RunSummary:
     @property
     def duration(self) -> timedelta | None:
         return None if self.finished_at is None else self.finished_at - self.started_at
+
+
+@dataclass(frozen=True)
+class DaySpend:
+    """What the usage ledger records for one day: settled calls at their cost, calls in
+    flight (or whose process died) at their reservation."""
+
+    usd: float = 0.0
+    tokens_out: int = 0
+
+
+_USD_TOLERANCE = 1e-12
+"""Relative (and absolute, in dollars) slack when comparing a settled cost with its
+reservation: float sums of the same prices may differ in their last bits."""
+
+
+@dataclass(frozen=True)
+class Overrun:
+    """A call that cost more than its reservation (`Store.settle_usage`)."""
+
+    reserved_usd: float
+    usd: float
+    reserved_tokens_out: int
+    tokens_out: int
+
+
+@dataclass(frozen=True)
+class UsageGroup:
+    """LLM calls of one day, pipeline, model alias, backend and model (`Store.usage_report`)."""
+
+    day: str
+    """The local day (`YYYY-MM-DD`, instance time zone)."""
+    pipeline: str
+    alias: str
+    backend: str | None
+    model: str | None
+    calls: int
+    tokens_in: int
+    tokens_out: int
+    cache_read_tokens: int
+    cache_write_tokens: int
+    usd: float
+    unpriced: int
+    """Calls of an alias without `price` (their `usd` is `0`)."""
+    in_flight: int
+    """Calls still `reserved`, counted at their reservation (an upper bound): in flight, or
+    their process died and the run was not recovered yet."""
+    estimated: int
+    """Settled calls counted at their reservation: the provider reported no usage, or their
+    run was abandoned (`abandon_run`)."""
+    over_reservation: int
+    """Settled calls that cost more than they reserved (logged when settled)."""
 
 
 @dataclass(frozen=True)
@@ -569,6 +671,7 @@ class Store:
         try:
             conn.execute("PRAGMA foreign_keys = ON")
             conn.execute("PRAGMA synchronous = NORMAL")
+            conn.execute("PRAGMA secure_delete = FAST")
             migrate(conn)
             return cls._from_connection(conn, _path=path)
         except sqlite3.Error as exc:
@@ -676,6 +779,125 @@ class Store:
         if status != "running":
             raise RunNotRunning(run_id, status)
 
+    # --- the secret gate (#53) ------------------------------------------------------------
+
+    @staticmethod
+    def _finding(names: set[str] | frozenset[str], where: str, how: str) -> list[str]:
+        """Log (names only) one finding of the gate and return its violation detail (empty
+        when `names` is). `how`: `redacted`, `kept`, `new` or `collided`."""
+        if not names:
+            return []
+        redactor = current_redactor()
+        shown = ", ".join(sorted(names))
+        where = redactor.redact_text(where)[0]  # a target, say, can hold one too
+        if how == "redacted":
+            detail = f"the store redacted secret {shown} in {where} (a producer did not redact it)"
+        elif how == "kept":
+            detail = (
+                f"the store found secret {shown} in {where} (kept as written: identifiers "
+                "and numbers are exempt)"
+            )
+        elif how == "new":
+            detail = (
+                f"the store found secret {shown} in {where}, not in the note before (kept "
+                "byte for byte: the journalled content is exempt)"
+            )
+        else:
+            detail = (
+                f"redacting secret {shown} made two object keys equal in {where}: the later "
+                "one was renamed with a #2 (or next) suffix"
+            )
+        _log.warning("%s", detail)
+        return [detail]
+
+    def _findings(self, found: Findings, where: str) -> list[str]:
+        return [
+            *self._finding(found.redacted, where, "redacted"),
+            *self._finding(found.flagged, where, "kept"),
+            *self._finding(found.collisions, where, "collided"),
+        ]
+
+    def _write_flags(self, run_id: str | None, details: list[str]) -> None:
+        """Keep `details` for `run_id`'s record (inside the caller's transaction)."""
+        if run_id is None or not details:
+            return
+        self._conn.executemany(
+            "INSERT OR IGNORE INTO secret_flags (run_id, detail) VALUES (?, ?)",
+            [(run_id, detail) for detail in details],
+        )
+
+    def _text(self, value: str, where: str) -> tuple[str, list[str]]:
+        """Free text: redacted."""
+        new, names = current_redactor().redact_text(value)
+        return new, self._finding(names, where, "redacted")
+
+    def _ident(self, value: str | None, where: str) -> list[str]:
+        """An identifier: kept as written, flagged."""
+        if value is None:
+            return []
+        return self._finding(current_redactor().names_in(value), where, "kept")
+
+    def _new_in(self, data: bytes | None, before: bytes | None, where: str) -> list[str]:
+        """Exempt content Horae wrote: flagged for the secrets it holds more often than
+        `before` (a secret the user already had in their note is not flagged)."""
+        if data is None:
+            return []
+        redactor = current_redactor()
+        had = redactor.counts(before or b"")
+        new = {name for name, count in redactor.counts(data).items() if count > had.get(name, 0)}
+        return self._finding(new, where, "new")
+
+    def _clean_record(self, record: RunRecord) -> tuple[RunRecord, list[int]]:
+        """`record` with its free text redacted, and every finding of the gate for it (in
+        it, and those kept in `secret_flags`) recorded as `secret_in_output` violations; also
+        the ids of the `secret_flags` rows used (deleted when the record is saved)."""
+        redactor = current_redactor()
+        rows = self._conn.execute(
+            "SELECT id, detail FROM secret_flags WHERE run_id = ? ORDER BY id", (record.id,)
+        ).fetchall()
+        if not redactor and not rows:
+            return record, []
+        data = record.model_dump(mode="json")
+        found = scrub_record(data, redactor)
+        details = [detail for _id, detail in rows] + self._findings(found, "the run record")
+        if not details:
+            return record, []
+        violations = data["violations"]
+        have = {v.get("detail") for v in violations if isinstance(v, dict)}
+        new = list(dict.fromkeys(d for d in details if d not in have))
+        room = MAX_ITEMS - len(violations)
+        if len(new) > room > 0:
+            rest = len(new) - (room - 1)
+            new = [
+                *new[: room - 1],
+                f"the store's secret gate made {rest} more findings for this run (names "
+                "only, in the horae.store log)",
+            ]
+        for detail in new[: max(room, 0)]:
+            violations.append({"kind": "secret_in_output", "detail": detail})
+        try:
+            cleaned = RunRecord.model_validate_json(json.dumps(data))
+        except ValidationError:
+            name = ", ".join(sorted(found.redacted)) or "?"
+            raise SecretRefused(name, f"run record {record.id!r}") from None
+        return cleaned, [flag_id for flag_id, _detail in rows]
+
+    def _step_json(self, run_id: str, index: int, step: StepRecord) -> tuple[str, list[str]]:
+        """The step row's JSON, its free text redacted, and the gate's findings."""
+        redactor = current_redactor()
+        if not redactor:
+            return step.model_dump_json(), []
+        data = step.model_dump(mode="json")
+        found = scrub_step(data, redactor)
+        details = self._findings(found, f"step {index}")
+        if not found.redacted and not found.collisions:
+            return step.model_dump_json(), details
+        try:
+            return StepRecord.model_validate_json(json.dumps(data)).model_dump_json(), details
+        except ValidationError:
+            name = ", ".join(sorted(found.redacted))
+            raise SecretRefused(name, f"step {index} of run {run_id!r}") from None
+
     @_api
     def begin_run(
         self,
@@ -708,6 +930,7 @@ class Store:
                 "heartbeat_at) VALUES (?, ?, 'running', ?, ?, ?, ?, ?)",
                 (run_id, pipeline, int(dry_run), started, owner_pid, owner_host, started),
             )
+            self._write_flags(run_id, self._ident(owner_host, "the run's host"))
 
     @_api
     def heartbeat(self, run_id: str, at: datetime) -> None:
@@ -731,6 +954,7 @@ class Store:
             self._beat = sqlite3.connect(
                 self._path, timeout=HEARTBEAT_BUSY_TIMEOUT_MS / 1000, autocommit=True
             )
+            self._beat.execute("PRAGMA secure_delete = FAST")
         beat = self._beat
         beat.execute("BEGIN IMMEDIATE")
         try:
@@ -775,13 +999,16 @@ class Store:
     ) -> None:
         """Mark a running run whose process died as `failed`, without a run record.
 
-        This releases the store's pipeline guard. Its journal stays, for undo. It is a
+        This releases the store's pipeline guard. Its journal stays, for undo. Its usage
+        ledger rows still `reserved` (calls its process never settled) become `settled` at
+        their reservation, marked `estimated` (schemas decision 41 D). It is a
         compare-and-set: it changes run `run_id` only while it is still `running` (else
         `RunNotRunning` / `UnknownRun`) and, with `heartbeat_before`, only if its last
         heartbeat (or its start) is not later than that, i.e. the row has not changed since
         it was read (else `RunNotStale`)."""
         stamp = _ts(at)
         before = None if heartbeat_before is None else _ts(heartbeat_before)
+        error, _found = self._text(error, f"the error of abandoned run {run_id}")
         with self.transaction():
             cur = self._conn.execute(
                 "UPDATE runs SET status = 'failed', finished_at = ?, abandoned_at = ?, "
@@ -792,13 +1019,22 @@ class Store:
             if cur.rowcount != 1:
                 self._require_running(run_id)
                 raise RunNotStale(run_id)
+            self._conn.execute(
+                "UPDATE llm_usage SET state = 'settled', estimated = 1, settled_at = ? "
+                "WHERE run_id = ? AND state = 'reserved'",
+                (stamp, run_id),
+            )
+            # The run gets no record: its findings were logged, nothing to record them on.
+            self._conn.execute("DELETE FROM secret_flags WHERE run_id = ?", (run_id,))
 
     @_api
     def save_run(self, record: RunRecord) -> None:
         """Insert or replace a run's record (also its step rows).
 
         Replacing keeps the pipeline, `dry_run` and `started_at` (a mismatch raises
-        `InvalidRow`), e.g. to mark a run `undone`. An abandoned run cannot get a record."""
+        `InvalidRow`), e.g. to mark a run `undone`. An abandoned run cannot get a record.
+        Secrets are redacted and flagged first (the secret gate, see the module docstring)."""
+        record, flag_ids = self._clean_record(record)
         started = _ts(record.started_at)
         values = (
             record.status,
@@ -839,7 +1075,10 @@ class Store:
                 )
             self._conn.execute("DELETE FROM steps WHERE run_id = ?", (record.id,))
             for index, step in enumerate(record.steps):
-                self._insert_step(record.id, index, step)
+                self._insert_step(record.id, index, step.model_dump_json(), step)
+            self._conn.executemany(
+                "DELETE FROM secret_flags WHERE id = ?", [(flag_id,) for flag_id in flag_ids]
+            )
 
     @_api
     def get_run(self, run_id: str) -> RunRecord | None:
@@ -938,7 +1177,7 @@ class Store:
         ).fetchall()
         return [self._summary(row) for row in rows]
 
-    def _insert_step(self, run_id: str, index: int, step: StepRecord) -> None:
+    def _insert_step(self, run_id: str, index: int, record: str, step: StepRecord) -> None:
         self._conn.execute(
             "INSERT OR REPLACE INTO steps (run_id, idx, kind, status, started_at, "
             "finished_at, duration_ms, record) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -950,7 +1189,7 @@ class Store:
                 _opt_ts(step.started_at),
                 _opt_ts(step.finished_at),
                 step.duration_ms,
-                step.model_dump_json(),
+                record,
             ),
         )
 
@@ -963,6 +1202,7 @@ class Store:
         `RunNotRunning`: once a run has its record, `save_run` owns its steps."""
         if type(index) is not int or index < 0:
             raise ValueError("step index must be an int >= 0")
+        record, details = self._step_json(run_id, index, step)
         with self.transaction():
             self._require_running(run_id)
             (count,) = self._conn.execute(
@@ -970,7 +1210,8 @@ class Store:
             ).fetchone()
             if index > count:
                 raise InvalidRow(f"step {index} of run {run_id!r}: the next step is {count}")
-            self._insert_step(run_id, index, step)
+            self._insert_step(run_id, index, record, step)
+            self._write_flags(run_id, details)
 
     @_api
     def steps(self, run_id: str) -> list[StepRecord]:
@@ -989,8 +1230,10 @@ class Store:
     def prune_runs(self, older_than: datetime) -> int:
         """Delete finished runs that finished before `older_than`; return how many.
 
-        Their steps and journal go with them (tasks and notifications keep their rows, without
-        the run), and journal contents no longer referenced are deleted."""
+        Their steps and journal go with them (tasks, notifications and usage ledger rows keep
+        their rows, without the run: a day's ledger totals never change; the ledger has its
+        own retention, `prune_usage`), and journal contents no longer referenced are
+        deleted."""
         with self.transaction():
             cur = self._conn.execute(
                 "DELETE FROM runs WHERE status <> 'running' AND finished_at < ?",
@@ -1081,6 +1324,15 @@ class Store:
             raise ValueError("an undoable change needs `before` or `after`")
         for content in (before, after):
             self._check_size(content)
+        # The secret gate: `before` is exempt (the user's note, restored byte for byte by
+        # undo); `after` is exempt, flagged for a secret not already in `before`; the other
+        # columns are identifiers (exempt, flagged).
+        details = [
+            *self._ident(target, "a journal target"),
+            *self._ident(applied_by, "a journal entry's sink"),
+            *self._ident(sink_identity, "a journal entry's sink identity"),
+            *self._new_in(after, before, f"the content Horae wrote to {target}"),
+        ]
         with self.transaction():
             self._require_running(run_id)
             before_sha = self._put_blob(before)
@@ -1106,6 +1358,7 @@ class Store:
                     "sink_identity": sink_identity,
                 },
             ).fetchall()
+            self._write_flags(run_id, details)
         return self._entry(row)
 
     @_api
@@ -1121,6 +1374,14 @@ class Store:
             )
             if cur.rowcount != 1:
                 raise UnknownJournalEntry(entry_id)
+            if actual_after is not None and current_redactor().spans(actual_after):
+                run_id, target, before_sha = self._conn.execute(
+                    "SELECT run_id, target, before_sha256 FROM journal WHERE id = ?",
+                    (entry_id,),
+                ).fetchone()
+                before = None if before_sha is None else self.blob(before_sha)
+                where = f"the content a sink wrote to {target}"
+                self._write_flags(run_id, self._new_in(actual_after, before, where))
 
     @_api
     def journal_mark_undone(
@@ -1218,7 +1479,15 @@ class Store:
         at: datetime,
         expires_at: datetime | None = None,
     ) -> None:
-        """Insert or replace the response for a request hash."""
+        """Insert or replace the response for a request hash. An entry holding a secret (in
+        any string, object key or number) is refused (`SecretRefused`, nothing stored): a
+        hit would replay it into later runs. Callers treat that as "do not cache"
+        (`cache_put_safe`)."""
+        names = current_redactor().find([skill, skill_version, model, response])
+        if names:
+            name = ", ".join(sorted(names))
+            _log.warning("secret %s found in an LLM cache entry by the store; refused", name)
+            raise SecretRefused(name, "the LLM cache entry")
         with self.transaction():
             self._conn.execute(
                 "INSERT OR REPLACE INTO llm_cache (key, skill, skill_version, model, response, "
@@ -1237,6 +1506,36 @@ class Store:
                     _opt_ts(expires_at),
                 ),
             )
+
+    def cache_put_safe(
+        self,
+        key: str,
+        *,
+        skill: str,
+        skill_version: str,
+        model: str,
+        response: Any,
+        usage: Usage,
+        at: datetime,
+        expires_at: datetime | None = None,
+    ) -> bool:
+        """`cache_put`, treating `SecretRefused` as "do not cache": returns whether the entry
+        was stored. The cache's writer (#32) uses this, so a response holding a secret is
+        simply not cached (the run goes on; the refusal is logged by name)."""
+        try:
+            self.cache_put(
+                key,
+                skill=skill,
+                skill_version=skill_version,
+                model=model,
+                response=response,
+                usage=usage,
+                at=at,
+                expires_at=expires_at,
+            )
+        except SecretRefused:
+            return False
+        return True
 
     @_api
     def cache_purge_expired(self, now: datetime) -> int:
@@ -1269,8 +1568,15 @@ class Store:
         """Insert or replace a task by fingerprint (`created_at` is kept)."""
         stamp = _ts(at)
         until, tz, wake = _snooze(task.status, task.snoozed_until, task.snooze_tz)
+        title, details = self._text(task.title, "a task title")
+        details += [
+            *self._ident(task.fingerprint, "a task fingerprint"),
+            *self._ident(task.source, "a task source"),
+            *self._ident(task.target, "a task target"),
+        ]
         with self.transaction():
             self._require_run(task.run_id)
+            self._write_flags(task.run_id, details)
             self._conn.execute(
                 "INSERT INTO tasks (fingerprint, title, status, due, time, snoozed_until, "
                 "snooze_tz, wake_at, target, source, run_id, created_at, updated_at) "
@@ -1283,7 +1589,7 @@ class Store:
                 "updated_at = excluded.updated_at",
                 (
                     task.fingerprint,
-                    task.title,
+                    title,
                     task.status,
                     None if task.due is None else task.due.isoformat(),
                     task.time,
@@ -1383,8 +1689,10 @@ class Store:
     ) -> NotificationState:
         """Record a send for a dedupe key and return the updated state."""
         stamp = _ts(at)
+        details = self._ident(key, "a notification key")
         with self.transaction():
             self._require_run(run_id)
+            self._write_flags(run_id, details)
             (row,) = self._conn.execute(
                 "INSERT INTO notifications (key, run_id, first_sent_at, last_sent_at, count) "
                 "VALUES (?, ?, ?, ?, 1) ON CONFLICT (key) DO UPDATE SET "
@@ -1405,3 +1713,223 @@ class Store:
         if row is None:
             return None
         return NotificationState(row[0], row[1], _dt(row[2]), _dt(row[3]), row[4])
+
+    # --- usage ledger (#33) ----------------------------------------------------------------
+
+    @_api
+    def day_spend(self, day: date, *, pipeline: str | None = None) -> DaySpend:
+        """The ledger's spend on local `day`, of every pipeline or of `pipeline` only.
+
+        Call it inside `transaction()` together with `reserve_usage`, so that no other
+        process reserves in between (the daily ceilings). The `day` of a row is the one
+        stored when it was reserved."""
+        row = self._conn.execute(
+            "SELECT coalesce(sum(usd), 0), coalesce(sum(tokens_out), 0) FROM llm_usage "
+            "WHERE day = :day AND (:pipeline IS NULL OR pipeline = :pipeline)",
+            {"day": day.isoformat(), "pipeline": pipeline},
+        ).fetchone()
+        return DaySpend(usd=float(row[0]), tokens_out=int(row[1]))
+
+    @_api
+    def reserve_usage(
+        self,
+        run_id: str,
+        *,
+        step: int,
+        attempt: int,
+        alias: str,
+        at: datetime,
+        day: date,
+        usd: float,
+        tokens_out: int,
+        tokens_in: int = 0,
+        backend: str | None = None,
+        model: str | None = None,
+        priced: bool | None = None,
+    ) -> int:
+        """Record a call about to be made, at the most it can cost; return the row's id.
+
+        The run must be `running` (`RunNotRunning`, `UnknownRun`). `day` is stored as given
+        (the local day at reservation time; a later time zone change does not move it).
+        `settle_usage` replaces the reservation with what the call cost; `release_usage`
+        drops it (no call made)."""
+        if type(step) is not int or step < 0 or type(attempt) is not int or attempt < 1:
+            raise ValueError("step must be an int >= 0 and attempt an int >= 1")
+        if not usd >= 0 or tokens_out < 0 or tokens_in < 0:
+            raise ValueError("a reservation is not negative")
+        details = [
+            *self._ident(alias, "the usage ledger"),
+            *self._ident(backend, "the usage ledger"),
+            *self._ident(model, "the usage ledger"),
+        ]
+        with self.transaction():
+            self._require_running(run_id)
+            self._write_flags(run_id, list(dict.fromkeys(details)))
+            (pipeline,) = self._conn.execute(
+                "SELECT pipeline FROM runs WHERE id = ?", (run_id,)
+            ).fetchone()
+            cur = self._conn.execute(
+                "INSERT INTO llm_usage (run_id, pipeline, step, attempt, alias, backend, model, "
+                "state, tokens_in, tokens_out, usd, priced, at, day) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'reserved', ?, ?, ?, ?, ?, ?)",
+                (
+                    run_id,
+                    pipeline,
+                    step,
+                    attempt,
+                    alias,
+                    backend,
+                    model,
+                    tokens_in,
+                    tokens_out,
+                    usd,
+                    None if priced is None else int(priced),
+                    _ts(at),
+                    day.isoformat(),
+                ),
+            )
+            entry = cur.lastrowid
+        if entry is None:  # pragma: no cover - an INSERT always sets it
+            raise StoreError("the reservation has no id")
+        return entry
+
+    @_api
+    def settle_usage(
+        self,
+        entry_id: int,
+        usage: Usage | None,
+        *,
+        at: datetime,
+        backend: str | None = None,
+        model: str | None = None,
+    ) -> Overrun | None:
+        """Replace a reservation with what the call cost; `usage=None` keeps the reserved
+        amounts, marked `estimated` (the provider reported nothing: a timeout, say).
+        Settling twice, or a row pruned by `prune_usage`, is a no-op.
+
+        Returns an `Overrun` when the call cost more (`usd` or `tokens_out`) than it
+        reserved; the row is then marked `over_reservation` (the caller logs it)."""
+        stamp = _ts(at)
+        details = list(
+            dict.fromkeys(
+                [*self._ident(backend, "the usage ledger"), *self._ident(model, "the usage ledger")]
+            )
+        )
+        with self.transaction():
+            if details:
+                found = self._conn.execute(
+                    "SELECT run_id FROM llm_usage WHERE id = ?", (entry_id,)
+                ).fetchone()
+                if found is not None and found[0] is not None:
+                    self._write_flags(found[0], details)
+            if usage is None:
+                self._conn.execute(
+                    "UPDATE llm_usage SET state = 'settled', estimated = 1, settled_at = ?, "
+                    "backend = coalesce(?, backend), model = coalesce(?, model) "
+                    "WHERE id = ? AND state = 'reserved'",
+                    (stamp, backend, model, entry_id),
+                )
+                return None
+            row = self._conn.execute(
+                "SELECT usd, tokens_out FROM llm_usage WHERE id = ? AND state = 'reserved'",
+                (entry_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            reserved_usd, reserved_tokens = float(row[0]), int(row[1])
+            over = (
+                usage.usd > reserved_usd * (1 + _USD_TOLERANCE) + _USD_TOLERANCE
+                or usage.tokens_out > reserved_tokens
+            )
+            self._conn.execute(
+                "UPDATE llm_usage SET state = 'settled', settled_at = ?, tokens_in = ?, "
+                "tokens_out = ?, cache_read_tokens = ?, cache_write_tokens = ?, usd = ?, "
+                "priced = coalesce(?, priced), backend = coalesce(?, backend), "
+                "model = coalesce(?, model), over_reservation = ? "
+                "WHERE id = ? AND state = 'reserved'",
+                (
+                    stamp,
+                    usage.tokens_in,
+                    usage.tokens_out,
+                    usage.cache_read_tokens,
+                    usage.cache_write_tokens,
+                    usage.usd,
+                    None if usage.priced is None else int(usage.priced),
+                    backend,
+                    model,
+                    int(over),
+                    entry_id,
+                ),
+            )
+        if not over:
+            return None
+        return Overrun(reserved_usd, usage.usd, reserved_tokens, usage.tokens_out)
+
+    @_api
+    def prune_usage(self, older_than: date) -> int:
+        """Delete the settled usage ledger rows of local days before `older_than`; return
+        how many. The ledger's own retention (decision 41 C): independent of `prune_runs`.
+        Rows still `reserved` are kept (they still count)."""
+        with self.transaction():
+            cur = self._conn.execute(
+                "DELETE FROM llm_usage WHERE state = 'settled' AND day < ?",
+                (older_than.isoformat(),),
+            )
+        return cur.rowcount
+
+    @_api
+    def release_usage(self, entry_id: int) -> None:
+        """Drop a reservation whose call was not made (a no-op once it is settled)."""
+        with self.transaction():
+            self._conn.execute(
+                "DELETE FROM llm_usage WHERE id = ? AND state = 'reserved'", (entry_id,)
+            )
+
+    @_api
+    def usage_report(
+        self,
+        *,
+        since: date | None = None,
+        until: date | None = None,
+        pipeline: str | None = None,
+    ) -> list[UsageGroup]:
+        """The ledger grouped by local day, pipeline, alias, backend and model, oldest day
+        first; `since` and `until` are inclusive local days."""
+        rows = self._conn.execute(
+            "SELECT day, pipeline, alias, backend, model, count(*), sum(tokens_in), "
+            "sum(tokens_out), coalesce(sum(cache_read_tokens), 0), "
+            "coalesce(sum(cache_write_tokens), 0), sum(usd), "
+            "sum(CASE WHEN priced = 0 THEN 1 ELSE 0 END), "
+            "sum(CASE WHEN state = 'reserved' THEN 1 ELSE 0 END), "
+            "sum(estimated), sum(over_reservation) "
+            "FROM llm_usage WHERE (:since IS NULL OR day >= :since) "
+            "AND (:until IS NULL OR day <= :until) "
+            "AND (:pipeline IS NULL OR pipeline = :pipeline) "
+            "GROUP BY day, pipeline, alias, backend, model "
+            "ORDER BY day, pipeline, alias, backend, model",
+            {
+                "since": None if since is None else since.isoformat(),
+                "until": None if until is None else until.isoformat(),
+                "pipeline": pipeline,
+            },
+        ).fetchall()
+        return [
+            UsageGroup(
+                day=row[0],
+                pipeline=row[1],
+                alias=row[2],
+                backend=row[3],
+                model=row[4],
+                calls=int(row[5]),
+                tokens_in=int(row[6]),
+                tokens_out=int(row[7]),
+                cache_read_tokens=int(row[8]),
+                cache_write_tokens=int(row[9]),
+                usd=float(row[10]),
+                unpriced=int(row[11]),
+                in_flight=int(row[12]),
+                estimated=int(row[13]),
+                over_reservation=int(row[14]),
+            )
+            for row in rows
+        ]

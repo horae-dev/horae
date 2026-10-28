@@ -1,0 +1,3 @@
+# `usd: null` is not a ceiling: the branch it satisfies requires a number.
+budgets:
+  daily: { usd: null }

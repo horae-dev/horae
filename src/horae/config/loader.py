@@ -16,7 +16,7 @@ from horae.contracts.instance import InstanceConfig, LlmBackend, ModelAlias, Plu
 from horae.contracts.lockfile import Lockfile
 from horae.contracts.pipeline import LlmStep, Pipeline
 from horae.engine.canonical import sha256_hex
-from horae.secrets import Secret, SecretError, SecretResolver
+from horae.secrets import Secret, SecretError, SecretResolver, redact
 
 CONFIG_FILE = "horae.yaml"
 LOCK_FILE = "horae.lock"
@@ -43,6 +43,28 @@ class ResolvedModel:
     model: str
     base_url: str | None
     secret: Secret | None
+
+
+def redaction_names(config: InstanceConfig, lock: Lockfile | None) -> tuple[str, ...]:
+    """Every secret an instance names, sorted: `secrets.refs`, the secrets `horae.lock`
+    grants its plugins and the model aliases' `secret` (for redaction, #53)."""
+    names = set(config.secrets.refs)
+    for plugin in () if lock is None else lock.plugins.values():
+        names.update(plugin.permissions.secrets)
+    names.update(spec.secret for spec in config.models.values() if spec.secret)
+    return tuple(sorted(names))
+
+
+def read_lock(root: Path) -> Lockfile | None:
+    """`<root>/horae.lock` if it exists and is valid, else `None` (best effort: for
+    redaction by commands that read `horae.yaml` alone; the loader reports its problems)."""
+    path = root / LOCK_FILE
+    if not path.is_file():
+        return None
+    try:
+        return validate(read_yaml(path), Lockfile)
+    except (ProblemsError, OSError, ValueError):
+        return None
 
 
 @dataclass(frozen=True)
@@ -86,6 +108,18 @@ class Instance:
         """A resolver for this instance's secrets. `environ` (default: `os.environ`) is read
         only for the secrets that have an explicit `{env: VAR}` reference."""
         return SecretResolver(self.config.secrets.refs, self.secrets_dir, environ)
+
+    def redaction_names(self) -> tuple[str, ...]:
+        """Every secret the instance names (`redaction_names(config, lock)`)."""
+        return redaction_names(self.config, self.lock)
+
+    def prime_redaction(self) -> None:
+        """Resolve every secret the instance names (`redaction_names`), for redaction only, so
+        that the process registry (`horae.secrets.redact`) knows them before anything is
+        run, stored, logged or printed (#53, schemas decision 43 A). A secret that cannot
+        be resolved is skipped: what needs it fails later with its own error. The values
+        are never sent anywhere; only redaction uses them."""
+        redact.prime(self.secret_resolver(), self.redaction_names())
 
     def plugin_timeouts(self, plugin: str) -> PluginDefaults:
         """The effective startup and call timeouts of `plugin` (for the plugin host)."""
@@ -234,6 +268,16 @@ def _cross_check(state: _Loaded) -> None:
                 config_doc.problem(
                     ("plugins", name),
                     f"plugin {name!r} is not installed (not in {LOCK_FILE})",
+                    value=False,
+                )
+            )
+    names = {pipeline.name for pipeline, _ in state.pipelines.values()}
+    for name in config.budgets.pipelines:
+        if name not in names:
+            state.problems.append(
+                config_doc.problem(
+                    ("budgets", "pipelines", name),
+                    f"budget for unknown pipeline {name!r}",
                     value=False,
                 )
             )

@@ -35,12 +35,18 @@ from pydantic_core import CoreSchema, core_schema
 
 from horae.contracts.instance import EnvSecretRef, SecretRef
 from horae.contracts.types import SecretName
+from horae.secrets import redact
 
 REDACTED = "[REDACTED]"
 """What a secret looks like wherever it is printed, logged or serialized."""
 
 MAX_SECRET_BYTES = 64 * 1024
 """Largest secret file read, in bytes."""
+
+MIN_SECRET_BYTES = redact.MIN_SECRET_BYTES
+"""Shortest secret value accepted, in UTF-8 bytes (#53, schemas decision 43 H): a shorter value
+cannot be redacted reliably (its encodings would match unrelated text, and its raw value
+matches inside ordinary words), so it is refused when it is resolved."""
 
 _SAFE_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-./")
 
@@ -165,6 +171,8 @@ def _problem(value: str) -> str | None:
         return "contains a NUL character"
     if "\r" in value or "\n" in value:
         return "contains a line break (only one trailing newline is allowed)"
+    if len(value.encode("utf-8")) < MIN_SECRET_BYTES:
+        return f"is too short for reliable redaction (min {MIN_SECRET_BYTES} bytes)"
     return None
 
 
@@ -198,8 +206,14 @@ class SecretResolver:
     environment variable or file only. Any other name is read from the file of the same name
     in `directory` only, never from the environment.
 
+    A value shorter than `MIN_SECRET_BYTES` (8 bytes of UTF-8) is refused (`SecretError`
+    "... is too short for reliable redaction (min 8 bytes)", never the value): it could not be
+    redacted reliably (schemas decision 43 H).
+
     The resolver remembers every secret it handed out (`resolved()`), so that the plugin
-    host can redact all of them from captured output.
+    host can redact all of them from captured output, and adds each one to the process
+    registry (`horae.secrets.redact.remember`), so that the store, the logs, the LLM layer
+    and the CLI redact it too (#53).
     """
 
     def __init__(
@@ -240,6 +254,7 @@ class SecretResolver:
         else:
             secret = self._from_file(name, self._directory / name)
         self._resolved[name] = secret
+        redact.remember(secret)
         return secret
 
     def _from_env(self, name: str, variable: str) -> Secret:
@@ -311,6 +326,7 @@ class SecretResolver:
 
 __all__ = [
     "MAX_SECRET_BYTES",
+    "MIN_SECRET_BYTES",
     "REDACTED",
     "Secret",
     "SecretError",

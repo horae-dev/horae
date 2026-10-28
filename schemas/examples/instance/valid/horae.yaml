@@ -19,6 +19,13 @@ models:
     model: mistral-small
     base_url: https://openrouter.example.org/api/v1
     secret: OPENROUTER_API_KEY
+  # A local vLLM without JSON Schema support: `structured_output` (openai-compatible only)
+  # falls back to `json_object` (or `none`); `base_url` includes the `/v1` prefix. No key.
+  vllm:
+    backend: openai-compatible
+    model: qwen
+    base_url: "http://vllm:8000/v1"
+    structured_output: json_object
   # http to a single-label host: the `ollama` service of the same Compose project.
   local: { backend: ollama, model: llama3, base_url: "http://ollama:11434" }
 plugin_defaults: { startup_timeout_s: 10, call_timeout_s: 30 }
@@ -31,3 +38,8 @@ secrets:
     OPENROUTER_API_KEY: { env: OPENROUTER_KEY }
 scheduler: { mode: external }
 runs: { timeout_s: 1200 }
+# Daily LLM spend ceilings across runs, in the instance's time zone (decision 41).
+budgets:
+  daily: { usd: 2.0, tokens_out: 200000 }
+  pipelines:
+    daily-brief: { daily: { usd: 0.5 } }

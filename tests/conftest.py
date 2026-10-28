@@ -1,13 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 import shutil
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+
+from horae.secrets import redact
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 ANTHROPIC_KEY = "sentinel-value-for-anthropic"  # synthetic, never a real key
 GITHUB_TOKEN = "sentinel-value-for-github"  # noqa: S105 (synthetic)
+
+
+@pytest.fixture(autouse=True)
+def _fresh_secret_registry() -> Iterator[None]:
+    """Each test starts with an empty process registry of resolved secrets (#53): a process
+    never forgets a secret, but one test's secrets must not redact another test's data."""
+    redact.forget_all()
+    yield
+    redact.forget_all()
 
 
 @pytest.fixture

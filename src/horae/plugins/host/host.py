@@ -111,7 +111,7 @@ from horae.plugins.host import logs
 from horae.plugins.host.capture import StderrCapture
 from horae.plugins.host.env import BASE_PATH, build_env, check_names
 from horae.plugins.host.errors import HostErrorKind, PluginCallError
-from horae.plugins.host.redact import MAX_EXPANSION, MIN_PARTIAL_BYTES, Redactor, SecretInKey
+from horae.plugins.host.redact import MAX_EXPANSION, Redactor, SecretInKey
 from horae.plugins.host.session import INTENTS_META, CallFailed, PluginProcess, Spawn
 from horae.secrets import MAX_SECRET_BYTES, Secret, SecretError, SecretResolver
 
@@ -317,7 +317,6 @@ class PluginHost:
         self._group: anyio.abc.TaskGroup | None = None
         self._run_dir: Path | None = None
         self._redactor: tuple[tuple[Secret, ...], Redactor] | None = None
-        self._warned_short: set[str] = set()
         self.leftover_stderr: dict[str, str] = {}
         """Per plugin, the (redacted) stderr written after its last call, kept when it was
         released or the host exited."""
@@ -398,20 +397,12 @@ class PluginHost:
     # --- redaction -------------------------------------------------------------------------
 
     def redactor(self) -> Redactor:
-        """A redactor of every secret resolved so far (rebuilt when they change). Warns once
-        per secret shorter than `MIN_PARTIAL_BYTES` (by name: its encodings are not redacted)."""
+        """A redactor of every secret resolved so far (rebuilt when they change). Every
+        secret is at least `MIN_SECRET_BYTES` long (the resolver refuses a shorter one,
+        schemas decision 43 H, superseding the short-secret handling of decision 35 D)."""
         resolved = self.secrets.resolved()
         if self._redactor is None or self._redactor[0] != resolved:
             self._redactor = (resolved, Redactor(resolved))
-            for name in self._redactor[1].short:
-                if name not in self._warned_short:
-                    self._warned_short.add(name)
-                    _log.warning(
-                        "secret %s is shorter than %d bytes: only its raw value is redacted, "
-                        "not its encodings",
-                        name,
-                        MIN_PARTIAL_BYTES,
-                    )
         return self._redactor[1]
 
     def _redact_message(self, message: str) -> str:
