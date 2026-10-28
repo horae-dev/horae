@@ -1366,8 +1366,10 @@ loosened later without breaking a valid file.
       redacted). `Instance.prime_redaction()` resolves, for redaction only, every secret the
       instance names (`secrets.refs`, the secrets `horae.lock` grants, the model aliases'
       `secret`), skipping one that cannot be resolved; `Runner.run` and the CLI commands that
-      read the instance call it first (those that read `horae.yaml` alone prime its refs and
-      aliases). A provider backend still resolves its own key lazily, through its own
+      read the instance call it first; those that read `horae.yaml` alone (`runs`, `diff`,
+      `usage`, `undo`) prime the same names (`horae.config.loader.secret_names(config,
+      lock)`, shared with the instance), reading `horae.lock` best effort (an absent or
+      invalid lock adds nothing). A provider backend still resolves its own key lazily, through its own
       resolver (no key is read by `open_ports` before a call);
     - **B. logs.** `horae.secrets.logs.install()` (the CLI entry point, `Runner.run`, an
       opening `PluginHost`; idempotent) wraps the log record factory: every record of the

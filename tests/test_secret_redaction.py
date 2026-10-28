@@ -795,3 +795,66 @@ def test_a_malformed_log_record_shows_its_format_only(
     logging.getLogger("horae.test").info("value %s %s", LONG)  # one argument missing
     (record,) = [r for r in caplog.records if r.name == "horae.test"]
     assert (record.getMessage(), record.args) == ("value %s %s", None)
+
+
+PLUGIN_SECRET = "Sentinel-Plugin-Granted-Secret-42"  # noqa: S105 (synthetic)
+
+
+def _instance_with_a_plugin_secret(tmp_path: Path) -> Path:
+    """An instance whose only knowledge of `PLUGIN_TOKEN` is `horae.lock` (no `secrets.refs`,
+    no model alias): the secret is granted to a plugin, read from `secrets/PLUGIN_TOKEN`."""
+    root = tmp_path / "inst"
+    (root / "pipelines").mkdir(parents=True)
+    (root / "secrets").mkdir()
+    (root / "secrets" / "PLUGIN_TOKEN").write_text(PLUGIN_SECRET, encoding="utf-8")
+    config = {"timezone": "UTC", "state_dir": "state", "secrets": {"dir": "secrets"}}
+    (root / "horae.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
+    pipeline = {"name": "feed", "steps": [{"collect": [{"fixture-source.serve": {}}]}]}
+    (root / "pipelines" / "feed.yaml").write_text(yaml.safe_dump(pipeline), encoding="utf-8")
+    entry = {
+        "version": "0.1.0",
+        "repo": "https://github.com/horae-dev/horae.git",
+        "commit": "0" * 40,
+        "permissions": {"network": [], "secrets": ["PLUGIN_TOKEN"], "paths": {}, "intents": []},
+    }
+    lock = {"schema_version": 1, "plugins": {"fixture-source": entry}}
+    (root / "horae.lock").write_text(yaml.safe_dump(lock), encoding="utf-8")
+    return root
+
+
+def test_a_plugin_secret_is_redacted_by_every_command_that_reads_the_store(
+    tmp_path: Path,
+) -> None:
+    root = _instance_with_a_plugin_secret(tmp_path)
+    assert load_instance(root).secret_names() == ("PLUGIN_TOKEN",)
+    # A record written by a process that did not know the secret (no gate could catch it).
+    with Store.open(root / "state" / "horae.db") as store:
+        store.begin_run("r1", "feed", AT)
+        store.abandon_run("r1", at=AT, error=f"plugin said {PLUGIN_SECRET}")
+    assert redact.known() == ()
+    for args in (
+        ["runs", "-i", str(root), "--json"],
+        ["runs", "-i", str(root)],
+        ["usage", "-i", str(root), "--json"],
+        ["diff", PLUGIN_SECRET, "-i", str(root), "--json"],
+        ["replay", PLUGIN_SECRET, "-i", str(root), "--json"],
+        ["undo", PLUGIN_SECRET, "-i", str(root), "--json"],
+    ):
+        redact.forget_all()  # each command primes the registry itself
+        result = CliRunner().invoke(app, args)
+        printed = (result.stdout + result.stderr).encode()
+        assert _leaks(printed, PLUGIN_SECRET) == [], (args, printed)
+        if args[0] != "usage":
+            assert b"[REDACTED:PLUGIN_TOKEN]" in printed, (args, printed)
+
+
+def test_a_lock_that_cannot_be_read_primes_nothing_from_it(tmp_path: Path) -> None:
+    from horae.config.loader import read_lock
+
+    root = _instance_with_a_plugin_secret(tmp_path)
+    (root / "horae.lock").write_text("plugins: [not, a, mapping", encoding="utf-8")
+    assert read_lock(root) is None
+    assert read_lock(tmp_path / "nowhere") is None
+    result = CliRunner().invoke(app, ["runs", "-i", str(root), "--json"])
+    assert result.exit_code == 0, result.stdout
+    assert redact.known() == ()

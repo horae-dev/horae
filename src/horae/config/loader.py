@@ -45,6 +45,28 @@ class ResolvedModel:
     secret: Secret | None
 
 
+def secret_names(config: InstanceConfig, lock: Lockfile | None) -> tuple[str, ...]:
+    """Every secret an instance names, sorted: `secrets.refs`, the secrets `horae.lock`
+    grants its plugins and the model aliases' `secret` (for redaction, #53)."""
+    names = set(config.secrets.refs)
+    for plugin in () if lock is None else lock.plugins.values():
+        names.update(plugin.permissions.secrets)
+    names.update(spec.secret for spec in config.models.values() if spec.secret)
+    return tuple(sorted(names))
+
+
+def read_lock(root: Path) -> Lockfile | None:
+    """`<root>/horae.lock` if it exists and is valid, else `None` (best effort: for
+    redaction by commands that read `horae.yaml` alone; the loader reports its problems)."""
+    path = root / LOCK_FILE
+    if not path.is_file():
+        return None
+    try:
+        return validate(read_yaml(path), Lockfile)
+    except (ProblemsError, OSError, ValueError):
+        return None
+
+
 @dataclass(frozen=True)
 class Instance:
     """A loaded, valid instance."""
@@ -88,13 +110,8 @@ class Instance:
         return SecretResolver(self.config.secrets.refs, self.secrets_dir, environ)
 
     def secret_names(self) -> tuple[str, ...]:
-        """Every secret the instance names, sorted: `secrets.refs`, the secrets `horae.lock`
-        grants its plugins and the model aliases' `secret`."""
-        names = set(self.config.secrets.refs)
-        for plugin in self.lock.plugins.values():
-            names.update(plugin.permissions.secrets)
-        names.update(spec.secret for spec in self.config.models.values() if spec.secret)
-        return tuple(sorted(names))
+        """Every secret the instance names (`secret_names(config, lock)`)."""
+        return secret_names(self.config, self.lock)
 
     def prime_redaction(self) -> None:
         """Resolve every secret the instance names (`secret_names`), for redaction only, so

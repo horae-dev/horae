@@ -43,6 +43,7 @@ import typer
 from typer.core import TyperCommand, TyperGroup
 
 from horae.apply.render import dumps, safe
+from horae.config.loader import read_lock, secret_names
 from horae.contracts.instance import InstanceConfig
 from horae.secrets import SecretResolver
 from horae.secrets.redact import current as current_redactor
@@ -103,10 +104,11 @@ def plural(count: int, word: str, plurals: str | None = None) -> str:
 
 
 def prime_secrets(root: Path, config: InstanceConfig) -> None:
-    """Resolve, for redaction only, the secrets `horae.yaml` names (`secrets.refs` and the
-    model aliases' `secret`) for a command that reads `horae.yaml` alone (#53)."""
-    names = set(config.secrets.refs)
-    names.update(spec.secret for spec in config.models.values() if spec.secret)
+    """Resolve, for redaction only, every secret the instance names, as
+    `Instance.secret_names` does (`secrets.refs`, the model aliases' `secret` and, when
+    `horae.lock` exists and is valid, the secrets it grants its plugins), for a command that
+    reads `horae.yaml` alone (#53)."""
+    names = secret_names(config, read_lock(root))
     prime(SecretResolver(config.secrets.refs, root / config.secrets.dir), names)
 
 
