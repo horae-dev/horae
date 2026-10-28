@@ -24,6 +24,7 @@ from horae.engine.executor import (
 from horae.engine.ports import (
     EngineCallError,
     LlmBackend,
+    LlmCache,
     LlmError,
     LlmRequest,
     LlmResponse,
@@ -51,6 +52,7 @@ __all__ = [
     "TARGET_FIELDS",
     "EngineCallError",
     "LlmBackend",
+    "LlmCache",
     "LlmError",
     "LlmRequest",
     "LlmResponse",

@@ -154,13 +154,18 @@ the skill's `intents`, at most its `intent_limits` of each type (`intent_rejecte
 input of `null` (the input does not have the view's shape) degrades the step without calling
 the LLM (`input_invalid`). The skill is loaded before the backend is checked, so an invalid
 skill is `skill_invalid` even without a backend.
-When `previous` (the last accepted output, `PreviousLlm`) has the same key, no LLM
-call is made: its output and intents are reused (validated and routed again), recorded as an
-`LlmCall` with `cached=True` and zero usage, and the run continues. If the reused intents no
-longer validate or route (e.g. an explicit target bound to `{{date}}` moved to a new day), it
-is a cache miss: nothing of `previous` is recorded and the LLM is called. Without a usable
-`previous` the LLM is called. A reused run re-proposes the same intents, including
-`notify.push`: appliers must deduplicate notifications (e.g. by `input_hash` and intent).
+When `previous` (an accepted output, `PreviousLlm`, e.g. the one a replayed run reused) has the
+same key, or else the `cache` (`LlmCache`, the store's `llm_cache` table under the runner, #32)
+holds a live entry for the key that still passes the skill's full output schema (the cache
+re-validates it), no LLM call is made: its output and intents are reused (validated and routed
+again), recorded as an `LlmCall` with `cached=True`, zero usage and the request marker
+`{skill, model, reused_input_hash, source_run?}` (`source_run`: the run that produced it),
+and the run continues. If the reused intents no longer validate or route (e.g. an explicit
+target bound to `{{date}}` moved to a new day), it is a cache miss: nothing of the entry is
+recorded and the LLM is called. Without a usable entry (or when `cache.lookup` raises: a
+miss) the LLM is called. A hit calls no backend, so no usage is reserved or charged (schemas
+decision 45). A reused run re-proposes the same intents, including `notify.push`: appliers
+must deduplicate notifications (e.g. by `input_hash` and intent).
 `timeout_s` (default `DEFAULT_LLM_TIMEOUT_S`) is one deadline for both attempts. The budget
 counts what every attempt cost, including the `usage` of a failed attempt (`LlmError.usage`,
 also of one whose output could not be validated, `validator_unavailable`, which is not
@@ -252,6 +257,7 @@ from horae.engine.canonical import canonical_json, canonical_pipeline, pipeline_
 from horae.engine.ports import (
     EngineCallError,
     LlmBackend,
+    LlmCache,
     LlmError,
     LlmRequest,
     LlmResponse,
@@ -807,6 +813,7 @@ class _Run:
     tools: ToolCaller
     llm: LlmBackend | None
     previous: PreviousLlm | None
+    cache: LlmCache | None
     models: Mapping[str, str]
     entries: tuple[_Entry, ...]
     monotonic: Callable[[], float]
@@ -1180,7 +1187,7 @@ def _cache_key(
     return sha256_hex(key)
 
 
-def _reuse(
+async def _reuse(
     run: _Run,
     step: _Planned,
     spec: LlmSpec,
@@ -1188,9 +1195,16 @@ def _reuse(
     key: str,
     viewed: Any,
 ) -> _Outcome | None:
-    """The previous accepted output, reused; `None` if it cannot be (then the LLM is called)."""
+    """An accepted output for `key`, reused; `None` if there is none or it cannot be reused
+    (then the LLM is called)."""
     previous = run.previous
-    if previous is None or previous.input_hash != key:
+    if (previous is None or previous.input_hash != key) and run.cache is not None:
+        schema = None if step.skill is None else step.skill.output_schema
+        try:
+            previous = await run.cache.lookup(key, model_alias=spec.model, output_schema=schema)
+        except Exception:  # a broken cache is a miss, never a failed run
+            previous = None
+    if not isinstance(previous, PreviousLlm) or previous.input_hash != key:
         return None
     try:
         output = _json_copy(previous.output, "previous LLM output")
@@ -1206,7 +1220,7 @@ def _reuse(
             schema_valid=True,
             model_alias=spec.model,
             input_hash=sha256_hex(viewed),
-            request={"skill": spec.skill, "model": spec.model, "reused_input_hash": key},
+            request=_reuse_marker(spec, key, previous.source_run),
             response=output,
             intents=raw,
             usage=_ZERO,
@@ -1225,6 +1239,15 @@ def _reuse(
     run.llm_calls.append(call)
     run.data, run.input_hash, run.reused = output, key, True
     return _Outcome("ok", output=output, intents=accepted)
+
+
+def _reuse_marker(spec: LlmSpec, key: str, source_run: str | None) -> dict[str, Any]:
+    """The recorded request of a reuse: no call was made (`reused_input_hash`), and the run
+    that produced the output, when known (`source_run`)."""
+    marker: dict[str, Any] = {"skill": spec.skill, "model": spec.model, "reused_input_hash": key}
+    if source_run is not None:
+        marker["source_run"] = source_run
+    return marker
 
 
 def _shown(step: _Planned, viewed: Any) -> dict[str, Any]:
@@ -1252,7 +1275,7 @@ async def _llm_step(run: _Run, step: _Planned) -> _Outcome:
         message = f"{spec.skill}: the step input does not have the shape of the input view"
         return _Outcome("degraded", StepError(kind="input_invalid", message=message), stop=True)
     key = _cache_key(run, spec, plugin, skill, viewed)
-    reused = _reuse(run, step, spec, plugin, key, viewed)
+    reused = await _reuse(run, step, spec, plugin, key, viewed)
     if reused is not None:
         return reused
     prompt = None if skill is None else skill.prompt
@@ -1392,6 +1415,7 @@ async def execute(
     skills: SkillSource | None = None,
     dry_run: bool = False,
     previous: PreviousLlm | None = None,
+    cache: LlmCache | None = None,
     models: Mapping[str, str] | None = None,
     lock_digest: str | None = None,
     config_digest: str | None = None,
@@ -1410,9 +1434,10 @@ async def execute(
       its prompt, output schema and version go into each `LlmRequest`, its input view
       restricts what the model sees, and its version and digest join the cache key. Without
       it (fakes and older callers) the request carries the whole input and no prompt.
-    - `previous`: the last accepted LLM output (`Store.last_accepted_llm`), for the
-      unchanged-input path. `models`: model alias to concrete model (`horae.yaml`), part of
-      the LLM cache key.
+    - `previous`: an accepted LLM output for the unchanged-input path (replay gives the one
+      the recorded run reused); `cache`: looked up by the step's cache key when `previous`
+      does not match (the runner's `StoreLlmCache`, #32). `models`: model alias to concrete
+      model (`horae.yaml`), part of the LLM cache key.
     - `models` (when given), `lock_digest` and `config_digest` (`horae.config.Instance`) are
       recorded as given, for replays; an invalid value raises `ValueError` before anything
       runs. The canonical pipeline definition is recorded too (`pipeline_definition`), unless
@@ -1457,6 +1482,7 @@ async def execute(
         tools=tools,
         llm=llm,
         previous=previous,
+        cache=cache,
         models=dict(models or {}),
         entries=tuple(entry for p in plan for entry in p.entries),
         monotonic=monotonic,

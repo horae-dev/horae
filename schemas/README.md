@@ -1715,3 +1715,111 @@ loosened later without breaking a valid file.
     - **follow-ups**: a warm worker if the start-up cost matters (#29's CLI backend is
       slower anyway); a memory ceiling on macOS (none of its `setrlimit` limits applies);
       #51 (sandboxing plugins) may reuse the worker's isolation.
+
+### Provisional decisions (#32, pending maintainer review)
+
+45. **The LLM cache and the $0 path (#32).** Numbering: 44 is #31's (PR #108), opened in
+    parallel. Neither is renumbered: whichever of the two merges second places the #31 section
+    (44) before this one, so the list stays in order. A compatible v1 addition to `horae.yaml` and
+    the rules of `horae.runner._cache`, the engine, `horae undo` and the new `horae cache
+    purge`:
+    - **contract change** (optional): `horae.yaml` `cache: {ttl_s?, max_entries?}`, integers;
+      `ttl_s` 60 to 31622400 (366 days), default 604800 (7 days); `max_entries` 1 to 100000,
+      default 1000. Not part of `config_digest` (decision 33 D3): it changes what is reused,
+      never what a replay computes;
+    - **one source.** The store's `llm_cache` table is the single source of reusable outputs
+      for live runs; the runner no longer reads `Store.last_accepted_llm` (D2, decision 30),
+      which stays for tools and tests. Migration 6 adds the index `llm_cache_created` (on
+      `created_at`, which trimming orders by). A store upgraded from before #32 starts with an
+      empty cache: its first run per input calls the model once;
+    - **two keys (G).** The **engine key** (`RunRecord.input_hash`, unchanged: SHA-256 of the
+      canonical JSON of the skill, the skill plugin's name, version and commit, the resolved
+      model, the viewed input, and with a loaded skill its `skill_version` and
+      `skill_digest`, decision 39) is what the run records and what replay and undo use. The
+      **stored key** (`StoreLlmCache.stored_key`) is SHA-256 of `{input_hash, alias,
+      version}`: `alias` is the step's model alias as `horae.yaml` declares it at the time,
+      without `secret` and `price` and without unset fields (backend, model, `base_url`,
+      `structured_output`, `max_output_tokens`, `max_tokens_field`, and a later field such as
+      the `claude-cli` command), `version` is `LLM_KEY_VERSION`
+      (`horae.llm.backends._shared`, bumped whenever `SYSTEM_PREAMBLE` or the request framing
+      changes; a test pins the preamble's digest to it). So the same model name on another
+      backend or endpoint, or with another output mode, is a miss; a new price is not. The
+      entry's `response` is `{output, intents, backend, model, skill_version, input_hash,
+      run_id, created_at}` (`input_hash` the engine key, `run_id` the producing run); its
+      `tokens_*` and `cost_usd` are what producing it cost (both attempts), for information;
+
+      | | engine key (`input_hash`) | stored key (`llm_cache.key`) |
+      |---|---|---|
+      | skill name, version, digest | yes | via `input_hash` |
+      | skill plugin name, version, commit | yes | via `input_hash` |
+      | resolved model name | yes | via `input_hash`, and in `alias` |
+      | viewed input | yes | via `input_hash` |
+      | alias backend, `base_url`, `structured_output`, `max_output_tokens`, `max_tokens_field`, command | no | yes |
+      | alias `secret`, `price` | no | no |
+      | `LLM_KEY_VERSION` (preamble, framing) | no | yes |
+      | pipeline, act/notify bindings | no | no (re-checked on reuse, C) |
+    - **the engine reads, the runner writes.** `execute(cache=LlmCache)`: the engine awaits
+      `cache.lookup(key, model_alias=..., output_schema=...)` when `previous` does not match
+      the key; a hit is reused exactly as D2 (no backend call, `LlmCall` with `cached=True`,
+      zero usage and the request marker `{skill, model, reused_input_hash, source_run}`,
+      `source_run` the producing run; intents validated and routed again; a reuse whose
+      intents no longer route is a miss; the same step and run statuses: `noop` when nothing
+      is proposed). A hit names the alias' **current** backend and model (equal to the stored
+      ones, since they are in the stored key, unless the alias is no longer declared). No
+      backend call means no ledger row: a cached output is charged zero (decision 41). An
+      exception from `lookup`, or an entry for another key, is a miss. A store error while
+      reading, writing or purging is logged (type only) and never fails the run;
+
+      | rule | when |
+      |---|---|
+      | **write** (`remember`, after the record is saved) | the run is `ok` or `noop` (H: not `degraded`, `failed` or `undone`), not a dry run (D); the `llm` step `ok`; its last call schema-valid with recorded intents; no call of the step a reuse (a hit never extends an entry); no resolved secret in the entry (`cache_put_safe`, decision 43); two processes writing one key: the last write wins |
+      | **read** (`lookup`) | not `--no-cache`; the entry exists, `expires_at` not passed and `created_at` within the current `ttl_s` (A); well-formed (else deleted); the full output (the output with its reserved `intents` put back) passes the skill's full output schema (F, else deleted); its intents still validate and route in this pipeline (C) |
+      | **delete** | expiry and `max_entries` at the start of each non-dry run (first in, first out); invalid on read (F); `horae undo` of a run (B); `horae cache purge` (E) |
+    - **(A) bounded staleness.** An entry is live for `ttl_s` from when it was produced (its
+      `expires_at`, and also `created_at` against the current `ttl_s` at lookup: lowering
+      `ttl_s` applies at once to every entry; raising it applies to entries written from then
+      on). A hit does not extend it: an unchanged input asks the model again at most once per
+      `ttl_s` (PLAN.md §2.2's "no LLM call when inputs unchanged" holds within that window).
+      After expiry a non-deterministic model may answer differently, so an unchanged input may
+      produce new intents and notifications **once per `ttl_s`** (appliers still deduplicate
+      what is identical). At the start of every non-dry run, entries past `ttl_s` or their
+      `expires_at` are deleted, then the oldest beyond `max_entries` (`Store.cache_trim`,
+      first in, first out: a hit does not make an entry recent), best effort;
+    - **(B) undo invalidates.** When `horae undo` marks a run `undone`, every entry for that
+      run's engine key is deleted in the same store transaction (`Store.cache_delete_input`,
+      which matches the `input_hash` the entries record, whatever alias they were stored
+      under), also when the undone run was itself a cache hit: running the same input again
+      asks the model instead of re-applying what was just undone. A partial undo (not every
+      change undone) leaves the entry;
+    - **(C) cross-pipeline and cross-history reuse stays.** Any earlier accepted output is
+      reused, not only the last run's (input A, B, then A again makes two calls), across
+      processes, and across pipelines that run the same skill, model alias and viewed input.
+      This is safe because routing and bindings are re-checked on every reuse: an intent
+      whose explicit target is bound differently in the other pipeline does not route, which
+      is a miss (the model is called);
+    - **(D) dry runs read, never write.** A dry run reuses a live entry (a preview costs
+      nothing on unchanged input) but neither stores its output nor purges: a preview must
+      not change what later real runs do;
+    - **(E) `horae run --no-cache`** (debugging) skips the lookup: the model is called even on
+      unchanged input, and its accepted output still replaces the entry (a fresh answer is a
+      valid answer). `Runner.run(cache=False)` is the same. **`horae cache purge [--all |
+      --older-than DAYS] [--skill NAME] [--json]`** deletes entries on demand (`--skill`
+      alone: all of that skill's): it opens the store writable but never creates it, takes no
+      lock, prints how many entries were deleted and how many remain (`{schema_version,
+      instance, all, older_than_days, skill, deleted, remaining}`); exit codes per decision
+      37: 0 purged (possibly nothing), 1 configuration or store problem, 2 usage error
+      (nothing selected, `--all` with `--older-than`), 70 internal;
+    - **(F) re-validated on read.** A cached output is checked against the skill's full output
+      schema at every lookup, by the validator of the backend path: #31's
+      `horae.llm.validate.validate_output` once it is installed, until then
+      `horae.runner._cache.check_output` (the same size bound, `MAX_OUTPUT_BYTES`, and
+      `jsonschema`'s draft 2020-12 validator; `default_validator` switches by itself, so #31
+      needs no change here). An entry that fails, or that cannot be validated (fail closed),
+      is a miss and is deleted. So an entry written before a validator existed, or tampered
+      with in the store, is never reused unchecked;
+    - **replay stays exact.** Replay never reads the store's cache: a run that reused an entry
+      is replayed with that output as `previous` (`recorded_previous`, decision 33, which
+      keeps `source_run`), so the replay takes the same path; a run that called the model is
+      replayed from its tape;
+    - **follow-ups**: a per-skill `ttl_s`; LRU instead of first in, first out if hit rates
+      show it matters.

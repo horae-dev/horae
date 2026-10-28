@@ -37,6 +37,30 @@
       "title": "BudgetsConfig",
       "type": "object"
     },
+    "CacheConfig": {
+      "additionalProperties": false,
+      "description": "The LLM cache: accepted outputs reused on unchanged input, the $0 path (#32).",
+      "properties": {
+        "ttl_s": {
+          "default": 604800,
+          "description": "Seconds an accepted output is reused for (60 to 366 days; default 7 days), counted\nfrom when it was produced: a hit does not extend it, so an unchanged input asks the model\nagain at most once per `ttl_s`. Lowering it applies at once (to every entry, at lookup);\nraising it applies to new entries (an entry keeps the expiry it was written with).",
+          "maximum": 31622400,
+          "minimum": 60,
+          "title": "Ttl S",
+          "type": "integer"
+        },
+        "max_entries": {
+          "default": 1000,
+          "description": "Most entries kept: at the start of each (non-dry) run, expired entries are deleted, then\nthe oldest beyond this many (first in, first out: a hit does not make an entry recent).",
+          "maximum": 100000,
+          "minimum": 1,
+          "title": "Max Entries",
+          "type": "integer"
+        }
+      },
+      "title": "CacheConfig",
+      "type": "object"
+    },
     "DailyBudget": {
       "additionalProperties": false,
       "anyOf": [
@@ -637,6 +661,10 @@
     "budgets": {
       "$ref": "#/$defs/BudgetsConfig",
       "description": "Daily LLM spend ceilings across runs (#33)."
+    },
+    "cache": {
+      "$ref": "#/$defs/CacheConfig",
+      "description": "The LLM cache's expiry policy (#32)."
     }
   },
   "title": "Horae instance configuration (horae.yaml)",

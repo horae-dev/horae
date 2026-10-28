@@ -43,3 +43,5 @@ budgets:
   daily: { usd: 2.0, tokens_out: 200000 }
   pipelines:
     daily-brief: { daily: { usd: 0.5 } }
+# The LLM cache: accepted outputs reused on unchanged input for a day (decision 45).
+cache: { ttl_s: 86400, max_entries: 500 }
