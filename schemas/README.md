@@ -14,6 +14,8 @@ All schemas use JSON Schema **draft 2020-12**. `$id` values below are relative t
 | Run record | [`run-record/v1.json`](run-record/v1.json) | `run-record/v1.json` | one run (§3.1, §2.1.6) |
 | Instance configuration | [`instance/v1.json`](instance/v1.json) | `instance/v1.json` | `horae.yaml` (§3.1, §3.4, §7) |
 | Skill | [`skill/v1.json`](skill/v1.json) | `skill/v1.json` | `skills/<namespace>/<skill>/skill.yaml` of a plugin (§2.1, §3.4) |
+| Eval case | [`eval-case/v1.json`](eval-case/v1.json) | `eval-case/v1.json` | `skills/<namespace>/<skill>/evals/<case>.yaml` (§5) |
+| Eval recorded response | [`eval-recorded/v1.json`](eval-recorded/v1.json) | `eval-recorded/v1.json` | `evals/recorded/<backend>/<case>.json` (§5) |
 
 ## Source of truth
 
@@ -1978,3 +1980,105 @@ loosened later without breaking a valid file.
       - **bounded work**: the new scans are line loops and `find` loops that resume after each
         match (wikilinks reuse the next `]]` and line end), plus one regular expression
         without nested quantifiers (`click`); a test scans 1 MiB per hostile shape.
+
+### Provisional decisions (#36, pending maintainer review)
+
+48. **Skill evaluation harness: golden cases, recorded responses, `horae eval` (#36).**
+    Numbering: 46 is #35's, 47 is held by #34 (de-identification). Two new contracts,
+    `schemas/eval-case/v1.json` (`horae.contracts.evals.EvalCase`) and
+    `schemas/eval-recorded/v1.json` (`RecordedResponse`), and the rules of `horae.evals` and
+    `horae.cli_eval`:
+    - **(A) where the cases live.** Next to the skill, in its folder:
+      `skills/<namespace>/<skill>/evals/<case>.yaml` (a case name is `[a-z0-9][a-z0-9_-]{0,63}`,
+      at most 256 cases) and `evals/recorded/<backend>/<case>.json` (one recording per
+      backend, `<backend>` one of the `models.<alias>.backend` names). The skill loader ignores
+      `evals/`, so the cases do not change the skill's digest. Every eval file is opened
+      `O_NOFOLLOW` (a link is refused), must be a regular file, and is size-bounded (256 KiB a
+      case, 512 KiB a recording); the folders must be real directories;
+    - **(B) a case** has `schema_version: 1`, the step `input` **before** the input view (plain
+      JSON: a YAML date must be quoted), optional `description`, `targets` (the routed `path` or
+      `url` of each target-bound intent type, which a pipeline's `act` entries bind in a run; a
+      note type without one gets `Evals/<case>.md`), `budget` (a live call's; default
+      `{usd: 0.05, tokens_out: 1024}`) and `expect`: `schema_valid` (default `true`), the exact
+      `output` (without its reserved `intents`), `assertions` (each a JSON pointer, RFC 6901, into
+      `{"output": ..., "intents": [...]}` with exactly one of `equals`, `length`, `contains` (a
+      substring, or an array element) and `exists`), the exact raw `intents` or `intent_counts`
+      per type, and `guard` (`pass`, the default, or `violation` for a case that proves a hostile
+      output is refused). Equality is canonical JSON equality;
+    - **(C) a recording is provider-agnostic** (maintainer's preference): the parsed JSON
+      output as the provider backend returned it (the reserved `intents` included), its `usage`
+      and `stop_reason`, the concrete `model`, the skill's name, version and digest, and the
+      SHA-256 of what was sent (`request`: the skill's prompt, the viewed input, the output
+      schema: `RenderedRequest.summary`'s digests). Never the provider's payload, headers or a
+      secret. A recording whose skill digest or version, prompt, input or schema digest differs
+      from the current one is **stale**: reported (`stale: [skill, prompt, input, schema]`), a
+      warning, not a failure (the repository's own CI test refuses stale fixtures);
+    - **(D) offline is the run's path, minus routing.** `horae eval <skill>`: the input view
+      (`Skill.view`), the request rendered by the **real** provider backend of the alias
+      (`ModelBackends.render`: prompt, viewed input, schema, `max_tokens` from the budget, its
+      pre-flight), then the recorded result handed back by a provider backend whose `render` is
+      the real one and whose `send` returns the recording, so `ModelBackends.send`'s own path
+      runs: the production validator (`validate_output`, the killable worker; a
+      `validator_unavailable` is an error), the intents split off (an invalid output proposes
+      nothing), the redaction. Then the intents' omitted targets are filled from `targets`,
+      `validate_intents` checks them against the plugin's `permissions.intents` narrowed to the
+      skill's, and the action guard (`check_intents`) runs with the viewed input as what the
+      model was shown and the skill's per-type limits. Without `--alias`, each recorded backend
+      is evaluated with a synthetic alias (the recorded model, a placeholder secret name and a
+      `.invalid` endpoint, which `render` never uses; nothing is resolved or sent); `--alias`
+      renders with that instance alias and only its backend's recordings. A backend without a
+      factory (`claude-cli` today) is an error (`backend_unavailable`). No network, no secret,
+      no cost: CI runs every skill's cases (`tests/test_evals.py`, over `tests/fixtures/plugins`
+      and the built-in plugins);
+    - **(E) the skill** comes from the instance's installed plugins (`<instance>/plugins`,
+      checked against `horae.lock`, `plugins_invalid` 1) or, with `--plugin-dir`, a plugin
+      folder or a folder of plugins (folders without a valid `plugin.yaml` are skipped); it is
+      loaded as the engine loads it (`load_skill` with the plugin's `permissions.intents`,
+      `skill_invalid` 1). An unknown skill is `unknown_skill` (3), a malformed name a usage
+      error (2), an unknown `--case` `unknown_case` (3), an invalid case or recording
+      `eval_invalid` (1), a skill without cases `no_cases` (1);
+    - **(F) `--live` spends money, explicitly.** It needs the instance (its alias and secret;
+      `--alias`, required when the instance has more than one, `unknown_alias` 3). Every case is
+      rendered first and the eval's worst case (the sum of `ModelBackends.worst_case`, what the
+      usage ledger would reserve) is shown on stderr. It must fit `--max-usd` and what the
+      instance's `budgets.daily` has left today (`Store.day_spend` of the usage ledger, read
+      only, when the store exists; the whole ceiling otherwise), else `budget_exceeded` (3),
+      nothing sent. **`--max-usd` is required when no daily budget bounds the eval** (usage, 2).
+      Then `--yes`, or a confirmation on a terminal (refused: `not_confirmed`, 3; not a terminal
+      without `--yes`: usage, 2). Each case is sent **once** (no repair retry: the eval reports
+      validity, it does not repair) with the alias' declared key, through a provider backend
+      that keeps the raw result for `--record`. **The eval is not a run**: it records nothing in
+      the store, its ledger or the LLM cache (provisional; recording eval spend in the ledger
+      needs a run row, a follow-up). A report is written to
+      `<state_dir>/evals/<namespace>/<skill>/<UTC timestamp>.json` (the `--json` document, with
+      `report` set) and a `.txt` summary beside it (folders 0700, files opened `x`). Each live
+      case also carries its `usage`, `worst_case` and `recorded_diff` (the unified diff against
+      the recorded output, both redacted);
+    - **(G) `--record`** (with `--live` only) replaces each answered case's recording,
+      atomically (a temporary file in the same folder, then `rename`). The output and stop
+      reason are redacted with the process registry first (decision 43: the instance's secrets
+      are primed by `load`, the alias' key once resolved), so a key echoed by the model is
+      written `[REDACTED:<NAME>]`; a recording that cannot be written is reported on stderr and
+      the eval goes on;
+    - **(H) results and exit codes** (decision 37). Each case (per backend) is `pass`, `fail` (a
+      check failed) or `error` (it could not be evaluated: `no_recording`, `input_invalid`, a
+      backend or validator error). Exit `0` every case passed, `4` some failed, `1` some could
+      not be evaluated (or any problem above), `2` usage, `3` unknown or refused, `70` internal.
+      `--json`: `{schema_version, mode, skill, skill_version, skill_digest, plugin, alias, cases:
+      [{case, backend, model, status, schema_valid, schema_errors, intents_error, guard
+      (pass | violation | not_run), guard_detail, stale, checks: [{name, ok, message, diff}],
+      usage, worst_case, recorded_diff, recorded_path, error}], summary: {cases, passed, failed,
+      errors, stale, usage}, estimate, report, error}` (`error` is `eval_failed` or
+      `eval_errors` with a count, else `null`); a command error is `{schema_version, error}`.
+      Diffs are unified diffs of indented canonical JSON (sorted keys, ASCII), at most 400
+      lines; text output escapes untrusted characters (`safe`). Schema errors and guard details
+      stay content-free (decisions 44 and 46);
+    - **(I) `pack-daily-brief`** ships three cases for `daily-brief/rank-and-word` with
+      `anthropic` recordings (synthetic): `overdue-first` (assertions, one note), `tasks-only`
+      (exact output, no intent) and `injected-embed` (a recorded output that obeyed an injected
+      image embed; the guard must refuse it). Rendering them for `anthropic` showed that the
+      fixture's output schema could not be used for structured output (`transform_schema`
+      needs a `type` beside `enum` and `const`): the fixture now declares `"type": "string"`
+      there;
+    - **follow-ups**: recording live eval spend in the usage ledger; a `--repair` live mode
+      that exercises the repair retry; `horae eval --all` over every installed skill.

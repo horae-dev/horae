@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Command-line entry point for Horae (#26): init, run, runs, diff, undo, replay, doctor,
-usage.
+usage, eval.
 
 Every command shares the exit codes, error reporting and `--json` conventions of
 `horae.cli_output` (schemas decision 37): 0 ok, 1 problems, 2 usage, 3 unknown or refused,
@@ -598,9 +598,10 @@ def replay_command(
     )
 
 
-# `horae init`, `run`, `undo`, `usage` and `cache` live in their own modules; registered here
-# so `horae.cli.app` has every command.
+# `horae init`, `run`, `undo`, `usage`, `eval` and `cache` live in their own modules;
+# registered here so `horae.cli.app` has every command.
 from horae.cli_cache import cache_app as _cache_app  # noqa: E402
+from horae.cli_eval import eval_command as _eval  # noqa: E402
 from horae.cli_init import init as _init  # noqa: E402
 from horae.cli_run import run as _run  # noqa: E402
 from horae.cli_undo import undo as _undo  # noqa: E402
@@ -610,6 +611,7 @@ _command("init")(_init)
 _command("run")(_run)
 _command("undo")(_undo)
 _command("usage")(_usage)
+_command("eval")(_eval)
 app.add_typer(_cache_app, name="cache")
 
 __all__ = [

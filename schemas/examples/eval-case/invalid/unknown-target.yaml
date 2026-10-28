@@ -1,0 +1,4 @@
+# Only the routed intent types take a target.
+schema_version: 1
+input: {}
+targets: { task.create: Inbox }

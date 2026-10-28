@@ -1,0 +1,6 @@
+# An assertion has exactly one check.
+schema_version: 1
+input: {}
+expect:
+  assertions:
+    - { pointer: /output/summary, equals: x, exists: true }
