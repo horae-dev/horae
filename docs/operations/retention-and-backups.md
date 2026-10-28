@@ -16,7 +16,7 @@ directory, [ADR 0006](../adr/0006-sqlite-as-the-store.md)). Horae creates the st
 |---|---|---|
 | `runs`, `steps` | run records: collected inputs, LLM requests and responses, intents, stderr excerpts | `Store.prune_runs` |
 | `journal`, `blobs` | every applied change, with the note's bytes before and after | `Store.prune_runs` (with its runs; a blob is kept while any journal entry refers to it) |
-| `llm_cache` | LLM responses keyed on the input hash | `Store.cache_purge`, `Store.cache_purge_expired` |
+| `llm_cache` | accepted LLM outputs and their intents, keyed on the input hash (#32) | every non-dry `horae run`: entries older than `cache.ttl_s` (default 7 days) and the oldest beyond `cache.max_entries` (default 1000); the entries of a run `horae undo` reverts; `horae cache purge [--all \| --older-than DAYS] [--skill NAME]` on demand (also `Store.cache_purge`, `Store.cache_purge_expired`, `Store.cache_trim`) |
 | `tasks`, `notifications` | task titles and statuses, notification dedupe keys | not pruned (they lose their run link when the run is pruned) |
 | `secret_flags` | names of secrets the store's secret gate found while a run was running, and where (never a value, #53) | turned into violations of the run's record when it is saved, deleted when the run is abandoned or pruned |
 

@@ -51,6 +51,7 @@ uv run horae diff <run-id> -i ~/horae-demo     # what a stored (dry) run would c
 uv run horae replay <run-id> -i ~/horae-demo   # re-executes the run from its record and compares
 uv run horae undo <run-id> -i ~/horae-demo     # restores every note the run changed, byte for byte
 uv run horae usage -i ~/horae-demo             # LLM cost per pipeline and day (the usage ledger)
+uv run horae cache purge --all -i ~/horae-demo # forget cached LLM outputs (the next run asks again)
 ```
 
 `-i` defaults to the current directory (or `HORAE_INSTANCE`). Every command takes `--json`

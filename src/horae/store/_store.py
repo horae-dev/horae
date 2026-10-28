@@ -1090,7 +1090,10 @@ class Store:
 
     @_api
     def last_accepted_llm(self, pipeline: str) -> PreviousLlm | None:
-        """The accepted LLM output of `pipeline`'s last run, for the unchanged-input path.
+        """The accepted LLM output of `pipeline`'s last run (schemas decision 30, D2).
+
+        Since #32 the runner reads the LLM cache (`llm_cache`, `horae.runner.StoreLlmCache`)
+        instead; this stays for tools and tests that rebuild the D2 `previous` of a run.
 
         Only the most recent finished, non-dry-run run counts, and only if it is `ok` or
         `noop`: after a `degraded`, `failed` or `undone` run (or with no run, or no accepted
@@ -1542,6 +1545,48 @@ class Store:
         """Delete entries expired at `now`; return how many."""
         with self.transaction():
             cur = self._conn.execute("DELETE FROM llm_cache WHERE expires_at <= ?", (_ts(now),))
+        return cur.rowcount
+
+    @_api
+    def cache_delete(self, key: str) -> bool:
+        """Delete the entry stored under `key`; return whether there was one."""
+        with self.transaction():
+            cur = self._conn.execute("DELETE FROM llm_cache WHERE key = ?", (_sha(key),))
+        return cur.rowcount > 0
+
+    @_api
+    def cache_delete_input(self, input_hash: str) -> int:
+        """Delete every entry produced for the engine cache key `input_hash` (the
+        `input_hash` its response records, whatever the model alias it was stored under, #32
+        decision 45 B); return how many. Undo calls this when it marks a run `undone`."""
+        with self.transaction():
+            cur = self._conn.execute(
+                "DELETE FROM llm_cache WHERE json_valid(response) "
+                "AND json_type(response) = 'object' "
+                "AND json_extract(response, '$.input_hash') = ?",
+                (_sha(input_hash),),
+            )
+        return cur.rowcount
+
+    @_api
+    def cache_count(self) -> int:
+        """How many entries the LLM cache holds (expired ones included)."""
+        row = self._conn.execute("SELECT count(*) FROM llm_cache").fetchone()
+        return int(row[0])
+
+    @_api
+    def cache_trim(self, max_entries: int) -> int:
+        """Keep the `max_entries` most recently created entries, delete the others; return how
+        many were deleted. First in, first out: a hit does not make an entry recent (the
+        `llm_cache_created` index, migration 6, serves the ordering)."""
+        if max_entries < 0:
+            raise ValueError("max_entries must be >= 0")
+        with self.transaction():
+            cur = self._conn.execute(
+                "DELETE FROM llm_cache WHERE key IN (SELECT key FROM llm_cache "
+                "ORDER BY created_at DESC, key DESC LIMIT -1 OFFSET ?)",
+                (max_entries,),
+            )
         return cur.rowcount
 
     @_api

@@ -47,6 +47,11 @@ there). Once a note is restored its entries are marked undone (`Store.journal_ma
 re-running undo after a crash continues where it stopped. When every undoable entry is undone,
 a run with a record is saved `undone`; a run abandoned by a crash has no record and stays
 `failed` (the store keeps abandoned runs failed), with its journal entries undone.
+
+**The LLM cache.** In the same store transaction as saving the run `undone`, every LLM cache
+entry for the run's cache key (`RunRecord.input_hash`) is deleted (`Store.cache_delete_input`,
+schemas decision 45 B), whether the run produced that output or reused it: running the same
+input again asks the model instead of re-applying what was just undone.
 """
 
 import asyncio
@@ -430,7 +435,11 @@ async def undo_run(
     if result.complete and summary.status != "undone" and summary.abandoned_at is None:
         record = store.get_run(run_id)
         if record is not None:
-            store.save_run(record.model_copy(update={"status": "undone"}))
+            with store.transaction():
+                store.save_run(record.model_copy(update={"status": "undone"}))
+                if record.input_hash is not None:
+                    # The LLM output behind the undone changes is no longer reused (#32).
+                    store.cache_delete_input(record.input_hash)
             result = replace(result, run_status="undone", marked_undone=True)
     return result
 

@@ -862,13 +862,14 @@ def test_a_crash_that_cannot_be_abandoned_is_logged(
     assert lock_is_free(inst.state_dir, "collect") is True
 
 
-def test_reading_the_previous_output_happens_inside_the_run(
+def test_a_store_failure_in_the_run_is_a_crash(
     inst: Instance, store: Store, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def broken(pipeline: str) -> None:
+    def broken(*args: object, **kwargs: object) -> None:
         raise StoreError("synthetic")
 
-    monkeypatch.setattr(store, "last_accepted_llm", broken)
+    # (A failing LLM cache is only a miss: tests/test_llm_cache.py.)
+    monkeypatch.setattr(store, "record_step", broken)
     with pytest.raises(StoreError):
         asyncio.run(_runner(inst, store).run("collect"))
     (run,) = store.list_runs()

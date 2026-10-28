@@ -348,6 +348,26 @@ class RunsConfig(Contract):
     limits are separate: `plugin_defaults.call_timeout_s` and the LLM step's `timeout_s`."""
 
 
+MIN_CACHE_TTL_S = 60
+MAX_CACHE_TTL_S = 366 * 86400
+DEFAULT_CACHE_TTL_S = 7 * 86400
+MAX_CACHE_ENTRIES = 100_000
+DEFAULT_CACHE_ENTRIES = 1000
+
+
+class CacheConfig(Contract):
+    """The LLM cache: accepted outputs reused on unchanged input, the $0 path (#32)."""
+
+    ttl_s: Annotated[StrictInt, Field(ge=MIN_CACHE_TTL_S, le=MAX_CACHE_TTL_S)] = DEFAULT_CACHE_TTL_S
+    """Seconds an accepted output is reused for (60 to 366 days; default 7 days), counted
+    from when it was produced: a hit does not extend it, so an unchanged input asks the model
+    again at most once per `ttl_s`. Lowering it applies at once (to every entry, at lookup);
+    raising it applies to new entries (an entry keeps the expiry it was written with)."""
+    max_entries: Annotated[StrictInt, Field(ge=1, le=MAX_CACHE_ENTRIES)] = DEFAULT_CACHE_ENTRIES
+    """Most entries kept: at the start of each (non-dry) run, expired entries are deleted, then
+    the oldest beyond this many (first in, first out: a hit does not make an entry recent)."""
+
+
 class SchedulerConfig(Contract):
     """How pipelines with a `trigger` are started."""
 
@@ -432,6 +452,8 @@ class InstanceConfig(Contract):
     """Bounds of every pipeline run (the run timeout)."""
     budgets: BudgetsConfig = Field(default_factory=BudgetsConfig)
     """Daily LLM spend ceilings across runs (#33)."""
+    cache: CacheConfig = Field(default_factory=CacheConfig)
+    """The LLM cache's expiry policy (#32)."""
 
     def plugin_timeouts(self, plugin: str) -> PluginDefaults:
         """The effective timeouts of `plugin`: its own settings, else `plugin_defaults`."""

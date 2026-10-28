@@ -201,12 +201,13 @@ class LlmResponse:
 
 @dataclass(frozen=True)
 class PreviousLlm:
-    """The last accepted LLM output of a pipeline, for the unchanged-input path.
+    """An accepted LLM output, for the unchanged-input path: a cache entry.
 
-    Built by the caller from the last finished, non-dry-run run when it is `ok` or `noop`
-    (`horae.store.Store.last_accepted_llm`). When its `input_hash` equals this run's cache key,
-    the engine makes no LLM call and reuses `output` and `intents` (or, if those intents no
-    longer validate or route, calls the LLM as on a cache miss).
+    Given by the caller as `previous` (replay: the output the recorded run reused) or
+    returned by an `LlmCache` (`horae.runner.StoreLlmCache`, the store's `llm_cache` table,
+    #32). When its `input_hash` equals this run's cache key, the engine makes no LLM call and
+    reuses `output` and `intents` (or, if those intents no longer validate or route, calls the
+    LLM as on a cache miss).
 
     Reuse re-proposes identical intents, `notify.push` included: appliers (#21/#22) must
     deduplicate notifications, e.g. by `input_hash` and intent, so an unchanged input does not
@@ -219,6 +220,27 @@ class PreviousLlm:
     skill_version: str
     model: str
     backend: LlmBackendName
+    source_run: str | None = None
+    """The run that produced the output (a cache entry's producer), recorded in the reuse
+    marker of the run that reuses it (`request.source_run`); `None` when unknown."""
+
+
+class LlmCache(Protocol):
+    """Looks up accepted LLM outputs by cache key (the unchanged-input path, #32).
+
+    The engine only reads: it awaits `lookup` once per `llm` step, with the step's cache key
+    (`RunRecord.input_hash` once accepted), the step's model alias and, with a loaded skill,
+    its full output schema (the reserved `intents` property included). Writing accepted
+    outputs, expiry and purging are the caller's (`horae.runner`). `lookup` may read and
+    clean local storage (the SQLite store) and validate the entry against `output_schema`
+    (an invalid entry is a miss), but must not call a model or the network. An exception is
+    a cache miss."""
+
+    async def lookup(
+        self, key: str, *, model_alias: str, output_schema: Mapping[str, Any] | None
+    ) -> PreviousLlm | None:
+        """The live, valid entry for `key` (its `input_hash` is `key`), or `None`."""
+        ...
 
 
 class SkillUnavailable(Exception):

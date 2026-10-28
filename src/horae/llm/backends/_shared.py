@@ -64,6 +64,13 @@ SYSTEM_PREAMBLE = (
 )
 """Horae's own system text, sent before the skill's prompt (every backend)."""
 
+LLM_KEY_VERSION = 1
+"""Version of what Horae itself sends around a skill's prompt and input: `SYSTEM_PREAMBLE`
+and the request framing (the `<input>` / `<schema_errors>` tags). Part of the LLM cache's
+stored key (`horae.runner._cache`, schemas decision 45 G): **bump it whenever either changes**,
+so outputs produced under the old framing are no longer reused (`tests/test_llm_cache.py` pins
+the preamble's digest to this version)."""
+
 USER_AGENT = "horae"
 """The `user-agent` header sent (no SDK, OS or runtime detail)."""
 
@@ -770,6 +777,7 @@ __all__ = [
     "INVALID",
     "LAN_NETWORKS",
     "LIMITS",
+    "LLM_KEY_VERSION",
     "MAX_COUNT",
     "MAX_ERROR_BYTES",
     "MAX_RESPONSE_BYTES",
