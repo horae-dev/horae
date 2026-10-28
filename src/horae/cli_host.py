@@ -195,14 +195,53 @@ def _backend_problems(instance: Instance) -> list[Problem]:
     return problems
 
 
+def _budget_problems(instance: Instance) -> list[Problem]:
+    """A warning for each `usd` daily ceiling (`budgets.daily`, `budgets.pipelines.<name>`)
+    that covers a pipeline whose `llm` step uses an alias without `price` (schemas decision
+    41 B): that alias' calls are recorded at `usd: 0`, so the ceiling does not bound their
+    dollars (only `tokens_out` does)."""
+    budgets = instance.config.budgets
+    problems: list[Problem] = []
+    for pipeline in sorted(instance.pipelines.values(), key=lambda p: p.name):
+        aliases = sorted({s.llm.model for s in pipeline.steps if isinstance(s, LlmStep)})
+        unpriced = [
+            alias
+            for alias in aliases
+            if (spec := instance.config.models.get(alias)) is not None and spec.price is None
+        ]
+        if not unpriced:
+            continue
+        own = budgets.pipelines.get(pipeline.name)
+        ceilings = []
+        if budgets.daily is not None and budgets.daily.usd is not None:
+            ceilings.append("budgets.daily.usd")
+        if own is not None and own.daily.usd is not None:
+            ceilings.append(f"budgets.pipelines.{pipeline.name}.daily.usd")
+        for where in ceilings:
+            for alias in unpriced:
+                problems.append(
+                    Problem(
+                        CONFIG_FILE,
+                        None,
+                        None,
+                        f"{where}: pipeline {pipeline.name!r} uses model alias {alias!r}, "
+                        "which has no price: the usd ceiling does not bound its calls "
+                        "(only tokens_out does)",
+                        severity="warning",
+                    )
+                )
+    return problems
+
+
 def instance_problems(instance: Instance) -> list[Problem]:
     """What `horae doctor` checks beyond the configuration (`check_instance`): the lock's
     paths exist, the instance's own `vault/` is the one the lock writes to, each model alias
     an `llm` step uses has an available backend (and, for a cloud backend, a `price`, else a
-    warning), and, when the instance has a `plugins/` directory, the plugins are installed
+    warning; a warning too for a `usd` daily ceiling over such an unpriced alias), and,
+    when the instance has a `plugins/` directory, the plugins are installed
     as the lock pins them (`check_plugins`) and each command (its interpreter) exists and is
     executable."""
-    problems = _path_problems(instance) + _backend_problems(instance)
+    problems = _path_problems(instance) + _backend_problems(instance) + _budget_problems(instance)
     if plugins_dir(instance.root).is_dir():
         try:
             registry = _registry(instance)

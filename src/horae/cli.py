@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Command-line entry point for Horae (#26): init, run, runs, diff, undo, replay, doctor.
+"""Command-line entry point for Horae (#26): init, run, runs, diff, undo, replay, doctor,
+usage.
 
 Every command shares the exit codes, error reporting and `--json` conventions of
 `horae.cli_output` (schemas decision 37): 0 ok, 1 problems, 2 usage, 3 unknown or refused,
@@ -582,10 +583,12 @@ def replay_command(
 from horae.cli_init import init as _init  # noqa: E402
 from horae.cli_run import run as _run  # noqa: E402
 from horae.cli_undo import undo as _undo  # noqa: E402
+from horae.cli_usage import usage as _usage  # noqa: E402
 
 _command("init")(_init)
 _command("run")(_run)
 _command("undo")(_undo)
+_command("usage")(_usage)
 
 __all__ = [
     "EXIT_DIFFERENT",

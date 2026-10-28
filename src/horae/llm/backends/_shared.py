@@ -629,6 +629,13 @@ class JsonApiBackend:
     def name(self) -> LlmBackendName:
         return self.BACKEND
 
+    @property
+    def may_write_cache(self) -> bool:
+        """`False`: these backends record no cache write (an OpenAI-compatible provider's
+        automatic prompt cache bills only reads, `cached_tokens`, below the input price;
+        decision 41)."""
+        return False
+
     def render(self, completion: Completion) -> dict[str, Any]:  # pragma: no cover - abstract
         raise NotImplementedError
 

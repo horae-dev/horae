@@ -1,0 +1,4 @@
+# A daily ceiling is positive: to stop every call, remove the alias instead.
+budgets:
+  pipelines:
+    daily-brief: { daily: { usd: 0 } }
