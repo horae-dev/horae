@@ -442,6 +442,7 @@ wheels = [
 name = "horae"
 source = { editable = "." }
 dependencies = [
+    { name = "jsonschema" },
     { name = "mcp" },
     { name = "pydantic" },
     { name = "pyyaml" },
@@ -465,6 +466,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "jsonschema", specifier = ">=4.23" },
     { name = "mcp", specifier = ">=2.3,<2.4" },
     { name = "pydantic", specifier = ">=2.14" },
     { name = "pyyaml", specifier = ">=6" },

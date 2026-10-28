@@ -1,0 +1,13 @@
+# A PLAN.md §3.2 skill, as a pack-daily-brief plugin would ship it (synthetic).
+name: daily-brief/rank-and-word
+version: 1.0.0
+description: Rank today's tasks and word the morning note.
+input_view:
+  - tasks[].title
+  - tasks[].due
+  - tasks[].fingerprint
+  - events[].start
+  - events[].summary
+prompt: prompt.md
+output_schema: output.schema.json
+intents: [note.create]

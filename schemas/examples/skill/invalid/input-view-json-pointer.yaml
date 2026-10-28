@@ -1,0 +1,4 @@
+name: daily-brief/rank-and-word
+version: 1.0.0
+description: Rank today's tasks.
+input_view: [/tasks/0/title]

@@ -13,7 +13,8 @@ one `horae undo`), everything the runner needs from the installed plugins:
 - `McpSinks`, the `SinkRegistry` that applies routed intents through the plugins' sink
   operations (`horae.plugins.host.sink`).
 
-`LivePorts.ports` is the runner's `Ports(plugins=registry, tools=host, sinks=sinks)`.
+`LivePorts.ports` is the runner's `Ports(plugins=registry, tools=host, sinks=sinks,
+skills=...)`, the skills read from `<plugins_dir>/<name>/skills/` (`DirectorySkills`, #27).
 `llm` is `None` until M2 wires a backend. Where `horae plugin add` installs plugins (the
 `plugins_dir`) is M4's (#44); the walking skeleton and the tests write it with
 `horae.plugins.builtin.install`. `horae run`, `horae diff` and `horae undo` open it on
@@ -33,6 +34,7 @@ from horae.engine import LlmBackend
 from horae.plugins.host import HostRegistry, McpSinks, PluginHost, host_for_instance
 from horae.runner._runner import Ports
 from horae.secrets import SecretResolver
+from horae.skills import DirectorySkills
 
 
 @dataclass(frozen=True)
@@ -57,7 +59,8 @@ async def open_ports(
     registry = HostRegistry.from_directory(instance.lock, plugins_dir)
     async with host_for_instance(instance, registry, secrets=secrets) as host:
         sinks = McpSinks(registry, host)
-        ports = Ports(plugins=registry, tools=host, llm=llm, sinks=sinks)
+        skills = DirectorySkills({p.manifest.name: p.root for p in registry.plugins()})
+        ports = Ports(plugins=registry, tools=host, llm=llm, sinks=sinks, skills=skills)
         yield LivePorts(registry, host, sinks, ports)
 
 

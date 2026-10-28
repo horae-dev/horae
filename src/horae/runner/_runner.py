@@ -113,6 +113,7 @@ from horae.engine import (
     PluginRegistry,
     PreviousLlm,
     RunCancelled,
+    SkillSource,
     ToolCaller,
     execute,
     make_context,
@@ -228,6 +229,9 @@ class Ports:
     tools: ToolCaller
     llm: LlmBackend | None = None
     sinks: SinkRegistry | None = None
+    skills: SkillSource | None = None
+    """Loads the `llm` step's skill (#27): `horae.skills.DirectorySkills` over the installed
+    plugins; `None` sends the whole input and no prompt (fakes only)."""
     """The sinks and notifiers that apply a run's intents (#22); `None` applies nothing."""
 
 
@@ -630,6 +634,7 @@ class Runner:
                 plugins=self.ports.plugins,
                 tools=self.ports.tools,
                 llm=self.ports.llm,
+                skills=self.ports.skills,
                 dry_run=dry_run,
                 previous=previous,
                 models=models,

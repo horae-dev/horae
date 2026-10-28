@@ -137,7 +137,13 @@ every call, shared with replay.
 **The LLM step.** Its cache key, recorded as `RunRecord.input_hash` once the output is
 accepted, is the SHA-256 of the canonical JSON of `{skill, plugin: {name, version, commit},
 model, input}`, where `model` is the alias's target from `models` when the caller knows it, else
-the alias. When `previous` (the last accepted output, `PreviousLlm`) has the same key, no LLM
+the alias. With a `SkillSource` (#27), the skill is loaded while planning (`skill_invalid`
+otherwise), `input` is the step input restricted to the skill's input view (what the model
+sees, also what `LlmRequest.input` and `LlmCall.input_hash` hold), and the key adds
+`skill_version` and `skill_digest` (prompt, output schema, view and intents), so a new version
+or an edited prompt is a cache miss; `LlmCall.skill_version` is the loaded skill's, and the
+LLM's intents are checked against the plugin's permissions narrowed to the skill's `intents`.
+When `previous` (the last accepted output, `PreviousLlm`) has the same key, no LLM
 call is made: its output and intents are reused (validated and routed again), recorded as an
 `LlmCall` with `cached=True` and zero usage, and the run continues. If the reused intents no
 longer validate or route (e.g. an explicit target bound to `{{date}}` moved to a new day), it
@@ -233,9 +239,12 @@ from horae.engine.ports import (
     LlmError,
     LlmRequest,
     LlmResponse,
+    LoadedSkill,
     PluginRegistry,
     PreviousLlm,
     ResolvedPlugin,
+    SkillSource,
+    SkillUnavailable,
     ToolCaller,
     ToolResult,
     UnknownPlugin,
@@ -491,6 +500,7 @@ class _Planned:
     entries: tuple[_Entry, ...] = ()
     llm: LlmSpec | None = None
     skill_plugin: ResolvedPlugin | None = None
+    skill: LoadedSkill | None = None
 
 
 class _PlanError(Exception):
@@ -612,6 +622,7 @@ def _plan(
     context: RunContext,
     plugins: PluginRegistry,
     has_llm: bool,
+    skills: SkillSource | None = None,
 ) -> tuple[_Planned, ...]:
     planned: list[_Planned] = []
     used: set[str] = set()
@@ -644,7 +655,12 @@ def _plan(
             if step.llm.skill not in skill_plugin.manifest.provides.skills:
                 fail("tool_not_provided", f"{step.llm.skill} is not in the plugin's skills")
             use(skill_plugin)
-            planned.append(_Planned(index, kind, llm=step.llm, skill_plugin=skill_plugin))
+            skill = None if skills is None else _load_skill(skills, step.llm.skill, skill_plugin)
+            if isinstance(skill, StepError):
+                fail(skill.kind, skill.message)
+            planned.append(
+                _Planned(index, kind, llm=step.llm, skill_plugin=skill_plugin, skill=skill)
+            )
             continue
         calls: list[_Call] = []
         entries: list[_Entry] = []
@@ -678,6 +694,36 @@ def _plan(
                 calls.append(_Call(ref, rendered, plugin, position, planned_call.timeout_s))
         planned.append(_Planned(index, kind, calls=tuple(calls), entries=tuple(entries)))
     return tuple(planned)
+
+
+def _load_skill(skills: SkillSource, ref: str, plugin: ResolvedPlugin) -> LoadedSkill | StepError:
+    """The skill of the `llm` step, loaded and checked while planning (`skill_invalid`)."""
+    try:
+        skill = skills.load_skill(ref, plugin)
+        name, intents = skill.name, frozenset(skill.intents)
+    except SkillUnavailable as error:
+        return StepError(kind="skill_invalid", message=_cap(str(error) or "skill unavailable"))
+    except Exception as error:  # a port bug must not crash the run
+        return StepError(kind="host_error", message=f"unexpected {type(error).__name__}")
+    if name != ref:
+        return StepError(kind="skill_invalid", message=_cap(f"{ref}: the source loaded {name}"))
+    extra = sorted(intents - set(plugin.manifest.permissions.intents))
+    if extra:
+        message = f"{ref}: intents {', '.join(extra)} are not in the plugin's permissions"
+        return StepError(kind="skill_invalid", message=_cap(message))
+    return skill
+
+
+def _proposer(plugin: ResolvedPlugin, skill: LoadedSkill | None) -> ResolvedPlugin:
+    """Whose permissions the LLM's intents are checked against: the plugin's, narrowed to
+    the loaded skill's `intents` (an empty list: the skill proposes none)."""
+    if skill is None:
+        return plugin
+    permissions = plugin.manifest.permissions.model_copy(
+        update={"intents": [t for t in plugin.manifest.permissions.intents if t in skill.intents]}
+    )
+    manifest = plugin.manifest.model_copy(update={"permissions": permissions})
+    return ResolvedPlugin(manifest, plugin.commit)
 
 
 # --- execution -------------------------------------------------------------------------------
@@ -1054,23 +1100,32 @@ async def _apply_step(run: _Run, step: _Planned) -> _Outcome:
     return _Outcome("ok", output=output)
 
 
-def _cache_key(run: _Run, spec: LlmSpec, plugin: ResolvedPlugin) -> str:
-    return sha256_hex(
-        {
-            "skill": spec.skill,
-            "plugin": {
-                "name": plugin.manifest.name,
-                "version": plugin.manifest.version,
-                "commit": plugin.commit,
-            },
-            "model": run.models.get(spec.model, spec.model),
-            "input": run.data,
-        }
-    )
+def _cache_key(
+    run: _Run, spec: LlmSpec, plugin: ResolvedPlugin, skill: LoadedSkill | None, viewed: Any
+) -> str:
+    key: dict[str, Any] = {
+        "skill": spec.skill,
+        "plugin": {
+            "name": plugin.manifest.name,
+            "version": plugin.manifest.version,
+            "commit": plugin.commit,
+        },
+        "model": run.models.get(spec.model, spec.model),
+        "input": viewed,
+    }
+    if skill is not None:
+        key["skill_version"] = skill.version
+        key["skill_digest"] = skill.digest
+    return sha256_hex(key)
 
 
 def _reuse(
-    run: _Run, step: _Planned, spec: LlmSpec, plugin: ResolvedPlugin, key: str
+    run: _Run,
+    step: _Planned,
+    spec: LlmSpec,
+    plugin: ResolvedPlugin,
+    key: str,
+    viewed: Any,
 ) -> _Outcome | None:
     """The previous accepted output, reused; `None` if it cannot be (then the LLM is called)."""
     previous = run.previous
@@ -1082,13 +1137,13 @@ def _reuse(
         call = LlmCall(
             step=step.index,
             skill=spec.skill,
-            skill_version=previous.skill_version,
+            skill_version=previous.skill_version if step.skill is None else step.skill.version,
             backend=previous.backend,
             model=previous.model,
             cached=True,
             schema_valid=True,
             model_alias=spec.model,
-            input_hash=sha256_hex(run.data),
+            input_hash=sha256_hex(viewed),
             request={"skill": spec.skill, "model": spec.model, "reused_input_hash": key},
             response=output,
             intents=raw,
@@ -1097,7 +1152,10 @@ def _reuse(
     except (_DataError, ValidationError):
         return None
     violations = len(run.violations)
-    accepted, rejected = run.propose(raw, plugin, f"skill:{spec.skill}", step.index, spec.skill, 0)
+    proposer = _proposer(plugin, step.skill)
+    accepted, rejected = run.propose(
+        raw, proposer, f"skill:{spec.skill}", step.index, spec.skill, 0
+    )
     if rejected is not None:
         # E.g. a target bound to `{{date}}` moved on: a cache miss, not a failure.
         del run.violations[violations:]
@@ -1111,10 +1169,20 @@ async def _llm_step(run: _Run, step: _Planned) -> _Outcome:
     spec, plugin, backend = step.llm, step.skill_plugin, run.llm
     if spec is None or plugin is None or backend is None:  # pragma: no cover (planned)
         raise RuntimeError("an llm step is planned with its spec, plugin and backend")
-    key = _cache_key(run, spec, plugin)
-    reused = _reuse(run, step, spec, plugin, key)
+    skill = step.skill
+    try:
+        viewed = run.data if skill is None else _json_copy(skill.view(run.data), "viewed input")
+    except _DataError as error:
+        return _Outcome("degraded", StepError(kind=error.kind, message=error.message), stop=True)
+    except Exception as error:  # a skill bug must not crash the run
+        message = f"unexpected {type(error).__name__} applying the input view"
+        return _Outcome("degraded", StepError(kind="host_error", message=message), stop=True)
+    key = _cache_key(run, spec, plugin, skill, viewed)
+    reused = _reuse(run, step, spec, plugin, key, viewed)
     if reused is not None:
         return reused
+    prompt = None if skill is None else skill.prompt
+    output_schema = None if skill is None else dict(skill.output_schema)
 
     def degraded(kind: str, message: str) -> _Outcome:
         return _Outcome("degraded", StepError(kind=kind, message=_cap(message)), stop=True)
@@ -1133,7 +1201,17 @@ async def _llm_step(run: _Run, step: _Planned) -> _Outcome:
             usd=spec.budget.usd - spent_usd, tokens_out=spec.budget.tokens_out - spent_tokens
         )
         request = LlmRequest(
-            spec.skill, spec.model, _json_copy(run.data), budget, remaining, attempt, repair
+            spec.skill,
+            spec.model,
+            _json_copy(viewed),
+            budget,
+            remaining,
+            attempt,
+            repair,
+            prompt=prompt,
+            output_schema=None if output_schema is None else copy.deepcopy(output_schema),
+            skill_version=None if skill is None else skill.version,
+            skill_digest=None if skill is None else skill.digest,
         )
         try:
             async with asyncio.timeout(remaining):
@@ -1171,7 +1249,7 @@ async def _llm_step(run: _Run, step: _Planned) -> _Outcome:
             llm_call = LlmCall(
                 step=step.index,
                 skill=spec.skill,
-                skill_version=response.skill_version,
+                skill_version=response.skill_version if skill is None else skill.version,
                 backend=response.backend,
                 model=response.model,
                 cached=response.cached,
@@ -1198,7 +1276,8 @@ async def _llm_step(run: _Run, step: _Planned) -> _Outcome:
             return degraded("budget_exceeded", "the LLM step spent more than its budget")
         if not errors:
             source = f"skill:{spec.skill}"
-            accepted, rejected = run.propose(raw, plugin, source, step.index, spec.skill, 0)
+            proposer = _proposer(plugin, skill)
+            accepted, rejected = run.propose(raw, proposer, source, step.index, spec.skill, 0)
             if rejected is not None:
                 return _Outcome("failed", rejected, stop=True)
             run.data, run.input_hash = output, key
@@ -1227,6 +1306,7 @@ async def execute(
     plugins: PluginRegistry,
     tools: ToolCaller,
     llm: LlmBackend | None = None,
+    skills: SkillSource | None = None,
     dry_run: bool = False,
     previous: PreviousLlm | None = None,
     models: Mapping[str, str] | None = None,
@@ -1243,6 +1323,10 @@ async def execute(
     - `started_at`: the run's start, the value given to `Store.begin_run` (the record keeps it).
     - `tools` is called for `collect` and `transform` only; `act` / `notify` entries are
       routed to, never called (ADR 0002).
+    - `skills`: loads the `llm` step's skill while planning (`skill_invalid` when it cannot);
+      its prompt, output schema and version go into each `LlmRequest`, its input view
+      restricts what the model sees, and its version and digest join the cache key. Without
+      it (fakes and older callers) the request carries the whole input and no prompt.
     - `previous`: the last accepted LLM output (`Store.last_accepted_llm`), for the
       unchanged-input path. `models`: model alias to concrete model (`horae.yaml`), part of
       the LLM cache key.
@@ -1273,7 +1357,7 @@ async def execute(
     status: RunStatus = "ok"
     run_error: str | None = None
     try:
-        plan = _plan(pipeline, context, plugins, llm is not None)
+        plan = _plan(pipeline, context, plugins, llm is not None, skills)
     except _PlanError as error:
         plan = ()
         status, run_error = "failed", f"step {error.index}: {error.error.message}"

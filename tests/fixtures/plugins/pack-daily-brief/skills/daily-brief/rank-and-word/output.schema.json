@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "summary",
+    "ranked"
+  ],
+  "properties": {
+    "summary": {
+      "type": "string",
+      "maxLength": 500
+    },
+    "ranked": {
+      "type": "array",
+      "maxItems": 50,
+      "items": {
+        "$ref": "#/$defs/line"
+      }
+    }
+  },
+  "$defs": {
+    "line": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "title",
+        "why"
+      ],
+      "properties": {
+        "title": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "why": {
+          "enum": [
+            "overdue",
+            "today",
+            "later"
+          ]
+        }
+      }
+    }
+  }
+}

@@ -25,6 +25,9 @@ Synthetic plugins for the plugin host tests (#24), both run with the test interp
   Its tools report the environment, sleep, crash, write stderr, propose intents through
   `_meta["dev.horae/intents"]`, echo values and start a child process. The secret it declares
   (`PROBE_TOKEN`) is a synthetic value the tests write to a temporary secrets directory.
+- `pack-daily-brief/`: a skill-only pack (no runtime, #27) shipping the minimal
+  `daily-brief/rank-and-word` skill (`skills/daily-brief/rank-and-word/`: `skill.yaml`,
+  `prompt.md`, `output.schema.json`), used by the skill loader and engine tests.
 - `raw/raw_server.py`: a hand-written JSON-RPC server that misbehaves on purpose (junk and
   oversized messages, error responses, a sampling request, a startup that never answers, a
   process that ignores `SIGTERM`).

@@ -15,7 +15,7 @@ from horae.contracts.pipeline import LlmStep, Pipeline
 from horae.contracts.run import RunRecord, RunStatus
 from horae.engine.canonical import pipeline_digest
 from horae.engine.executor import execute
-from horae.engine.ports import PluginRegistry, ResolvedPlugin, UnknownPlugin
+from horae.engine.ports import PluginRegistry, ResolvedPlugin, SkillSource, UnknownPlugin
 from horae.replay._lock import pipeline_refs
 from horae.replay._tape import (
     RecordedLlm,
@@ -348,6 +348,7 @@ async def replay_async(
     lock_digest: str | None = None,
     config_digest: str | None = None,
     clock: Callable[[], datetime.datetime] | None = None,
+    skills: SkillSource | None = None,
 ) -> ReplayResult:
     """`replay`, as a coroutine."""
     current = None if pipeline is None else pipeline_digest(pipeline)
@@ -394,6 +395,7 @@ async def replay_async(
         plugins=_Snapshot(plugins, chosen),
         tools=tools,
         llm=llm,
+        skills=skills,
         dry_run=record.dry_run,
         previous=recorded_previous(record),
         models=used_models,
@@ -429,6 +431,7 @@ def replay(
     lock_digest: str | None = None,
     config_digest: str | None = None,
     clock: Callable[[], datetime.datetime] | None = None,
+    skills: SkillSource | None = None,
 ) -> ReplayResult:
     """Re-execute `record` from the record alone, and compare.
 
@@ -446,6 +449,9 @@ def replay(
     - `lock_digest` / `config_digest`: the current instance's (`horae.config.Instance`), to
       compare with the recorded ones; `None` skips the check.
     - `clock` gives the replayed record's timestamps (default: frozen at the run's start).
+    - `skills`: the skill source of the run (#27), for a run whose `llm` step loaded a skill:
+      the input view and the skill's version and digest are part of what is compared (the
+      viewed input's hash and the cache key), so an edited skill replays as different.
 
     Not for use inside a running event loop: use `replay_async` there."""
     return asyncio.run(
@@ -458,5 +464,6 @@ def replay(
             lock_digest=lock_digest,
             config_digest=config_digest,
             clock=clock,
+            skills=skills,
         )
     )

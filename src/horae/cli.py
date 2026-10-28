@@ -20,7 +20,7 @@ from pydantic import ValidationError
 from horae import __version__
 from horae.apply import LocalSink, SinkRegistry, StaticSinks, plan_changes, to_json
 from horae.apply.render import render_text
-from horae.cli_host import host_sinks, instance_problems, load, uses_host
+from horae.cli_host import PLUGINS_DIR, host_sinks, instance_problems, load, uses_host
 from horae.cli_output import (
     EXIT_DIFFERENT,
     EXIT_INTERNAL,
@@ -56,6 +56,7 @@ from horae.config import (
 from horae.contracts import InstanceConfig, RunRecord
 from horae.replay import LockRegistry, ReplayResult, definition_for, replay
 from horae.runner import lock_is_free
+from horae.skills import DirectorySkills
 from horae.store import MAX_LIST_RUNS, RunSummary, Store, StoreError
 
 EXIT_CODES_HELP = (
@@ -484,6 +485,14 @@ def _replay(instance: Path, store: Path | None, run_id: str, against_current: bo
             ),
         )
     models = {alias: spec.model for alias, spec in loaded.config.models.items()}
+    # Skills are read from the installed plugins (local files only, #27); without them a run
+    # whose `llm` step loaded a skill replays as different (the viewed input and key differ).
+    plugins_dir = instance / PLUGINS_DIR
+    skills = (
+        DirectorySkills({name: plugins_dir / name for name in loaded.lock.plugins})
+        if plugins_dir.is_dir()
+        else None
+    )
     return replay(
         record,
         current,
@@ -492,6 +501,7 @@ def _replay(instance: Path, store: Path | None, run_id: str, against_current: bo
         against_current=against_current,
         lock_digest=loaded.lock_digest(),
         config_digest=loaded.config_digest(),
+        skills=skills,
     )
 
 
