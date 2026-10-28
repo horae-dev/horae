@@ -110,7 +110,10 @@ JSON Schema cannot express these; the models enforce them and the tests pin the 
   `applied_by_call` are all set or all absent (the JSON Schema's `dependentRequired` checks
   presence, the model also rejects an explicit `null` next to a value); `pipeline_definition`
   is a valid pipeline named `pipeline`, at most 64 KiB as compact JSON (decision 33).
-- `plugin-manifest`: the host of an `mcp-http` `runtime.url` is listed in `permissions.network`.
+- `plugin-manifest`: the host of an `mcp-http` `runtime.url` is listed in `permissions.network`;
+  no tool in `provides` is a sink operation of the plugin's own sink or notifier namespaces
+  (`<ns>.read`, `<ns>.apply`, `<ns>.restore`, `<ns>.parent_exists`, `<ns>.identity`,
+  decision 36).
 - Hosts (`permissions.network`, every `https` URL): a label starting with `xn--` must be a valid
   IDNA A-label. It must round-trip through Python's `idna` codec (IDNA2003, so no runtime
   dependency) and decode to letters, marks, digits and `-` only. The second rule rejects what
@@ -401,9 +404,9 @@ loosened later without breaking a valid file.
       `horae.apply.notes`, and builds task, notification and HTTP previews from the intent
       alone, without calling the sink, so a plugin cannot show one change and make another.
       What a sink returns is type-checked at runtime (`bytes` or `None`, else
-      `preview_invalid`). Over MCP (#24) note bytes travel base64-encoded, at most 16 MiB
-      (`MAX_NOTE_BYTES`, `note_too_large`). The sink receives a deep copy of the intent and
-      its entry's parameters;
+      `preview_invalid`). Over MCP note bytes travel base64-encoded, at most
+      `MAX_MCP_NOTE_BYTES` (about 5.95 MiB, decision 36; `note_too_large`). The sink receives
+      a deep copy of the intent and its entry's parameters;
     - **(D2) Horae never creates content in a note it does not own.** A note is owned when
       its file name ends in `.assistant.md`, decided on the path the sink resolved without
       following symlinks. `note.create` (`note_exists` if present) and `note.append_section`
@@ -594,8 +597,8 @@ loosened later without breaking a valid file.
       the sink an entry's tool resolves to now has another identity than the one recorded
       (e.g. `--vault` names an empty or another vault). A note missing together with its
       directory is never "already restored" when a change of it was applied
-      (`parent_missing`: `RestorableSink.parent_exists`). Carrying the identity over MCP is
-      left to #24;
+      (`parent_missing`: `RestorableSink.parent_exists`). Over MCP the identity is
+      the plugin's (decision 36);
     - **undo restores bytes, not intents.** `RestorableSink` adds `read_target(target)`,
       `parent_exists(target)` and `restore(target, content, *, expected_sha256)`
       (`content=None` removes the note), a compare-and-swap. A synthetic `apply` was
@@ -749,3 +752,118 @@ loosened later without breaking a valid file.
       call timeout; the run timeout (#19) bounds the whole. Group termination cannot reach a
       descendant that left the group (`setsid`/`setpgid`), and the final `killpg` after the
       leader is reaped has a (very unlikely) PID-reuse race; both are M5's (#50, #51).
+
+### Provisional decisions (#25, pending maintainer review)
+
+36. **Plugin sinks, fixture plugins and the walking skeleton (#25).** One contract rule (the
+    manifest's reserved sink operation names, a pydantic-only rule: the generated schemas do
+    not change). The rules (`horae.plugins.host.sink`, `horae.plugins.builtin`,
+    `horae.runner.open_ports`):
+    - **sink operations by convention.** An `act` / `notify` entry's tool (`<ns>.<tool>`, in
+      `provides.sinks` or `provides.notifiers`) is never called. The core applies the intents
+      routed to it through five tools of the same plugin, named `<ns>.read`, `<ns>.apply`,
+      `<ns>.restore`, `<ns>.parent_exists` and `<ns>.identity`
+      (`horae.contracts.plugin.SINK_OPERATIONS`), which the plugin lists in `tools/list` but
+      **not** in `provides`, so no pipeline step can call them (the engine only calls provided
+      tools); the core calls them with `PluginHost.call_operation` (same process, timeouts,
+      restart and redaction as any call). `McpSinks` is the `SinkRegistry` (`Ports.sinks`):
+      one `McpSink` per (plugin, namespace);
+    - **reserved names.** The manifest contract refuses a plugin that provides `<ns>.<op>` for
+      an operation `op` and one of its own sink or notifier namespaces `ns`; `HostRegistry`
+      refuses any plugin providing a sink operation name of **any** installed plugin's
+      namespaces (and a manifest built without validation). `call_operation` only calls
+      `tool == f"{ns}.{op}"` with `op` in `SINK_OPERATIONS`, `ns` a sink or notifier namespace
+      of that plugin and `tool` provided by no plugin (`tool_missing` otherwise): it is not a
+      way to call arbitrary unprovided tools;
+    - **the core computes the bytes (D1 of decision 32).** For a `note.*` intent `McpSink.apply`
+      reads the note (`<ns>.read`), checks the planned SHA-256 (`target_changed`), computes the
+      new bytes with `horae.apply.notes.note_after` and sends them to `<ns>.apply` with
+      `expected_before_sha256`: the plugin only writes them, atomically, if the note still has
+      that digest, and reports the digest of what it wrote. Other intents are passed through
+      (`content` and `expected_before_sha256` `null`). `restore` is the same compare-and-swap
+      for undo (`content: null` removes the note);
+    - **`apply_mismatch` over MCP has no `actual_after`.** A sink reporting another digest than
+      the planned one fails the change with `apply_mismatch`; only the digest came back, not
+      the bytes, so the journal entry keeps `applied = 0` without `actual_after`, and
+      `horae undo` takes the note for "changed since": restoring it needs `--force` (which
+      keeps the overwritten bytes in the journal, decision 34);
+    - **double read (accepted).** `apply_changes` reads a note to check it against the plan,
+      and `McpSink.apply` reads it again to build the bytes it sends: two `<ns>.read` per note
+      change. The adapter never sends bytes computed from a read it did not make itself, notes
+      are small, and merging the reads would couple the adapter to the apply phase;
+    - **one note-size cap over MCP.** Note bytes are standard base64, at most
+      `MAX_MCP_NOTE_BYTES` = (`MAX_MESSAGE_BYTES` 8 MiB − a 64 KiB envelope margin) × 3/4 =
+      6,242,304 bytes (about 5.95 MiB) decoded, either way (`note_too_large`; the built-in
+      `LocalFileSink` keeps 16 MiB). A sink sends each result once, as `structuredContent`
+      with a short text block (no second copy of the payload). The cap is checked before
+      encoding on both sides: `McpSink.apply` / `restore` refuse larger content before the
+      call, and `file-sink.read` of a larger note returns `note_too_large` (never an oversized
+      message, which would cost the plugin its process with `output_too_large`). Malformed
+      results are `output_invalid`. A sink error is a result `{"error": {"kind", "message"}}`:
+      the kind must match `^[a-z_]{1,32}$` (else `host_error`), the message (already redacted
+      by the host) loses its control and format characters and is capped at 500 characters. A
+      host failure becomes `SinkError` with the host's kind (`timeout`, `plugin_crashed`,
+      `tool_missing`…);
+    - **`secret_in_output` from sink operations.** It is logged by secret name only (the host
+      redacted the value) and kept by `McpSinks`; `apply_changes` adds those collected during
+      a run (the runner's diff and apply) to `RunRecord.violations`
+      (`McpSinks.take_violations`, deduplicated, at most 256 in all). Outside a run
+      (`horae undo`, a dry run's diff built outside the runner) there is no record: they are
+      only logged;
+    - **trusted configuration.** `horae.yaml` has no per-plugin configuration in v1, so every
+      sink operation receives `paths`, the plugin's path permissions as approved in
+      `horae.lock`, and every tool call carries them in `_meta["dev.horae/paths"]`.
+      `file-sink` writes to its single `paths.write` entry (`vault_unset` without one,
+      `config_invalid` otherwise); its manifest asks for no path, since where the vault is is
+      the user's choice, granted in the lock. **This channel stays for v1**: M4's
+      `horae plugin add` (#44) must carry the `paths.write` entry into the lock it writes (a
+      per-plugin configuration in `horae.yaml` is a later decision);
+    - **identity (decision 34).** `mcp:<plugin>:<what <ns>.identity returns>` (its SHA-256 when
+      longer than 512 characters). `sink_identity` stays synchronous, with a **mandatory**
+      asynchronous prepare done by the core: a registry may have `prepare(tools)`, which
+      `horae.apply.prepare_sinks` awaits before any identity is read, with only the tools
+      about to be used (`apply_changes`: the run's `applied_by` tools, so a `notify.push` or
+      `task.*` change, which reads nothing first, still journals its identity; `undo_run`:
+      the journal's undoable entries). No caller prepares by hand. Until it is fetched the
+      identity raises `identity_unknown`. Definitive failures (`identity_invalid`,
+      `vault_unset`, `config_invalid`) are cached; any other kind (host kinds: a timeout, a
+      crash) is retried once on the next prepare, then cached. `file-sink` returns
+      `local:<st_dev>:<st_ino>:<real path>` of its vault, so undo refuses another vault
+      (`sink_mismatch`). The prefix keeps a plugin from claiming the identity of the built-in
+      `LocalFileSink`: `horae undo --vault` refuses a run applied through `file-sink` until #26
+      wires undo to the plugin host;
+    - **built-in fixture plugins.** `fixture-source` (`fixture-source.serve`, data and intents
+      from a JSON fixture file, default the packaged one; a `file` must be a regular file whose
+      real path is inside a `paths.read` entry approved in the lock, opened with `O_NONBLOCK`
+      and checked with `fstat`; its manifest asks for no path, and the walking skeleton's lock
+      grants none, so only the packaged fixture is served there) and `file-sink`
+      (`file-sink.write_note`, built on `LocalFileSink`, so the same path and write rules) are
+      stdio MCP servers in `horae.plugins.builtin`, version 0.1.0. Their packaged manifests run
+      `python3 -m <module>`; `horae.plugins.builtin.install(directory)` writes them to
+      `<directory>/<name>/plugin.yaml` (mode 0644, a temporary file then `os.replace`, no
+      symbolic link followed for the directories, `InstallError` when `sys.executable` is
+      empty) with the command pinned to the running interpreter, until M4 installs plugins
+      into their own environments (#44, #46);
+    - **placeholder commit for built-ins.** The walking skeleton's lock pins both plugins at
+      commit `0000000000000000000000000000000000000000` (a commit of the core cannot name the
+      commit that contains it). It is **not fetched**: the plugins ship inside the core. M4's
+      fetch and verify (#44, #46) must special-case built-in plugins rather than try to
+      resolve that commit;
+    - **live ports.** `horae.runner.open_ports(instance, plugins_dir)` builds the
+      `HostRegistry` (`HostRegistry.from_directory`), opens a `PluginHost`
+      (`host_for_instance`) and `McpSinks` for one run or one undo, and closes the host at the
+      end of the block. Where plugins are installed is M4's; the CLI wiring (and so
+      `open_ports` in `horae run` / `horae undo`) is #26;
+    - **the walking skeleton** (`examples/walking-skeleton`) pins both plugins with the
+      placeholder commit and a vault path to replace (in a copy of the directory);
+      `tests/test_e2e.py` builds its lock from it at test time. The end-to-end test runs dry
+      run (under the write guard, which then allows the plugins' processes and Horae's own
+      state: the store, `<state_dir>/locks` and `<state_dir>/plugin-runs`; the vault is also
+      compared byte for byte), run, replay and undo with real subprocesses, and fails when the
+      module takes 60 s or more;
+    - **store first open (a flake fix found here).** `Store.open` (writable) initialises a
+      database (create, WAL, migrate) under a POSIX advisory lock `<db>.init.lock` (0600,
+      `O_NOFOLLOW`, `flock` retried with full-jitter backoff for at most the busy timeout, then
+      `StoreBusy`); an open whose database header already says WAL and the current schema
+      version skips it. Read-only opens never take it nor create the file. The lock file is
+      left in place (removing it would race with the next opener).

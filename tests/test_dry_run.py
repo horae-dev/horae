@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """`--dry-run` writes nothing anywhere (PLAN.md §2.2, #21), enforced.
 
-An autouse guard replaces every Python-level way this process could write a file, change
-file metadata, open a network connection, resolve a host name or start a process. Each
-attempt is recorded (and raises, unless caught) and fails the test at teardown, so code that
-swallows exceptions cannot hide one. The only place a test may write to is its own `scratch`
+An autouse guard (`write_guard.arm`, shared with the end-to-end test) replaces every
+Python-level way this process could write a file, change file metadata, open a network
+connection, resolve a host name or start a process. Each attempt is recorded (and raises,
+unless caught) and fails the test at teardown, so code that swallows exceptions cannot hide
+one. The only place a test may write to is its own `scratch`
 directory, and Horae's own state database (`<state_dir>/horae.db` and its `-wal`, `-shm` and
 `-journal` files: Horae's state, not user data, which `horae run --dry-run` will record its
 run in, #26; schemas decision 32, D5). The vault and the instance (with its state database)
@@ -13,24 +14,22 @@ and mtimes, and the database's `user_version`. SQLite may only be opened on thos
 read-only (`mode=ro` in a `file:` URI).
 
 Out of scope: writes made below Python (`ctypes`, C extensions calling libc directly) and
-plugin subprocesses (the #24 host's sandbox covers those; no process can start here).
+plugin subprocesses (no process can start here; `tests/test_e2e.py` allows the built-in
+plugins' and compares the vault byte for byte).
 """
 
+import _posixsubprocess
 import _socket
 import asyncio
-import builtins
-import io
+import multiprocessing
 import os
 import pty
-import shutil
 import socket
 import sqlite3
 import subprocess
 import sys
 from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Any
-from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from typer.testing import CliRunner
@@ -41,72 +40,7 @@ from horae.apply.testing import FixtureSink
 from horae.cli import EXIT_OK, app
 from horae.config import STORE_FILE
 from horae.store import Store
-
-_WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_TRUNC
-_PATH_TYPES = (str, bytes, os.PathLike)
-
-_OS_PATH_OPS = {
-    # name: how many leading arguments are paths
-    "replace": 2,
-    "rename": 2,
-    "renames": 2,
-    "link": 2,
-    "symlink": 2,
-    "unlink": 1,
-    "remove": 1,
-    "rmdir": 1,
-    "removedirs": 1,
-    "mkdir": 1,
-    "makedirs": 1,
-    "truncate": 1,
-    "chmod": 1,
-    "lchmod": 1,
-    "chown": 1,
-    "lchown": 1,
-    "utime": 1,
-    "mkfifo": 1,
-    "mknod": 1,
-    "setxattr": 1,
-    "removexattr": 1,
-    "chflags": 1,
-    "lchflags": 1,
-}
-_OS_NEVER = (
-    "system",
-    "posix_spawn",
-    "posix_spawnp",
-    "fork",
-    "forkpty",
-    "execv",
-    "execve",
-    "execvp",
-    "execvpe",
-    "ftruncate",
-    "fchmod",
-    "fchown",
-)
-
-
-class Forbidden(Exception):
-    """A write, connection or process the dry run must never make."""
-
-
-def _tree(root: Path) -> dict[str, tuple[bytes | None, int, int]]:
-    """Everything under `root` (itself included): bytes (`None` for a directory), mode and
-    mtime, without following symlinks."""
-    entries = {}
-    for path in [root, *sorted(root.rglob("*"))]:
-        info = path.lstat()
-        data = path.read_bytes() if path.is_file() and not path.is_symlink() else None
-        entries[str(path.relative_to(root))] = (data, info.st_mode, info.st_mtime_ns)
-    return entries
-
-
-def _user_version(db: Path) -> int:
-    with sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro&immutable=1", uri=True) as conn:
-        version: int = conn.execute("PRAGMA user_version").fetchone()[0]
-    conn.close()
-    return version
+from write_guard import Forbidden, arm, tree, under, user_version
 
 
 @pytest.fixture
@@ -135,91 +69,15 @@ def guard(
     scratch = os.path.realpath(tmp_path / "scratch")
     os.mkdir(scratch)
     db = stored / "state" / STORE_FILE
-    before = _tree(vault), _tree(stored), _user_version(db)
-    seen: list[str] = []
-
-    def forbid(what: str) -> None:
-        seen.append(what)
-        raise Forbidden(what)
-
+    before = tree(vault), tree(stored), user_version(db)
     state_db = os.path.realpath(db)
     state_files = {state_db + suffix for suffix in ("", "-wal", "-shm", "-journal")}
-
-    def allowed(path: Any) -> bool:
-        if not isinstance(path, _PATH_TYPES):
-            return False
-        real = os.path.realpath(os.fsdecode(path))
-        return real in state_files or os.path.commonpath([scratch, real]) == scratch
-
-    real_open, real_os_open, real_connect = builtins.open, os.open, sqlite3.connect
-
-    def guarded_open(file: Any, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
-        if any(flag in mode for flag in "wax+") and not allowed(file):
-            forbid(f"open({file!r}, {mode!r})")
-        return real_open(file, mode, *args, **kwargs)
-
-    def guarded_os_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
-        if flags & _WRITE_FLAGS and not allowed(path):
-            forbid(f"os.open({path!r}, {flags:#o})")
-        return real_os_open(path, flags, *args, **kwargs)
-
-    def guarded_connect(database: Any, *args: Any, **kwargs: Any) -> Any:
-        uri = kwargs.get("uri", False)
-        if uri and isinstance(database, str) and database.startswith("file:"):
-            parts = urlsplit(database)
-            if parse_qs(parts.query).get("mode") == ["ro"] or allowed(parts.path):
-                return real_connect(database, *args, **kwargs)
-        elif allowed(database):
-            return real_connect(database, *args, **kwargs)
-        forbid(f"sqlite3.connect({database!r})")
-
-    def path_op(name: str, real: Any, paths: int) -> Any:
-        def guarded(*args: Any, **kwargs: Any) -> Any:
-            if kwargs.get("dir_fd") is not None or not all(allowed(a) for a in args[:paths]):
-                forbid(f"{name}{args!r}")
-            return real(*args, **kwargs)
-
-        return guarded
-
-    def never(name: str) -> Any:
-        def guarded(*args: Any, **kwargs: Any) -> Any:
-            forbid(f"{name}{args!r}")
-
-        return guarded
-
-    class GuardedSocket(_socket.socket):
-        connect = never("_socket.socket.connect")
-        connect_ex = never("_socket.socket.connect_ex")
-
-    monkeypatch.setattr(builtins, "open", guarded_open)
-    monkeypatch.setattr(io, "open", guarded_open)
-    monkeypatch.setattr(os, "open", guarded_os_open)
-    monkeypatch.setattr(sqlite3, "connect", guarded_connect)
-    for name, paths in _OS_PATH_OPS.items():
-        if hasattr(os, name):
-            monkeypatch.setattr(os, name, path_op(f"os.{name}", getattr(os, name), paths))
-    for name in _OS_NEVER:
-        if hasattr(os, name):
-            monkeypatch.setattr(os, name, never(f"os.{name}"))
-    monkeypatch.setattr(pty, "fork", never("pty.fork"))
-    monkeypatch.setattr(shutil, "rmtree", never("shutil.rmtree"))
-    for name in ("connect", "connect_ex", "sendto", "sendmsg", "bind"):
-        monkeypatch.setattr(socket.socket, name, never(f"socket.{name}"))
-    # `_socket.socket` is an immutable C type: replace it with a guarded subclass.
-    monkeypatch.setattr(_socket, "socket", GuardedSocket)
-    for name in (
-        "create_connection",
-        "getaddrinfo",
-        "gethostbyname",
-        "gethostbyname_ex",
-        "gethostbyaddr",
-    ):
-        monkeypatch.setattr(socket, name, never(f"socket.{name}"))
-    monkeypatch.setattr(subprocess, "Popen", never("subprocess.Popen"))
+    in_scratch = under(Path(scratch))
+    seen = arm(monkeypatch, lambda real: real in state_files or in_scratch(real))
     yield seen
     monkeypatch.undo()
     assert seen == [], f"the dry run tried to write: {seen}"
-    assert (_tree(vault), _tree(stored), _user_version(db)) == before
+    assert (tree(vault), tree(stored), user_version(db)) == before
 
 
 async def _dry_run(sinks: StaticSinks) -> ChangeSet:
@@ -263,8 +121,8 @@ def test_dry_run_with_the_local_sink_only_reads_the_vault(vault: Path) -> None:
 
 def test_horae_diff_writes_nothing(stored: Path, vault: Path) -> None:
     state = stored / "state"
-    listing = _tree(state)
-    version = _user_version(state / STORE_FILE)
+    listing = tree(state)
+    version = user_version(state / STORE_FILE)
     runner = CliRunner()
     for extra in ([], ["--json"], ["--color"]):
         result = runner.invoke(
@@ -272,8 +130,8 @@ def test_horae_diff_writes_nothing(stored: Path, vault: Path) -> None:
         )
         assert result.exit_code == EXIT_OK, result.output
         assert DAILY in result.output
-    assert _tree(state) == listing
-    assert _user_version(state / STORE_FILE) == version
+    assert tree(state) == listing
+    assert user_version(state / STORE_FILE) == version
 
 
 def test_the_engine_calls_no_sink_during_a_dry_run() -> None:
@@ -336,11 +194,20 @@ def test_the_guard_catches_writes(
         with pytest.raises(Forbidden):
             attempt()
     assert len(guard) == len(attempts)
+    # Below Popen: multiprocessing's spawn start method calls `_posixsubprocess.fork_exec`.
+    guard.clear()
+    process = multiprocessing.get_context("spawn").Process(target=print)
+    with pytest.raises(Forbidden):
+        process.start()
+    assert any("fork_exec" in attempt for attempt in guard), guard
+    with pytest.raises(Forbidden):
+        _posixsubprocess.fork_exec()  # type: ignore[call-arg]
+    guard.clear()
     scratch = tmp_path / "scratch"
     (scratch / "ok.txt").write_text("allowed")
     os.chmod(scratch / "ok.txt", 0o600)
     sqlite3.connect(scratch / "ok.db").close()
-    assert _user_version(stored / "state" / STORE_FILE) > 0  # read-only: allowed
+    assert user_version(stored / "state" / STORE_FILE) > 0  # read-only: allowed
     for name in ("x.db", "horae.db-other"):
         with pytest.raises(Forbidden):
             sqlite3.connect(stored / "state" / name)

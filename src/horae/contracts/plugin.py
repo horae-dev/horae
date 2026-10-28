@@ -41,6 +41,11 @@ checked, not the license list."""
 
 CommandArg = Annotated[str, Strict(), StringConstraints(pattern=r"^[^\x00]+$", max_length=4096)]
 
+SINK_OPERATIONS = ("read", "apply", "restore", "parent_exists", "identity")
+"""The sink operations (`horae.plugins.host.sink`, #25): for every namespace `<ns>` of a
+plugin's `provides.sinks` and `provides.notifiers`, only the core calls `<ns>.<operation>`, a
+tool the plugin lists in `tools/list` but may not provide (so no pipeline step can call it)."""
+
 
 class Provides(Contract):
     """What the plugin provides. Tools are `<namespace>.<tool>`; see `PluginRef` for how a
@@ -101,6 +106,24 @@ class HttpRuntime(Contract):
 Runtime = Annotated[StdioRuntime | HttpRuntime, Field(discriminator="protocol")]
 
 
+TOOL_KINDS = ("sources", "transforms", "sinks", "notifiers")
+"""The `provides` fields that list tools."""
+
+
+def sink_namespaces(provides: Provides) -> frozenset[str]:
+    """The namespaces of `provides.sinks` and `provides.notifiers`."""
+    return frozenset(ref.split(".", 1)[0] for ref in (*provides.sinks, *provides.notifiers))
+
+
+def reserved_tools(provides: Provides) -> frozenset[str]:
+    """`<ns>.<operation>` for every sink or notifier namespace and every `SINK_OPERATIONS`."""
+    return frozenset(
+        f"{namespace}.{operation}"
+        for namespace in sink_namespaces(provides)
+        for operation in SINK_OPERATIONS
+    )
+
+
 class PluginManifest(Contract):
     """A plugin's `plugin.yaml`."""
 
@@ -121,6 +144,18 @@ class PluginManifest(Contract):
     runtime: Runtime | None = None
     """How to start or reach the plugin. Omitted for plugins that only ship skills or
     pipelines."""
+
+    @model_validator(mode="after")
+    def _sink_operations_not_provided(self) -> Self:
+        # Not expressible in JSON Schema: checked by the pydantic model only.
+        provided = {ref for kind in TOOL_KINDS for ref in getattr(self.provides, kind)}
+        clash = sorted(provided & reserved_tools(self.provides))
+        if clash:
+            raise ValueError(
+                f"{', '.join(clash)}: a sink operation of the plugin's own sink or notifier "
+                "namespace cannot be provided (only the core calls it)"
+            )
+        return self
 
     @model_validator(mode="after")
     def _runtime_host_declared(self) -> Self:

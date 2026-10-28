@@ -6,7 +6,9 @@ manifests (`plugin.yaml`). A manifest must be pinned in the lock at the same ver
 not ask for more than the user approved there (`network`, `secrets`, `paths`, `intents`): the
 **locked** permissions are the ones in force. A tool or skill resolves to the plugin whose
 manifest `provides` it (decision 11: the namespace need not be the plugin's name); two plugins
-providing the same ref is an error. Resolution reads only the documents given (#23).
+providing the same ref is an error, and so is providing a sink operation name
+(`<ns>.<operation>` of any plugin's sink or notifier namespace, #25). Resolution reads only
+the documents given (#23).
 
 **Host.** `PluginHost` is used for one run: `async with PluginHost(...) as host`. It is the
 run's `ToolCaller`:
@@ -39,6 +41,14 @@ run's `ToolCaller`:
 - **results**: `isError: true` is `tool_error`; the data is `structuredContent`, else a single
   text block that parses as JSON (PR #85 answer 9), else `output_invalid`; intents come from
   `_meta["dev.horae/intents"]` (a list) and are validated by the engine;
+- **sink operations** (`call_operation`): the core, never a pipeline step, may call a tool a
+  plugin lists in `tools/list` but not in `provides`, its sink operations
+  (`horae.plugins.host.sink`, #25), through the same process, timeouts and redaction. Only
+  `<ns>.<operation>` for an operation of `SINK_OPERATIONS` and a namespace of the plugin's
+  sinks or notifiers, which no plugin provides (the registry refuses a plugin providing one,
+  as the manifest contract does), else `tool_missing`;
+- **trusted paths**: every request carries the plugin's path permissions as approved in
+  `horae.lock` in `_meta["dev.horae/paths"]` (`horae.plugins.host.session`, #25);
 - **runtime.command is not pinned** against the lock in v1: the lock pins the plugin's
   version, commit and permissions, and the installed manifest's command is used as it is.
   Pinning it (and the plugin's files) is M4's install and verify work (#44, #46);
@@ -86,7 +96,15 @@ from horae.config import Instance
 from horae.config.documents import read_yaml, validate
 from horae.contracts.instance import PluginDefaults
 from horae.contracts.lockfile import Lockfile
-from horae.contracts.plugin import Permissions, PluginManifest, StdioRuntime
+from horae.contracts.plugin import (
+    SINK_OPERATIONS,
+    TOOL_KINDS,
+    Permissions,
+    PluginManifest,
+    StdioRuntime,
+    reserved_tools,
+    sink_namespaces,
+)
 from horae.contracts.run import Violation
 from horae.engine.ports import ResolvedPlugin, ToolResult, UnknownPlugin
 from horae.plugins.host import logs
@@ -104,7 +122,7 @@ STDERR_SETTLE_S = 0.5
 CAPTURE_MARGIN = MAX_EXPANSION * MAX_SECRET_BYTES
 """Bytes each stderr window keeps past its cut: the longest pattern any secret can produce."""
 _MAX_MESSAGE = 1000
-_PROVIDED = ("sources", "transforms", "sinks", "notifiers")
+_PROVIDED = TOOL_KINDS
 
 
 class RegistryError(ValueError):
@@ -170,6 +188,13 @@ class HostRegistry:
                 self._claim(self._tools, ref, name)
             for skill in provides.skills:
                 self._claim(self._skills, skill, name)
+        for name, plugin in self._plugins.items():
+            clash = sorted(set(self._tools) & reserved_tools(plugin.manifest.provides))
+            if clash:
+                raise RegistryError(
+                    f"plugin {name}: {', '.join(clash)} is a sink operation of its namespace "
+                    "and cannot be provided by any plugin"
+                )
 
     @staticmethod
     def _claim(index: dict[str, str], ref: str, name: str) -> None:
@@ -419,15 +444,64 @@ class PluginHost:
         except Exception:  # a host bug must never crash the run, nor leak a message
             raise PluginCallError("host_error", f"{ref}: unexpected host error") from None
 
+    async def call_operation(
+        self,
+        plugin: str,
+        tool: str,
+        arguments: dict[str, Any],
+        *,
+        timeout_s: float | None = None,
+    ) -> ToolResult:
+        """Call `plugin`'s sink operation `tool` (`horae.plugins.host.sink`), a tool it lists in
+        `tools/list` but not in `provides`, which only the core calls, never a pipeline step
+        (the engine's calls go through `call`, which requires `provides`). `tool` must be
+        `<ns>.<operation>` with `operation` in `SINK_OPERATIONS` and `<ns>` the namespace of
+        one of the plugin's `provides.sinks` or `provides.notifiers`, and no plugin may
+        provide it (`tool_missing` otherwise: this is not a way to call arbitrary unprovided
+        tools). Same process, timeouts, restarts, results and redaction as `call`; no input
+        `_meta`. Raises `PluginCallError` only."""
+        try:
+            try:
+                installed = self.registry.installed(plugin)
+            except UnknownPlugin:
+                raise PluginCallError("tool_missing", f"no installed plugin {plugin}") from None
+            namespace, _, operation = tool.partition(".")
+            provided = True
+            try:
+                self.registry.installed_for_tool(tool)
+            except UnknownPlugin:
+                provided = False
+            if (
+                operation not in SINK_OPERATIONS
+                or namespace not in sink_namespaces(installed.manifest.provides)
+                or provided
+            ):
+                raise PluginCallError("tool_missing", f"{tool} is not a sink operation of {plugin}")
+            return await self._call_on(installed, tool, arguments, None, timeout_s)
+        except PluginCallError as error:
+            raise self._redacted(error) from None
+        except Exception:  # a host bug must never crash the run, nor leak a message
+            raise PluginCallError("host_error", f"{tool}: unexpected host error") from None
+
     async def _call(
         self, ref: str, params: dict[str, Any], input: Any, timeout_s: float | None
     ) -> ToolResult:
-        if self._group is None:
-            raise PluginCallError("host_error", "the plugin host is not open")
         try:
             installed = self.registry.installed_for_tool(ref)
         except UnknownPlugin:
             raise PluginCallError("tool_missing", f"no installed plugin provides {ref}") from None
+        return await self._call_on(installed, ref, params, input, timeout_s)
+
+    async def _call_on(
+        self,
+        installed: InstalledPlugin,
+        ref: str,
+        params: dict[str, Any],
+        input: Any,
+        timeout_s: float | None,
+    ) -> ToolResult:
+        if self._group is None:
+            raise PluginCallError("host_error", "the plugin host is not open")
         name = installed.manifest.name
         entry = self._entries.setdefault(name, _Entry(installed))
         async with entry.lock:
@@ -461,8 +535,10 @@ class PluginHost:
         if ref not in process.tools:
             raise PluginCallError("tool_missing", f"{name} does not list {ref} in tools/list")
         timeout = timeout_s or self._timeouts(name).call_timeout_s
+        locked = entry.installed.manifest.permissions.paths
+        paths = {"read": list(locked.read), "write": list(locked.write)}
         try:
-            result = await process.call(ref, params, input, timeout)
+            result = await process.call(ref, params, input, timeout, paths=paths)
         except CallFailed as failed:
             await process.stop(forced=True)
             self._lost(entry)

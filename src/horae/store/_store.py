@@ -11,10 +11,12 @@ Errors: every failure is a `StoreError` subclass (see `horae.store._errors`); `V
 raised only for programming errors, i.e. arguments that are wrong whatever the database holds.
 """
 
+import fcntl
 import functools
 import hashlib
 import json
 import os
+import random
 import re
 import socket
 import sqlite3
@@ -339,6 +341,63 @@ def _prepare_files(path: Path) -> None:
     os.close(fd)
 
 
+INIT_LOCK_SUFFIX = ".init.lock"
+"""`<db>.init.lock`: the advisory lock that serialises first-open initialisation."""
+_HEADER = b"SQLite format 3\x00"
+
+
+def _initialised(path: Path) -> bool:
+    """Whether the main file's header already says WAL and the current schema version.
+
+    Both only move forward, so a stale header (the version still in a `-wal` file) only
+    makes `open` take the init lock when it did not need to, never the other way round."""
+    try:
+        with path.open("rb") as handle:
+            header = handle.read(100)
+    except OSError:
+        return False
+    if len(header) < 100 or not header.startswith(_HEADER):
+        return False
+    wal = header[18] == 2 and header[19] == 2
+    return wal and int.from_bytes(header[60:64], "big") == SCHEMA_VERSION
+
+
+def _backoff(delay: float, remaining: float) -> float:
+    """A full-jitter sleep (uniform in `[0, delay]`), never past `remaining`."""
+    return min(random.uniform(0, delay), remaining)  # noqa: S311 - jitter, not a secret
+
+
+@contextmanager
+def _init_lock(path: Path, timeout: float) -> Iterator[None]:
+    """Hold the POSIX advisory lock `<db>.init.lock` (0600, created if missing, never through
+    a symbolic link): `flock(LOCK_EX | LOCK_NB)` retried with jittered backoff for at most
+    `timeout`, then `StoreBusy`. Closing the descriptor releases it (also if the process
+    dies); the file is left in place (removing it would race with the next opener)."""
+    lock = path.with_name(path.name + INIT_LOCK_SUFFIX)
+    try:
+        fd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    except OSError as exc:
+        raise StoreError(f"cannot open the init lock {lock}: {exc.strerror}") from exc
+    try:
+        deadline = time.monotonic() + timeout
+        delay = 0.005
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise StoreBusy(
+                        "another process is initialising the database (init lock held)"
+                    ) from None
+                time.sleep(_backoff(delay, remaining))
+                delay = min(delay * 2, 0.1)
+        yield
+    finally:
+        os.close(fd)
+
+
 def _wal_attempt(conn: sqlite3.Connection) -> str:
     (mode,) = conn.execute("PRAGMA journal_mode").fetchone()
     if mode != "wal":
@@ -351,8 +410,9 @@ def _enable_wal(path: Path, timeout: float) -> None:
 
     The switch needs an exclusive lock and SQLite does not always wait for it with the busy
     handler, so concurrent first opens of a new database retry here, on a connection that does
-    not wait itself, with a backoff that never sleeps past `timeout` in total. Only
-    SQLITE_BUSY and SQLITE_LOCKED are retried."""
+    not wait itself, with a full-jitter backoff that never sleeps past `timeout` in total.
+    Only SQLITE_BUSY and SQLITE_LOCKED are retried. (`open` also runs it under the init lock,
+    so this only waits for connections that are not initialising.)"""
     conn = sqlite3.connect(path, timeout=0, autocommit=True)
     try:
         deadline = time.monotonic() + timeout
@@ -367,7 +427,7 @@ def _enable_wal(path: Path, timeout: float) -> None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise StoreBusy(f"cannot enable WAL mode: {exc}") from exc
-                time.sleep(min(delay, remaining))
+                time.sleep(_backoff(delay, remaining))
                 delay = min(delay * 2, 0.1)
     finally:
         conn.close()
@@ -461,6 +521,13 @@ class Store:
     ) -> Self:
         """Open (creating it if needed) and migrate the database at `path`.
 
+        **First open.** Creating the file, switching it to WAL and migrating it run under a
+        POSIX advisory lock, `<db>.init.lock` (0600, `flock`, waited for at most the busy
+        timeout, then `StoreBusy`), so concurrent first opens (several processes starting on
+        a new instance) initialise it once, one after the other. An open whose database
+        header already says WAL and the current schema version skips the lock (and never
+        creates the lock file).
+
         A new state directory is created 0700 and a new database file 0600; the umask is
         0077 while the connection opens, so `-wal` and `-shm` are private too (the umask is
         process-wide: open stores before starting threads that create files).
@@ -482,25 +549,34 @@ class Store:
             return cls._open_read_only(path, timeout)
         old_umask = os.umask(0o077)
         try:
-            _prepare_files(path)
-            try:
-                _enable_wal(path, timeout)
-                conn = sqlite3.connect(path, timeout=timeout, autocommit=True)
-            except sqlite3.Error as exc:
-                raise translate(exc) from exc
-            try:
-                conn.execute("PRAGMA foreign_keys = ON")
-                conn.execute("PRAGMA synchronous = NORMAL")
-                migrate(conn)
-                return cls._from_connection(conn, _path=path)
-            except sqlite3.Error as exc:
-                conn.close()
-                raise translate(exc) from exc
-            except BaseException:
-                conn.close()
-                raise
+            if _initialised(path):
+                return cls._open_initialised(path, timeout)
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            with _init_lock(path, timeout):
+                return cls._open_initialised(path, timeout)
         finally:
             os.umask(old_umask)
+
+    @classmethod
+    def _open_initialised(cls, path: Path, timeout: float) -> Self:
+        """Create, switch to WAL and migrate (each a no-op when done already), then wrap."""
+        _prepare_files(path)
+        try:
+            _enable_wal(path, timeout)
+            conn = sqlite3.connect(path, timeout=timeout, autocommit=True)
+        except sqlite3.Error as exc:
+            raise translate(exc) from exc
+        try:
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("PRAGMA synchronous = NORMAL")
+            migrate(conn)
+            return cls._from_connection(conn, _path=path)
+        except sqlite3.Error as exc:
+            conn.close()
+            raise translate(exc) from exc
+        except BaseException:
+            conn.close()
+            raise
 
     def close(self) -> None:
         if self._beat is not None:

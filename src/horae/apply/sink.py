@@ -32,8 +32,9 @@ intent and, for `note.*`, from the note's current bytes, with the conventions of
 with more than one hard link is refused, and ownership (`*.assistant.md`) is decided on that
 path (so a link cannot turn a user note into an owned one); `apply` (#22) must do the same.
 
-**Over MCP (#24)** note bytes travel base64-encoded and are capped at `MAX_NOTE_BYTES`
-(16 MiB) each way; the core checks the type and size of whatever comes back.
+**Over MCP (#25)** note bytes travel base64-encoded and are capped each way at
+`horae.plugins.host.sink.MAX_MCP_NOTE_BYTES` (about 5.95 MiB, below `MAX_NOTE_BYTES`: the
+host's JSON-RPC message cap); the core checks the type and size of whatever comes back.
 
 **Untrusted text.** Titles, bodies and note content in an intent are data from the proposer.
 A sink must treat them as data, never as markup to interpret, commands or further targets.
@@ -51,10 +52,12 @@ tell one vault from another. Reading it may raise `SinkError` (e.g. `vault_unset
 """
 
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, runtime_checkable
 
 from horae.contracts.intents import Intent
+from horae.contracts.run import Violation
 
 MAX_NOTE_BYTES = 16 * 1024 * 1024
 """The largest note read or written through a sink (16 MiB)."""
@@ -212,11 +215,46 @@ class RestorableSink(Sink, Protocol):
 
 
 class SinkRegistry(Protocol):
-    """Finds the sink for an entry's tool (`ProposedIntent.applied_by`)."""
+    """Finds the sink for an entry's tool (`ProposedIntent.applied_by`).
+
+    A registry may also have (the plugin host's `McpSinks` has both):
+
+    - `async prepare(tools)`: make the identity of the sinks serving `tools` readable
+      (`sink_identity` is synchronous, a plugin's identity is fetched over MCP). The core
+      awaits it (`prepare_sinks`) with the tools it is about to use before it reads any
+      identity: `apply_changes` for the run's `applied_by` tools, `undo_run` for the
+      journal's. It must not raise; a failure is raised when the identity is read;
+    - `take_violations()`: violations (e.g. `secret_in_output`) its sinks met since the last
+      call; `apply_changes` adds them to the run's `violations`."""
 
     def sink_for(self, tool: str) -> Sink | None:
         """The sink serving `tool`, or `None` if there is none."""
         ...
+
+
+async def prepare_sinks(sinks: SinkRegistry, tools: Iterable[str]) -> None:
+    """Await `sinks.prepare(tools)` when the registry has it (see `SinkRegistry`). Never
+    raises an `Exception`: a failure shows when an identity is read."""
+    prepare = getattr(sinks, "prepare", None)
+    if prepare is None:
+        return
+    try:
+        await prepare(tuple(sorted(set(tools))))
+    except Exception:  # the identity read reports it (identity_unknown or the sink's kind)
+        return
+
+
+def take_violations(sinks: SinkRegistry) -> tuple[Violation, ...]:
+    """`sinks.take_violations()` when the registry has it (see `SinkRegistry`), else `()`;
+    anything other than `Violation` objects is dropped."""
+    take = getattr(sinks, "take_violations", None)
+    if take is None:
+        return ()
+    try:
+        taken = tuple(take())
+    except Exception:
+        return ()
+    return tuple(item for item in taken if isinstance(item, Violation))
 
 
 @dataclass(frozen=True)

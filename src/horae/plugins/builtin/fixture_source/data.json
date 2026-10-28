@@ -1,0 +1,15 @@
+{
+  "data": {
+    "items": [
+      {"id": "fx-1", "title": "Water the plants", "due": "2026-10-28"},
+      {"id": "fx-2", "title": "Read chapter 3", "due": "2026-10-29"}
+    ]
+  },
+  "intents": [
+    {
+      "type": "note.replace_owned_block",
+      "block": "fixture",
+      "content": "- [ ] Water the plants (fx-1)\n- [ ] Read chapter 3 (fx-2)\n"
+    }
+  ]
+}
