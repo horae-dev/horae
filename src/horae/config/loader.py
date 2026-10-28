@@ -15,6 +15,7 @@ from horae.config.documents import Problem, ProblemsError, YamlDocument, read_ya
 from horae.contracts.instance import InstanceConfig, LlmBackend, ModelAlias, PluginDefaults
 from horae.contracts.lockfile import Lockfile
 from horae.contracts.pipeline import LlmStep, Pipeline
+from horae.engine.canonical import sha256_hex
 from horae.secrets import Secret, SecretError, SecretResolver
 
 CONFIG_FILE = "horae.yaml"
@@ -63,6 +64,19 @@ class Instance:
     def store_path(self) -> Path:
         """The SQLite store (`<state_dir>/horae.db`)."""
         return self.state_dir / STORE_FILE
+
+    def lock_digest(self) -> str:
+        """`RunRecord.lock_digest`: SHA-256 of the canonical JSON of `horae.lock` as validated
+        (plugins and permission lists sorted; an absent lockfile is an empty one)."""
+        return sha256_hex(self.lock.model_dump(mode="json"))
+
+    def config_digest(self) -> str:
+        """`RunRecord.config_digest`: SHA-256 of the canonical JSON of the `models` and `plugins`
+        sections of `horae.yaml` as validated (defaults filled in), what a run's LLM cache key
+        and plugins depend on. Other settings (time zone, state directory, timeouts) are not
+        part of it."""
+        data = self.config.model_dump(mode="json", include={"models", "plugins"})
+        return sha256_hex(data)
 
     @property
     def secrets_dir(self) -> Path:

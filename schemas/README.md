@@ -107,7 +107,8 @@ JSON Schema cannot express these; the models enforce them and the tests pin the 
 - `run-record`: `changes[].intent` is an index into `intents`; `finished_at` is not before
   `started_at` (run and step records); `intents[].applied_by`, `applied_by_step` and
   `applied_by_call` are all set or all absent (the JSON Schema's `dependentRequired` checks
-  presence, the model also rejects an explicit `null` next to a value).
+  presence, the model also rejects an explicit `null` next to a value); `pipeline_definition`
+  is a valid pipeline named `pipeline`, at most 64 KiB as compact JSON (decision 32).
 - `plugin-manifest`: the host of an `mcp-http` `runtime.url` is listed in `permissions.network`.
 - Hosts (`permissions.network`, every `https` URL): a label starting with `xn--` must be a valid
   IDNA A-label. It must round-trip through Python's `idna` codec (IDNA2003, so no runtime
@@ -383,3 +384,73 @@ loosened later without breaking a valid file.
       abandoned, started_at, finished_at, duration_s, cost: {usd, tokens_in, tokens_out},
       error}]}`, where `instance` is the resolved absolute path and `error` is the run's full
       error, which carries step messages as capped by the engine (4096 characters).
+
+### Provisional decisions (#23, pending maintainer review)
+
+32. **Replay (#23): run record extensions and `horae replay`.** Compatible v1 additions, all
+    optional, so records written before them stay valid (they are only not replayable). The
+    engine (`horae.engine.execute`) writes them; D1 to D6 are provisional maintainer
+    decisions:
+    - **(D1) `pipeline_definition`**: the canonical pipeline definition that ran
+      (`horae.engine.canonical_pipeline`, the input of `pipeline_digest`), at most 64 KiB as
+      compact JSON (`MAX_PIPELINE_BYTES`; omitted when larger). It is named
+      `pipeline_definition` because `pipeline` already holds the pipeline's name. The models
+      check that it is a valid pipeline named `pipeline`; replay checks that its digest is
+      `pipeline_digest`. Replay runs this definition, so a run replays as it ran after its
+      file was edited (noted); without it, only a current definition with the same digest
+      replays, else "pipeline changed" (unless `--against-current`);
+    - **per-call raw proposals** (finding 1): `inputs[].call` (the source's index in its step)
+      and `inputs[].intents` (the raw intents it returned, any JSON shape, absent when none);
+      a collect source whose proposals failed the step is recorded too. A failed source's
+      entry in the step `output` gains `call`. A `transform` step that ran has
+      `steps[].calls: [{call, ref, params, input_hash, intents?, error_kind?}]`: each call
+      made, `input_hash` the SHA-256 of the canonical JSON of the input it was given
+      (intermediate outputs are not recorded). Replay answers each call by `(step, call)` and
+      the engine re-validates and re-routes the raw proposals, so a target omitted by the
+      proposer is filled again from the (possibly edited) entry, and a rejected or unroutable
+      proposal fails the replayed step as it failed the run;
+    - **engine-owned LLM fields** (finding 2): `llm[].model_alias` (the pipeline's alias),
+      `input_hash` (SHA-256 of the attempt's input; not the cache key, which is
+      `input_hash` of the run), `repair` (the errors sent with the attempt) and
+      `schema_errors` (each capped at 4096 characters, at most 256; the repair retry is sent
+      these capped errors). `request` stays whatever the backend reports, for information;
+    - **(D3) `models`** (alias to concrete model, as given to the engine) and
+      `lock_digest` / `config_digest`: the engine records what its caller passes; the runner
+      (#19) passes `Instance.lock_digest()` (SHA-256 of the canonical JSON of the validated
+      `horae.lock`) and `Instance.config_digest()` (SHA-256 of the canonical JSON of the
+      validated `models` and `plugins` sections of `horae.yaml`, defaults filled in; the time
+      zone, state directory and timeouts are not part of it). Replay uses the recorded
+      `models` (the caller's only when the record has none, noted). A recorded digest that
+      differs from the current instance's is an error, or a note with `--against-current`;
+    - **(D5) `plugins[].provides`**: the tools and skills of the pipeline the run resolved to
+      that plugin, sorted. `horae.replay.LockRegistry` resolves a ref to the plugin the run
+      resolved it to when that plugin is still locked, else to the locked plugin named after
+      its namespace, with the locked version, commit and permissions. So the PLAN.md §3.2
+      brief (`coach.brief` from `mcp-brief`, the skill from `pack-daily-brief`) replays from
+      the CLI. Replay asks its registry once, up front, for every ref of the pipeline and runs
+      the engine on that frozen snapshot; a `PluginRegistry` does no I/O beyond local files and
+      starts no process; `horae replay` never uses a live plugin host;
+    - **comparison**: canonical pretty JSON of the intents (routing fields included), plus a
+      summary of the run status, `input_hash`, step kinds, statuses and error kinds, counts,
+      violation kinds and plugin versions (with `provides`). An `undone` run's status is
+      compared as it was before the undo, derived from its steps (noted). Messages, timings,
+      `stderr` and cost are not compared;
+    - **(D4, refined by finding 7) `horae replay` exit codes**: `0` identical, `1`
+      configuration or store problem (an invalid instance, a store that cannot be opened, a
+      schema older or newer than this Horae: like `doctor` and `runs`), `2` usage error (a bad
+      option, an unknown run, no store at the path), `3` not comparable (the pipeline,
+      `horae.lock` or `horae.yaml` changed without `--against-current`, an unresolved plugin, a
+      call the record cannot answer, a record that is not a valid v1 record or predates these
+      fields), `4` different, `70` internal error (its type only). `--json` prints
+      `{"schema_version": 1, "run_id", "pipeline", "outcome", "identical", "against_current",
+      "definition", "pipeline_digest", "lock_digest", "config_digest", "error", "mismatches",
+      "notes", "intents_diff", "summary"}` with every key also on errors (`null` or empty),
+      each digest as `{recorded, current, changed}`;
+    - **(D6)** `horae replay` opens the store with `Store.open(path, read_only=True)` and never
+      creates it;
+    - **(D2)** these extensions land with the replay itself (#23), not in a separate change.
+
+    Remaining limits: per-call `stderr` and failure messages beyond their recorded excerpt are
+    not reproduced (messages are not compared), and only the first call of a multi-call
+    `transform` step has its input checked (later calls get the previous call's output,
+    which is not recorded).

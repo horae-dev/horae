@@ -9,12 +9,13 @@ anywhere, because there is nowhere to forward it to.
 
 import copy
 from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
-from horae.contracts.pipeline import CollectStep, Pipeline, TransformStep
-from horae.contracts.run import LlmCall, ProposedIntent, RunContext, RunRecord, StepRecord, Usage
-from horae.engine.canonical import canonical_json
+from horae.contracts.pipeline import Pipeline
+from horae.contracts.run import LlmCall, RunContext, RunRecord, Usage
+from horae.engine.canonical import canonical_json, sha256_hex
+from horae.engine.executor import PlannedCall, planned_calls
 from horae.engine.ports import (
     LlmError,
     LlmRequest,
@@ -23,20 +24,10 @@ from horae.engine.ports import (
     ToolCallError,
     ToolResult,
 )
-from horae.engine.template import TemplateError, render, variables
-from horae.intents import STEP_ERROR_KIND
+from horae.engine.template import TemplateError
 
 MISMATCH = "replay_mismatch"
 """Error kind of a call the record cannot answer."""
-
-INTENT_KINDS = frozenset(
-    {STEP_ERROR_KIND, "intent_unrouted", "intent_ambiguous", "run_intents_exceeded"}
-)
-"""Step error kinds caused by a step's proposals (whose rejected intents are not recorded)."""
-
-
-class NotReplayable(Exception):
-    """The record lacks what an exact replay needs (see `horae.replay`, "Gaps")."""
 
 
 def _canon(value: Any) -> bytes:
@@ -56,182 +47,117 @@ def _tail(message: str, ref: str, kind: str) -> str | None:
     return _unquote(message[len(head) :]) if message.startswith(head) else None
 
 
-@dataclass(frozen=True)
-class Expected:
-    """One tool call the pipeline makes, in order: what the engine will ask for."""
+def missing_per_call(record: RunRecord) -> str | None:
+    """Why `record` cannot be replayed call by call, or `None`.
 
-    step: int
-    call: int
-    ref: str
-    params: dict[str, Any]
-
-
-def planned_calls(pipeline: Pipeline, context: RunContext) -> list[Expected]:
-    """Every `collect` / `transform` call of `pipeline`, rendered like the engine renders it.
-
-    The engine calls a prefix of this list, in this order (a step that stops the run ends it).
-    A template error yields no call (the engine fails the plan before calling anything)."""
-    try:
-        names = variables(context)
-        expected: list[Expected] = []
-        for index, step in enumerate(pipeline.steps):
-            if not isinstance(step, CollectStep | TransformStep):
-                continue
-            calls = step.collect if isinstance(step, CollectStep) else step.transform
-            for position, call in enumerate(calls):
-                ref, params = (call, {}) if isinstance(call, str) else next(iter(call.items()))
-                rendered = render(copy.deepcopy(params), names)
-                expected.append(Expected(index, position, ref, rendered))
-    except TemplateError:
-        return []
-    return expected
+    Every `collect` step that ran must give each source's position (`InputSnapshot.call`, and
+    `call` in its failed sources), and every `transform` step that ran its calls
+    (`StepRecord.calls`): records written before these fields existed lack them."""
+    for index, step in enumerate(record.steps):
+        if step.started_at is None or step.status == "skipped":
+            continue  # never ran, or failed while planning: no call to answer
+        if step.kind == "collect":
+            snapshots = [s for s in record.inputs if s.step == index]
+            failures = step.output if isinstance(step.output, list) else []
+            if any(s.call is None for s in snapshots) or any(
+                not isinstance(f, dict) or type(f.get("call")) is not int for f in failures
+            ):
+                return f"step {index} (collect) does not record the position of its sources"
+        elif step.kind == "transform" and step.calls is None:
+            return f"step {index} (transform) does not record its calls"
+    return None
 
 
 @dataclass(frozen=True)
 class _Answer:
+    ref: str
+    params: Any
     data: Any = None
-    intents: tuple[Any, ...] = ()
+    intents: Any = None
+    """The raw intents, as recorded."""
     error: tuple[str, str] | None = None
     """`(kind, message)` of a recorded failure."""
+    input_hash: str | None = None
+    """The recorded input's SHA-256, checked when set."""
 
 
-def _intents_by(record: RunRecord) -> dict[tuple[int, str], list[Any]]:
-    """Recorded intents by `(step, proposed_by)`, in record order, as plain intent data."""
-    found: dict[tuple[int, str], list[Any]] = {}
-    for proposed in record.intents:
-        found.setdefault((proposed.step, proposed.proposed_by), []).append(_intent_data(proposed))
-    return found
-
-
-def _intent_data(proposed: ProposedIntent) -> Any:
-    return proposed.intent.model_dump(mode="json", exclude_none=True)
-
-
-@dataclass
-class _Tape:
-    """Answers per `(step, call)`."""
-
-    answers: dict[tuple[int, int], _Answer] = field(default_factory=dict)
-    notes: list[str] = field(default_factory=list)
-
-
-def _step(record: RunRecord, index: int) -> StepRecord | None:
-    return record.steps[index] if index < len(record.steps) else None
-
-
-def _collect_answers(
-    tape: _Tape, record: RunRecord, index: int, calls: list[Expected], intents: Any
-) -> None:
-    step = _step(record, index)
-    if step is None or step.kind != "collect" or step.status == "skipped":
-        return  # not run: any call is a mismatch
-    kind = step.error.kind if step.error is not None else None
-    if step.status == "failed" and kind != "source_failed":
-        raise NotReplayable(
-            f"step {index} (collect) failed with {kind}: the record keeps neither its sources' "
-            "data nor the intents they proposed"
-        )
-    successes = [snap for snap in record.inputs if snap.step == index]
-    failures = [f for f in step.output or [] if isinstance(f, dict)]
-    lines = step.error.message.split("\n") if step.error is not None else []
-    if len(lines) != len(failures):
-        lines = [""] * len(failures)
-    lines_by_failure = list(zip(failures, lines, strict=True))
-    claimed: set[str] = set()
-    for expected in calls:
-        key = _canon(expected.params)
-        snap = next(
-            (s for s in successes if s.source == expected.ref and _canon(s.params) == key), None
-        )
-        if snap is not None:
-            successes.remove(snap)
-            own: tuple[Any, ...] = ()
-            if expected.ref not in claimed:  # intents are recorded per tool, not per call
-                claimed.add(expected.ref)
-                own = tuple(intents.get((index, expected.ref), ()))
-            tape.answers[(index, expected.call)] = _Answer(data=snap.data, intents=own)
-            continue
-        failed = next(
-            (
-                (f, line)
-                for f, line in lines_by_failure
-                if f.get("source") == expected.ref and _canon(f.get("params")) == key
-            ),
-            None,
-        )
-        if failed is not None:
-            lines_by_failure.remove(failed)
-            error_kind = str(failed[0].get("error_kind"))
-            message = _tail(failed[1], expected.ref, error_kind) or "recorded failure"
-            tape.answers[(index, expected.call)] = _Answer(error=(error_kind, message))
-
-
-def _transform_answers(
-    tape: _Tape, record: RunRecord, index: int, calls: list[Expected], intents: Any
-) -> None:
-    step = _step(record, index)
-    if step is None or step.kind != "transform" or step.status == "skipped" or not calls:
-        return
-    if step.status != "failed":
-        claimed: set[str] = set()
-        for position, expected in enumerate(calls):
-            own: tuple[Any, ...] = ()
-            if expected.ref not in claimed:
-                claimed.add(expected.ref)
-                own = tuple(intents.get((index, expected.ref), ()))
-            # Only the step's final output is recorded; intermediate outputs only feed the
-            # next (recorded) transform, which ignores its input.
-            data = step.output if position == len(calls) - 1 else None
-            tape.answers[(index, expected.call)] = _Answer(data=data, intents=own)
-        return
-    error = step.error
-    kind = error.kind if error is not None else "host_error"
-    message = error.message if error is not None else ""
-    culprit = next((c for c in calls if message.startswith(f"{c.ref}: ")), calls[0])
-    for expected in calls:
-        if expected is culprit:
-            tail = _tail(message, expected.ref, kind)
-            tape.answers[(index, expected.call)] = _Answer(
-                error=(kind, tail if tail is not None else "recorded failure")
+def _answers(record: RunRecord) -> dict[tuple[int, int], _Answer]:
+    """What the record says each `(step, call)` returned."""
+    answers: dict[tuple[int, int], _Answer] = {}
+    for snap in record.inputs:
+        if snap.call is not None:
+            answers[(snap.step, snap.call)] = _Answer(
+                snap.source, snap.params, data=snap.data, intents=snap.intents
             )
-            break
-        tape.answers[(index, expected.call)] = _Answer()
-    if kind in INTENT_KINDS:
-        tape.notes.append(
-            f"step {index} (transform) failed with {kind}: the rejected intents are not "
-            "recorded, so the failure is served from the record instead of re-validated"
-        )
+    for index, step in enumerate(record.steps):
+        error = step.error
+        if step.kind == "collect" and isinstance(step.output, list):
+            failures = [f for f in step.output if isinstance(f, dict)]
+            # `source_failed` joins one line per failed source, in order. Any other error
+            # (rejected intents) replaced those lines: the messages are then not recorded.
+            lines = error.message.split("\n") if error and error.kind == "source_failed" else []
+            if len(lines) != len(failures):
+                lines = [""] * len(failures)
+            for failure, line in zip(failures, lines, strict=True):
+                position = failure.get("call")
+                if type(position) is not int:
+                    continue
+                ref, kind = str(failure.get("source")), str(failure.get("error_kind"))
+                message = _tail(line, ref, kind) or "recorded failure"
+                answers[(index, position)] = _Answer(
+                    ref, failure.get("params"), error=(kind, message)
+                )
+        elif step.kind == "transform" and step.calls:
+            for number, call in enumerate(step.calls):
+                # Only the first call's input is the record's own data: later calls are given
+                # the previous call's output, which is not recorded (only its hash is).
+                checked = call.input_hash if number == 0 else None
+                if call.error_kind is not None:
+                    tail = _tail(error.message, call.ref, call.error_kind) if error else None
+                    answers[(index, call.call)] = _Answer(
+                        call.ref,
+                        call.params,
+                        error=(call.error_kind, tail or "recorded failure"),
+                        input_hash=checked,
+                    )
+                    continue
+                last = number == len(step.calls) - 1 and step.status == "ok"
+                answers[(index, call.call)] = _Answer(
+                    call.ref,
+                    call.params,
+                    data=step.output if last else None,
+                    intents=call.intents,
+                    input_hash=checked,
+                )
+    return answers
 
 
-def _tape(record: RunRecord, expected: list[Expected]) -> _Tape:
-    tape = _Tape()
-    intents = _intents_by(record)
-    by_step: dict[int, list[Expected]] = {}
-    for call in expected:
-        by_step.setdefault(call.step, []).append(call)
-    for index, calls in by_step.items():
-        step = _step(record, index)
-        if step is not None and step.kind == "collect":
-            _collect_answers(tape, record, index, calls, intents)
-        elif step is not None and step.kind == "transform":
-            _transform_answers(tape, record, index, calls, intents)
-    return tape
+def _tool_calls(pipeline: Pipeline, context: RunContext) -> list[PlannedCall]:
+    """The `collect` / `transform` calls the engine will make, in order (`planned_calls`);
+    none when planning fails on a template (the engine then calls nothing)."""
+    try:
+        planned = planned_calls(pipeline, context)
+    except TemplateError:
+        return []
+    if any(call.params is None for call in planned):
+        return []
+    return [call for call in planned if call.kind in ("collect", "transform")]
 
 
 class RecordedToolCaller:
     """A `ToolCaller` that serves `collect` / `transform` results from a run record.
 
-    Each call is matched, in order, against the pipeline's planned calls: the `(step, call)`
-    position, the tool `ref` and the canonical JSON of the rendered `params` must all agree,
-    and the record must hold an answer for that position (a source's `InputSnapshot`, a failed
-    source's entry, a transform step's output or error). Anything else is a mismatch."""
+    Each call is matched, in order, against the pipeline's planned calls
+    (`horae.engine.planned_calls`), and answered by its `(step, call)` position: a source's
+    `InputSnapshot` (data and raw intents) or failed-source entry, or a transform's
+    `CallRecord` (raw intents, failure; the step's final output for its last call). The tool
+    `ref` and the canonical JSON of the rendered `params` must equal the recorded ones, and the
+    first transform call of a step must be given the input the record hashed. Anything else is
+    a mismatch."""
 
     def __init__(self, record: RunRecord, pipeline: Pipeline, context: RunContext) -> None:
-        planned = planned_calls(pipeline, context)
-        self._expected: Iterator[Expected] = iter(planned)
-        tape = _tape(record, planned)
-        self._answers = tape.answers
-        self.notes: list[str] = tape.notes
+        self._expected: Iterator[PlannedCall] = iter(_tool_calls(pipeline, context))
+        self._answers = _answers(record)
         self.mismatches: list[str] = []
 
     def _mismatch(self, message: str) -> ToolCallError:
@@ -242,18 +168,19 @@ class RecordedToolCaller:
         expected = next(self._expected, None)
         if expected is None or expected.ref != ref or _canon(expected.params) != _canon(params):
             raise self._mismatch(f"unexpected call to {ref}: the pipeline does not plan it here")
+        where = f"step {expected.step} call {expected.call} ({ref})"
         answer = self._answers.get((expected.step, expected.call))
-        if answer is None:
-            raise self._mismatch(
-                f"step {expected.step} call {expected.call} ({ref}): no recorded result "
-                "for this tool and these parameters"
-            )
+        if answer is None or answer.ref != ref or _canon(answer.params) != _canon(params):
+            raise self._mismatch(f"{where}: no recorded result for this tool and these parameters")
+        if answer.input_hash is not None and sha256_hex(input) != answer.input_hash:
+            raise self._mismatch(f"{where}: the input differs from the recorded one")
         if answer.error is not None:
             raise ToolCallError(*answer.error)
         return ToolResult(data=copy.deepcopy(answer.data), intents=copy.deepcopy(answer.intents))
 
 
 def _is_reuse(call: LlmCall) -> bool:
+    """The engine's record of a reused output (it builds this request itself)."""
     return (
         call.cached
         and call.attempt is None
@@ -290,10 +217,12 @@ def _leftover(record: RunRecord) -> Usage | None:
 class RecordedLlm:
     """An `LlmBackend` that serves the recorded `LlmCall`s of a run, by attempt.
 
-    The request must be for the recorded skill and, when the engine recorded its own request
-    shape, for the same input and repair errors. An attempt the record does not hold is
-    answered with the step's recorded failure if the step degraded or failed there, else it
-    is a mismatch."""
+    Each request is checked against the engine-owned fields of the recorded attempt, whatever
+    the backend recorded as `request`: the skill, the model alias (`model_alias`), the SHA-256
+    of the input (`input_hash`) and the repair errors (`repair`) must all match. The response
+    is served with its recorded schema errors (`schema_errors`). An attempt the record does not
+    hold is answered with the step's recorded failure if the step degraded or failed there,
+    else it is a mismatch."""
 
     def __init__(self, record: RunRecord) -> None:
         self._calls = {c.attempt: c for c in record.llm if not _is_reuse(c) and c.attempt}
@@ -308,20 +237,17 @@ class RecordedLlm:
         return LlmError(MISMATCH, message)
 
     def _check(self, call: LlmCall, request: LlmRequest) -> None:
+        attempt = f"LLM attempt {request.attempt}"
         if call.skill != request.skill:
-            raise self._mismatch(f"LLM attempt {request.attempt}: skill {request.skill} differs")
-        shape = call.request
-        if isinstance(shape, dict) and set(shape) == {
-            "skill",
-            "model",
-            "input",
-            "attempt",
-            "repair",
-        }:
-            if _canon(shape["input"]) != _canon(request.input):
-                raise self._mismatch(f"LLM attempt {request.attempt}: the input differs")
-            if shape["model"] != request.model:
-                raise self._mismatch(f"LLM attempt {request.attempt}: the model alias differs")
+            raise self._mismatch(f"{attempt}: skill {request.skill} differs")
+        if call.model_alias is None or call.input_hash is None or call.repair is None:
+            raise self._mismatch(f"{attempt}: the record has no model alias, input hash or repair")
+        if call.model_alias != request.model:
+            raise self._mismatch(f"{attempt}: the model alias differs")
+        if call.input_hash != sha256_hex(request.input):
+            raise self._mismatch(f"{attempt}: the input differs")
+        if list(request.repair) != call.repair:
+            raise self._mismatch(f"{attempt}: the repair errors differ")
 
     async def complete(self, request: LlmRequest) -> LlmResponse:
         self.requests.append(request)
@@ -335,7 +261,10 @@ class RecordedLlm:
         self._check(call, request)
         errors: tuple[str, ...] = ()
         if call.schema_valid is False:
-            errors = self._repair_errors(request.attempt)
+            if not call.schema_errors:
+                message = f"LLM attempt {request.attempt}: the record has no schema errors"
+                raise self._mismatch(message)
+            errors = tuple(call.schema_errors)
         return LlmResponse(
             output=copy.deepcopy(call.response),
             schema_errors=errors,
@@ -347,12 +276,3 @@ class RecordedLlm:
             cached=call.cached,
             intents=copy.deepcopy(list(call.intents or [])),
         )
-
-    def _repair_errors(self, attempt: int) -> tuple[str, ...]:
-        """The schema errors of `attempt`, as the next attempt's request recorded them."""
-        following = self._calls.get(attempt + 1)
-        if following is not None and isinstance(following.request, dict):
-            repair = following.request.get("repair")
-            if isinstance(repair, list) and repair and all(isinstance(e, str) for e in repair):
-                return tuple(repair)
-        return ("the recorded response failed its schema",)

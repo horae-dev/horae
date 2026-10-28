@@ -20,7 +20,7 @@ import pytest
 
 from horae.config import STORE_FILE, Instance
 from horae.contracts import RunId, RunRecord
-from horae.engine import ToolResult
+from horae.engine import ToolResult, canonical_pipeline
 from horae.runner import (
     LOCKS_DIR,
     PipelineLock,
@@ -36,7 +36,7 @@ from horae.runner import (
 )
 from horae.runner import _runner as runner_module
 from horae.store import RunExists, RunNotStale, Store, StoreError
-from runner_fixtures import Plugins, brief_llm, instance, write_instance
+from runner_fixtures import SKILL, Plugins, brief_llm, instance, write_instance
 
 FIXTURES = Path(__file__).resolve().parent / "runner_fixtures.py"
 
@@ -134,6 +134,33 @@ def test_ok_run_is_saved_and_releases_the_lock(inst: Instance, store: Store) -> 
     assert lock_is_free(inst.state_dir, "collect") is True
     # The lock is free again: a second run starts.
     assert asyncio.run(_runner(inst, store).run("collect")).status == "ok"
+
+
+def test_the_record_keeps_lock_config_digests_models_and_definition(
+    inst: Instance, store: Store
+) -> None:
+    """What `horae replay` compares and replays with (#23, D1 and D3)."""
+    record = asyncio.run(_runner(inst, store, llm=brief_llm()).run("brief"))
+    assert record.lock_digest == inst.lock_digest()
+    assert record.config_digest == inst.config_digest()
+    assert record.models == {"default": "sonnet"}
+    assert record.pipeline_definition == canonical_pipeline(inst.pipelines["brief"])
+    assert record.plugins["fixture"].provides == ["fixture.items"]
+    assert record.plugins["pack"].provides == [SKILL]
+    assert len({inst.lock_digest(), inst.config_digest()}) == 2
+    # The config digest covers `models` and `plugins` only.
+    other = Instance(
+        root=inst.root,
+        config=inst.config.model_copy(update={"timezone": "Europe/Paris"}),
+        pipelines=inst.pipelines,
+        lock=inst.lock,
+    )
+    assert other.config_digest() == inst.config_digest()
+    renamed = inst.config.model_validate(
+        {"models": {"default": {"backend": "claude-cli", "model": "opus"}}}
+    )
+    moved = Instance(root=inst.root, config=renamed, pipelines=inst.pipelines, lock=inst.lock)
+    assert moved.config_digest() != inst.config_digest()
 
 
 def test_statuses_degraded_failed_and_noop(inst: Instance, store: Store) -> None:

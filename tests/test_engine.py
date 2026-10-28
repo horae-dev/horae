@@ -757,7 +757,12 @@ def test_collect_partial_failure_skips_act_but_notifies() -> None:
     assert "calendar.events: plugin_crashed" in error.message
     assert "\x1b" not in error.message
     assert record.steps[0].output == [
-        {"source": "calendar.events", "params": {"days": 2}, "error_kind": "plugin_crashed"}
+        {
+            "source": "calendar.events",
+            "call": 1,
+            "params": {"days": 2},
+            "error_kind": "plugin_crashed",
+        }
     ]
     assert record.steps[0].stderr == "--- calendar ---\ntrace\n"
     assert [s.source for s in record.inputs] == [
@@ -799,7 +804,9 @@ def test_collect_total_failure_fails_the_run() -> None:
     record = _run(_pipeline(*FLOW), plugins, FakeLlm())
     assert record.status == "failed"
     assert _statuses(record) == ["failed", "skipped", "skipped", "skipped", "skipped"]
-    assert record.steps[0].output == [{"source": "src.read", "params": {}, "error_kind": "timeout"}]
+    assert record.steps[0].output == [
+        {"source": "src.read", "call": 0, "params": {}, "error_kind": "timeout"}
+    ]
     assert plugins.refs == ["src.read"]
 
 
@@ -861,7 +868,7 @@ def test_a_host_returning_no_tool_result_is_contained() -> None:
     )
     assert _error_kind(record, 0) == "source_failed"
     assert record.steps[0].output == [
-        {"source": "src.read", "params": {}, "error_kind": "output_invalid"}
+        {"source": "src.read", "call": 0, "params": {}, "error_kind": "output_invalid"}
     ]
 
 

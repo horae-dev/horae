@@ -60,8 +60,10 @@ from horae.contracts.plugin import (
     VersionSpecifier,
 )
 from horae.contracts.run import (
+    MAX_PIPELINE_BYTES,
     MAX_RUN_INTENTS,
     AppliedChange,
+    CallRecord,
     InputSnapshot,
     LlmCall,
     PluginVersion,
@@ -99,6 +101,7 @@ from horae.contracts.types import (
 __all__ = [
     "INTENT_MODELS",
     "INTENT_TYPES",
+    "MAX_PIPELINE_BYTES",
     "MAX_RUN_INTENTS",
     "AbsolutePath",
     "ActStep",
@@ -106,6 +109,7 @@ __all__ = [
     "BackendUrl",
     "BlockId",
     "Budget",
+    "CallRecord",
     "ClockTime",
     "CollectStep",
     "CommitSha",
