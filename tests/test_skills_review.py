@@ -7,6 +7,7 @@ import inspect
 import json
 import math
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -502,3 +503,61 @@ def test_an_unreadable_file(plugin: Path) -> None:
         _fails(plugin, "prompt.md cannot be read")
     finally:
         prompt.chmod(0o644)
+
+
+# --- `$ref` resolution agrees with the validator (security review) ---------------------------
+
+
+@pytest.mark.parametrize("ref", ["#/$defs/a%2Fb", "#/%24defs/x", "#/$defs/a%2fb"])
+def test_percent_encoded_refs_are_refused(ref: str) -> None:
+    # The validator percent-decodes the pointer: `#/$defs/a%2Fb` is `a/b` to it.
+    schema = {
+        **_obj(v={"$ref": ref}),
+        "$defs": {
+            "a%2Fb": {"type": "null"},
+            "a/b": {"type": "string"},
+            "x": {"type": "null"},
+            "x%": {"type": "null"},
+        },
+    }
+    with pytest.raises(SchemaProblem, match="may not percent-encode"):
+        check_output_schema(schema)
+
+
+@pytest.mark.parametrize("key", ["$defs", "definitions"])
+def test_unreferenced_unbounded_definitions_are_refused(key: str) -> None:
+    schema = {**_obj(v={"type": "null"}), key: {"loose": {"type": "string"}}}
+    with pytest.raises(SchemaProblem, match=re.escape(f"#/{key}/loose: a string needs")):
+        check_output_schema(schema)
+    nested = _obj(v={"type": "null", "$defs": {"deep": {"type": "array"}}})
+    with pytest.raises(SchemaProblem, match="deep: an array needs `maxItems`"):
+        check_output_schema(nested)
+
+
+@pytest.mark.parametrize(
+    ("ref", "valid", "invalid"),
+    [
+        ("#/$defs/a~1b", None, "x"),  # `a/b`: null
+        ("#/$defs/t~0x", "abc", "abcdef"),  # `t~x`: a string of at most 3
+        ("#/$defs/t~01", True, None),  # `t~1` (not `t/`): a boolean
+        ("#/properties/plain", 1, 9),  # an integer from 0 to 5
+    ],
+)
+def test_refs_resolve_as_the_validator_resolves_them(ref: str, valid: Any, invalid: Any) -> None:
+    schema = {
+        **_obj(
+            v={"$ref": ref},
+            plain={"type": "integer", "minimum": 0, "maximum": 5},
+        ),
+        "$defs": {
+            "a/b": {"type": "null"},
+            "t~x": {"type": "string", "maxLength": 3},
+            "t~1": {"type": "boolean"},
+        },
+    }
+    bound = check_output_schema(schema)
+    validator = Draft202012Validator(schema)
+    assert validator.is_valid({"v": valid})
+    assert not validator.is_valid({"v": invalid})
+    # The checker bounded the very subschema the validator applies.
+    assert _compact({"v": valid}) <= bound

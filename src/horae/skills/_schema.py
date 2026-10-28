@@ -15,8 +15,11 @@ so the bound holds for what it stores. Rules, beyond the draft 2020-12 metaschem
   the structured-output modes of the backends, #28, accept);
 - self-contained: `$ref` is local (`#` or `#/...`), and `$id`, `$anchor`, `$dynamicRef`,
   `$dynamicAnchor`, `$recursiveRef`, `$recursiveAnchor` and `$vocabulary` are refused, so
-  nothing is ever fetched or re-based; a `$ref` cycle (a recursive schema) is refused, and so is
-  a chain of more than `MAX_REF_HOPS` `$ref`s;
+  nothing is ever fetched or re-based; a `$ref` is resolved with `referencing`, as the
+  validator resolves it, and may not contain `%` (the validator percent-decodes pointers);
+  a `$ref` cycle (a recursive schema) is refused, and so is a chain of more than
+  `MAX_REF_HOPS` `$ref`s; every subschema under `$defs` / `definitions` must be bounded,
+  referenced or not;
 - no regular expressions: `pattern`, `patternProperties`, `propertyNames` and
   `"format": "regex"` are refused (a regex chosen by a plugin author is a ReDoS risk; #31 must
   still run validation in a worker it can kill on a timeout);
@@ -50,6 +53,9 @@ from typing import Any
 
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
+from referencing import Registry, Resource
+from referencing.exceptions import Unresolvable
+from referencing.jsonschema import DRAFT202012
 
 from horae.llm.base import INTENTS_KEY
 
@@ -180,6 +186,10 @@ def _self_contained(schema: Any) -> None:
         ref = node.get("$ref")
         if ref is not None and not (ref == "#" or ref.startswith("#/")):
             raise SchemaProblem(f"{where}: `$ref` must be local (`#/...`), not {ref!r}")
+        if ref is not None and "%" in ref:
+            # The validator percent-decodes a pointer (`%2F`, `%24`): refused, so no `$ref`
+            # can be read one way here and another way there.
+            raise SchemaProblem(f"{where}: `$ref` {ref!r} may not percent-encode (`%`)")
         pending.extend(_subschemas(node, where))
 
 
@@ -195,6 +205,8 @@ class _Bounder:
     def __init__(self, root: dict[str, Any]) -> None:
         self.root = root
         self.refs: dict[str, int | SchemaProblem] = {}
+        resource = Resource.from_contents(root, default_specification=DRAFT202012)
+        self.resolver = Registry().with_resource("", resource).resolver(base_uri="")
 
     def bound(self, node: Any, where: str, stack: tuple[str, ...]) -> int:
         if node is True:
@@ -312,18 +324,30 @@ class _Bounder:
         return found
 
     def _resolve(self, ref: str, where: str) -> Any:
-        target: Any = self.root
-        for raw in ref[2:].split("/") if ref != "#" else []:
-            part = raw.replace("~1", "/").replace("~0", "~")
-            if isinstance(target, dict) and part in target:
-                target = target[part]
-            elif isinstance(target, list) and part.isdigit() and int(part) < len(target):
-                target = target[int(part)]
-            else:
-                raise SchemaProblem(f"{where}: `$ref` {ref!r} points to nothing")
+        """The subschema `ref` names, resolved by `referencing` exactly as the `jsonschema`
+        validator resolves it (the checker and the validator never disagree on a pointer)."""
+        try:
+            target: Any = self.resolver.lookup(ref).contents
+        except Unresolvable:
+            raise SchemaProblem(f"{where}: `$ref` {ref!r} points to nothing") from None
         if not isinstance(target, dict | bool):
             raise SchemaProblem(f"{where}: `$ref` {ref!r} is not a schema")
         return target
+
+
+def _definitions_bounded(bounder: _Bounder, schema: dict[str, Any]) -> None:
+    """Every subschema under a `$defs` / `definitions`, referenced or not, must be bounded:
+    a definition the bound never visited cannot widen what the validator accepts."""
+    pending: list[tuple[Any, str]] = [(schema, "#")]
+    while pending:
+        node, where = pending.pop()
+        if not isinstance(node, dict):
+            continue
+        for key in ("$defs", "definitions"):
+            if isinstance(node.get(key), dict):
+                for name, child in node[key].items():
+                    bounder.bound(child, f"{where}/{key}/{name}", ())
+        pending.extend(_subschemas(node, where))
 
 
 def _intents_property(schema: dict[str, Any], proposes: bool) -> None:
@@ -381,7 +405,9 @@ def _check(schema: Any, proposes_intents: bool | None) -> int:
         raise SchemaProblem('the output schema\'s root must be `"type": "object"`')
     if proposes_intents is not None:
         _intents_property(schema, proposes_intents)
-    size = _Bounder(schema).bound(schema, "#", ())
+    bounder = _Bounder(schema)
+    size = bounder.bound(schema, "#", ())
+    _definitions_bounded(bounder, schema)
     if size > MAX_OUTPUT_BYTES:
         raise SchemaProblem(
             f"the output schema accepts documents of up to {size} bytes "

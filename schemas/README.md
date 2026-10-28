@@ -1174,8 +1174,10 @@ loosened later without breaking a valid file.
       never interpolated into the prompt: it travels separately, as data (tenet 5);
     - **(E) output schema: draft 2020-12, self-contained, regex-free and bounded**
       (`horae.skills.check_output_schema`): the metaschema, an optional `$schema` that must
-      be 2020-12, a root `"type": "object"`, only local `$ref`s (at most 32 chained, no cycle)
-      and no `$id`, `$anchor`, `$dynamic*`, `$recursive*` or `$vocabulary`; **no `pattern`,
+      be 2020-12, a root `"type": "object"`, only local `$ref`s (at most 32 chained, no cycle,
+      no `%`: the validator percent-decodes pointers; resolved with `referencing`, as the
+      validator resolves them), every `$defs` / `definitions` entry bounded even when
+      unreferenced, and no `$id`, `$anchor`, `$dynamic*`, `$recursive*` or `$vocabulary`; **no `pattern`,
       `patternProperties`, `propertyNames` or `"format": "regex"`** (a plugin author's regex
       is a ReDoS risk; #31 must still validate outputs in a worker it can kill on a timeout);
       every subschema a value meets has a `type`, `enum`, `const`, `$ref` or combinator; a

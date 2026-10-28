@@ -15,6 +15,7 @@ dependencies = [
     "typer>=0.27",
     "tzdata>=2026.5",
     "jsonschema>=4.23",
+    "referencing>=0.35",
 ]
 
 [project.scripts]
