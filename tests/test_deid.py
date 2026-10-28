@@ -705,7 +705,7 @@ def test_a_request_holding_a_secret_is_refused_by_every_backend(
     assert recorder.requests == []
     assert PLANTED not in error.message
     assert PLANTED not in caplog.text
-    assert "PLANTED_TOKEN" in caplog.text
+    assert "1 secret(s) found in a request" in caplog.text
 
 
 def test_a_clean_request_passes_the_check(

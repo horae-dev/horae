@@ -72,7 +72,8 @@ before anything is rendered (an engine given no `Deidentifier`).
 (`RenderedRequest.body()`) for every secret the process resolved, in all its encodings (the
 redaction registry, `horae.secrets.redact.current()`: the raw bytes, and the decoded JSON
 strings, keys and numbers), whatever the backend: one found refuses the attempt with
-`secret_in_request` (naming the secrets, never their values) before the provider backend is
+`secret_in_request` (naming the secrets, never their values; the log gives their count)
+before the provider backend is
 called, so nothing is sent and nothing is billed (the usage ledger releases its reservation,
 decision 41); the engine records a `secret_in_request` violation and degrades the step.
 
@@ -688,8 +689,11 @@ class ModelBackends:
         held = secrets_in(body)
         if held:
             names = ", ".join(sorted(held))
+            # The names travel in the error (and the run's violation); the log says how many.
             _log.warning(
-                "secret %s found in a request to model alias %s; refused", names, rendered.alias
+                "%d secret(s) found in a request to model alias %s; refused",
+                len(held),
+                rendered.alias,
             )
             raise LlmError(
                 SECRET_IN_REQUEST,

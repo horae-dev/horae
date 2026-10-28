@@ -1906,8 +1906,8 @@ loosened later without breaking a valid file.
       (`horae.secrets.redact.current()`): the raw bytes and the decoded JSON (strings, object
       keys, whole numbers), every encoding of decision 43. For **every** backend, local ones
       too (a secret in a request is never legitimate, and a local endpoint may log it).
-      A match raises `secret_in_request` naming the secrets (never a value; logged by
-      name) before the provider backend is called: nothing is sent, the usage ledger
+      A match raises `secret_in_request` naming the secrets (never a value; the log
+      line gives only their count) before the provider backend is called: nothing is sent, the usage ledger
       releases the reservation (`NOT_BILLED`, decision 41), the step is `degraded` and the
       engine records a `secret_in_request` **violation** (run record v1, a compatible
       addition to `violations[].kind`: answer 6);
