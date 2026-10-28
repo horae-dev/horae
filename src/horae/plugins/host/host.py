@@ -68,6 +68,7 @@ is not alive during later steps that do not use it.
 """
 
 import json
+import logging
 import os
 import shutil
 import tempfile
@@ -92,11 +93,12 @@ from horae.plugins.host import logs
 from horae.plugins.host.capture import StderrCapture
 from horae.plugins.host.env import BASE_PATH, build_env, check_names
 from horae.plugins.host.errors import HostErrorKind, PluginCallError
-from horae.plugins.host.redact import MAX_EXPANSION, Redactor, SecretInKey
+from horae.plugins.host.redact import MAX_EXPANSION, MIN_PARTIAL_BYTES, Redactor, SecretInKey
 from horae.plugins.host.session import INTENTS_META, CallFailed, PluginProcess, Spawn
 from horae.secrets import MAX_SECRET_BYTES, Secret, SecretError, SecretResolver
 
 MANIFEST_FILE = "plugin.yaml"
+_log = logging.getLogger("horae.plugins.host")
 STDERR_QUIET_S = 0.05
 STDERR_SETTLE_S = 0.5
 CAPTURE_MARGIN = MAX_EXPANSION * MAX_SECRET_BYTES
@@ -290,6 +292,7 @@ class PluginHost:
         self._group: anyio.abc.TaskGroup | None = None
         self._run_dir: Path | None = None
         self._redactor: tuple[tuple[Secret, ...], Redactor] | None = None
+        self._warned_short: set[str] = set()
         self.leftover_stderr: dict[str, str] = {}
         """Per plugin, the (redacted) stderr written after its last call, kept when it was
         released or the host exited."""
@@ -370,14 +373,32 @@ class PluginHost:
     # --- redaction -------------------------------------------------------------------------
 
     def redactor(self) -> Redactor:
-        """A redactor of every secret resolved so far (rebuilt when they change)."""
+        """A redactor of every secret resolved so far (rebuilt when they change). Warns once
+        per secret shorter than `MIN_PARTIAL_BYTES` (by name: its encodings are not redacted)."""
         resolved = self.secrets.resolved()
         if self._redactor is None or self._redactor[0] != resolved:
             self._redactor = (resolved, Redactor(resolved))
+            for name in self._redactor[1].short:
+                if name not in self._warned_short:
+                    self._warned_short.add(name)
+                    _log.warning(
+                        "secret %s is shorter than %d bytes: only its raw value is redacted, "
+                        "not its encodings",
+                        name,
+                        MIN_PARTIAL_BYTES,
+                    )
         return self._redactor[1]
 
+    def _redact_message(self, message: str) -> str:
+        """`message` redacted; a `<ref>: <body>` message's body is also matched as a whole."""
+        redactor = self.redactor()
+        prefix, separator, body = message.partition(": ")
+        if separator:
+            return redactor.redact_text(prefix)[0] + separator + redactor.redact_text(body)[0]
+        return redactor.redact_text(message)[0]
+
     def _redacted(self, error: PluginCallError) -> PluginCallError:
-        message, _ = self.redactor().redact_text(error.message)
+        message = self._redact_message(error.message)
         if len(message) > _MAX_MESSAGE:
             message = message[: _MAX_MESSAGE - 1] + "…"
         kind: HostErrorKind = error.host_kind

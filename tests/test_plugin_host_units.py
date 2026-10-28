@@ -182,16 +182,43 @@ def test_misaligned_base64_hex_basic_auth_and_json_are_redacted() -> None:
     assert redactor.redact_bytes(embedded.encode()).count(token("S").encode()) == 2
 
 
-def test_short_secrets_match_whole_values_only() -> None:
+def test_short_secrets_match_their_bounded_raw_value_only() -> None:
     short = "pin42"
     assert len(short) < MIN_PARTIAL_BYTES
     redactor = Redactor([Secret("PIN", short), Secret("NUM", "12345678901")])
-    assert redactor.redact_text(f"spin42 {short}") == (f"spin42 {short}", set())
-    assert redactor.redact_bytes(short.encode()) == short.encode()
-    assert redactor.redact_text(short) == (token("PIN"), {"PIN"})
-    value = {"a": short, "b": f"x{short}", "n": 12345678901, "f": 1.5, "t": True}
+    assert redactor.short == ("PIN",)
+    pin = token("PIN")
+    # Inside text: matched when bounded (punctuation, spaces, the ends), not inside a word.
+    assert redactor.redact_text(f"token={short};") == (f"token={pin};", {"PIN"})
+    assert redactor.redact_text(f"probe.fail: {short}")[0] == f"probe.fail: {pin}"
+    assert redactor.redact_text(f"spin42 xpin42y pin42x {short}") == (
+        f"spin42 xpin42y pin42x {pin}",
+        {"PIN"},
+    )
+    assert (
+        redactor.redact_bytes(b"auth " + short.encode() + b"\n") == b"auth " + pin.encode() + b"\n"
+    )
+    assert redactor.redact_bytes(b"spin42s") == b"spin42s"
+    # Encodings of a short secret are not looked for (they would match everywhere).
+    encoded = base64.b64encode(short.encode()).decode()
+    assert redactor.redact_text(encoded) == (encoded, set())
+    value = {
+        "a": short,
+        "b": f"x{short}",
+        "c": f'{{"token": "{short}"}}',
+        "n": 12345678901,
+        "f": 1.5,
+        "t": True,
+    }
     data, found = redactor.redact_data(value)
-    assert data == {"a": token("PIN"), "b": f"x{short}", "n": token("NUM"), "f": 1.5, "t": True}
+    assert data == {
+        "a": pin,
+        "b": f"x{short}",
+        "c": f'{{"token": "{pin}"}}',
+        "n": token("NUM"),
+        "f": 1.5,
+        "t": True,
+    }
     assert found == {"PIN", "NUM"}
 
 

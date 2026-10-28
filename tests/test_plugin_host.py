@@ -863,3 +863,33 @@ def test_a_plugin_is_stopped_after_its_last_planned_call(
     else:
         assert watch.alive["raw.ok"] == {"probe": False}  # gone before the transform ran
     assert not any(_alive(pid) for pid in watch.pids.values())
+
+
+def test_a_short_secret_is_redacted_in_stderr_messages_and_strings_with_a_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    short = "pin42"
+    resolver = SecretResolver({}, secrets_dir(tmp_path, PROBE_TOKEN=PROBE_TOKEN, PIN=short))
+    resolver.resolve("PIN")
+
+    async def scenario() -> tuple[str, Any, Any]:
+        async with host(tmp_path, resolver=resolver) as h:
+            line = _parts((f"login with {short}, not spin42s\nEND\n", 1))
+            stderr = await _drain(h, "probe", (await _call(h, "probe.stderr", line)).stderr, "END")
+            failed = await _error(h, "probe.fail", {"message": short})
+            echoed = await _call(h, "probe.echo", {"value": f"token={short}"})
+            return stderr, failed, echoed
+
+    with caplog.at_level(logging.WARNING, logger="horae.plugins.host"):
+        stderr, failed, echoed = _run(scenario())
+    assert "login with [REDACTED:PIN], not spin42s" in stderr
+    assert failed.message.startswith("probe.fail: ")  # `<ref>: <the tool's message>`
+    assert failed.message.endswith(": [REDACTED:PIN]")
+    assert short not in failed.message
+    assert echoed.data["value"] == "token=[REDACTED:PIN]"
+    assert "PIN" in echoed.violations[0].detail
+    warnings = [r.getMessage() for r in caplog.records if r.name == "horae.plugins.host"]
+    assert warnings == [
+        "secret PIN is shorter than 8 bytes: only its raw value is redacted, not its encodings"
+    ]
+    assert short not in caplog.text

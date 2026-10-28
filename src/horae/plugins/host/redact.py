@@ -19,10 +19,14 @@ UTF-8, in these forms:
 - its percent-encoding (`urllib.parse.quote(value, safe="")`, upper- and lower-case hex);
 - its JSON string escaping (`json.dumps`, with and without `ensure_ascii`, quotes removed).
 
-**Short secrets** (under 8 bytes) are only matched as a **whole** value: a JSON string or
-number that is exactly the secret, or a message that is exactly it. Matching them inside text
-would rewrite unrelated output (and confirm the value by its absence); they are not looked for
-in stderr.
+**Short secrets** (under 8 bytes) are matched by their **raw value only**, in every channel
+(stderr, messages, string leaves), and only where it is **bounded**: not preceded nor
+followed by an ASCII letter or digit (`token=abc123` and `ref: abc123` match, `xabc123y` does
+not), which limits over-matching inside longer words. Their encoded and partial forms are not
+looked for (a short value's base64 or hex core would match unrelated text everywhere). A JSON
+string or number that is exactly a short secret is matched too. Redaction of short secrets is
+therefore weaker (an encoded short secret passes through); the host warns, without the value,
+when it redacts a secret shorter than 8 bytes.
 
 Each match becomes `[REDACTED:<NAME>]` (the name is not sensitive). Patterns are tried longest
 first, so a value that contains another secret is replaced whole. **Overlaps:** when the
@@ -97,25 +101,45 @@ class Redactor:
 
     def __init__(self, secrets: Iterable[Secret]) -> None:
         owner: dict[str, str] = {}
+        bounded: set[str] = set()
+        """Forms matched only where not next to an ASCII letter or digit (short values)."""
         self._whole: dict[str, str] = {}
         """Every value (long or short) to its name, for whole-value matches."""
+        self.short: tuple[str, ...] = ()
+        """The names of the secrets under `MIN_PARTIAL_BYTES` (weaker redaction)."""
+        short: list[str] = []
         for secret in secrets:
             value = secret.reveal()
             self._whole.setdefault(value, secret.name)
             if len(value.encode("utf-8")) >= MIN_PARTIAL_BYTES:
                 for form in _forms(value):
                     owner.setdefault(form, secret.name)
+            else:
+                short.append(secret.name)
+                if value not in owner:
+                    owner[value] = secret.name
+                    bounded.add(value)
+        self.short = tuple(short)
         ordered = sorted(owner, key=lambda form: (-len(form.encode("utf-8")), form))
         self._names = dict(owner)
         self._bytes_names = {form.encode("utf-8"): name for form, name in owner.items()}
-        self._text = re.compile("|".join(map(re.escape, ordered))) if ordered else None
-        self._bytes = (
-            re.compile(b"|".join(re.escape(form.encode("utf-8")) for form in ordered))
-            if ordered
-            else None
-        )
+
+        def text_pattern(form: str) -> str:
+            escaped = re.escape(form)
+            return rf"(?<![A-Za-z0-9]){escaped}(?![A-Za-z0-9])" if form in bounded else escaped
+
+        def bytes_pattern(form: str) -> bytes:
+            escaped = re.escape(form.encode("utf-8"))
+            if form in bounded:
+                return rb"(?<![A-Za-z0-9])" + escaped + rb"(?![A-Za-z0-9])"
+            return escaped
+
+        self._text = re.compile("|".join(map(text_pattern, ordered))) if ordered else None
+        self._bytes = re.compile(b"|".join(map(bytes_pattern, ordered))) if ordered else None
         self.max_len = max((len(form.encode("utf-8")) for form in ordered), default=0)
-        """The longest pattern, in bytes."""
+        """The longest pattern, in bytes (a bounded match looks at one more byte each side,
+        which the capture's margin of `max_len - 1` bytes past a cut does not always hold:
+        a short secret right at a cut can then be matched without its boundary check)."""
 
     def __bool__(self) -> bool:
         return bool(self._whole)
@@ -129,14 +153,13 @@ class Redactor:
         ]
 
     def redact_bytes(self, data: bytes) -> bytes:
-        """`data` with every match of a long secret replaced."""
+        """`data` with every match replaced."""
         if self._bytes is None:
             return data
         return self._bytes.sub(lambda m: token(self._bytes_names[m.group(0)]).encode(), data)
 
     def redact_text(self, text: str) -> tuple[str, set[str]]:
-        """`text` with every match replaced (a short secret only when it is all of `text`),
-        and the names of the secrets found."""
+        """`text` with every match replaced, and the names of the secrets found."""
         whole = self._whole.get(text)
         if whole is not None:
             return token(whole), {whole}

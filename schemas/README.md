@@ -717,8 +717,12 @@ loosened later without breaking a valid file.
       the characters that depend on the value alone, `ceil(8k/6)` to `floor((8k + 8n)/6)` for
       offset `k` and `n` bytes, so up to 4 bits of the value can stay visible on each side;
     - **D. Short secrets and keys.** Encoded and partial forms are used only for secrets of at
-      least 8 bytes; a shorter secret is matched only as a whole value (a JSON string or
-      number that is exactly it, or a whole message), never inside text or stderr. Object keys
+      least 8 bytes. A shorter secret is matched by its raw value only, in every channel
+      (stderr, messages, string leaves), where it is bounded (not next to an ASCII letter or
+      digit: `token=abc123` and `<ref>: abc123` match, `xabc123y` does not), and as a whole
+      JSON string or number; the body of a `<ref>: <message>` error is matched on its own.
+      The host logs a warning (name only) for each secret under 8 bytes it redacts, since its
+      encodings are not redacted. Object keys
       are never rewritten: a key holding a secret fails the call with `output_invalid` and
       nothing is stored. When the matches of two secrets overlap, only the leftmost one is
       replaced (documented limit). A JSON number whose `json.dumps` is a secret becomes the
