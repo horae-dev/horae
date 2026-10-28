@@ -42,8 +42,8 @@ from horae.engine import LlmError
 from horae.llm import Completion
 from horae.llm.backends import claude_cli
 from horae.plugins.host.capture import StderrCapture
-from horae.plugins.host.redact import Redactor
 from horae.secrets import SecretResolver
+from horae.secrets.redact import Redactor
 
 pytestmark = pytest.mark.live
 

@@ -157,8 +157,8 @@ def test_default_environ_is_the_process_environment(
 
 
 def test_resolver_remembers_what_it_handed_out(tmp_path: Path) -> None:
-    (tmp_path / "A_KEY").write_text("a-value", encoding="utf-8")
-    resolver = _resolver(tmp_path, {"VAR": "b-value"}, B_KEY=EnvSecretRef(env="VAR"))
+    (tmp_path / "A_KEY").write_text("a-value-8", encoding="utf-8")
+    resolver = _resolver(tmp_path, {"VAR": "b-value-8"}, B_KEY=EnvSecretRef(env="VAR"))
     assert resolver.resolved() == ()
     b = resolver.resolve("B_KEY")
     a = resolver.resolve("A_KEY")
@@ -166,7 +166,7 @@ def test_resolver_remembers_what_it_handed_out(tmp_path: Path) -> None:
     with pytest.raises(SecretError):
         resolver.resolve("MISSING")
     assert resolver.resolved() == (b, a)
-    assert [s.reveal() for s in resolver.resolved()] == ["b-value", "a-value"]
+    assert [s.reveal() for s in resolver.resolved()] == ["b-value-8", "a-value-8"]
 
 
 @pytest.mark.parametrize("name", ["/etc/hosts", "../x", "api_key", "", "LD_PRELOAD", "HORAE_X"])

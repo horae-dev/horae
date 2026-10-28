@@ -49,13 +49,16 @@ def uses_host(root: Path, vault: Path | None) -> bool:
 
 
 def load(root: Path) -> Instance:
-    """The instance, or `CommandFailed(config_invalid)` listing its problems."""
+    """The instance, or `CommandFailed(config_invalid)` listing its problems. Every secret
+    it names is resolved for redaction (`Instance.prime_redaction`, #53)."""
     try:
-        return load_instance(root)
+        instance = load_instance(root)
     except InstanceError as exc:
         found = plural(len(exc.problems), "problem") + " found"
         message = "; ".join([*map(str, exc.problems), found])
         raise CommandFailed(EXIT_PROBLEMS, "config_invalid", message) from None
+    instance.prime_redaction()
+    return instance
 
 
 def check_plugins(instance: Instance) -> None:

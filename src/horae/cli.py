@@ -36,10 +36,12 @@ from horae.cli_output import (
     CommandFailed,
     JsonUsageCommand,
     JsonUsageGroup,
+    echo,
     echo_json,
     internal_message,
     io_failed,
     plural,
+    prime_secrets,
     report_error,
     run_command,
     safe,
@@ -57,6 +59,7 @@ from horae.config import (
 from horae.contracts import InstanceConfig, RunRecord
 from horae.replay import LockRegistry, ReplayResult, definition_for, replay
 from horae.runner import lock_is_free
+from horae.secrets import logs
 from horae.store import MAX_LIST_RUNS, RunSummary, Store, StoreError
 
 EXIT_CODES_HELP = (
@@ -87,7 +90,7 @@ def _command(name: str | None = None) -> Callable[[Callable[..., None]], Callabl
 
 def _version_callback(value: bool) -> None:
     if value:
-        typer.echo(f"horae {__version__}")
+        echo(f"horae {__version__}")
         raise typer.Exit
 
 
@@ -104,6 +107,7 @@ def main(
     ] = False,
 ) -> None:
     """Horae: a predictable, self-hosted personal agent."""
+    logs.install()  # every command's logs are scrubbed of secret values (#53)
 
 
 _plural = plural
@@ -123,6 +127,7 @@ def _report(instance: Path, json_output: bool) -> int:
     result = check_instance(instance)
     problems = list(result.problems)
     if result.instance is not None:
+        result.instance.prime_redaction()
         problems.extend(instance_problems(result.instance))
     ok = not any(problem.severity == "error" for problem in problems)
     warnings = sum(problem.severity == "warning" for problem in problems)
@@ -136,17 +141,17 @@ def _report(instance: Path, json_output: bool) -> int:
         echo_json(report)
     else:
         for problem in problems:
-            typer.echo(safe(str(problem)))
+            echo(safe(str(problem)))
         if ok and result.instance is not None:
             loaded = result.instance
-            typer.echo(
+            echo(
                 f"OK: {_plural(len(loaded.pipelines), 'pipeline')}, "
                 f"{_plural(len(loaded.lock.plugins), 'plugin')}, "
                 f"{_plural(len(loaded.config.models), 'model alias', 'model aliases')}"
                 + (f" ({_plural(warnings, 'warning')})" if warnings else "")
             )
         else:
-            typer.echo(_plural(len(problems) - warnings, "problem") + " found")
+            echo(_plural(len(problems) - warnings, "problem") + " found")
     return EXIT_OK if ok else EXIT_PROBLEMS
 
 
@@ -278,13 +283,16 @@ def _table(header: list[str], rows: list[list[str]]) -> list[str]:
 
 
 def _config(instance: Path) -> InstanceConfig:
-    """`horae.yaml` alone (enough for the store and the locks), or `config_invalid`."""
+    """`horae.yaml` alone (enough for the store and the locks), or `config_invalid`. The
+    secrets it names are resolved for redaction (`prime_secrets`)."""
     try:
-        return validate(read_yaml(instance / CONFIG_FILE), InstanceConfig)
+        config = validate(read_yaml(instance / CONFIG_FILE), InstanceConfig)
     except ProblemsError as exc:
         found = _plural(len(exc.problems), "problem") + " found"
         message = "; ".join([*map(str, exc.problems), found])
         raise CommandFailed(EXIT_PROBLEMS, "config_invalid", message) from None
+    prime_secrets(instance, config)
+    return config
 
 
 def _list_runs(
@@ -324,7 +332,7 @@ def _list_runs(
         }
         echo_json(report)
     elif not runs:
-        typer.echo("no runs")
+        echo("no runs")
     else:
         header = [
             "RUN",
@@ -338,7 +346,7 @@ def _list_runs(
         ]
         rows = [_run_row(run, s) for run, s in zip(runs, stale, strict=True)]
         for line in _table(header, rows):
-            typer.echo(line)
+            echo(line)
     return EXIT_OK
 
 
@@ -408,9 +416,9 @@ def _diff(instance: Path, run_id: str, vault: Path | None, json_output: bool, co
     except OSError as exc:
         raise io_failed(exc, path, store=path) from None
     if json_output:
-        typer.echo(to_json(changes))
+        echo(to_json(changes))
     else:
-        typer.echo(render_text(changes, color=color), nl=False, color=color or None)
+        echo(render_text(changes, color=color), nl=False, color=color or None)
     if changes.refused is not None:
         return EXIT_REFUSED
     return EXIT_DIFFERENT if changes.problems else EXIT_OK
@@ -450,6 +458,7 @@ def diff(
 def _replay(instance: Path, store: Path | None, run_id: str, against_current: bool) -> ReplayResult:
     try:
         loaded = load_instance(instance)
+        loaded.prime_redaction()
     except InstanceError as exc:
         problems = "; ".join(str(problem) for problem in exc.problems)
         raise CommandFailed(EXIT_PROBLEMS, "config_invalid", problems) from None
@@ -534,7 +543,7 @@ def _replay_report(
     if json_output:
         echo_json(_replay_json(result, "not_comparable"))
     else:
-        typer.echo(result.render())
+        echo(result.render())
     return _REPLAY_CODES[result.outcome]
 
 

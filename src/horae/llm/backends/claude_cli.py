@@ -109,9 +109,9 @@ from horae.llm.base import Completion, CompletionResult, cost, input_bound
 from horae.plugins.host.capture import StderrCapture
 from horae.plugins.host.env import BASE_PATH, base_env
 from horae.plugins.host.host import CAPTURE_MARGIN
-from horae.plugins.host.redact import Redactor
 from horae.plugins.host.transport import _close_transport, exit_status, terminate
 from horae.secrets import Secret, SecretError, SecretResolver
+from horae.secrets.redact import Redactor
 
 CLAUDE_CODE_VERSION_RANGE = ">=2.1.284,<2.2"
 """The Claude Code releases this backend runs (a minor range, refused outside it; answer 2
