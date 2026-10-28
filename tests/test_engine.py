@@ -610,27 +610,48 @@ def test_task_status_needs_a_collected_fingerprint(data: Any) -> None:
     assert _error_kind(record, 0) == "intent_unrouted"
 
 
-LINK = "obsidian://open?vault=Main&file=Daily%2F2026-10-27"
+NOTES = "https://notes.example.org/notes/"
+VAULT = "obsidian://vault/Main/"
+LINK = VAULT + "Daily/2026-10-27"
 
 
 @pytest.mark.parametrize(
-    ("params", "link", "routed"),
+    ("prefix", "link", "routed"),
     [
-        ({}, None, True),
-        ({}, LINK, False),  # no link_prefix: a proposed link is never routed
-        ({"link_prefix": "obsidian://open?vault=Main&file="}, LINK, True),
-        ({"link_prefix": "obsidian://open?vault=Main&file="}, None, True),
-        ({"link_prefix": "obsidian://open?vault=Other&file="}, LINK, False),
-        ({"link_prefix": "obsidian://open?vault=Main&file="}, "https://evil.example.org/", False),
-        ({"link_prefix": "https://example.org/"}, "https://example.org.evil.example/x", False),
-        ({"link_prefix": "https://example.org/"}, "https://example.org/notes/1", True),
+        (None, None, True),
+        (None, LINK, False),  # no link_prefix: a proposed link is never routed
+        (VAULT, LINK, True),
+        (VAULT, None, True),
+        (VAULT, VAULT, True),
+        ("obsidian://vault/Other/", LINK, False),
+        ("obsidian://vault/Main/Daily/", "obsidian://vault/Main/Secrets/x", False),
+        (VAULT, "https://evil.example.org/Main/Daily", False),  # another scheme
+        (NOTES, NOTES + "1", True),
+        (NOTES, NOTES + "2026/10/27?view=day#top", True),  # own query and fragment
+        (NOTES, NOTES + "2026/", True),
+        (NOTES, "https://notes.example.org/notes/../admin", False),
+        (NOTES, "https://notes.example.org/notes/./x", False),
+        (NOTES, "https://notes.example.org/notes//x", False),
+        (NOTES, "https://notes.example.org/notes%2f..", False),
+        (NOTES, "https://notes.example.org/notes/%2E%2E/admin", False),
+        (NOTES, "https://notes.example.org/notes/%2fadmin", False),
+        (NOTES, "https://notes.example.org/notes/%252e%252e/admin", False),
+        (NOTES, "https://notes.example.org/notes/a\\b", False),
+        (NOTES, "https://notes.example.org/notesX/1", False),
+        (NOTES, "https://notes.example.org/admin/notes/1", False),
+        (NOTES, "https://notes.example.org.evil.example/notes/1", False),
+        (NOTES, "https://notes.example.org@evil.example/notes/1", False),
+        (NOTES, "https://notes.example.org:8443/notes/1", False),
+        (NOTES, "https://NOTES.example.org/notes/1", False),
+        (NOTES, "https://[notes.example.org/notes/1", False),  # urlsplit raises
     ],
 )
 def test_notification_links_need_a_trusted_prefix(
-    params: dict[str, Any], link: str | None, routed: bool
+    prefix: str | None, link: str | None, routed: bool
 ) -> None:
     push = {**PUSH, "link": link} if link else PUSH
-    record = _route([push], notify=[{"sink.notify": params}] if params else None)
+    notify = [{"sink.notify": {"link_prefix": prefix}}] if prefix else None
+    record = _route([push], notify=notify)
     if routed:
         assert record.status == "ok", record.error
         assert record.intents[0].applied_by == "sink.notify"
@@ -641,7 +662,26 @@ def test_notification_links_need_a_trusted_prefix(
 
 
 @pytest.mark.parametrize(
-    "prefix", [7, "", "ftp://example.org/", "https://example.org", "https://ex ample.org/"]
+    "prefix",
+    [
+        7,
+        "",
+        "ftp://example.org/notes/",
+        "https://ex ample.org/notes/",
+        "https://example.org",  # no path
+        "https://example.org/",  # no path after the host
+        "https://example.org/notes",  # does not end with /
+        "https://example.org/notes?",
+        "https://example.org/notes?file=",
+        "obsidian://open?vault=Main&file=",
+        "https://example.org/notes/#",
+        "https://example.org/?x=/",  # a query, even ending with /
+        "https://user@example.org/notes/",
+        "https://example.org/a/../notes/",
+        "https://example.org/a//notes/",
+        "https://example.org/a/%2e%2e/",
+        "https://example.org/a\\b/",
+    ],
 )
 def test_invalid_link_prefix_is_a_plan_error(prefix: Any) -> None:
     plugins = _flow_plugins([])

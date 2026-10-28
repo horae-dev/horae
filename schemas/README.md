@@ -291,7 +291,13 @@ loosened later without breaking a valid file.
       `replace-owned`, `tasks`, `post`); the note modes bind `path` and `post` binds `url`,
       compared as exact strings (no case, Unicode or URL normalisation);
     - a `notify.push` `link` is routed only to a `notify` entry whose trusted `link_prefix` it
-      starts with; without `link_prefix` a proposed link is never routed;
+      falls under; without `link_prefix` a proposed link is never routed. A prefix is an
+      `https://` or `obsidian://` link with a host, no user info, query or fragment, and a
+      clean path that ends with `/` (e.g. `obsidian://vault/Main/`), else `params_invalid`.
+      Both are parsed (`urlsplit`), not compared as strings: same scheme, exactly the same
+      netloc, and a link path under the prefix path whose rest has no empty, `.` or `..`
+      segment, backslash, or `%2e` / `%2f` / `%5c` / `%25` (so no `/notes/../admin`, no
+      `host.evil` or `host@evil`). The link may add its own query and fragment;
     - a `task.update_status` is routed only if its `task` fingerprint appears as a string value
       in the run's collected input; `task.create` binds no target;
     - two entries that may apply the same type to the same target make every such intent

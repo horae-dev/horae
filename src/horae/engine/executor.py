@@ -65,8 +65,15 @@ entry of a later step, which is recorded in `ProposedIntent.applied_by` (the ent
    target, the core fills it from the one entry that binds the type; if there is none or more
    than one, the intent is unrouted or ambiguous;
 3. a `notify.push` with a `link` is taken only by a `notify` entry with a trusted
-   `link_prefix` parameter that the link starts with (a prefix must be a valid notification
-   link ending in one of `/ ? = & #`); without `link_prefix`, a proposed link is never routed;
+   `link_prefix` parameter the link falls under; without `link_prefix`, a proposed link is
+   never routed. A prefix is an `https://` or `obsidian://` link with a host, no user info,
+   query or fragment, and a clean path of at least one segment that **ends with `/`** (no
+   empty, `.` or `..` segment, backslash, or the escapes below), e.g.
+   `https://notes.example.org/daily/` or
+   `obsidian://vault/Main/`. Both are parsed with `urllib.parse.urlsplit`: the link must have
+   the same scheme and exactly the same netloc, and its path must start with the prefix's
+   path; the rest of the path may have no empty, `.` or `..` segment, backslash, or `%2e`,
+   `%2f`, `%5c` or `%25` (any case). The link may add its own query and fragment;
 4. a `task.update_status` is routed only if its `task` fingerprint appears, as an exact string
    value, in the data collected so far in the run (`RunRecord.inputs`, and the current
    `collect` step's earlier sources and own output): a proposer can change the status of a
@@ -155,6 +162,7 @@ import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, NoReturn
+from urllib.parse import urlsplit
 
 from pydantic import TypeAdapter, ValidationError
 
@@ -237,7 +245,8 @@ TARGET_FIELDS: dict[IntentType, str] = {
 
 _NOTIFY_TYPES: frozenset[IntentType] = frozenset({"notify.push"})
 _LINK: TypeAdapter[str] = TypeAdapter(NotifyLink)
-_PREFIX_ENDS = frozenset("/?=&#")
+_LINK_SCHEMES = frozenset({"https", "obsidian"})
+_UNSAFE_ESCAPES = ("%2e", "%2f", "%5c", "%25")
 _BINDING_TYPES: dict[str, TypeAdapter[str]] = {
     "path": TypeAdapter(NotePath),
     "url": TypeAdapter(HttpsUrl),
@@ -386,7 +395,7 @@ class _Entry:
             return False
         if isinstance(intent, NotifyPush):
             prefix = self.binds.get("link_prefix")
-            return intent.link is None or (prefix is not None and intent.link.startswith(prefix))
+            return intent.link is None or (prefix is not None and _link_under(intent.link, prefix))
         bound = TARGET_FIELDS.get(intent.type)
         return bound is None or self.binds.get(bound) == getattr(intent, bound)
 
@@ -433,6 +442,52 @@ def _calls_of(step: Step) -> list[PluginCall]:
     return []  # pragma: no cover (the llm step calls no plugin tool)
 
 
+def _clean_path(path: str, *, prefix: bool) -> bool:
+    """A `link_prefix` path (`prefix=True`: absolute, at least one segment, ending in `/`), or
+    the rest of a link's path after it: no empty (but a trailing), `.` or `..` segment, no
+    backslash, no escaped dot, slash, backslash or percent sign."""
+    lowered = path.lower()
+    if "\\" in path or any(escape in lowered for escape in _UNSAFE_ESCAPES):
+        return False
+    segments = path.split("/")
+    if prefix:
+        if len(segments) < 3 or segments[0] != "" or segments[-1] != "":
+            return False
+        segments = segments[1:-1]
+    elif segments[-1] == "":
+        segments = segments[:-1]
+    return all(segment not in ("", ".", "..") for segment in segments)
+
+
+def _check_link_prefix(prefix: str) -> str:
+    """`prefix` if it is a safe `link_prefix`; `ValueError` otherwise."""
+    parts = urlsplit(prefix)
+    if (
+        parts.scheme not in _LINK_SCHEMES
+        or not parts.netloc
+        or "@" in parts.netloc
+        or "?" in prefix
+        or "#" in prefix
+        or not prefix.endswith("/")
+        or not _clean_path(parts.path, prefix=True)
+    ):
+        raise ValueError("unsafe link prefix")
+    return prefix
+
+
+def _link_under(link: str, prefix: str) -> bool:
+    """`link` falls under `prefix` (a `_check_link_prefix`-valid prefix), compared parsed."""
+    try:
+        got, want = urlsplit(link), urlsplit(prefix)
+    except ValueError:
+        return False
+    if got.scheme != want.scheme or got.netloc != want.netloc:
+        return False
+    if not got.path.startswith(want.path):
+        return False
+    return _clean_path(got.path[len(want.path) :], prefix=False)
+
+
 def _entry_binding(
     kind: StepKind, ref: str, params: dict[str, Any], plugin: ResolvedPlugin
 ) -> tuple[frozenset[IntentType], dict[str, str]]:
@@ -444,12 +499,10 @@ def _entry_binding(
         prefix = params.get("link_prefix")
         if prefix is not None:
             try:
-                binds["link_prefix"] = _LINK.validate_python(prefix)
-            except ValidationError:
-                raise ValueError(f"{ref}: `link_prefix` is not a valid link") from None
-            if prefix[-1] not in _PREFIX_ENDS:
-                ends = " ".join(sorted(_PREFIX_ENDS))
-                raise ValueError(f"{ref}: `link_prefix` must end with one of {ends}")
+                binds["link_prefix"] = _check_link_prefix(_LINK.validate_python(prefix))
+            except (ValidationError, ValueError):
+                message = "must be an https:// or obsidian:// link with a clean path ending in /"
+                raise ValueError(f"{ref}: `link_prefix` {message}") from None
         return _NOTIFY_TYPES & allowed, binds
     for name, adapter in _BINDING_TYPES.items():
         if name in params:
