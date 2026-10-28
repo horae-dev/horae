@@ -1560,3 +1560,41 @@ def test_an_unreadable_vocabulary_sends_nothing(
     assert code == 1, document
     assert document["cases"][0]["error"]["kind"] == "deid_unavailable"
     assert fake.requests == []
+
+
+def _plant_title_fragment(tmp_path: Path) -> None:
+    """A resolved secret that is part of a classed task title (synthetic)."""
+    from horae.secrets import SecretResolver
+
+    folder = tmp_path / "planted"
+    folder.mkdir()
+    (folder / "TITLE_TOKEN").write_text("train tickets", encoding="utf-8")
+    SecretResolver({}, folder).resolve("TITLE_TOKEN")
+
+
+def test_a_secret_in_the_viewed_input_is_refused_before_deid_live(
+    instance: Path, provider: Callable[..., FakeProvider], pack: Path, tmp_path: Path
+) -> None:
+    _classed_pack(pack)
+    _plant_title_fragment(tmp_path)
+    fake = provider(_recorded_outputs()["tasks-only"])
+    args = ("--plugin-dir", str(pack), "--case", "tasks-only")
+    code, document, _ = _invoke(*_live_args(instance, *args))
+    assert code == 1, document
+    error = document["cases"][0]["error"]
+    assert error["kind"] == "secret_in_request"
+    assert "TITLE_TOKEN" in error["message"]
+    assert "train tickets" not in json.dumps(document)
+    assert fake.requests == []  # nothing sent, nothing billed
+
+
+def test_a_secret_in_the_viewed_input_is_refused_before_deid_offline(
+    pack: Path, tmp_path: Path
+) -> None:
+    _classed_pack(pack)
+    _plant_title_fragment(tmp_path)
+    code, document, _ = _invoke(SKILL, "--plugin-dir", str(pack), "--case", "tasks-only", "--json")
+    assert code == 1, document
+    error = document["cases"][0]["error"]
+    assert error["kind"] == "secret_in_request"
+    assert "TITLE_TOKEN" in error["message"]

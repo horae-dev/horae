@@ -2139,6 +2139,28 @@ loosened later without breaking a valid file.
         SHA-256 of the real viewed input: it is stored locally only (run record, cache),
         never sent, and a salt would break replay and the cache across processes; a
         dictionary attack on it needs the store, which holds the real outputs anyway;
+    - **(J) amendment: the secret check before de-identification (security review of
+      PR #110).** H scanned only the rendered request, after pseudonymization: a classed
+      value or an amount rendering inside a secret (secret `sk-live-alice-smith-1234567`,
+      classed person "Alice Smith") was rewritten, so the scan of the whole value no longer
+      matched while the rest of the secret was sent (a parser differential). So:
+      - the engine scans the **real viewed input** (its canonical JSON bytes, every
+        encoding, and its strings, object keys and whole numbers: the same check as
+        `secrets_in`) for every resolved or primed secret **before** it is pseudonymized,
+        and before the LLM cache is consulted; a match degrades the step with
+        `secret_in_request` and records the same violation (naming the secrets, never a
+        value), nothing is sent and nothing is billed; `horae eval` (#36, decision 48) runs
+        the same check (`horae.engine.secrets_in_viewed`) on each case's viewed input, offline
+        and live, before de-identifying: the case is an error (`secret_in_request`) and
+        nothing is rendered or sent;
+      - `ModelBackends.send` keeps its check of the rendered bytes (defence in depth: the
+        prompt, the schema and anything added when rendering);
+      - belt and braces, the pseudonymizer replaces no known value, phone or amount
+        rendering whose span in a scanned string overlaps a resolved secret, so a secret is
+        never sent in part even if the engine's check were bypassed;
+      - the engine's check sees the process registry, which the runner primes with every
+        declared secret before a run (#53); a declared secret first resolved by
+        `ModelBackends` (an engine used without the runner) is caught by the backend's check;
     - **limits**: matching misses nicknames, initials, typos and transliterations, and
       over-matches a known value that is also a common word; a value of more than 48
       tokens is not looked for in text; values in unclassed fields that equal no known value

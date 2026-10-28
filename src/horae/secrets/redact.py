@@ -209,6 +209,13 @@ class Redactor:
 
         return self._text.sub(replace, text), found
 
+    def text_spans(self, text: str) -> list[tuple[int, int, str]]:
+        """`(start, end, name)` of every match in `text` (character offsets), left to right,
+        not overlapping."""
+        if self._text is None:
+            return []
+        return [(m.start(), m.end(), self._names[m.group(0)]) for m in self._text.finditer(text)]
+
     def names_in(self, text: str) -> set[str]:
         """The names of the secrets matched in `text`."""
         if self._text is None:

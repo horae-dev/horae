@@ -43,7 +43,7 @@ from horae.contracts.intents import IntentType
 from horae.contracts.pipeline import Budget
 from horae.contracts.plugin import PluginManifest
 from horae.contracts.run import Usage
-from horae.engine import TARGET_FIELDS, check_task_fingerprints, fill_target
+from horae.engine import TARGET_FIELDS, check_task_fingerprints, fill_target, secrets_in_viewed
 from horae.engine.guard import check_intents
 from horae.engine.ports import DeidUnavailable, LlmError, LlmRequest, LlmResponse
 from horae.evals._cases import LoadedCase
@@ -375,7 +375,18 @@ def deidentify(
 ) -> tuple[bool, Pseudonymized | None]:
     """`(ok, pseudonymized viewed input)` as the engine's `llm` step makes it before a cloud
     alias (schemas decision 47; `None`: a local alias, or a skill without classes); not ok
-    (and `result` an error, `deid_unavailable`) when it cannot be done: nothing is sent."""
+    (and `result` an error, `deid_unavailable`) when it cannot be done: nothing is sent.
+    First, as the engine does (decision 47 J), the real viewed input is checked for a
+    resolved secret: a match is `secret_in_request` (naming the secrets), nothing is
+    pseudonymized, rendered or sent."""
+    held = secrets_in_viewed(viewed)
+    if held:
+        names = ", ".join(sorted(held))
+        message = (
+            f"the request to model alias {alias!r} holds secret {names}: refused before sending"
+        )
+        result.fail("secret_in_request", message)
+        return False, None
     try:
         return True, policy.pseudonymize(alias, sue.skill.view_options, viewed)
     except DeidUnavailable as error:
