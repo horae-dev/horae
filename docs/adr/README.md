@@ -5,12 +5,12 @@ alternatives considered. All ADRs use the same [template](0000-template.md).
 
 | ADR | Title | Status | PLAN.md |
 |---|---|---|---|
-| [0001](0001-pipelines-not-agent-loops.md) | Pipelines, not agent loops | Proposed | [§2.1](../PLAN.md#21-design-tenets), [§3.2](../PLAN.md#32-a-pipeline-example-the-morning-note) |
-| [0002](0002-intents-applied-by-the-core.md) | Plugins return intents; the core applies them | Proposed | [§2.1](../PLAN.md#21-design-tenets), [§3.3](../PLAN.md#33-plugin-manifest-and-permissions) |
-| [0003](0003-mcp-as-the-plugin-protocol.md) | MCP as the plugin protocol | Proposed | [§3.3](../PLAN.md#33-plugin-manifest-and-permissions) |
-| [0004](0004-git-marketplace-with-sha-pinning.md) | Git marketplace with commit-SHA pinning | Proposed | [§4](../PLAN.md#4-marketplace-git-only) |
-| [0005](0005-claude-cli-backend-and-its-terms.md) | The `claude-cli` backend and its terms | Proposed | [§3.4](../PLAN.md#34-llm-step-and-backends) |
-| [0006](0006-sqlite-as-the-store.md) | SQLite as the store | Proposed | [§3.1](../PLAN.md#31-concepts), [§2.1](../PLAN.md#21-design-tenets) |
+| [0001](0001-pipelines-not-agent-loops.md) | Pipelines, not agent loops | Accepted | [§2.1](../PLAN.md#21-design-tenets), [§3.2](../PLAN.md#32-a-pipeline-example-the-morning-note) |
+| [0002](0002-intents-applied-by-the-core.md) | Plugins return intents; the core applies them | Accepted | [§2.1](../PLAN.md#21-design-tenets), [§3.3](../PLAN.md#33-plugin-manifest-and-permissions) |
+| [0003](0003-mcp-as-the-plugin-protocol.md) | MCP as the plugin protocol | Accepted | [§3.3](../PLAN.md#33-plugin-manifest-and-permissions) |
+| [0004](0004-git-marketplace-with-sha-pinning.md) | Git marketplace with commit-SHA pinning | Accepted | [§4](../PLAN.md#4-marketplace-git-only) |
+| [0005](0005-claude-cli-backend-and-its-terms.md) | The `claude-cli` backend and its terms | Accepted | [§3.4](../PLAN.md#34-llm-step-and-backends) |
+| [0006](0006-sqlite-as-the-store.md) | SQLite as the store | Accepted | [§3.1](../PLAN.md#31-concepts), [§2.1](../PLAN.md#21-design-tenets) |
 
 ## Process
 

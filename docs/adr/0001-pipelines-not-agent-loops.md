@@ -1,7 +1,8 @@
 # ADR 0001: Pipelines, not agent loops
 
-- **Status:** Proposed
-- **Date:** 2026-10-27
+- **Status:** Accepted
+- **Date:** 2026-10-27 (proposed)
+- **Accepted:** 2026-10-28
 
 ## Context
 
