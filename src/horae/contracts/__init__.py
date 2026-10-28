@@ -46,6 +46,7 @@ from horae.contracts.pipeline import (
     NotifyStep,
     Pipeline,
     Step,
+    ToolCall,
     TransformStep,
     Trigger,
 )
@@ -174,6 +175,7 @@ __all__ = [
     "TaskCreate",
     "TaskUpdateStatus",
     "Timestamp",
+    "ToolCall",
     "TransformStep",
     "Trigger",
     "Usage",

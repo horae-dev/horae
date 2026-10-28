@@ -278,7 +278,11 @@ class AppliedChange(Contract):
 class Violation(Contract):
     """Access that was blocked or flagged during the run."""
 
-    kind: Literal["egress_blocked", "guard", "undeclared_secret", "undeclared_path"]
+    kind: Literal[
+        "egress_blocked", "guard", "undeclared_secret", "undeclared_path", "secret_in_output"
+    ]
+    """`secret_in_output`: a plugin returned the value (or an encoding) of an instance secret in
+    its output or intents; the plugin host replaced it with `[REDACTED:<NAME>]` (#24)."""
     detail: Message
 
 

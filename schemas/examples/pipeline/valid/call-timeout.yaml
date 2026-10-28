@@ -1,0 +1,12 @@
+# Per-call timeouts (#24): the explicit call form `{tool, params, timeout_s}`. Without
+# `timeout_s` it is the same call as the mapping form (and digests the same).
+name: slow-sources
+steps:
+  - collect:
+      - tool: calendar.events
+        params: { days: 2 }
+        timeout_s: 90
+      - tool: github.review_requests
+      - coach.brief: { endpoints: [finance] }
+  - notify:
+      - ntfy.digest: {}

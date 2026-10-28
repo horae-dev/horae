@@ -164,7 +164,9 @@ class RecordedToolCaller:
         self.mismatches.append(message)
         return ToolCallError(MISMATCH, message)
 
-    async def call(self, ref: str, params: dict[str, Any], input: Any) -> ToolResult:
+    async def call(
+        self, ref: str, params: dict[str, Any], input: Any, *, timeout_s: float | None = None
+    ) -> ToolResult:
         expected = next(self._expected, None)
         if expected is None or expected.ref != ref or _canon(expected.params) != _canon(params):
             raise self._mismatch(f"unexpected call to {ref}: the pipeline does not plan it here")

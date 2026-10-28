@@ -849,7 +849,9 @@ def test_a_host_returning_no_tool_result_is_contained() -> None:
     plugins = _flow_plugins([])
 
     class Host(FixturePlugins):
-        async def call(self, ref: str, params: dict[str, Any], input: Any) -> ToolResult:
+        async def call(
+            self, ref: str, params: dict[str, Any], input: Any, *, timeout_s: float | None = None
+        ) -> ToolResult:
             return _NotAResult()  # type: ignore[return-value]
 
     host = Host(plugins=plugins.plugins)

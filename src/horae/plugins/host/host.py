@@ -1,0 +1,466 @@
+# SPDX-License-Identifier: Apache-2.0
+"""The plugin host: `PluginRegistry` and `ToolCaller` over MCP stdio plugins (#24).
+
+**Registry.** `HostRegistry` resolves tools and skills from `horae.lock` and the installed
+manifests (`plugin.yaml`). A manifest must be pinned in the lock at the same version, and may
+not ask for more than the user approved there (`network`, `secrets`, `paths`, `intents`): the
+**locked** permissions are the ones in force. A tool or skill resolves to the plugin whose
+manifest `provides` it (decision 11: the namespace need not be the plugin's name); two plugins
+providing the same ref is an error. Resolution reads only the documents given (#23).
+
+**Host.** `PluginHost` is used for one run: `async with PluginHost(...) as host`. It is the
+run's `ToolCaller`:
+
+- **one process per plugin per run**, started lazily on the first call to one of its tools,
+  reused for every later call, and stopped when the host exits (no daemons, nothing carried
+  between runs). Calls to one plugin are serialised (one in flight per process, so its stderr
+  belongs to one call); calls to different plugins run concurrently (the engine's parallel
+  `collect`);
+- **startup**: the declared secrets are resolved (`secret_missing`) and checked against the
+  deny list (`env_unsafe`), `argv[0]` is resolved to an absolute path (a bare name with
+  `shutil.which` on the child's `PATH`, a relative path against the plugin's directory), the
+  process is spawned (`horae.plugins.host.transport`) with the environment of
+  `horae.plugins.host.env` and an empty working directory, and the MCP handshake and
+  `tools/list` must finish within the plugin's `startup_timeout_s` (`startup_timeout`);
+- **calls**: the tool must be in the manifest's `provides` and in `tools/list`
+  (`tool_missing`); each call is bounded by its pipeline `timeout_s`, else the plugin's
+  `call_timeout_s` (`horae.yaml`), else `plugin_defaults.call_timeout_s`;
+- **failures**: after a timeout, a crash, an oversized or malformed message, the process is
+  killed (its group: `SIGTERM`, then `SIGKILL`) and the call fails; the next call to the plugin
+  starts it again, **once per run** (PR #85 answer 6). A second such failure, or any failed
+  start, makes the plugin `plugin_unavailable` for the rest of the run. A timed-out call is
+  never retried (no double side effects);
+- **results**: `isError: true` is `tool_error`; the data is `structuredContent`, else a single
+  text block that parses as JSON (PR #85 answer 9), else `output_invalid`; intents come from
+  `_meta["dev.horae/intents"]` (a list) and are validated by the engine;
+- **redaction** (PR #85 answer 4): every secret the instance resolved
+  (`SecretResolver.resolved()`) and its encodings is replaced with `[REDACTED:<NAME>]` in
+  stderr, error messages, tool output and intents. A secret found in the output or intents
+  does not fail the call: it is redacted and recorded as a `secret_in_output` violation
+  (`ToolResult.violations`). This is how the maintainer's answer "add the secrets from the
+  output" is read: redact them, flag them, keep going.
+
+**Stderr** is captured per call (`horae.plugins.host.capture`): what the plugin wrote since
+the previous call ended, until the pipe has been quiet for `STDERR_QUIET_S` after the result
+(at most `STDERR_SETTLE_S`), or until the process is gone after a failure.
+
+Nothing here puts a secret into Horae's own environment: each child's mapping is built
+explicitly and handed to the spawn call only.
+"""
+
+import json
+import os
+import shutil
+import tempfile
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
+from pathlib import Path
+from types import TracebackType
+from typing import Any, Self
+
+import anyio
+import anyio.abc
+import mcp_types
+
+from horae.config import Instance
+from horae.config.documents import read_yaml, validate
+from horae.contracts.instance import PluginDefaults
+from horae.contracts.lockfile import Lockfile
+from horae.contracts.plugin import Permissions, PluginManifest, StdioRuntime
+from horae.contracts.run import Violation
+from horae.engine.ports import ResolvedPlugin, ToolResult, UnknownPlugin
+from horae.plugins.host.capture import StderrCapture
+from horae.plugins.host.env import BASE_PATH, build_env, check_names
+from horae.plugins.host.errors import HostErrorKind, PluginCallError
+from horae.plugins.host.redact import MAX_EXPANSION, Redactor
+from horae.plugins.host.session import INTENTS_META, CallFailed, PluginProcess, Spawn
+from horae.secrets import MAX_SECRET_BYTES, Secret, SecretError, SecretResolver
+
+MANIFEST_FILE = "plugin.yaml"
+STDERR_QUIET_S = 0.05
+STDERR_SETTLE_S = 0.5
+CAPTURE_MARGIN = MAX_EXPANSION * MAX_SECRET_BYTES
+"""Bytes each stderr window keeps past its cut: the longest pattern any secret can produce."""
+_MAX_MESSAGE = 1000
+_PROVIDED = ("sources", "transforms", "sinks", "notifiers")
+
+
+class RegistryError(ValueError):
+    """The installed plugins do not match `horae.lock` (the message names the plugin)."""
+
+
+@dataclass(frozen=True)
+class InstalledPlugin:
+    """A plugin the host can start: its manifest with the locked permissions."""
+
+    manifest: PluginManifest
+    commit: str | None = None
+    root: Path | None = None
+    """The plugin's directory (relative commands are resolved against it)."""
+
+    @property
+    def resolved(self) -> ResolvedPlugin:
+        return ResolvedPlugin(self.manifest, self.commit)
+
+
+def _exceeds(asked: Permissions, approved: Permissions) -> list[str]:
+    extra = [
+        f"{field}: {', '.join(sorted(set(getattr(asked, field)) - set(getattr(approved, field))))}"
+        for field in ("network", "secrets", "intents")
+        if not set(getattr(asked, field)) <= set(getattr(approved, field))
+    ]
+    for access in ("read", "write"):
+        wanted = set(getattr(asked.paths, access)) - set(getattr(approved.paths, access))
+        if wanted:
+            extra.append(f"paths.{access}: {', '.join(sorted(wanted))}")
+    return extra
+
+
+class HostRegistry:
+    """A `PluginRegistry` over `horae.lock` and the installed manifests."""
+
+    def __init__(
+        self,
+        lock: Lockfile,
+        manifests: Mapping[str, PluginManifest],
+        roots: Mapping[str, Path] | None = None,
+    ) -> None:
+        self._plugins: dict[str, InstalledPlugin] = {}
+        self._tools: dict[str, str] = {}
+        self._skills: dict[str, str] = {}
+        for name, manifest in sorted(manifests.items()):
+            locked = lock.plugins.get(name)
+            if manifest.name != name or locked is None:
+                raise RegistryError(f"plugin {name}: not pinned in horae.lock")
+            if manifest.version != locked.version:
+                raise RegistryError(
+                    f"plugin {name}: version {manifest.version} is installed, "
+                    f"horae.lock pins {locked.version}"
+                )
+            extra = _exceeds(manifest.permissions, locked.permissions)
+            if extra:
+                raise RegistryError(f"plugin {name}: permissions not approved ({'; '.join(extra)})")
+            effective = manifest.model_copy(update={"permissions": locked.permissions})
+            root = (roots or {}).get(name)
+            self._plugins[name] = InstalledPlugin(effective, locked.commit, root)
+            provides = manifest.provides
+            for ref in (ref for kind in _PROVIDED for ref in getattr(provides, kind)):
+                self._claim(self._tools, ref, name)
+            for skill in provides.skills:
+                self._claim(self._skills, skill, name)
+
+    @staticmethod
+    def _claim(index: dict[str, str], ref: str, name: str) -> None:
+        owner = index.setdefault(ref, name)
+        if owner != name:
+            raise RegistryError(f"{ref} is provided by both {owner} and {name}")
+
+    @classmethod
+    def from_directory(cls, lock: Lockfile, directory: Path) -> Self:
+        """Read `<directory>/<name>/plugin.yaml` for every plugin in `lock`.
+
+        Raises `ProblemsError` for an invalid manifest, `RegistryError` for one that does not
+        match the lock. (Where `horae plugin add` installs plugins is M4's; this is the layout
+        it is expected to produce.)"""
+        manifests: dict[str, PluginManifest] = {}
+        roots: dict[str, Path] = {}
+        for name in sorted(lock.plugins):
+            root = directory / name
+            manifests[name] = validate(read_yaml(root / MANIFEST_FILE), PluginManifest)
+            roots[name] = root
+        return cls(lock, manifests, roots)
+
+    def installed(self, name: str) -> InstalledPlugin:
+        try:
+            return self._plugins[name]
+        except KeyError:
+            raise UnknownPlugin(name) from None
+
+    def installed_for_tool(self, ref: str) -> InstalledPlugin:
+        try:
+            return self._plugins[self._tools[ref]]
+        except KeyError:
+            raise UnknownPlugin(ref) from None
+
+    def plugin_for_tool(self, ref: str) -> ResolvedPlugin:
+        return self.installed_for_tool(ref).resolved
+
+    def plugin_for_skill(self, skill: str) -> ResolvedPlugin:
+        try:
+            return self._plugins[self._skills[skill]].resolved
+        except KeyError:
+            raise UnknownPlugin(skill) from None
+
+
+def resolve_command(command: list[str], root: Path | None) -> list[str]:
+    """`command` with `argv[0]` as an absolute path (see the module docstring)."""
+    first = command[0]
+    if os.path.isabs(first):
+        path: str | None = first
+    elif "/" in first:
+        path = str(root / first) if root is not None else None
+    else:
+        path = shutil.which(first, path=BASE_PATH)
+    if path is None or not os.path.isfile(path) or not os.access(path, os.X_OK):
+        raise PluginCallError("spawn_failed", f"command {first!r} not found or not executable")
+    return [path, *command[1:]]
+
+
+@dataclass
+class _Entry:
+    """One plugin's state in this run."""
+
+    installed: InstalledPlugin
+    lock: anyio.Lock = field(default_factory=anyio.Lock)
+    process: PluginProcess | None = None
+    starts: int = 0
+    dead: str | None = None
+    """Why the plugin is unavailable for the rest of the run."""
+
+
+def _text(result: mcp_types.CallToolResult) -> str:
+    return "\n".join(block.text for block in result.content if block.type == "text")
+
+
+class PluginHost:
+    """The run's `ToolCaller` (see the module docstring)."""
+
+    def __init__(
+        self,
+        registry: HostRegistry,
+        *,
+        secrets: SecretResolver,
+        work_dir: Path,
+        timezone: str = "UTC",
+        timeouts: Callable[[str], PluginDefaults] | None = None,
+    ) -> None:
+        self.registry = registry
+        self.secrets = secrets
+        self.timezone = timezone
+        self._work_root = work_dir
+        self._timeouts = timeouts or (lambda _name: PluginDefaults())
+        self._entries: dict[str, _Entry] = {}
+        self._group: anyio.abc.TaskGroup | None = None
+        self._run_dir: Path | None = None
+        self._redactor: tuple[tuple[Secret, ...], Redactor] | None = None
+
+    # --- lifecycle -------------------------------------------------------------------------
+
+    async def __aenter__(self) -> Self:
+        self._work_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self._run_dir = Path(tempfile.mkdtemp(prefix="run-", dir=self._work_root))
+        self._group = anyio.create_task_group()
+        await self._group.__aenter__()
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> bool | None:
+        group, self._group = self._group, None
+        try:
+            with anyio.CancelScope(shield=True):
+                async with anyio.create_task_group() as stopping:
+                    for entry in self._entries.values():
+                        if entry.process is not None:
+                            stopping.start_soon(entry.process.stop)
+            if group is not None:
+                group.cancel_scope.cancel()
+                await group.__aexit__(None, None, None)
+        finally:
+            if self._run_dir is not None:
+                shutil.rmtree(self._run_dir, ignore_errors=True)
+        return None
+
+    # --- redaction -------------------------------------------------------------------------
+
+    def redactor(self) -> Redactor:
+        """A redactor of every secret resolved so far (rebuilt when they change)."""
+        resolved = self.secrets.resolved()
+        if self._redactor is None or self._redactor[0] != resolved:
+            self._redactor = (resolved, Redactor(resolved))
+        return self._redactor[1]
+
+    def _redacted(self, error: PluginCallError) -> PluginCallError:
+        message, _ = self.redactor().redact_text(error.message)
+        if len(message) > _MAX_MESSAGE:
+            message = message[: _MAX_MESSAGE - 1] + "…"
+        kind: HostErrorKind = error.host_kind
+        return PluginCallError(kind, message, stderr=error.stderr)
+
+    # --- calls -----------------------------------------------------------------------------
+
+    async def call(
+        self, ref: str, params: dict[str, Any], input: Any, *, timeout_s: float | None = None
+    ) -> ToolResult:
+        """Call tool `ref` (see the module docstring); raises `PluginCallError` only."""
+        try:
+            return await self._call(ref, params, input, timeout_s)
+        except PluginCallError as error:
+            raise self._redacted(error) from None
+        except Exception:  # a host bug must never crash the run, nor leak a message
+            raise PluginCallError("host_error", f"{ref}: unexpected host error") from None
+
+    async def _call(
+        self, ref: str, params: dict[str, Any], input: Any, timeout_s: float | None
+    ) -> ToolResult:
+        if self._group is None:
+            raise PluginCallError("host_error", "the plugin host is not open")
+        try:
+            installed = self.registry.installed_for_tool(ref)
+        except UnknownPlugin:
+            raise PluginCallError("tool_missing", f"no installed plugin provides {ref}") from None
+        name = installed.manifest.name
+        entry = self._entries.setdefault(name, _Entry(installed))
+        async with entry.lock:
+            process = await self._ready(entry)
+            if ref not in process.tools:
+                raise PluginCallError("tool_missing", f"{name} does not list {ref} in tools/list")
+            timeout = timeout_s or self._timeouts(name).call_timeout_s
+            try:
+                result = await process.call(ref, params, input, timeout)
+            except CallFailed as failed:
+                await process.stop(forced=True)
+                self._lost(entry)
+                stderr = process.capture.take(self.redactor())
+                raise PluginCallError(
+                    failed.kind, f"{ref}: {failed.message}", stderr=stderr
+                ) from None
+            except PluginCallError as error:
+                stderr = await self._stderr(process)
+                kind: HostErrorKind = error.host_kind
+                raise PluginCallError(kind, f"{ref}: {error.message}", stderr=stderr) from None
+            stderr = await self._stderr(process)
+            return self._result(ref, result, stderr)
+
+    def _lost(self, entry: _Entry) -> None:
+        """The process failed: it may be started once more in this run."""
+        entry.process = None
+        if entry.starts >= 2:
+            entry.dead = "it failed twice in this run (one restart allowed)"
+
+    async def _ready(self, entry: _Entry) -> PluginProcess:
+        name = entry.installed.manifest.name
+        if entry.process is not None and not entry.process.alive:
+            await entry.process.stop(forced=True)  # it died between two calls
+            self._lost(entry)
+        if entry.dead is not None:
+            raise PluginCallError(
+                "plugin_unavailable", f"plugin {name} is unavailable: {entry.dead}"
+            )
+        if entry.process is not None:
+            return entry.process
+        entry.starts += 1
+        try:
+            process = await self._start(entry)
+        except PluginCallError as error:
+            entry.dead = "it could not be started"
+            raise error
+        entry.process = process
+        return process
+
+    async def _start(self, entry: _Entry) -> PluginProcess:
+        manifest = entry.installed.manifest
+        name = manifest.name
+        runtime = manifest.runtime
+        if not isinstance(runtime, StdioRuntime):
+            what = "no runtime" if runtime is None else f"runtime {runtime.protocol}"
+            raise PluginCallError("runtime_unsupported", f"plugin {name} has {what}")
+        declared = list(manifest.permissions.secrets)
+        check_names(name, declared)
+        values: dict[str, Secret] = {}
+        for secret in declared:
+            try:
+                values[secret] = self.secrets.resolve(secret)
+            except SecretError as error:
+                raise PluginCallError("secret_missing", str(error)) from None
+        argv = resolve_command(list(runtime.command), entry.installed.root)
+        if self._run_dir is None or self._group is None:  # pragma: no cover (checked in _call)
+            raise PluginCallError("host_error", "the plugin host is not open")
+        base = self._run_dir / f"{name}.{entry.starts}"
+        home, tmpdir, cwd = base / "home", base / "tmp", base / "cwd"
+        for directory in (home, tmpdir, cwd):
+            directory.mkdir(mode=0o700, parents=True)
+        env = build_env(name, home=home, tmpdir=tmpdir, timezone=self.timezone, secrets=values)
+        startup = self._timeouts(name).startup_timeout_s
+        process = PluginProcess(
+            Spawn(name, tuple(argv), env, cwd, startup), StderrCapture(CAPTURE_MARGIN)
+        )
+        self._group.start_soon(process.serve)
+        await process.ready.wait()
+        if process.error is not None:
+            await process.stop(forced=True)
+            stderr = process.capture.take(self.redactor())
+            raise PluginCallError(process.error.host_kind, process.error.message, stderr=stderr)
+        return process
+
+    async def _stderr(self, process: PluginProcess) -> str | None:
+        """The call's stderr, once the pipe has been quiet (see the module docstring)."""
+        start = anyio.current_time()
+        while True:
+            now = anyio.current_time()
+            quiet = now - max(start, process.last_stderr)
+            if quiet >= STDERR_QUIET_S or now - start >= STDERR_SETTLE_S:
+                break
+            await anyio.sleep(STDERR_QUIET_S - quiet)
+        return process.capture.take(self.redactor())
+
+    def _result(self, ref: str, result: mcp_types.CallToolResult, stderr: str | None) -> ToolResult:
+        def invalid(message: str) -> PluginCallError:
+            return PluginCallError("output_invalid", f"{ref}: {message}", stderr=stderr)
+
+        if result.is_error:
+            text = _text(result) or "the tool reported an error"
+            raise PluginCallError("tool_error", f"{ref}: {text}", stderr=stderr)
+        if result.structured_content is not None or "structured_content" in result.model_fields_set:
+            data = result.structured_content
+        elif len(result.content) == 1 and result.content[0].type == "text":
+            try:
+                data = json.loads(result.content[0].text)
+            except ValueError:
+                raise invalid("the text result is not JSON") from None
+        else:
+            raise invalid("no structured content and not a single JSON text block")
+        intents = (result.meta or {}).get(INTENTS_META, [])
+        if not isinstance(intents, list):
+            raise invalid(f"_meta[{INTENTS_META!r}] is not a list")
+        redactor = self.redactor()
+        data, in_data = redactor.redact_data(data)
+        intents, in_intents = redactor.redact_data(intents)
+        violations: tuple[Violation, ...] = ()
+        found = in_data | in_intents
+        if found:
+            where = " and ".join(
+                part for part, hit in (("output", in_data), ("intents", in_intents)) if hit
+            )
+            detail = f"{ref} returned secret {', '.join(sorted(found))} in its {where} (redacted)"
+            violations = (Violation(kind="secret_in_output", detail=detail),)
+        return ToolResult(data=data, intents=intents, stderr=stderr, violations=violations)
+
+
+def host_for_instance(
+    instance: Instance, registry: HostRegistry, *, secrets: SecretResolver | None = None
+) -> PluginHost:
+    """A `PluginHost` for `instance` (`horae.config.Instance`): its time zone, plugin timeouts,
+    secret resolver and `<state_dir>/plugin-runs` as the work directory."""
+    return PluginHost(
+        registry,
+        secrets=secrets or instance.secret_resolver(),
+        work_dir=instance.state_dir / "plugin-runs",
+        timezone=instance.config.timezone,
+        timeouts=instance.plugin_timeouts,
+    )
+
+
+__all__ = [
+    "CAPTURE_MARGIN",
+    "MANIFEST_FILE",
+    "HostRegistry",
+    "InstalledPlugin",
+    "PluginHost",
+    "RegistryError",
+    "host_for_instance",
+    "resolve_command",
+]

@@ -24,7 +24,10 @@ with
 - defaults filled in (`on_unchanged_input: skip` written or omitted gives the same digest),
 - fields that are `None` left out (a new optional field does not change existing digests),
 - every plugin call in the mapping form: a bare `tasks.normalize` becomes
-  `{"tasks.normalize": {}}`, so both spellings of the same call digest the same.
+  `{"tasks.normalize": {}}`, so both spellings of the same call digest the same. A call in the
+  explicit form (`{tool, params, timeout_s}`, #24) without a `timeout_s` is written in the
+  mapping form too; with one, it stays `{"tool", "params", "timeout_s"}` (a timeout changes how
+  the call runs, so it changes the digest).
 
 Comments, key order and YAML formatting therefore never change the digest; any change to what
 runs does. `pipeline_digest` is the SHA-256 of the canonical JSON of the canonical pipeline,
@@ -61,8 +64,16 @@ def canonical_pipeline(pipeline: Pipeline) -> dict[str, Any]:
     for step in dumped["steps"]:
         for kind in _CALL_KINDS:
             if kind in step:
-                step[kind] = [{call: {}} if isinstance(call, str) else call for call in step[kind]]
+                step[kind] = [_canonical_call(call) for call in step[kind]]
     return dumped
+
+
+def _canonical_call(call: Any) -> Any:
+    if isinstance(call, str):
+        return {call: {}}
+    if "tool" in call and "timeout_s" not in call:  # a tool ref always has a dot: not a ref key
+        return {call["tool"]: call.get("params", {})}
+    return call
 
 
 def pipeline_digest(pipeline: Pipeline) -> str:

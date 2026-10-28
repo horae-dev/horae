@@ -158,7 +158,9 @@ def _record(
 class _Sentinel(FixturePlugins):
     """A registry whose tools fail the test if anything calls them."""
 
-    async def call(self, ref: str, params: dict[str, Any], input: Any) -> ToolResult:
+    async def call(
+        self, ref: str, params: dict[str, Any], input: Any, *, timeout_s: float | None = None
+    ) -> ToolResult:
         raise AssertionError(f"replay called the live tool {ref}")
 
 
@@ -502,12 +504,12 @@ def test_collect_intent_failure_is_revalidated() -> None:
     plugins.handlers["coach.brief"] = lambda p, i: ToolResult(data={}, intents=[PUSH])
     record = _record(_brief(), plugins, FakeLlm())
     assert _kind(record, 0) == "intent_rejected"
-    # The rejected source and its raw proposals are recorded, so the replay re-validates them.
-    assert [(s.source, s.call, s.intents) for s in record.inputs][-1] == (
-        "coach.brief",
-        2,
-        [PUSH],
-    )
+    # The rejected source and its raw proposals are recorded, so the replay re-validates them;
+    # so is every later source of the step (they all ran, concurrently).
+    recorded = [(s.source, s.call, s.intents) for s in record.inputs]
+    assert ("coach.brief", 2, [PUSH]) in recorded
+    calls = [call or 0 for _, call, _ in recorded]
+    assert calls == sorted(calls)
     result = _replay(record, _brief(), plugins)
     _assert_identical(result)
     assert result.replayed.steps[0].error == record.steps[0].error

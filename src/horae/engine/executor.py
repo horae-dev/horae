@@ -7,8 +7,16 @@ the pipeline: every step, every call, every plugin resolved and every parameter 
 returns is ever read as an instruction: a result that looks like steps, a "next step" or a
 template is plain data. The only deviation from "every step, in order" is the fixed policy
 below, which can stop the run early (the remaining steps are recorded as `skipped`) or skip an
-`act` step; it can never add, repeat or reorder a step. Calls run one at a time, in
-declaration order.
+`act` step; it can never add, repeat or reorder a step.
+
+**Concurrency.** The calls of a `collect` step run concurrently, at most `MAX_PARALLEL_CALLS`
+in flight, **started in declaration order** (a call starts only once the previous one has
+started). Their results are then processed one by one in declaration order, exactly as if they
+had run sequentially: snapshots, failed sources, stderr, violations and intents are recorded in
+declaration order whatever the order in which the calls finished, so the record (and a
+replay) does not depend on timing. Every source of the step is called and recorded, even when
+an earlier one's proposals then fail the step. `transform` calls run one at a time (each is
+fed the previous output), and steps run one after the other.
 
 **Who proposes, who applies (ADR 0002).** `collect` sources, `transform` tools and the `llm`
 step **propose** intents. `act` and `notify` entries are never called here: each entry
@@ -31,7 +39,7 @@ and every other step `skipped`, when:
 
 **Data between steps.** One JSON value flows through the run:
 
-- `collect` calls each source with `input=None`; its output is the list
+- `collect` calls each source with `input=None` (concurrently); its output is the list
   `[{"source": <ref>, "params": {...}, "data": <output>}, ...]` of the sources that succeeded,
   in declaration order, each also recorded as an `InputSnapshot` with its position (`call`)
   and the raw intents it proposed (a later `collect` step starts a new list; a source whose
@@ -191,6 +199,7 @@ from horae.contracts.pipeline import (
     PluginCall,
     Step,
     TransformStep,
+    call_parts,
 )
 from horae.contracts.run import (
     MAX_PIPELINE_BYTES,
@@ -240,6 +249,9 @@ MAX_DEPTH = MAX_BODY_DEPTH
 
 MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 """Largest output of one call (compact UTF-8 JSON): 4 MiB."""
+
+MAX_PARALLEL_CALLS = 8
+"""Most `collect` calls of one step in flight at once."""
 
 ACT_MODES: dict[str, frozenset[IntentType]] = {
     "create": frozenset({"note.create"}),
@@ -406,6 +418,8 @@ class PlannedCall:
     """The rendered parameters; `None` when a template is invalid (see `error`)."""
     error: str | None = None
     """Why the parameters could not be rendered (`TemplateError`)."""
+    timeout_s: float | None = None
+    """The call's own timeout (`ToolCall.timeout_s`), passed to the `ToolCaller`."""
 
 
 def planned_calls(pipeline: Pipeline, context: RunContext) -> list[PlannedCall]:
@@ -421,13 +435,13 @@ def planned_calls(pipeline: Pipeline, context: RunContext) -> list[PlannedCall]:
     for index, step in enumerate(pipeline.steps):
         kind = _kind_of(step)
         for position, call in enumerate(_calls_of(step)):
-            ref, params = (call, {}) if isinstance(call, str) else next(iter(call.items()))
+            ref, params, timeout_s = call_parts(call)
             try:
                 rendered = render(copy.deepcopy(params), names)
             except TemplateError as error:
-                planned.append(PlannedCall(index, position, kind, ref, None, str(error)))
+                planned.append(PlannedCall(index, position, kind, ref, None, str(error), timeout_s))
                 continue
-            planned.append(PlannedCall(index, position, kind, ref, rendered))
+            planned.append(PlannedCall(index, position, kind, ref, rendered, None, timeout_s))
     return planned
 
 
@@ -438,6 +452,7 @@ class _Call:
     plugin: ResolvedPlugin
     position: int = 0
     """Index of the call in its step's list of calls."""
+    timeout_s: float | None = None
 
 
 @dataclass(frozen=True)
@@ -655,7 +670,7 @@ def _plan(
                     fail("params_invalid", str(error))
                 entries.append(_Entry(index, position, ref, rendered, plugin, types, binds))
             else:
-                calls.append(_Call(ref, rendered, plugin, position))
+                calls.append(_Call(ref, rendered, plugin, position, planned_call.timeout_s))
         planned.append(_Planned(index, kind, calls=tuple(calls), entries=tuple(entries)))
     return tuple(planned)
 
@@ -667,12 +682,16 @@ def _plan(
 class _Failure:
     kind: str
     message: str
+    stderr: object = None
+    violations: tuple[Violation, ...] = ()
 
 
 @dataclass(frozen=True)
 class _Result:
     data: Any
     intents: Any
+    stderr: object = None
+    violations: tuple[Violation, ...] = ()
 
 
 @dataclass
@@ -713,27 +732,36 @@ class _Run:
         )
 
     async def call(self, call: _Call, data: Any) -> _Result | _Failure:
-        """One tool call; failures are returned, never raised."""
+        """One tool call; failures are returned, never raised. Touches no run state (the calls
+        of a `collect` step run concurrently): `absorb` records its stderr and violations."""
         try:
-            result = await self.tools.call(call.ref, copy.deepcopy(call.params), _json_copy(data))
+            result: object = await self.tools.call(
+                call.ref, copy.deepcopy(call.params), _json_copy(data), timeout_s=call.timeout_s
+            )
         except EngineCallError as error:
-            self._stderr(call, getattr(error, "stderr", None))
-            return _Failure(_kind(error.kind), _describe(call.ref, error.kind, error.message))
+            message = _describe(call.ref, error.kind, error.message)
+            return _Failure(_kind(error.kind), message, getattr(error, "stderr", None))
         except Exception as error:  # a host bug must not crash the run
             return _Failure("host_error", f"{call.ref}: unexpected {type(error).__name__}")
+        if not isinstance(result, ToolResult):
+            return _Failure(
+                "output_invalid", f"{call.ref}: output_invalid: the host returned no ToolResult"
+            )
+        violations = _violations(result.violations)
         try:
-            if not isinstance(result, ToolResult):
-                raise _DataError("output_invalid", "the host returned no ToolResult")
-            self._stderr(call, result.stderr)
             output = _json_copy(result.data, "tool output")
             intents = _json_copy(_intent_list(result.intents), "tool's intents")
         except _DataError as error:
-            return _Failure(error.kind, f"{call.ref}: {error.kind}: {error.message}")
-        return _Result(output, intents)
+            message = f"{call.ref}: {error.kind}: {error.message}"
+            return _Failure(error.kind, message, result.stderr, violations)
+        return _Result(output, intents, result.stderr, violations)
 
-    def _stderr(self, call: _Call, stderr: object) -> None:
-        if isinstance(stderr, str) and stderr:
-            self.stderr.append((call.plugin.manifest.name, stderr))
+    def absorb(self, call: _Call, outcome: "_Result | _Failure") -> None:
+        """Record a finished call's stderr and violations (in declaration order)."""
+        if isinstance(outcome.stderr, str) and outcome.stderr:
+            self.stderr.append((call.plugin.manifest.name, outcome.stderr))
+        room = MAX_ITEMS - len(self.violations)
+        self.violations.extend(outcome.violations[: max(0, room)])
 
     def propose(
         self,
@@ -828,6 +856,13 @@ class _Run:
         return {**payload, name: takers[0].binds[name]}
 
 
+def _violations(raw: object) -> tuple[Violation, ...]:
+    """The host's violations that are `Violation`s (anything else is dropped)."""
+    if not isinstance(raw, (tuple, list)):
+        return ()
+    return tuple(item for item in raw if isinstance(item, Violation))
+
+
 def _strings(*values: Any) -> frozenset[str]:
     """Every string value (not object key) inside `values`, iteratively."""
     found: set[str] = set()
@@ -877,14 +912,36 @@ def _join_stderr(parts: list[tuple[str, str]]) -> str | None:
     return _cap("\n".join(chunks), _MAX_STDERR)
 
 
+async def _call_all(run: _Run, calls: tuple[_Call, ...]) -> list[_Result | _Failure]:
+    """Every call, concurrently (at most `MAX_PARALLEL_CALLS` in flight), started in
+    declaration order: a slot is taken before the next task is created, and the event loop
+    runs new tasks in creation order. The results are in declaration order."""
+    slots = asyncio.Semaphore(MAX_PARALLEL_CALLS)
+
+    async def one(call: _Call) -> _Result | _Failure:
+        try:
+            return await run.call(call, None)
+        finally:
+            slots.release()
+
+    tasks: list[asyncio.Task[_Result | _Failure]] = []
+    async with asyncio.TaskGroup() as group:
+        for call in calls:
+            await slots.acquire()
+            tasks.append(group.create_task(one(call)))
+    return [task.result() for task in tasks]
+
+
 async def _collect(run: _Run, step: _Planned) -> _Outcome:
     collected: list[dict[str, Any]] = []
     snapshots: list[InputSnapshot] = []
     kept: list[ProposedIntent] = []
     failed: list[dict[str, Any]] = []
     messages: list[str] = []
-    for call in step.calls:
-        result = await run.call(call, None)
+    rejected: StepError | None = None
+    results = await _call_all(run, step.calls)
+    for call, result in zip(step.calls, results, strict=True):
+        run.absorb(call, result)
         if isinstance(result, _Failure):
             failed.append(
                 {
@@ -896,8 +953,6 @@ async def _collect(run: _Run, step: _Planned) -> _Outcome:
             )
             messages.append(result.message)
             continue
-        name = call.plugin.manifest.name
-        seen = (*(entry["data"] for entry in collected), result.data)
         snapshots.append(
             InputSnapshot(
                 step=step.index,
@@ -908,17 +963,20 @@ async def _collect(run: _Run, step: _Planned) -> _Outcome:
                 intents=_raw(result.intents),
             )
         )
-        accepted, rejected = run.propose(
-            result.intents, call.plugin, name, step.index, call.ref, len(kept), seen
-        )
-        if rejected is not None:
-            # Recorded, with the rejected proposals, so that a replay re-validates them.
-            run.inputs.extend(snapshots)
-            return _Outcome("failed", rejected, output=failed or None)
-        kept.extend(accepted)
+        if rejected is None:
+            name = call.plugin.manifest.name
+            seen = (*(entry["data"] for entry in collected), result.data)
+            accepted, rejected = run.propose(
+                result.intents, call.plugin, name, step.index, call.ref, len(kept), seen
+            )
+            kept.extend(accepted)
         collected.append({"source": call.ref, "params": call.params, "data": result.data})
-    run.data = collected
     run.inputs.extend(snapshots)
+    if rejected is not None:
+        # Every source that ran is recorded, with the rejected proposals, so that a replay
+        # re-validates them.
+        return _Outcome("failed", rejected, output=failed or None)
+    run.data = collected
     if not failed:
         return _Outcome("ok", intents=kept)
     error = StepError(kind="source_failed", message=_cap("\n".join(messages)))
@@ -934,6 +992,7 @@ async def _transform(run: _Run, step: _Planned) -> _Outcome:
     for call in step.calls:
         input_hash = sha256_hex(run.data)
         result = await run.call(call, run.data)
+        run.absorb(call, result)
         if isinstance(result, _Failure):
             calls.append(
                 CallRecord(
@@ -1334,6 +1393,7 @@ __all__ = [
     "MAX_DEPTH",
     "MAX_LLM_ATTEMPTS",
     "MAX_OUTPUT_BYTES",
+    "MAX_PARALLEL_CALLS",
     "TARGET_FIELDS",
     "PlannedCall",
     "RunCancelled",

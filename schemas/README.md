@@ -57,8 +57,9 @@ pydantic may change them; the drift test then fails in CI and the fix is to rege
   an unquoted `2026-10-27` is a YAML timestamp, not a string, and the JSON Schema rejects it.
 - A pipeline step is an object with exactly one key: `collect`, `transform`, `llm`, `act` or
   `notify`. Each lists plugin calls, either bare (`tasks.normalize`) or with parameters
-  (`calendar.events: { days: 2 }`). A pipeline has **at most one** `llm` step
-  (`contains` + `maxContains: 1`).
+  (`calendar.events: { days: 2 }`), or in the explicit form with a per-call timeout
+  (`{ tool: calendar.events, params: { days: 2 }, timeout_s: 90 }`, decision 35). A pipeline
+  has **at most one** `llm` step (`contains` + `maxContains: 1`).
 - The `llm` step has no `tools` key, and requires a budget with both `usd` and `tokens_out`.
 - Plugin permissions (`network`, `secrets`, `paths`, `intents`) default to empty: no access.
 - Sinks apply intents (PLAN.md §3.1, §3.3); `permissions.intents` lists the intents a plugin may
@@ -647,3 +648,50 @@ loosened later without breaking a valid file.
       later_runs, overwrote_sha256}], not_undoable: [{intent, intent_type, target,
       applied_by, applied}], problems}`; errors are `{"schema_version": 1, "error": {kind,
       message}}`.
+
+### Provisional decisions (#24, pending maintainer review)
+
+35. **Plugin host v1 (#24, design note and maintainer answers on #85).** Contract changes,
+    both compatible v1 additions:
+    - **per-call timeout (answer 8).** A plugin call has a third, explicit form,
+      `{tool: <ref>, params: {...}, timeout_s: N}` (`ToolCall`; `params` optional, `timeout_s`
+      1 to 600 like `plugin_defaults.call_timeout_s`). It cannot be confused with the mapping
+      form, whose single key is a tool ref (always with a dot). The suggested
+      `{ref: {params: {...}, timeout_s: N}}` was not used: it is ambiguous with a tool whose
+      parameters are named `params` or `timeout_s`. Without `timeout_s` the explicit form is
+      the same call as the mapping form and has the same pipeline digest; with one, the
+      canonical form keeps `{tool, params, timeout_s}` (a timeout changes how the call runs).
+      When omitted, `plugins.<name>.call_timeout_s`, then `plugin_defaults.call_timeout_s`
+      apply. The engine passes it to `ToolCaller.call(..., timeout_s=)`;
+    - **`secret_in_output` violation (answer 4).** The maintainer's answer "add the secrets
+      from the output" is read as: a secret value (or its base64, percent or JSON encoding)
+      found in a tool's output or intents is **redacted** (`[REDACTED:<NAME>]`) and recorded
+      as a `secret_in_output` violation; the step does not fail. Redaction covers every
+      secret the instance resolved (`SecretResolver.resolved()`), in stderr, error messages,
+      outputs and intents. A replay leaves this kind out of the compared violations (it
+      describes the live process).
+
+    Rules of the host (`horae.plugins.host`), not part of a schema:
+    - `mcp>=2.3,<2.4` is a core dependency (answer 1). The host spawns the process itself
+      (answer 2; `stdio_client` copies host variables) and keeps the SDK's `ClientSession`,
+      which advertises no client capability and refuses sampling, roots and elicitation;
+    - the child environment is exactly `PATH` (fixed), `HOME` and `TMPDIR` (empty per-run
+      directories), `LANG=C.UTF-8`, `TZ` (the instance time zone) and the declared secrets
+      (answer 3), with the deny list of decision 28 (`env_unsafe`);
+    - one process per plugin per run, lazily started; one in flight per process; after a
+      timeout, crash or protocol failure the process group is killed and the plugin may be
+      started **once** more in the run, then `plugin_unavailable` (answer 6);
+    - intents travel in the result's `_meta["dev.horae/intents"]` (answer 5); the untrusted
+      input of a transform in the request's `_meta["dev.horae/input"]`, so the arguments are
+      the trusted parameters only. Data is `structuredContent`, else a single text block that
+      parses as JSON (answer 9);
+    - **parallel `collect` (answer 7).** The calls of a `collect` step run concurrently (at
+      most 8 in flight, started in declaration order); results, snapshots, stderr, violations
+      and intents are recorded in declaration order, so records and replays do not depend on
+      timing. Every source of the step is called and recorded, even when an earlier one's
+      proposals fail the step (sequentially, the later ones were not called). Transforms stay
+      sequential (each feeds the next); `act` / `notify` entries are never called;
+    - `/proc/<pid>/environ` (answer 10): Horae never adds a resolved secret to its own
+      environment, and secret files (decision 25, the default) are recommended over
+      `{env: VAR}` references, whose values a same-user plugin can read on Linux. The proper
+      fix is the M5 container isolation (#50, #51).

@@ -28,6 +28,9 @@
                   "maxLength": 128
                 },
                 "type": "object"
+              },
+              {
+                "$ref": "#/$defs/ToolCall"
               }
             ]
           },
@@ -93,6 +96,9 @@
                   "maxLength": 128
                 },
                 "type": "object"
+              },
+              {
+                "$ref": "#/$defs/ToolCall"
               }
             ]
           },
@@ -199,6 +205,9 @@
                   "maxLength": 128
                 },
                 "type": "object"
+              },
+              {
+                "$ref": "#/$defs/ToolCall"
               }
             ]
           },
@@ -212,6 +221,45 @@
         "notify"
       ],
       "title": "NotifyStep",
+      "type": "object"
+    },
+    "ToolCall": {
+      "additionalProperties": false,
+      "description": "A plugin call in the explicit form, `{tool: <ref>, params: {...}, timeout_s: N}`.\n\nNeeded only for a per-call `timeout_s`; `{tool: x.y, params: {...}}` without one is the same\ncall as `{x.y: {...}}` (and digests the same). `tool` and `params` can never be confused with\nthe mapping form: a tool ref always contains a dot.",
+      "properties": {
+        "tool": {
+          "description": "The plugin tool, `<namespace>.<tool>`.",
+          "maxLength": 128,
+          "pattern": "^[a-z][a-z0-9-]*\\.[a-z][a-z0-9_]*$",
+          "title": "Tool",
+          "type": "string"
+        },
+        "params": {
+          "additionalProperties": true,
+          "description": "Its parameters (templated like the mapping form's).",
+          "title": "Params",
+          "type": "object"
+        },
+        "timeout_s": {
+          "anyOf": [
+            {
+              "maximum": 600.0,
+              "minimum": 1.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Seconds this call may take. When omitted, the plugin's `call_timeout_s` in `horae.yaml`\n(else `plugin_defaults.call_timeout_s`) applies.",
+          "title": "Timeout S"
+        }
+      },
+      "required": [
+        "tool"
+      ],
+      "title": "ToolCall",
       "type": "object"
     },
     "TransformStep": {
@@ -240,6 +288,9 @@
                   "maxLength": 128
                 },
                 "type": "object"
+              },
+              {
+                "$ref": "#/$defs/ToolCall"
               }
             ]
           },

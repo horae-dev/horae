@@ -1,0 +1,5 @@
+# A per-call timeout is 1 to 600 seconds, like plugin_defaults.call_timeout_s.
+name: slow-sources
+steps:
+  - collect:
+      - { tool: calendar.events, timeout_s: 900 }
