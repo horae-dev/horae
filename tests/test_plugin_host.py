@@ -893,3 +893,21 @@ def test_a_short_secret_is_redacted_in_stderr_messages_and_strings_with_a_warnin
         "secret PIN is shorter than 8 bytes: only its raw value is redacted, not its encodings"
     ]
     assert short not in caplog.text
+
+
+def test_an_error_message_is_redacted_whole_before_its_body(tmp_path: Path) -> None:
+    colon = "colon: inside-the-secret"
+    straddling = "fail: straddling-secret"
+    resolver = SecretResolver(
+        {}, secrets_dir(tmp_path, PROBE_TOKEN=PROBE_TOKEN, COLON=colon, STRADDLE=straddling)
+    )
+    for name in ("COLON", "STRADDLE"):
+        resolver.resolve(name)
+    h = host(tmp_path, resolver=resolver)
+    for message, expected in (
+        (f"probe.fail: got {colon} back", "probe.fail: got [REDACTED:COLON] back"),
+        ("probe.fail: straddling-secret", "probe.[REDACTED:STRADDLE]"),
+        ("probe.fail: pin42", "probe.fail: pin42"),
+    ):
+        error = h._redacted(PluginCallError("tool_error", message))
+        assert error.message == expected

@@ -390,12 +390,14 @@ class PluginHost:
         return self._redactor[1]
 
     def _redact_message(self, message: str) -> str:
-        """`message` redacted; a `<ref>: <body>` message's body is also matched as a whole."""
+        """`message` redacted as a whole first (a secret may contain or straddle `": "`); then
+        the body of the redacted `<ref>: <body>` message is also matched as a whole value."""
         redactor = self.redactor()
-        prefix, separator, body = message.partition(": ")
-        if separator:
-            return redactor.redact_text(prefix)[0] + separator + redactor.redact_text(body)[0]
-        return redactor.redact_text(message)[0]
+        redacted, _ = redactor.redact_text(message)
+        prefix, separator, body = redacted.partition(": ")
+        if not separator:
+            return redacted
+        return prefix + separator + redactor.redact_text(body)[0]
 
     def _redacted(self, error: PluginCallError) -> PluginCallError:
         message = self._redact_message(error.message)

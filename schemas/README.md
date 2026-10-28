@@ -720,7 +720,9 @@ loosened later without breaking a valid file.
       least 8 bytes. A shorter secret is matched by its raw value only, in every channel
       (stderr, messages, string leaves), where it is bounded (not next to an ASCII letter or
       digit: `token=abc123` and `<ref>: abc123` match, `xabc123y` does not), and as a whole
-      JSON string or number; the body of a `<ref>: <message>` error is matched on its own.
+      JSON string or number; an error message is redacted whole first (a secret may contain
+      or straddle `: `), then the body of the redacted `<ref>: <message>` is also matched
+      as a whole value.
       The host logs a warning (name only) for each secret under 8 bytes it redacts, since its
       encodings are not redacted. Object keys
       are never rewritten: a key holding a secret fails the call with `output_invalid` and
