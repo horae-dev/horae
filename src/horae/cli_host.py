@@ -18,8 +18,10 @@ from pathlib import Path
 
 from horae.apply import SinkRegistry
 from horae.cli_output import EXIT_PROBLEMS, CommandFailed, plural
-from horae.config import Instance, InstanceError, Problem, ProblemsError, load_instance
+from horae.config import CONFIG_FILE, Instance, InstanceError, Problem, ProblemsError, load_instance
+from horae.contracts.pipeline import LlmStep
 from horae.contracts.plugin import StdioRuntime
+from horae.llm.backends import FACTORIES
 from horae.plugins.host import HostRegistry, PluginCallError, RegistryError
 from horae.plugins.host.host import resolve_command
 from horae.runner import LivePorts, open_ports
@@ -124,12 +126,41 @@ def _command_problems(registry: HostRegistry) -> list[Problem]:
     return problems
 
 
+def _backend_problems(instance: Instance) -> list[Problem]:
+    """Each model alias used by an `llm` step whose backend this Horae does not implement
+    (`horae.llm.backends.FACTORIES`). Aliases no pipeline uses are not checked."""
+    used = sorted(
+        {
+            step.llm.model
+            for pipeline in instance.pipelines.values()
+            for step in pipeline.steps
+            if isinstance(step, LlmStep)
+        }
+    )
+    problems: list[Problem] = []
+    for alias in used:
+        spec = instance.config.models.get(alias)
+        if spec is not None and spec.backend not in FACTORIES:
+            available = ", ".join(sorted(FACTORIES))
+            problems.append(
+                Problem(
+                    CONFIG_FILE,
+                    None,
+                    None,
+                    f"models.{alias}.backend: backend {spec.backend!r} is not available in "
+                    f"this version of Horae (available: {available})",
+                )
+            )
+    return problems
+
+
 def instance_problems(instance: Instance) -> list[Problem]:
     """What `horae doctor` checks beyond the configuration (`check_instance`): the lock's
     paths exist, the instance's own `vault/` is the one the lock writes to, and, when the
+    model alias an `llm` step uses has an available backend, and, when the
     instance has a `plugins/` directory, the plugins are installed as the lock pins them
     (`check_plugins`) and each command (its interpreter) exists and is executable."""
-    problems = _path_problems(instance)
+    problems = _path_problems(instance) + _backend_problems(instance)
     if plugins_dir(instance.root).is_dir():
         try:
             registry = _registry(instance)

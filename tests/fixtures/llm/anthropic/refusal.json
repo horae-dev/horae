@@ -1,0 +1,21 @@
+{
+  "status": 200,
+  "body": {
+    "id": "msg_01SyntheticFixture000000",
+    "type": "message",
+    "role": "assistant",
+    "model": "claude-fixture-1",
+    "content": [],
+    "stop_reason": "refusal",
+    "stop_sequence": null,
+    "usage": {
+      "input_tokens": 900,
+      "output_tokens": 3
+    },
+    "stop_details": {
+      "type": "refusal",
+      "category": "general_harms",
+      "explanation": "Synthetic explanation."
+    }
+  }
+}

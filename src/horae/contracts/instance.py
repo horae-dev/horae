@@ -112,6 +112,26 @@ host such as a Compose service name (`ollama`). Optional port; no user info, fra
 backslash, whitespace or control characters (schemas README, decision 24)."""
 
 
+MAX_PRICE_PER_MTOK = 10000.0
+"""Largest price accepted, in US dollars per million tokens (a typo guard)."""
+
+PricePerMtok = Annotated[StrictFloat, Field(ge=0, le=MAX_PRICE_PER_MTOK)]
+"""A price in US dollars per million tokens."""
+
+
+class ModelPrice(Contract):
+    """What a model's tokens cost, in US dollars per million tokens (schemas decision 38).
+
+    Horae ships no price list: prices change and differ per account, so the instance states
+    the ones it pays. Cache prices are optional; cache tokens without one are priced as
+    input tokens."""
+
+    input_per_mtok: PricePerMtok
+    output_per_mtok: PricePerMtok
+    cache_read_per_mtok: PricePerMtok | None = None
+    cache_write_per_mtok: PricePerMtok | None = None
+
+
 class ModelAlias(Contract):
     """What a model alias resolves to."""
 
@@ -151,6 +171,9 @@ class ModelAlias(Contract):
     secret: SecretName | None = None
     """The secret holding the backend's API key or token, e.g. `ANTHROPIC_API_KEY`; required
     for `anthropic`."""
+    price: ModelPrice | None = None
+    """What the model costs, for `Usage.usd` and the step's `usd` budget. Without it a call
+    is recorded with `usd: 0` and `priced: false`, and only `tokens_out` bounds the step."""
 
     @model_validator(mode="after")
     def _backend_requirements(self) -> Self:

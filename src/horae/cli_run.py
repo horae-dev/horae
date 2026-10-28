@@ -16,8 +16,11 @@ while the run stops is ignored (the runner's grace period still bounds the stop)
 run is nonetheless abandoned during the apply (a crash), the command says so and names
 `horae undo <id>`.
 
-**LLM.** M1 wires no LLM backend: a pipeline with an `llm` step fails with
-`llm_unavailable` (exit 1). M2 adds the backends.
+**LLM.** When a pipeline of the instance has an `llm` step, `open_ports` gives the runner the
+instance's model aliases (`horae.llm.ModelBackends`, #28): the alias' backend is built, and
+its declared secret resolved, on the step's first call. A backend that is not available yet
+fails the step with `backend_unavailable`, and a skill whose prompt is not loaded with
+`skill_unavailable` (until #27); the run is then `degraded`.
 
 Exit codes (`horae.cli_output`): 0 the run finished `ok`, `noop` or `degraded` (a dry run:
 planned without problems), 1 configuration, plugin, store or runtime problem (the run
@@ -395,8 +398,8 @@ def run(
     would apply is shown, as `horae diff` shows it. SIGINT and SIGTERM cancel the run (a
     second signal is ignored): before the apply its partial record is saved failed; during
     the apply, the apply finishes and the record is saved before the run is reported
-    interrupted. No LLM backend in M1: a pipeline with an llm step fails with
-    llm_unavailable.
+    interrupted. An llm step calls the backend of its model alias (horae.yaml models), with
+    the API key from the alias' declared secret.
 
     Exit codes: 0 ok, noop or degraded (dry run: planned without problems), 1 configuration,
     plugin, store or runtime problem (the run failed or timed out; a dry run whose plan

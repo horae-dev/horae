@@ -993,3 +993,67 @@ loosened later without breaking a valid file.
     - **follow-ups** (out of scope here): enforcing the manifests' `horae` version range
       against `horae.__version__`; whether a second identical run should be `noop` rather
       than `ok`.
+
+### Provisional decisions (#28, pending maintainer review)
+
+38. **LLM backend interface, the `anthropic` backend, usage and cost (#28).** Compatible v1
+    additions and the rules of `horae.llm` (interface) and `horae.llm.backends.anthropic`:
+    - **contract changes** (all optional): `models.<alias>.price` in `horae.yaml`,
+      `{input_per_mtok, output_per_mtok, cache_read_per_mtok?, cache_write_per_mtok?}`, US
+      dollars per million tokens, each `0` to `10000`. **Horae ships no price list**: prices
+      change and differ per account, so the instance states the ones it pays. `Usage` (run
+      records: `llm[].usage`, `cost`) gains `cache_read_tokens`, `cache_write_tokens` (when
+      the provider reports them; `tokens_in` stays the input billed at the full price) and
+      `priced` (`false` when the alias has no `price`: `usd` is then `0` and does not reflect
+      the cost, and only `tokens_out` bounds the step). Cache tokens without a cache price
+      are priced as input tokens. A `price` is part of the `models` section, so changing it
+      changes `config_digest` (decision 33), not the LLM cache key;
+    - **two layers**: `ModelBackends` is the engine's `LlmBackend` (alias → backend, model,
+      `base_url`, `secret`, `price`; prompt from a `PromptSource`; `max_tokens` from the
+      budget); a `ProviderBackend` per alias makes one request with no tools. Both split an
+      attempt into `render` (pure: the exact provider payload, a `RenderedRequest` whose
+      `body()` is canonical JSON bytes; no I/O, no secret) and `send` (one network call with
+      exactly that payload), so the core can inspect what leaves the host first (T10,
+      #34/#53); `complete` is `send(render(...))`. `LlmCall.request` is the rendered payload
+      (never a header);
+    - **`max_tokens`** is the attempt's remaining `tokens_out`, lowered when the alias has a
+      price so that the output alone stays within the remaining `usd` (at least 1). The
+      timeout is what is left of the step's deadline;
+    - **the API key comes from the declared secret only** (`models.<alias>.secret`, through
+      the instance's `SecretResolver`, decision 25), resolved on the first call. The SDK reads
+      `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, credential profiles and
+      `ANTHROPIC_BASE_URL` only when it is not given a key and a URL, so it always gets a
+      placeholder key and an explicit `base_url` (default `https://api.anthropic.com`). It
+      also merges `ANTHROPIC_CUSTOM_HEADERS` from the environment into every request, which
+      can override `x-api-key`; a request hook on its HTTP client therefore sets `x-api-key`
+      to the declared secret at the last moment, drops every header outside an allowlist
+      (`Authorization`, custom and `x-stainless-*` platform headers included), and refuses a
+      request to another origin than the endpoint. Redirects are not followed; OpenTelemetry
+      spans are off. SDK retries are disabled (`max_retries=0`): the engine owns the single
+      repair retry;
+    - **request shape**: `system` is the skill's rendered prompt; one user message holds the
+      untrusted input as JSON inside `<input>` tags (`<` escaped as `<`), then, on the
+      repair retry, the previous attempt's schema errors. The output is constrained with
+      structured outputs (`output_config.format: {type: json_schema, schema}`, the schema
+      passed through `anthropic.transform_schema`); the text must parse as one JSON value
+      (no `NaN`);
+    - **error kinds** (messages are Horae's: the HTTP status and the API error `type`, never
+      the API's text): `timeout` (SDK timeout, 408, 504), `rate_limited` (429),
+      `auth_failed` (401, 403, an unresolvable secret), `overloaded` (529, 503),
+      `invalid_request` (400, 404, 409, 413, 422, an unknown alias, a schema structured
+      outputs cannot take), `output_invalid` (refusal, `max_tokens` or context-window
+      truncation, tool or other non-text content, not JSON; with the reported usage),
+      `host_error` (connection failure, a refused request, another status);
+      `backend_unavailable` (an alias whose backend has no implementation yet) and
+      `skill_unavailable` (no prompt for the skill) come from `ModelBackends`;
+    - **wiring**: `open_ports` gives the runner a `ModelBackends` over the instance's
+      aliases when a pipeline has an `llm` step (sharing the host's `SecretResolver`; lazy;
+      closed with the ports), so `horae run` no longer fails with `llm_unavailable` (decision
+      37) when an alias is configured. `horae doctor` reports a model alias used by an `llm`
+      step whose backend is not available (`models.<alias>.backend`), besides its secret;
+    - **integration points**: the prompt, viewed input, output schema and skill version come
+      from the `LlmRequest` (`RequestPrompts`, the fields #27 adds); until then the step
+      stops with `skill_unavailable` before any request. Schema validation is a
+      `ModelBackends(validate=...)` hook for #31; without it `schema_errors` is empty and
+      structured outputs is the only check. Raw intents in the output are left to the skill
+      format (#27): `LlmResponse.intents` is empty for now.

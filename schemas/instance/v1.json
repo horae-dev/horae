@@ -141,6 +141,18 @@
           "default": null,
           "description": "The secret holding the backend's API key or token, e.g. `ANTHROPIC_API_KEY`; required\nfor `anthropic`.",
           "title": "Secret"
+        },
+        "price": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ModelPrice"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "What the model costs, for `Usage.usd` and the step's `usd` budget. Without it a call\nis recorded with `usd: 0` and `priced: false`, and only `tokens_out` bounds the step."
         }
       },
       "required": [
@@ -148,6 +160,58 @@
         "model"
       ],
       "title": "ModelAlias",
+      "type": "object"
+    },
+    "ModelPrice": {
+      "additionalProperties": false,
+      "description": "What a model's tokens cost, in US dollars per million tokens (schemas decision 38).\n\nHorae ships no price list: prices change and differ per account, so the instance states\nthe ones it pays. Cache prices are optional; cache tokens without one are priced as\ninput tokens.",
+      "properties": {
+        "input_per_mtok": {
+          "maximum": 10000.0,
+          "minimum": 0,
+          "title": "Input Per Mtok",
+          "type": "number"
+        },
+        "output_per_mtok": {
+          "maximum": 10000.0,
+          "minimum": 0,
+          "title": "Output Per Mtok",
+          "type": "number"
+        },
+        "cache_read_per_mtok": {
+          "anyOf": [
+            {
+              "maximum": 10000.0,
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cache Read Per Mtok"
+        },
+        "cache_write_per_mtok": {
+          "anyOf": [
+            {
+              "maximum": 10000.0,
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cache Write Per Mtok"
+        }
+      },
+      "required": [
+        "input_per_mtok",
+        "output_per_mtok"
+      ],
+      "title": "ModelPrice",
       "type": "object"
     },
     "PluginDefaults": {

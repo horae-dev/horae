@@ -1,0 +1,278 @@
+# SPDX-License-Identifier: Apache-2.0
+"""The LLM backends wired into the runner, `open_ports`, `horae run` and `horae doctor` (#28).
+
+No network: the anthropic backend's transport is an `httpx2.MockTransport` (see
+`tests/test_llm_anthropic.py` for the recorded fixtures)."""
+
+import asyncio
+import json
+import re
+from collections.abc import Iterator, Mapping
+from pathlib import Path
+from typing import Any
+
+import httpx2
+import pytest
+import yaml
+from typer.testing import CliRunner
+
+from horae.cli import app
+from horae.config import Instance
+from horae.contracts import InstanceConfig, Lockfile, RunRecord
+from horae.contracts.instance import ModelAlias
+from horae.engine import LlmRequest
+from horae.llm import ModelBackends, Prompt
+from horae.llm.backends import AnthropicBackend
+from horae.runner import Ports, Runner, open_ports, uses_llm
+from horae.secrets import SecretResolver
+from horae.store import Store
+from runner_fixtures import PIPELINES, Plugins, pipeline
+from test_llm_anthropic import DECLARED_VALUE, SCHEMA, SYSTEM, Recorder
+
+runner = CliRunner()
+ANTHROPIC = {
+    "backend": "anthropic",
+    "model": "claude-fixture-1",
+    "secret": "ANTHROPIC_API_KEY",
+    "price": {"input_per_mtok": 3.0, "output_per_mtok": 15.0},
+}
+
+
+class Prompts:
+    def prompt(self, request: LlmRequest) -> Prompt:
+        return Prompt(SYSTEM, request.input, SCHEMA, "1.2.0")
+
+
+def _instance(root: Path, models: Mapping[str, Any], names: tuple[str, ...]) -> Instance:
+    secrets = root / "secrets"
+    secrets.mkdir(parents=True)
+    (secrets / "ANTHROPIC_API_KEY").write_text(DECLARED_VALUE, encoding="utf-8")
+    config = InstanceConfig.model_validate({"models": models, "secrets": {"dir": "secrets"}})
+    return Instance(
+        root=root,
+        config=config,
+        pipelines={name: pipeline(name) for name in names},
+        lock=Lockfile(schema_version=1),
+    )
+
+
+@pytest.fixture
+def inst(tmp_path: Path) -> Instance:
+    return _instance(tmp_path / "instance", {"default": ANTHROPIC}, tuple(PIPELINES))
+
+
+@pytest.fixture
+def store(inst: Instance) -> Iterator[Store]:
+    with Store.open(inst.store_path) as opened:
+        yield opened
+
+
+def _llm(inst: Instance, recorder: Recorder) -> ModelBackends:
+    def factory(alias: str, spec: ModelAlias, secrets: SecretResolver) -> AnthropicBackend:
+        return AnthropicBackend(alias, spec, secrets, transport=recorder.transport)
+
+    return ModelBackends(
+        inst.config.models, inst.secret_resolver({}), {"anthropic": factory}, Prompts()
+    )
+
+
+def test_a_run_records_usage_and_cost_per_call(inst: Instance, store: Store) -> None:
+    recorder = Recorder("success")
+    plugins = Plugins()
+    llm = _llm(inst, recorder)
+    record = asyncio.run(Runner(inst, store, Ports(plugins, plugins, llm)).run("brief"))
+    asyncio.run(llm.aclose())
+    assert record.status == "ok"
+    [call] = record.llm
+    assert (call.backend, call.model, call.model_alias, call.skill_version) == (
+        "anthropic",
+        "claude-fixture-1",
+        "default",
+        "1.2.0",
+    )
+    assert (call.usage.tokens_in, call.usage.tokens_out, call.usage.priced) == (1200, 45, True)
+    assert call.usage.usd == pytest.approx((1200 * 3 + 45 * 15) / 1e6)
+    assert record.cost.usd == pytest.approx(call.usage.usd)
+    assert call.request == recorder.body()
+    assert call.response == {"items": ["Review PR 42"], "summary": "One review is waiting."}
+    # the collected input reaches the model as data
+    assert "Review PR 42" in recorder.body()["messages"][0]["content"][0]["text"]
+    stored = store.get_run(record.id)
+    assert stored is not None
+    text = json.dumps(stored.model_dump(mode="json"))
+    assert DECLARED_VALUE not in text
+    assert RunRecord.model_validate(stored.model_dump(mode="json")) == stored
+
+
+def test_a_failed_call_costs_what_it_reported(inst: Instance, store: Store) -> None:
+    plugins = Plugins()
+    llm = _llm(inst, Recorder("max_tokens"))
+    record = asyncio.run(Runner(inst, store, Ports(plugins, plugins, llm)).run("brief"))
+    asyncio.run(llm.aclose())
+    assert record.status == "degraded"
+    assert record.steps[1].error is not None
+    assert record.steps[1].error.kind == "output_invalid"
+    assert record.cost.tokens_out == 2000
+    assert record.cost.usd == pytest.approx((1200 * 3 + 2000 * 15) / 1e6)
+
+
+def test_uses_llm(inst: Instance, tmp_path: Path) -> None:
+    assert uses_llm(inst)
+    plain = _instance(tmp_path / "plain", {"default": ANTHROPIC}, ("collect", "partial"))
+    assert not uses_llm(plain)
+
+
+def test_open_ports_builds_the_backends_lazily(inst: Instance, tmp_path: Path) -> None:
+    async def go() -> None:
+        secrets = inst.secret_resolver({})
+        async with open_ports(inst, tmp_path / "plugins", secrets=secrets) as live:
+            assert isinstance(live.ports.llm, ModelBackends)
+            assert live.ports.llm.models == inst.config.models
+            assert secrets.resolved() == ()  # no key read before a call
+
+    asyncio.run(go())
+
+
+def test_open_ports_without_an_llm_step_has_no_backend(tmp_path: Path) -> None:
+    plain = _instance(tmp_path / "plain", {"default": ANTHROPIC}, ("collect",))
+
+    async def go() -> None:
+        async with open_ports(plain, tmp_path / "plugins") as live:
+            assert live.ports.llm is None
+
+    asyncio.run(go())
+
+
+def test_open_ports_keeps_a_given_backend(inst: Instance, tmp_path: Path) -> None:
+    given = _llm(inst, Recorder("success"))
+
+    async def go() -> None:
+        async with open_ports(inst, tmp_path / "plugins", llm=given) as live:
+            assert live.ports.llm is given
+
+    asyncio.run(go())
+
+
+def test_open_ports_closes_its_backends(
+    inst: Instance, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    closed: list[bool] = []
+
+    async def aclose(self: ModelBackends) -> None:
+        closed.append(True)
+
+    monkeypatch.setattr(ModelBackends, "aclose", aclose)
+
+    async def go() -> None:
+        async with open_ports(inst, tmp_path / "plugins"):
+            pass
+
+    asyncio.run(go())
+    assert closed == [True]
+
+
+# --- horae run and horae doctor ---------------------------------------------------------------
+
+
+def _write(root: Path, models: Mapping[str, Any], steps: list[dict[str, Any]]) -> Path:
+    (root / "pipelines").mkdir(parents=True)
+    (root / "secrets").mkdir()
+    (root / "secrets" / "ANTHROPIC_API_KEY").write_text(DECLARED_VALUE, encoding="utf-8")
+    config = {"models": models, "secrets": {"dir": "secrets"}}
+    (root / "horae.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
+    definition = {"name": "brief", "steps": steps}
+    (root / "pipelines" / "brief.yaml").write_text(yaml.safe_dump(definition), encoding="utf-8")
+    # A plugin that only ships the skill (no runtime: no process is started).
+    permissions: dict[str, Any] = {"intents": []}
+    lock = {
+        "schema_version": 1,
+        "plugins": {
+            "pack": {
+                "version": "0.1.0",
+                "repo": "https://github.com/horae-dev/pack-fixture.git",
+                "commit": "0" * 40,
+                "permissions": permissions,
+            }
+        },
+    }
+    (root / "horae.lock").write_text(yaml.safe_dump(lock), encoding="utf-8")
+    manifest = {
+        "name": "pack",
+        "version": "0.1.0",
+        "horae": ">=0.1,<0.2",
+        "provides": {"skills": ["pack/brief"]},
+        "permissions": permissions,
+    }
+    (root / "plugins" / "pack").mkdir(parents=True)
+    (root / "plugins" / "pack" / "plugin.yaml").write_text(yaml.safe_dump(manifest), "utf-8")
+    return root
+
+
+LLM_STEP = {
+    "llm": {"skill": "pack/brief", "model": "default", "budget": {"usd": 0.05, "tokens_out": 50}}
+}
+
+
+def test_horae_run_reaches_the_model_alias_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`horae run` goes through the real `open_ports`: the llm step is no longer
+    `llm_unavailable`. Without a skill loader (#27) it stops at `skill_unavailable`, before any
+    request; no network is used either way."""
+    sent: list[httpx2.Request] = []
+
+    def refuse(request: httpx2.Request) -> httpx2.Response:  # pragma: no cover - never sent
+        sent.append(request)
+        return httpx2.Response(500)
+
+    original = AnthropicBackend.__init__
+
+    def patched(self: AnthropicBackend, *args: Any, **kwargs: Any) -> None:
+        original(self, *args, **kwargs, transport=httpx2.MockTransport(refuse))
+
+    monkeypatch.setattr(AnthropicBackend, "__init__", patched)
+    root = _write(tmp_path / "instance", {"default": ANTHROPIC}, [LLM_STEP])
+    result = runner.invoke(app, ["run", "brief", "-i", str(root), "--json"])
+    report = json.loads(result.stdout)
+    assert result.exit_code == 0, report
+    assert report["run"]["status"] == "degraded"
+    with Store.open(root / "state" / "horae.db") as store:
+        record = store.get_run(report["run_id"])
+    assert record is not None
+    error = record.steps[0].error
+    assert error is not None
+    assert error.kind == "skill_unavailable"
+    assert sent == []
+
+
+def _doctor(root: Path) -> tuple[int, dict[str, Any]]:
+    result = runner.invoke(app, ["doctor", "-i", str(root), "--json"])
+    return result.exit_code, json.loads(result.stdout)
+
+
+def test_doctor_reports_an_unavailable_backend(tmp_path: Path) -> None:
+    models = {"default": {"backend": "claude-cli", "model": "sonnet"}, "spare": ANTHROPIC}
+    root = _write(tmp_path / "instance", models, [LLM_STEP])
+    code, report = _doctor(root)
+    assert code == 1
+    [problem] = report["problems"]
+    assert problem["file"] == "horae.yaml"
+    assert re.search(
+        r"models\.default\.backend: backend 'claude-cli' is not available", problem["message"]
+    )
+    assert "available: anthropic" in problem["message"]
+
+
+def test_doctor_accepts_an_anthropic_alias_with_its_secret(tmp_path: Path) -> None:
+    unused = {"backend": "claude-cli", "model": "sonnet"}  # not used by a pipeline: not checked
+    root = _write(tmp_path / "instance", {"default": ANTHROPIC, "unused": unused}, [LLM_STEP])
+    assert _doctor(root) == (0, _doctor(root)[1])
+    assert _doctor(root)[1]["ok"] is True
+
+
+def test_doctor_reports_a_missing_alias_secret(tmp_path: Path) -> None:
+    root = _write(tmp_path / "instance", {"default": ANTHROPIC}, [LLM_STEP])
+    (root / "secrets" / "ANTHROPIC_API_KEY").unlink()
+    code, report = _doctor(root)
+    assert code == 1
+    assert any("ANTHROPIC_API_KEY" in p["message"] for p in report["problems"])
