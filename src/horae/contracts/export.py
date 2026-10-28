@@ -21,6 +21,7 @@ from pydantic import TypeAdapter
 from pydantic.json_schema import GenerateJsonSchema, JsonSchemaMode, JsonSchemaValue
 from pydantic_core import CoreSchema
 
+from horae.contracts.instance import InstanceConfig
 from horae.contracts.intents import INTENT_MODELS, Intent
 from horae.contracts.lockfile import Lockfile
 from horae.contracts.pipeline import Pipeline
@@ -104,6 +105,7 @@ SCHEMAS: tuple[SchemaSpec, ...] = (
     ),
     SchemaSpec("lockfile", 1, Lockfile, "Horae lockfile (horae.lock)"),
     SchemaSpec("run-record", 1, RunRecord, "Horae run record"),
+    SchemaSpec("instance", 1, InstanceConfig, "Horae instance configuration (horae.yaml)"),
 )
 
 

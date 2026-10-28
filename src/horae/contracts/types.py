@@ -210,7 +210,7 @@ _UNSAFE_ENV_NAME = r"^(HORAE(_|$)|LD_|DYLD_|PYTHON|PATH$|HOME$)"
 
 def _check_secret(name: str) -> str:
     if re.match(_UNSAFE_ENV_NAME, name):
-        raise ValueError(f"{name!r} is reserved or unsafe as a secret name")
+        raise ValueError("reserved or unsafe as a secret name")
     return name
 
 
