@@ -383,3 +383,87 @@ loosened later without breaking a valid file.
       abandoned, started_at, finished_at, duration_s, cost: {usd, tokens_in, tokens_out},
       error}]}`, where `instance` is the resolved absolute path and `error` is the run's full
       error, which carries step messages as capped by the engine (4096 characters).
+
+### Provisional decisions (#21, pending maintainer review)
+
+32. **Dry-run diff (#21).** `horae.apply` plans what applying a stored run would change and
+    `horae diff <run-id>` shows it; nothing is applied (that is the journal's, #22). The
+    rules (D1 to D8 are provisional maintainer decisions):
+    - **(D1) the core owns note conventions.** The `Sink` port (`horae.apply.sink`) has two
+      operations: `read(call) -> bytes | None`, a read-only fetch of a `note.*` intent's
+      current target (`None`: no such note), and
+      `apply(call, *, expected_before_sha256) -> Applied`, a compare-and-swap for #22 (the
+      SHA-256 of the bytes the change was planned against, `None` meaning "must not exist";
+      a mismatch changes nothing and raises `SinkError("target_changed")`). There is no
+      sink-side preview: the core computes each note change from `read()` and
+      `horae.apply.notes`, and builds task, notification and HTTP previews from the intent
+      alone, without calling the sink, so a plugin cannot show one change and make another.
+      What a sink returns is type-checked at runtime (`bytes` or `None`, else
+      `preview_invalid`). Over MCP (#24) note bytes travel base64-encoded, at most 16 MiB
+      (`MAX_NOTE_BYTES`, `note_too_large`). The sink receives a deep copy of the intent and
+      its entry's parameters;
+    - **(D2) Horae never creates content in a note it does not own.** A note is owned when
+      its file name ends in `.assistant.md`, decided on the path the sink resolved without
+      following symlinks. `note.create` (`note_exists` if present) and `note.append_section`
+      (`note_missing` if absent) need an owned note. `note.replace_owned_block` creates a
+      missing note or block only in an owned note; on any other note it only replaces a
+      block that already exists (`not_owned` otherwise);
+    - **markers and line breaks.** A block is the lines from `<!-- horae:begin <block> -->`
+      to `<!-- horae:end <block> -->`, both included; a marker may end the note without a
+      final newline. One case-insensitive recogniser (`horae:(begin|end)`, optionally with a
+      block name) serves both directions: in a note, every line naming the block counts and
+      must be exactly one canonical begin line followed by one canonical end line
+      (surrounding spaces and a final `\r` aside), else `block_ambiguous`; in untrusted text
+      (content, heading) it must not appear anywhere (`content_has_marker`). Untrusted text
+      may break lines only with `\n` or `\r\n`: a lone `\r`, U+0085, U+2028 or U+2029 is
+      refused (`content_line_break`). Inserted lines use the note's line ending (that of its
+      first line, `\n` for a new or one-line note); the rest of the note is kept byte for
+      byte;
+    - **targets (for #22 too).** A sink resolves a note path without following symlinks on
+      any component (`symlink`), refuses a file with more than one hard link (`hard_link`)
+      and anything but a regular file (`not_a_file`), and decides ownership on that path.
+      The built-in `LocalSink` walks the path with `dir_fd` and `O_NOFOLLOW`, opens the note
+      `O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC`, checks it with `fstat` and reads from
+      the descriptor; a name that is too long or a parent that is not a directory is
+      `not_a_file`, a permission or other OS error `unreadable`, a path holding `:` is
+      refused (`path_invalid`). POSIX only: Windows is unsupported. `apply` (#22) must use
+      the same resolution, on the descriptor it writes through;
+    - **chaining.** Several intents on one note are planned in run order, each against the
+      bytes the previous one leaves (`follows` names it; the note is read once), which is
+      the order #22 applies them in, so `before_sha256` is exactly the
+      `expected_before_sha256` of that `apply`. An intent that cannot be planned does not
+      change what the next one sees;
+    - **(D3) which runs.** `ok`, `noop` and `degraded` runs are planned. A `failed`
+      (`run_failed`) or `undone` (`run_undone`) run is refused, and so is a run whose
+      `changes` is not empty (`already_applied`: its journal, #22, says what changed);
+    - **(D4) `horae diff` exit codes:** `0` planned without problems, `1` configuration or
+      store problem, `2` usage error, `3` unknown, unfinished or refused run, `4` planned
+      with problems (some intents cannot be applied), `70` internal error. A notification
+      already sent (`duplicate`) is information, not a problem. With `--json`, an error is a
+      JSON object on stdout, `{"schema_version": 1, "error": {"kind", "message"}}` (kinds
+      `config_invalid`, `store_error`, `unknown_run`, `internal`), and a refused run is the
+      change set with `"refused": {"kind", "message"}`; without it, errors go to stderr.
+      Text output escapes every Unicode Cc, Cf, Zl and Zp character except tab; JSON output
+      is ASCII and strict (a non-finite number becomes a string);
+    - **(D5) what a dry run may write.** User data never: no vault change, no notification,
+      no remote write. Horae's own state database (`<state_dir>/horae.db`) is not user data:
+      `horae run --dry-run` (#26) will record its run there, and the write guard of
+      `tests/test_dry_run.py` allows only that path (and its `-wal`, `-shm`, `-journal`)
+      besides the test's scratch directory. `horae diff` itself opens the store with
+      `Store.open(path, read_only=True)`: it creates, migrates and changes nothing (an OS
+      error opening it exits 1). The guard covers Python-level writes, metadata changes,
+      sockets, name resolution, SQLite connections and process creation; writes made below
+      Python (`ctypes`, C extensions) and plugin subprocesses (#24's sandbox) are out of its
+      scope;
+    - **(D6) the vault** is given with `--vault` only (no environment variable, no
+      `horae.yaml` key) until plugin sinks exist (#24); without it note intents are
+      `vault_unset` problems;
+    - **(D7) notification deduplication.** `dedupe_key` is the SHA-256 (canonical JSON) of
+      the pipeline, the routing entry (`applied_by` and its recorded parameters), the run's
+      `input_hash` (or, without one, its id), the intent, and its occurrence index (how many
+      identical entry and intent pairs precede it in the run). A reused unchanged input
+      re-proposes the same keys, while two identical notifications of one run are both
+      sent. The applier (#22) records a key once sent (`Store.record_notification`) and
+      skips it afterwards; the key reaches the notifier as `SinkCall.dedupe_key`;
+    - **(D8)** `horae diff` ships in #21; `horae run --dry-run` printing the same diff is
+      wired by #26.

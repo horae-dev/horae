@@ -1,102 +1,127 @@
 # SPDX-License-Identifier: Apache-2.0
-"""A built-in, **read-only** sink for previews, until the plugin host (#24) provides real ones.
+"""A built-in, **read-only** sink for notes in a local vault, until the plugin host (#24)
+provides real ones.
 
-`LocalSink` previews every intent type without calling any plugin:
+`LocalSink.read` returns the current bytes of a `note.*` intent's target in a local vault
+directory, and nothing else: it never writes, and `apply` raises `SinkError("not_supported")`.
 
-- `note.*` against a local vault directory (`horae.apply.notes` for the conventions): it reads
-  the target note, nothing else. The path is resolved inside the vault (`outside_vault` if a
-  symlink leads out, `not_a_file` for anything but a regular file), and notes over
-  `MAX_READ_BYTES` are refused (`note_too_large`). Without a vault, `vault_unset`.
-- `task.*`, `notify.push` and `http.post` are described from the intent alone (the current
-  state of a task is not known here: `TaskChange.before` is `None`).
+**How a note is read.** The vault directory is opened, then the note path is walked one
+component at a time relative to it (`dir_fd`), every component opened with `O_NOFOLLOW` (so a
+symlink anywhere in the path is refused, `symlink`: a link can neither lead out of the vault
+nor make a user note look owned), the last one with
+`O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC` (a FIFO cannot block the read). The open file
+is checked with `fstat`: a regular file (`not_a_file`), with a single hard link (`hard_link`),
+of at most `MAX_NOTE_BYTES` (`note_too_large`, also checked while reading, for a file that
+grows). A missing note is `None`; a component that is not a directory or a name that is too
+long is `not_a_file`, a permission or other OS error `unreadable`. A path holding `:` is
+refused (`path_invalid`). Without a vault, `vault_unset`.
 
-It never applies anything: `apply` raises `PreviewError("not_supported")`.
+POSIX only (Linux, macOS): Windows is unsupported (no `O_NOFOLLOW`, no `dir_fd`).
 """
 
+import errno
 import os
 import stat
 from dataclasses import dataclass
 from pathlib import Path
 
-from horae.apply.notes import NoteIntent, note_after
-from horae.apply.sink import (
-    Applied,
-    FileChange,
-    HttpCall,
-    Notification,
-    Preview,
-    PreviewError,
-    SinkCall,
-    TaskChange,
-)
-from horae.contracts.intents import (
-    HttpPost,
-    Intent,
-    NotifyPush,
-    TaskCreate,
-    TaskUpdateStatus,
-)
+from horae.apply.notes import NoteIntent
+from horae.apply.sink import MAX_NOTE_BYTES, Applied, SinkCall, SinkError
 
-MAX_READ_BYTES = 16 * 1024 * 1024
-"""The largest note `LocalSink` reads (16 MiB)."""
+_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+_FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+_CHUNK = 1024 * 1024
 
 
-def describe(intent: Intent) -> Preview | None:
-    """The preview of a task, notification or HTTP intent, from the intent alone; `None` for
-    note intents."""
-    if isinstance(intent, TaskCreate):
-        line = f"- [ ] {intent.title}"
-        if intent.due is not None:
-            line += f" (due {intent.due}{'' if intent.time is None else ' ' + intent.time})"
-        return TaskChange(intent.fingerprint, "create", None, line)
-    if isinstance(intent, TaskUpdateStatus):
-        after = intent.status if intent.until is None else f"{intent.status} until {intent.until}"
-        return TaskChange(intent.task, "update_status", None, after)
-    if isinstance(intent, NotifyPush):
-        return Notification(intent.title, intent.body, intent.link)
-    if isinstance(intent, HttpPost):
-        return HttpCall(intent.url, intent.body)
-    return None
+def _is_symlink(name: str, dir_fd: int) -> bool:
+    try:
+        return stat.S_ISLNK(os.stat(name, dir_fd=dir_fd, follow_symlinks=False).st_mode)
+    except OSError:
+        return False
+
+
+def _open(name: str, flags: int, dir_fd: int, path: str) -> int | None:
+    """Open `name` relative to `dir_fd`; `None` if it does not exist."""
+    try:
+        return os.open(name, flags, dir_fd=dir_fd)
+    except FileNotFoundError:
+        return None
+    except NotADirectoryError:
+        if _is_symlink(name, dir_fd):  # `O_DIRECTORY | O_NOFOLLOW` on a link (macOS)
+            raise SinkError("symlink", f"{path} goes through a symbolic link") from None
+        raise SinkError("not_a_file", f"{path}: a parent is not a directory") from None
+    except PermissionError:
+        raise SinkError("unreadable", f"{path} cannot be read (permission denied)") from None
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise SinkError("symlink", f"{path} goes through a symbolic link") from None
+        if error.errno == errno.ENAMETOOLONG:
+            raise SinkError("not_a_file", f"{path}: a name is too long") from None
+        raise SinkError("unreadable", f"{path} cannot be read ({error.strerror})") from None
+
+
+def _too_large(path: str) -> SinkError:
+    return SinkError("note_too_large", f"{path} is larger than {MAX_NOTE_BYTES} bytes")
 
 
 def read_note(vault: Path, path: str) -> bytes | None:
     """The bytes of note `path` in `vault` (`None` if it does not exist), read-only."""
-    root = os.path.realpath(vault)
-    target = os.path.realpath(os.path.join(root, path))
-    if os.path.commonpath([root, target]) != root:
-        raise PreviewError("outside_vault", f"{path} resolves outside the vault")
+    parts = path.split("/")
+    if (
+        ":" in path
+        or "\\" in path
+        or path.startswith("/")
+        or any(part in {"", ".", ".."} for part in parts)
+    ):
+        raise SinkError("path_invalid", f"{path!r} is not a local note path")
     try:
-        info = os.stat(target)
-    except FileNotFoundError:
-        return None
-    if not stat.S_ISREG(info.st_mode):
-        raise PreviewError("not_a_file", f"{path} is not a regular file")
-    if info.st_size > MAX_READ_BYTES:
-        raise PreviewError("note_too_large", f"{path} is larger than {MAX_READ_BYTES} bytes")
-    with open(target, "rb") as handle:
-        data = handle.read(MAX_READ_BYTES + 1)
-    if len(data) > MAX_READ_BYTES:
-        raise PreviewError("note_too_large", f"{path} is larger than {MAX_READ_BYTES} bytes")
-    return data
+        root = os.open(vault, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    except OSError as error:
+        raise SinkError("unreadable", f"the vault cannot be opened ({error.strerror})") from None
+    fds = [root]
+    try:
+        for part in parts[:-1]:
+            directory = _open(part, _DIR_FLAGS, fds[-1], path)
+            if directory is None:
+                return None
+            fds.append(directory)
+        fd = _open(parts[-1], _FILE_FLAGS, fds[-1], path)
+        if fd is None:
+            return None
+        fds.append(fd)
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise SinkError("not_a_file", f"{path} is not a regular file")
+        if info.st_nlink > 1:
+            raise SinkError("hard_link", f"{path} has more than one hard link")
+        if info.st_size > MAX_NOTE_BYTES:
+            raise _too_large(path)
+        chunks: list[bytes] = []
+        size = 0
+        while chunk := os.read(fd, _CHUNK):
+            size += len(chunk)
+            if size > MAX_NOTE_BYTES:
+                raise _too_large(path)
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        for opened in reversed(fds):
+            os.close(opened)
 
 
 @dataclass(frozen=True)
 class LocalSink:
-    """Read-only previews over a local vault directory (`None`: notes cannot be previewed)."""
+    """Read-only access to the notes of a local vault directory (`None`: no vault)."""
 
     vault: Path | None = None
 
-    async def preview(self, call: SinkCall) -> Preview:
-        described = describe(call.intent)
-        if described is not None:
-            return described
+    async def read(self, call: SinkCall) -> bytes | None:
         intent = call.intent
-        if not isinstance(intent, NoteIntent):  # pragma: no cover - the closed set
-            raise PreviewError("not_supported", f"cannot preview {intent.type}")
+        if not isinstance(intent, NoteIntent):
+            raise SinkError("not_supported", f"the local sink reads no {intent.type} target")
         if self.vault is None:
-            raise PreviewError("vault_unset", "no vault directory to preview notes against")
-        before = read_note(self.vault, intent.path)
-        return FileChange(intent.path, before, note_after(intent, before))
+            raise SinkError("vault_unset", "no vault directory to read notes from")
+        return read_note(self.vault, intent.path)
 
-    async def apply(self, call: SinkCall) -> Applied:
-        raise PreviewError("not_supported", "the built-in local sink only previews")
+    async def apply(self, call: SinkCall, *, expected_before_sha256: str | None) -> Applied:
+        raise SinkError("not_supported", "the built-in local sink only reads")

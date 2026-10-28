@@ -1,57 +1,66 @@
 # SPDX-License-Identifier: Apache-2.0
 """The dry-run diff: what applying a run's routed intents would change (#21).
 
-`plan_changes(record, sinks)` calls each intent's sink **`preview`** (never `apply`) and
-collects the results in a `ChangeSet`: a unified diff per note, the task changes, and the
-notifications and HTTP calls that would be sent. Nothing is written anywhere.
+`plan_changes(record, sinks)` builds the change of every routed intent and collects them in a
+`ChangeSet`: a unified diff per note, the task changes, and the notifications and HTTP calls
+that would be sent. Nothing is written anywhere, and no sink is ever asked to apply.
 
-**What is planned (ADR 0002, schemas decision 30).**
+**The core builds every preview** (schemas decision 32, D1). For `note.*` it asks the sink
+only for the note's current bytes (`Sink.read`) and computes the new bytes itself
+(`horae.apply.notes`); tasks, notifications and HTTP calls are described from the intent
+alone, without calling the sink. So a plugin cannot show one change and make another. What a
+sink returns is checked at runtime (bytes or `None`, at most `MAX_NOTE_BYTES`, else
+`preview_invalid` / `note_too_large`), since over MCP (#24) it may return anything.
 
-- A `failed` run is never applied, so it is not planned either: the change set is `refused`.
-  So is an `undone` run, and a still running one cannot be planned (it has no record).
+**What is planned (ADR 0002, schemas decisions 30 and 32).**
+
+- A `failed` run is never applied, so it is not planned either: the change set is `refused`
+  (`run_failed`). So is an `undone` run (`run_undone`) and one whose changes were already
+  applied (`already_applied`: its journal, #22, says what changed). A still running run has
+  no record. A `degraded` run is planned: what it proposed is applied.
 - An intent without a route (`applied_by`) must not be applied: it is reported
-  (`unrouted`), never previewed. So is one whose entry's step did not run `ok`
-  (`entry_skipped`), one whose tool has no sink (`no_sink`), and one whose preview fails
-  (`PreviewError.kind`, or `host_error` for any other exception, without its message).
-- A preview must describe the routed target and the right kind of change: a `FileChange` with
-  the intent's `path` for `note.*`, a `TaskChange` with its fingerprint for `task.*`, a
-  `Notification` for `notify.push` and an `HttpCall` with its `url` for `http.post`
-  (`preview_invalid` otherwise).
+  (`unrouted`). So is one whose entry's step did not run `ok` (`entry_skipped`), one whose
+  tool has no sink (`no_sink`), and one whose note cannot be read or changed
+  (`SinkError.kind`, or `host_error` for any other exception, without its message).
 
 **Diffs** are `difflib` unified diffs, deterministic (3 lines of context, no timestamps),
 labelled `a/<path>` and `b/<path>` (`/dev/null` for a new note). A line without a final
 newline is followed by `\\ No newline at end of file`; carriage returns are kept in the diff
 text (`render_text` shows them as `\\r`). A side that is not UTF-8 or holds a NUL byte is
 `binary`, one larger than `MAX_DIFF_BYTES` is `too_large`: neither gets a diff, both keep
-their sizes and SHA-256. Each intent is previewed against the current target, so when
-several intents change the same note, each diff is relative to the current note and
-`overlaps` lists the others (their order of application is the journal's, #22).
+their sizes and SHA-256.
 
-**Notifications** carry a `dedupe_key`: the SHA-256 (canonical JSON) of the run's
-`input_hash` (or, without one, its id) and the intent. Reusing an unchanged input re-proposes
+**Several intents on one note are chained**, in run order: the first is planned against the
+note as read, each later one against the bytes the previous one leaves (`FileDiff.follows`
+names it), which is the order the journal (#22) applies them in. `before_sha256` is then
+exactly what that `apply` must find (`expected_before_sha256`, the compare-and-swap); an
+intent that cannot be planned does not change the bytes the next one sees.
+
+**Notifications** carry a `dedupe_key` (`dedupe_key`). Reusing an unchanged input re-proposes
 identical notifications (decision 30), so the applier (#22) sends a key once
 (`Store.record_notification`); given `notified`, `plan_changes` marks the keys already sent as
-`duplicate`.
+`duplicate`. A duplicate is information, not a problem.
 """
 
+import copy
 import difflib
 import hashlib
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from typing import Literal
+from typing import Any, Literal
 
+from horae.apply.notes import NoteIntent, note_after
 from horae.apply.sink import (
-    FileChange,
+    MAX_NOTE_BYTES,
     HttpCall,
     Notification,
-    Preview,
-    PreviewError,
     SinkCall,
+    SinkError,
     SinkRegistry,
     TaskChange,
 )
-from horae.contracts.intents import HttpPost, Intent, NotifyPush, TaskCreate, TaskUpdateStatus
-from horae.contracts.run import RunRecord
+from horae.contracts.intents import Intent, NotifyPush, TaskCreate, TaskUpdateStatus
+from horae.contracts.run import ProposedIntent, RunRecord
 from horae.engine.canonical import sha256_hex
 
 MAX_DIFF_BYTES = 1024 * 1024
@@ -59,7 +68,19 @@ MAX_DIFF_BYTES = 1024 * 1024
 
 NO_NEWLINE = "\\ No newline at end of file\n"
 
-_REFUSED_STATUSES = {"failed": "a failed run is never applied", "undone": "the run was undone"}
+
+@dataclass(frozen=True)
+class Refusal:
+    """Why nothing of a run is planned."""
+
+    kind: Literal["run_failed", "run_undone", "already_applied"]
+    message: str
+
+
+_REFUSED_STATUSES = {
+    "failed": Refusal("run_failed", "a failed run is never applied"),
+    "undone": Refusal("run_undone", "the run was undone"),
+}
 
 
 @dataclass(frozen=True)
@@ -73,13 +94,15 @@ class FileDiff:
     before_size: int | None
     after_size: int
     before_sha256: str | None
+    """What `apply` must find (`expected_before_sha256`); `None`: no note."""
     after_sha256: str
     diff: str | None
     """The unified diff; `None` when unchanged, binary or too large."""
     binary: bool = False
     too_large: bool = False
-    overlaps: tuple[int, ...] = ()
-    """Other intents of the run that change the same note."""
+    follows: int | None = None
+    """The earlier intent of the run changing the same note: this one is planned against the
+    bytes it leaves."""
 
 
 @dataclass(frozen=True)
@@ -124,7 +147,7 @@ class ChangeSet:
     pipeline: str
     run_status: str
     dry_run: bool
-    refused: str | None = None
+    refused: Refusal | None = None
     """Why nothing of the run is planned (e.g. it failed)."""
     files: tuple[FileDiff, ...] = ()
     tasks: tuple[TaskItem, ...] = ()
@@ -178,56 +201,92 @@ def unified_diff(path: str, before: bytes | None, after: bytes) -> str:
     return "".join(out)
 
 
-def _file_diff(index: int, tool: str, change: FileChange) -> FileDiff:
-    before, after = change.before, change.after
+def _sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _file_diff(
+    index: int, tool: str, path: str, before: bytes | None, after: bytes, follows: int | None
+) -> FileDiff:
     status: Literal["create", "modify", "unchanged"]
     status = "create" if before is None else "unchanged" if before == after else "modify"
     binary = _text(before) is None or _text(after) is None
     too_large = not binary and max(len(before or b""), len(after)) > MAX_DIFF_BYTES
     diff = None
     if status != "unchanged" and not binary and not too_large:
-        diff = unified_diff(change.path, before, after)
+        diff = unified_diff(path, before, after)
     return FileDiff(
         intent=index,
         applied_by=tool,
-        path=change.path,
+        path=path,
         status=status,
         before_size=None if before is None else len(before),
         after_size=len(after),
-        before_sha256=None if before is None else hashlib.sha256(before).hexdigest(),
-        after_sha256=hashlib.sha256(after).hexdigest(),
+        before_sha256=None if before is None else _sha(before),
+        after_sha256=_sha(after),
         diff=diff,
         binary=binary and status != "unchanged",
         too_large=too_large and status != "unchanged",
+        follows=follows,
     )
 
 
-def dedupe_key(record: RunRecord, intent: Intent) -> str:
-    """The deduplication key of a notification proposed by `record`."""
-    scope = {"input_hash": record.input_hash} if record.input_hash else {"run": record.id}
-    return sha256_hex({**scope, "intent": intent.model_dump(mode="json")})
+def entry_params(record: RunRecord, proposed: ProposedIntent) -> dict[str, Any]:
+    """The trusted parameters of the entry routing `proposed`, as its step recorded them
+    (empty when it did not), as a private copy."""
+    step, entry = proposed.applied_by_step, proposed.applied_by_call
+    if step is None or entry is None:
+        return {}
+    output = record.steps[step].output
+    if isinstance(output, list) and entry < len(output) and isinstance(output[entry], dict):
+        raw = output[entry].get("params")
+        if isinstance(raw, dict):
+            return copy.deepcopy(raw)
+    return {}
 
 
-def _is_bytes(value: object) -> bool:
-    """A runtime check: a sink over MCP may return anything."""
-    return isinstance(value, bytes)
+def _identity(record: RunRecord, proposed: ProposedIntent) -> dict[str, Any]:
+    return {
+        "applied_by": proposed.applied_by,
+        "params": entry_params(record, proposed),
+        "intent": proposed.intent.model_dump(mode="json"),
+    }
 
 
-def _expected(intent: Intent, preview: Preview) -> bool:
-    """`preview` is the right kind of change, for the routed target."""
-    if isinstance(intent, TaskCreate | TaskUpdateStatus):
-        fingerprint = intent.fingerprint if isinstance(intent, TaskCreate) else intent.task
-        return isinstance(preview, TaskChange) and preview.fingerprint == fingerprint
+def dedupe_key(record: RunRecord, index: int) -> str:
+    """The deduplication key of the notification at `index` in `record.intents`.
+
+    The SHA-256 (canonical JSON) of the pipeline, the routing entry (`applied_by` and its
+    parameters), the run's `input_hash` (or, without one, its id), the intent, and its
+    occurrence: how many identical (entry, intent) pairs come before it in the run. So a
+    reused input re-proposes the same keys, while two identical notifications in one run get
+    two keys (both are sent)."""
+    mine = _identity(record, record.intents[index])
+    occurrence = sum(1 for p in record.intents[:index] if _identity(record, p) == mine)
+    scope = {"input_hash": record.input_hash} if record.input_hash else {"run_id": record.id}
+    return sha256_hex({"pipeline": record.pipeline, **scope, **mine, "occurrence": occurrence})
+
+
+def describe(intent: Intent) -> TaskChange | Notification | HttpCall | None:
+    """The change of a task, notification or HTTP intent, from the intent alone (`None` for a
+    note intent). The current state of a task is not known: `TaskChange.before` is `None`."""
+    if isinstance(intent, TaskCreate):
+        line = f"- [ ] {intent.title}"
+        if intent.due is not None:
+            line += f" (due {intent.due}{'' if intent.time is None else ' ' + intent.time})"
+        return TaskChange(intent.fingerprint, "create", None, line)
+    if isinstance(intent, TaskUpdateStatus):
+        after = intent.status if intent.until is None else f"{intent.status} until {intent.until}"
+        return TaskChange(intent.task, "update_status", None, after)
     if isinstance(intent, NotifyPush):
-        return isinstance(preview, Notification)
-    if isinstance(intent, HttpPost):
-        return isinstance(preview, HttpCall) and preview.url == intent.url
-    return (
-        isinstance(preview, FileChange)
-        and preview.path == intent.path
-        and _is_bytes(preview.after)
-        and (preview.before is None or _is_bytes(preview.before))
-    )
+        return Notification(intent.title, intent.body, intent.link)
+    if isinstance(intent, NoteIntent):
+        return None
+    return HttpCall(intent.url, copy.deepcopy(intent.body))
+
+
+def _too_large(path: str) -> SinkError:
+    return SinkError("note_too_large", f"{path} is larger than {MAX_NOTE_BYTES} bytes")
 
 
 async def plan_changes(
@@ -236,20 +295,26 @@ async def plan_changes(
     *,
     notified: Callable[[str], bool] | None = None,
 ) -> ChangeSet:
-    """Preview every routed intent of `record` with its sink; never applies anything.
+    """Plan every routed intent of `record`; never applies anything.
 
-    `notified(key)` says whether a notification's `dedupe_key` was already sent."""
+    Only `Sink.read` is called, for `note.*` intents. `notified(key)` says whether a
+    notification's `dedupe_key` was already sent."""
     base = ChangeSet(record.id, record.pipeline, record.status, record.dry_run)
     if record.status in _REFUSED_STATUSES:
         return replace(base, refused=_REFUSED_STATUSES[record.status])
+    if record.changes:
+        message = "the run's changes were already applied (its journal, #22, lists them)"
+        return replace(base, refused=Refusal("already_applied", message))
     files: list[FileDiff] = []
     tasks: list[TaskItem] = []
     notes: list[NotificationItem] = []
     calls: list[HttpItem] = []
     problems: list[Problem] = []
+    pending: dict[tuple[int, str], tuple[bytes, int]] = {}
+    """The bytes each (sink, note) is left with by the last planned intent, and that intent."""
     for index, proposed in enumerate(record.intents):
-        tool, step, entry = proposed.applied_by, proposed.applied_by_step, proposed.applied_by_call
-        if tool is None or step is None or entry is None:
+        tool, step = proposed.applied_by, proposed.applied_by_step
+        if tool is None or step is None or proposed.applied_by_call is None:
             problems.append(Problem(index, None, "unrouted", "the intent has no sink"))
             continue
         if record.steps[step].status != "ok":
@@ -260,37 +325,56 @@ async def plan_changes(
         if sink is None:
             problems.append(Problem(index, tool, "no_sink", f"no sink serves {tool}"))
             continue
-        output = record.steps[step].output
-        params = {}
-        if isinstance(output, list) and entry < len(output) and isinstance(output[entry], dict):
-            raw = output[entry].get("params")
-            params = dict(raw) if isinstance(raw, dict) else {}
-        call = SinkCall(record.id, index, tool, params, proposed.intent, record.input_hash)
+        intent = proposed.intent
+        described = describe(intent)
+        if isinstance(described, TaskChange):
+            tasks.append(TaskItem(index, tool, described))
+            continue
+        if isinstance(described, Notification):
+            key = dedupe_key(record, index)
+            duplicate = None if notified is None else notified(key)
+            notes.append(NotificationItem(index, tool, described, key, duplicate))
+            continue
+        if isinstance(described, HttpCall):
+            calls.append(HttpItem(index, tool, described))
+            continue
+        assert isinstance(intent, NoteIntent)  # noqa: S101 - `describe` covers the rest
+        slot = (id(sink), intent.path)
+        follows: int | None = None
         try:
-            preview = await sink.preview(call)
-        except PreviewError as error:
+            if slot in pending:
+                before: bytes | None
+                before, follows = pending[slot]
+            else:
+                call = SinkCall(
+                    record.id,
+                    index,
+                    tool,
+                    entry_params(record, proposed),
+                    intent.model_copy(deep=True),
+                    record.input_hash,
+                )
+                try:
+                    before = await sink.read(call)
+                except SinkError:
+                    raise
+                except Exception:
+                    problems.append(Problem(index, tool, "host_error", "the sink read failed"))
+                    continue
+                if before is not None and type(before) is not bytes:
+                    message = "the sink returned something other than bytes for the note"
+                    problems.append(Problem(index, tool, "preview_invalid", message))
+                    continue
+                if before is not None and len(before) > MAX_NOTE_BYTES:
+                    raise _too_large(intent.path)
+            after = note_after(intent, before)
+            if len(after) > MAX_NOTE_BYTES:
+                raise _too_large(intent.path)
+        except SinkError as error:
             problems.append(Problem(index, tool, str(error.kind), str(error.message)))
             continue
-        except Exception:
-            problems.append(Problem(index, tool, "host_error", "the preview failed"))
-            continue
-        if not _expected(proposed.intent, preview):
-            message = f"the preview does not describe this {proposed.intent.type}"
-            problems.append(Problem(index, tool, "preview_invalid", message))
-        elif isinstance(preview, FileChange):
-            files.append(_file_diff(index, tool, preview))
-        elif isinstance(preview, TaskChange):
-            tasks.append(TaskItem(index, tool, preview))
-        elif isinstance(preview, Notification):
-            key = dedupe_key(record, proposed.intent)
-            duplicate = None if notified is None else notified(key)
-            notes.append(NotificationItem(index, tool, preview, key, duplicate))
-        else:
-            calls.append(HttpItem(index, tool, preview))
-    for position, diff in enumerate(files):
-        others = tuple(f.intent for f in files if f.path == diff.path and f is not diff)
-        if others:
-            files[position] = replace(diff, overlaps=others)
+        pending[slot] = (after, index)
+        files.append(_file_diff(index, tool, intent.path, before, after, follows))
     return replace(
         base,
         files=tuple(files),

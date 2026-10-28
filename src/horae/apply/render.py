@@ -3,18 +3,21 @@
 
 **Text** is colourless unless `color=True` (ANSI: removed lines red, added green, hunk
 headers cyan, file headers bold). Everything in it that comes from a note, an intent or a
-sink is untrusted, so control characters (except tab) and bidirectional-text controls are
+sink is untrusted, so every character of Unicode category Cc (controls), Cf (format: bidi
+controls, zero-width characters…), Zl or Zp (line and paragraph separators) except tab is
 shown escaped (`\\x1b`, `\\r`, `\\u202e`): a note cannot move the cursor, change colours or
 reorder what the terminal shows.
 
-**JSON** (`schema_version: 1`) has a fixed key order and is ASCII-only (`ensure_ascii`):
-`run`, `refused`, `files` (with the raw unified `diff`, carriage returns kept), `tasks`,
-`notifications`, `http_calls` and `problems`, each item with its `intent` index and
-`applied_by`.
+**JSON** (`schema_version: 1`) has a fixed key order, is ASCII-only (`ensure_ascii`) and
+strict (no `NaN` or `Infinity`: a non-finite number in an HTTP body is shown as a string):
+`run`, `refused` (`null` or `{kind, message}`), `files` (with the raw unified `diff`,
+carriage returns kept, and `follows`), `tasks`, `notifications`, `http_calls` and `problems`,
+each item with its `intent` index and `applied_by`.
 """
 
 import json
-import re
+import math
+import unicodedata
 from typing import Any
 
 from horae.apply.plan import ChangeSet, FileDiff
@@ -22,22 +25,48 @@ from horae.apply.plan import ChangeSet, FileDiff
 JSON_SCHEMA_VERSION = 1
 """Version of the `horae diff --json` report."""
 
-_UNSAFE = re.compile(r"[\x00-\x08\x0a-\x1f\x7f-\x9f؜‎‏‪-‮⁦-⁩]")
+_UNSAFE_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp"})
 _ESCAPES = {"\r": "\\r", "\n": "\\n"}
 _RED, _GREEN, _CYAN, _BOLD, _RESET = "\x1b[31m", "\x1b[32m", "\x1b[36m", "\x1b[1m", "\x1b[0m"
 
 
+def _escape(char: str) -> str:
+    if char in _ESCAPES:
+        return _ESCAPES[char]
+    code = ord(char)
+    if code < 0x100:
+        return f"\\x{code:02x}"
+    return f"\\u{code:04x}" if code < 0x10000 else f"\\U{code:08x}"
+
+
 def safe(text: str) -> str:
-    """`text` with control and bidi characters escaped, for a terminal."""
+    """`text` for a terminal: every control, format (bidi, zero-width…), line separator and
+    paragraph separator character escaped, except tab."""
+    if text.isascii() and text.isprintable():
+        return text
+    return "".join(
+        _escape(char) if char != "\t" and unicodedata.category(char) in _UNSAFE_CATEGORIES else char
+        for char in text
+    )
 
-    def escape(match: re.Match[str]) -> str:
-        char = match.group()
-        if char in _ESCAPES:
-            return _ESCAPES[char]
-        code = ord(char)
-        return f"\\x{code:02x}" if code < 0x100 else f"\\u{code:04x}"
 
-    return _UNSAFE.sub(escape, text)
+def _finite(value: Any) -> Any:
+    """`value` with every non-finite float replaced by its name (`"NaN"`, `"Infinity"`…)."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return json.dumps(value)
+    if isinstance(value, dict):
+        return {key: _finite(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_finite(item) for item in value]
+    return value
+
+
+def dumps(value: Any, **kwargs: Any) -> str:
+    """`json.dumps` of `value` as strict JSON: non-finite floats become strings."""
+    try:
+        return json.dumps(value, allow_nan=False, **kwargs)
+    except ValueError:
+        return json.dumps(_finite(value), allow_nan=False, **kwargs)
 
 
 def _paint(text: str, code: str, color: bool) -> str:
@@ -65,12 +94,12 @@ def _file_lines(item: FileDiff, color: bool) -> list[str]:
     path = safe(item.path)
     head = f"{path}: {item.status} (intent {item.intent}, {safe(item.applied_by)})"
     lines = [_paint(head, _BOLD, color)]
-    if item.overlaps:
-        others = ", ".join(str(i) for i in item.overlaps)
-        lines.append(f"  note: intents {others} also change it; diffed against the current note")
+    if item.follows is not None:
+        lines.append(f"  after intent {item.follows}: diffed against the note as it leaves it")
     size = f"{item.before_size or 0} -> {item.after_size} bytes"
     if item.binary:
-        lines.append(f"Binary files a/{path} and b/{path} differ ({size})")
+        old = "/dev/null" if item.before_size is None else f"a/{path}"
+        lines.append(f"Binary files {old} and b/{path} differ ({size})")
     elif item.too_large:
         lines.append(f"Too large to diff ({size}, sha256 {item.after_sha256})")
     elif item.diff is not None:
@@ -83,7 +112,7 @@ def render_text(changes: ChangeSet, *, color: bool = False) -> str:
     run = f"Run {safe(changes.run_id)} ({safe(changes.pipeline)}, {changes.run_status}"
     lines = [run + (", dry run)" if changes.dry_run else ")")]
     if changes.refused is not None:
-        lines.append(f"Nothing to apply: {changes.refused}.")
+        lines.append(f"Nothing to apply: {changes.refused.message} ({changes.refused.kind}).")
         return "\n".join(lines) + "\n"
     if changes.empty and not changes.problems:
         lines.append("No changes.")
@@ -106,7 +135,7 @@ def render_text(changes: ChangeSet, *, color: bool = False) -> str:
     if changes.http_calls:
         lines.extend(["", _paint("HTTP calls:", _BOLD, color)])
         for http in changes.http_calls:
-            body = json.dumps(http.call.body, separators=(",", ":"), ensure_ascii=False)
+            body = dumps(http.call.body, separators=(",", ":"), ensure_ascii=False)
             short = body if len(body) <= 200 else body[:200] + "…"
             lines.append(
                 f"  {http.call.method} {safe(http.call.url)} via {safe(http.applied_by)}"
@@ -132,7 +161,9 @@ def to_dict(changes: ChangeSet) -> dict[str, Any]:
             "status": changes.run_status,
             "dry_run": changes.dry_run,
         },
-        "refused": changes.refused,
+        "refused": None
+        if changes.refused is None
+        else {"kind": changes.refused.kind, "message": changes.refused.message},
         "files": [
             {
                 "intent": f.intent,
@@ -145,7 +176,7 @@ def to_dict(changes: ChangeSet) -> dict[str, Any]:
                 "after": {"size": f.after_size, "sha256": f.after_sha256},
                 "binary": f.binary,
                 "too_large": f.too_large,
-                "overlaps": list(f.overlaps),
+                "follows": f.follows,
                 "diff": f.diff,
             }
             for f in changes.files
@@ -192,4 +223,4 @@ def to_dict(changes: ChangeSet) -> dict[str, Any]:
 
 def to_json(changes: ChangeSet) -> str:
     """`changes` as an indented JSON document (no trailing newline)."""
-    return json.dumps(to_dict(changes), indent=2, ensure_ascii=True)
+    return dumps(to_dict(changes), indent=2, ensure_ascii=True)

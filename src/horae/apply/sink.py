@@ -2,32 +2,45 @@
 """The apply-layer port: what the core needs from a sink or notifier (ADR 0002, #21/#22).
 
 The plugin host (#24) implements `Sink` over MCP for each `act` sink and `notify` notifier;
-`horae.apply.local` has a built-in, read-only preview for notes in a local vault and
+`horae.apply.local` has a built-in, read-only sink for notes in a local vault and
 `horae.apply.testing` an in-memory reference implementation for tests.
+
+**The core owns what an intent means** (schemas decision 32, D1). A sink never describes a
+change itself: the dry-run diff (`horae.apply.plan_changes`) builds every preview from the
+intent and, for `note.*`, from the note's current bytes, with the conventions of
+`horae.apply.notes`. So a plugin cannot show one change and make another.
 
 **Two operations.**
 
-- `preview(call)` says what applying the intent **would** change: the current bytes of the
-  target note and the proposed bytes (`FileChange`, for `note.*`), the task line or state
-  change (`TaskChange`, for `task.*`), or a description of what would be sent
-  (`Notification` for `notify.push`, `HttpCall` for `http.post`). It is used by the dry-run
-  diff (`horae.apply.plan_changes`).
-- `apply(call)` performs the change and returns what the journal needs (`Applied`). It is used
-  by the journal and undo (#22), **never** by the dry-run diff.
+- `read(call)` returns the current bytes of the target of a `note.*` intent (`None`: the note
+  does not exist). It is the only call the dry-run diff makes, and only for notes. It must be
+  side-effect free: it may read its target, nothing else (no file created, written, renamed,
+  removed or locked, no directory created, no network request, no notification, no process
+  started, no cache or state updated). A dry run is only trustworthy if every read is
+  (PLAN.md §2.2 "`--dry-run` writes nothing"). A sink that serves no notes may raise
+  `SinkError("not_supported")`.
+- `apply(call, *, expected_before_sha256=...)` performs the change and returns what the
+  journal needs (`Applied`). It is used by the journal and undo (#22), **never** by the
+  dry-run diff. For a `note.*` intent it is a compare-and-swap: `expected_before_sha256` is
+  the SHA-256 (hex) of the bytes the change was planned against, `None` meaning "the note
+  must not exist"; if the target is not exactly that, the sink changes nothing and raises
+  `SinkError("target_changed")`. The sink applies the intent with the conventions of
+  `horae.apply.notes`, and the journal (#22) checks `Applied.after` against the bytes the core
+  planned. For other intents `expected_before_sha256` is `None` and ignored.
 
-**`preview` must be side-effect free.** It may read its target, nothing else: no file
-created, written, renamed, removed or locked, no directory created, no network request, no
-notification, no process started, no cache or state updated. A dry run is only trustworthy if
-every preview is (PLAN.md §2.2 "`--dry-run` writes nothing").
+**Targets** are resolved by the sink without following symlinks on any component, a target
+with more than one hard link is refused, and ownership (`*.assistant.md`) is decided on that
+path (so a link cannot turn a user note into an owned one); `apply` (#22) must do the same.
+
+**Over MCP (#24)** note bytes travel base64-encoded and are capped at `MAX_NOTE_BYTES`
+(16 MiB) each way; the core checks the type and size of whatever comes back.
 
 **Untrusted text.** Titles, bodies and note content in an intent are data from the proposer.
 A sink must treat them as data, never as markup to interpret, commands or further targets.
 The target itself (note `path`, `http.post` `url`, notification `link`) was bound by the
-engine to a trusted pipeline parameter (schemas decision 30); a preview must describe that
-target and no other (`plan_changes` checks it).
+engine to a trusted pipeline parameter (schemas decision 30).
 
-A preview that cannot be made (the note is missing, an owned block is not found…) raises
-`PreviewError`, with a machine-readable `kind`.
+A read or apply that cannot be done raises `SinkError`, with a machine-readable `kind`.
 """
 
 from dataclasses import dataclass, field
@@ -35,9 +48,12 @@ from typing import Any, Literal, Protocol
 
 from horae.contracts.intents import Intent
 
+MAX_NOTE_BYTES = 16 * 1024 * 1024
+"""The largest note read or written through a sink (16 MiB)."""
 
-class PreviewError(Exception):
-    """The sink cannot preview (or apply) this intent; `kind` is machine-readable."""
+
+class SinkError(Exception):
+    """The sink cannot read (or apply) this intent's target; `kind` is machine-readable."""
 
     def __init__(self, kind: str, message: str) -> None:
         super().__init__(kind, message)
@@ -47,7 +63,8 @@ class PreviewError(Exception):
 
 @dataclass(frozen=True)
 class SinkCall:
-    """One routed intent, as handed to its sink."""
+    """One routed intent, as handed to its sink (a private deep copy: a sink cannot change the
+    run record or the plan through it)."""
 
     run_id: str
     index: int
@@ -59,7 +76,9 @@ class SinkCall:
     (e.g. `{"path": ..., "mode": "replace-owned"}`); empty when the step did not record them."""
     intent: Intent
     input_hash: str | None = None
-    """The run's `input_hash`, for notification deduplication."""
+    """The run's `input_hash`."""
+    dedupe_key: str | None = None
+    """For `notify.push`: the notification's deduplication key (`horae.apply.dedupe_key`)."""
 
 
 @dataclass(frozen=True)
@@ -75,7 +94,7 @@ class FileChange:
 @dataclass(frozen=True)
 class TaskChange:
     """A task created or changed: human-readable states, e.g. the task line before and after
-    (`before` is `None` for a new task, or when the sink does not know the current state)."""
+    (`before` is `None` for a new task, or when the current state is not known)."""
 
     fingerprint: str
     action: Literal["create", "update_status"]
@@ -102,7 +121,7 @@ class HttpCall:
 
 
 Preview = FileChange | TaskChange | Notification | HttpCall
-"""What `Sink.preview` returns."""
+"""What the core plans for one intent."""
 
 
 @dataclass(frozen=True)
@@ -121,12 +140,15 @@ class Applied:
 class Sink(Protocol):
     """A sink or notifier that applies routed intents."""
 
-    async def preview(self, call: SinkCall) -> Preview:
-        """What applying `call` would change. Side-effect free; raises `PreviewError`."""
+    async def read(self, call: SinkCall) -> bytes | None:
+        """The current bytes of a `note.*` intent's target (`None`: no such note).
+
+        Side-effect free; raises `SinkError`."""
         ...
 
-    async def apply(self, call: SinkCall) -> Applied:
-        """Apply `call` (#22 only, never during a dry run); raises `PreviewError`."""
+    async def apply(self, call: SinkCall, *, expected_before_sha256: str | None) -> Applied:
+        """Apply `call` (#22 only, never during a dry run) if the target is still as planned
+        (`target_changed` otherwise); raises `SinkError`."""
         ...
 
 
