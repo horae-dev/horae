@@ -371,11 +371,13 @@ def prime(resolver: "SecretResolver", names: Iterable[str]) -> None:
         try:
             resolver.resolve(name)
         except SecretError as error:
-            if "too short" in error.reason:
+            too_short_value = "too short" in error.reason
+            del error
+            if too_short_value:  # the name only (a validated `SecretName`), never a value
                 _log.warning(
                     "secret %s is too short for reliable redaction (min %d bytes): "
                     "refused, so it is not primed and what needs it fails",
-                    error.name,
+                    name,
                     MIN_SECRET_BYTES,
                 )
 
