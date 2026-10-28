@@ -16,7 +16,8 @@ one `horae undo`), everything the runner needs from the installed plugins:
 `LivePorts.ports` is the runner's `Ports(plugins=registry, tools=host, sinks=sinks)`.
 `llm` is `None` until M2 wires a backend. Where `horae plugin add` installs plugins (the
 `plugins_dir`) is M4's (#44); the walking skeleton and the tests write it with
-`horae.plugins.builtin.install`. The CLI wiring is #26.
+`horae.plugins.builtin.install`. `horae run`, `horae diff` and `horae undo` open it on
+`<instance>/plugins` (`horae.cli_host`, #26).
 
 Raises `ProblemsError` for an invalid manifest and `RegistryError` for one that does not
 match `horae.lock`, before any process starts.

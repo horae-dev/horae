@@ -111,7 +111,7 @@ def test_undo_errors(applied: Path, vault: Path, tmp_path: Path, instance_dir: P
     assert lock is not None
     with lock:
         locked = _undo(RUN_ID, "-i", str(applied), "--vault", str(vault))
-    assert locked.exit_code == cli_undo.EXIT_PROBLEMS
+    assert locked.exit_code == cli_undo.EXIT_LOCKED == 5
     assert "is running" in locked.stderr
     assert _undo().exit_code == 2
 
@@ -134,7 +134,7 @@ def test_undo_store_and_internal_errors(
             pytest.skip("permissions are not enforced")
         result = _undo(RUN_ID, "-i", str(applied), "--json")
         assert result.exit_code == cli_undo.EXIT_PROBLEMS
-        assert json.loads(result.stdout)["error"]["kind"] == "store_error"
+        assert json.loads(result.stdout)["error"]["kind"] == "store_error", result.stdout
     finally:
         os.chmod(db, 0o600)
 
@@ -205,7 +205,7 @@ def test_undo_never_runs_during_an_apply(applied: Path, vault: Path) -> None:
     assert held is not None
     with held:
         result = _undo(RUN_ID, "-i", str(applied), "--vault", str(vault), "--json")
-    assert result.exit_code == cli_undo.EXIT_PROBLEMS
+    assert result.exit_code == cli_undo.EXIT_LOCKED == 5
     assert json.loads(result.stdout)["error"]["kind"] == "apply_locked"
     assert (vault / DAILY).exists()
 

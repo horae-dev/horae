@@ -244,19 +244,26 @@ def test_missing_pipeline_file(instance: Path) -> None:
     assert _invoke(RUN, "-i", str(instance))[0] == 0  # the recorded definition is enough
     code, report = _json(RUN, "-i", str(instance), "--against-current")
     assert code == cli.EXIT_NOT_COMPARABLE == 3
-    assert report["error"] == "--against-current: pipeline flow is not in the instance"
+    assert report["error"] == {
+        "kind": "not_comparable",
+        "message": "--against-current: pipeline flow is not in the instance",
+    }
 
 
-def test_unknown_run_and_missing_store_are_usage_errors(instance: Path, tmp_path: Path) -> None:
+def test_unknown_run_and_missing_store_are_refused(instance: Path, tmp_path: Path) -> None:
+    # Exit 3 like `horae diff` and `horae undo` (decision 37; was 2 before #26).
     code, out = _invoke("no-such-run", "-i", str(instance))
-    assert code == cli.EXIT_USAGE == 2
+    assert code == cli.EXIT_UNKNOWN_RUN == 3
     assert "unknown run 'no-such-run'" in out
     missing = tmp_path / "missing.db"
     code, report = _json(RUN, "-i", str(instance), "--store", str(missing))
-    assert code == 2
+    assert code == 3
     assert report["outcome"] == "error"
     assert report["identical"] is False
-    assert report["error"] == f"unknown run {RUN!r}: no store at {missing}"
+    assert report["error"] == {
+        "kind": "unknown_run",
+        "message": f"unknown run {RUN!r}: no store at {missing}",
+    }
     assert report["pipeline_digest"] == {"recorded": None, "current": None, "changed": None}
     assert report["mismatches"] == []
     assert report["summary"] == []
@@ -280,7 +287,8 @@ def test_store_problems_exit_1(instance: Path) -> None:
     conn.close()
     code, report = _json(RUN, "-i", str(instance))
     assert code == cli.EXIT_PROBLEMS == 1
-    assert "older than this Horae" in report["error"]
+    assert report["error"]["kind"] == "store_error"
+    assert "older than this Horae" in report["error"]["message"]
 
 
 def test_an_invalid_record_is_not_comparable(instance: Path) -> None:
@@ -289,7 +297,10 @@ def test_an_invalid_record_is_not_comparable(instance: Path) -> None:
     conn.close()
     code, report = _json(RUN, "-i", str(instance))
     assert code == 3
-    assert report["error"] == f"run {RUN!r}: its record is not a valid v1 run record"
+    assert report["error"] == {
+        "kind": "not_comparable",
+        "message": f"run {RUN!r}: its record is not a valid v1 run record",
+    }
 
 
 def test_explicit_store(instance: Path, tmp_path: Path) -> None:
@@ -327,7 +338,8 @@ def test_lock_and_model_drift(instance: Path) -> None:
     _edit(instance, "version: 0.1.0", "version: 0.2.0", "horae.lock")
     code, report = _json(RUN, "-i", str(instance))
     assert code == 3
-    assert report["error"].startswith("horae.lock changed since the run")
+    assert report["error"]["kind"] == "not_comparable"
+    assert report["error"]["message"].startswith("horae.lock changed since the run")
     assert report["lock_digest"]["changed"] is True
     code, report = _json(RUN, "-i", str(instance), "--against-current")
     assert code == 4  # the plugins are now 0.2.0
@@ -406,6 +418,6 @@ def test_help_documents_the_exit_codes() -> None:
     text = " ".join(_plain(result.output).split())
     for code in ("0 identical", "1 configuration or store problem", "2 usage error"):
         assert code in text
-    assert "3 not comparable" in text
+    assert "3 unknown run (or no store) or not comparable" in text
     assert "4 different" in text
     assert "70 internal error" in text

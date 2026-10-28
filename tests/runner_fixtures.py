@@ -148,5 +148,30 @@ def child_main(argv: list[str]) -> int:
     return 0
 
 
+def cli_main(argv: list[str]) -> None:
+    """`python tests/runner_fixtures.py --cli <ready> <release> <horae arguments>...`.
+
+    Runs the `horae` CLI with these fixture plugins instead of the plugin host's (no
+    process started), `fixture.slow` creating `<ready>` and waiting for `<release>`."""
+    from contextlib import asynccontextmanager
+    from types import SimpleNamespace
+
+    from horae import cli_run
+    from horae.apply import StaticSinks
+    from horae.cli import app
+    from horae.runner import Ports
+
+    plugins = Plugins(Path(argv[0]), Path(argv[1]))
+
+    @asynccontextmanager
+    async def live_ports(instance: Instance) -> Any:
+        yield SimpleNamespace(ports=Ports(plugins, plugins), sinks=StaticSinks())
+
+    setattr(cli_run, "live_ports", live_ports)  # noqa: B010 (the module's private name)
+    app(argv[2:], prog_name="horae")
+
+
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["--cli"]:
+        cli_main(sys.argv[2:])
     sys.exit(child_main(sys.argv[1:]))
