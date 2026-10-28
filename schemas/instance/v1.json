@@ -185,6 +185,38 @@
           "if": {
             "properties": {
               "backend": {
+                "not": {
+                  "enum": [
+                    "openai-compatible"
+                  ]
+                }
+              }
+            },
+            "required": [
+              "backend"
+            ]
+          },
+          "then": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "structured_output"
+                  ]
+                },
+                {
+                  "required": [
+                    "max_tokens_field"
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "backend": {
                 "enum": [
                   "anthropic"
                 ]
@@ -236,7 +268,7 @@
             }
           ],
           "default": null,
-          "description": "Endpoint; required for `openai-compatible` and `ollama`. See `BackendUrl`.",
+          "description": "Endpoint; required for `openai-compatible` and `ollama`. See `BackendUrl`. For\n`openai-compatible` it is the API root **with** its version prefix, as the OpenAI SDKs\ntake it (`https://api.mistral.ai/v1`, `https://openrouter.ai/api/v1`,\n`http://vllm:8000/v1`): requests go to `<base_url>/chat/completions`. For `ollama` it is\nthe server root (`http://ollama:11434`): requests go to `<base_url>/api/chat`.",
           "title": "Base Url"
         },
         "secret": {
@@ -254,7 +286,7 @@
             }
           ],
           "default": null,
-          "description": "The secret holding the backend's API key or token, e.g. `ANTHROPIC_API_KEY`; required\nfor `anthropic`.",
+          "description": "The secret holding the backend's API key or token, e.g. `ANTHROPIC_API_KEY`; required\nfor `anthropic`, optional for `openai-compatible` and `ollama` (sent as `Authorization:\nBearer`; a local server usually needs none).",
           "title": "Secret"
         },
         "price": {
@@ -283,6 +315,41 @@
           "default": null,
           "description": "A cap on `max_tokens` for every call of this alias, below the step's `tokens_out`\n(e.g. the model's own output limit).",
           "title": "Max Output Tokens"
+        },
+        "structured_output": {
+          "anyOf": [
+            {
+              "enum": [
+                "json_schema",
+                "json_object",
+                "none"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "`openai-compatible` only: how the output is constrained (`json_schema` when unset, or\n`json_object` / `none` for a server that lacks JSON Schema support). See\n`StructuredOutput`.",
+          "title": "Structured Output"
+        },
+        "max_tokens_field": {
+          "anyOf": [
+            {
+              "enum": [
+                "max_tokens",
+                "max_completion_tokens"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "`openai-compatible` only: the request field of the output limit (`max_tokens` when\nunset, or `max_completion_tokens`). See `MaxTokensField`.",
+          "title": "Max Tokens Field"
         }
       },
       "required": [

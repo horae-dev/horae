@@ -1,0 +1,35 @@
+{
+  "status": 200,
+  "body": {
+    "id": "chatcmpl-synthetic0001",
+    "object": "chat.completion",
+    "created": 1767225600,
+    "model": "fixture-model-1",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": null,
+          "refusal": null,
+          "tool_calls": [
+            {
+              "id": "call_synthetic",
+              "type": "function",
+              "function": {
+                "name": "fetch",
+                "arguments": "{}"
+              }
+            }
+          ]
+        },
+        "finish_reason": "tool_calls"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 1200,
+      "completion_tokens": 20,
+      "total_tokens": 1220
+    }
+  }
+}
