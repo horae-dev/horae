@@ -110,6 +110,86 @@ def test_plain_http_to_a_public_host_is_refused(url: str) -> None:
             ModelAlias(backend=backend, model="m", base_url=url)
 
 
+@pytest.mark.parametrize(
+    ("url", "reason"),
+    [
+        ("https://h/a%2Fb", "encoded"),
+        ("https://h/a%2fb", "encoded"),
+        ("https://h/%2e%2e/v1", "encoded"),
+        ("https://h/%2E/v1", "encoded"),
+        ("https://h/v1%5Cx", "encoded"),
+        ("https://h:8443/v1/%5c", "encoded"),
+        ("https://h/v1/../x", "segment"),
+        ("https://h/./v1", "segment"),
+        ("https://h/v1/..", "segment"),
+        ("http://ollama:11434/..", "segment"),
+    ],
+)
+def test_a_base_url_path_that_could_traverse_is_refused(url: str, reason: str) -> None:
+    for backend in ("openai-compatible", "ollama"):
+        with pytest.raises(ValidationError, match=reason):
+            ModelAlias(backend=backend, model="m", base_url=url)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://h/v1",
+        "https://h/api/v1.2/x..y",
+        "https://h/v1/%41b",
+        "https://h/v1?q=%2F..",  # the query is not sent (the guard sends none)
+        "http://ollama:11434",
+    ],
+)
+def test_an_ordinary_base_url_path_is_accepted(url: str) -> None:
+    assert ModelAlias(backend="openai-compatible", model="m", base_url=url).base_url == url
+
+
+def test_max_tokens_field_is_for_openai_compatible_only() -> None:
+    for field in ("max_tokens", "max_completion_tokens"):
+        assert OPENAI.alias(max_tokens_field=field).max_tokens_field == field
+    for kind in ("ollama", "anthropic"):
+        with pytest.raises(ValidationError, match="takes no `max_tokens_field`"):
+            ModelAlias.model_validate(
+                {
+                    "backend": kind,
+                    "model": "m",
+                    "base_url": "https://llm.internal.test",
+                    "secret": "LLM_API_KEY",
+                    "max_tokens_field": "max_tokens",
+                }
+            )
+    with pytest.raises(ValidationError):
+        OPENAI.alias(max_tokens_field="max_output_tokens")
+
+
+def test_openai_max_completion_tokens_for_reasoning_models(secrets: SecretResolver) -> None:
+    result, sent = run(OPENAI, secrets, "success", max_tokens_field="max_completion_tokens")
+    assert isinstance(result, CompletionResult)
+    body = json.loads(sent[0].content)
+    assert body["max_completion_tokens"] == 100
+    assert "max_tokens" not in body
+    truncated = failed(
+        run(OPENAI, secrets, "truncated", max_tokens_field="max_completion_tokens")[0]
+    )
+    assert "max_tokens 100" in truncated.message
+    assert truncated.usage is not None
+
+
+def test_openai_a_payload_of_another_max_tokens_field_is_refused(
+    secrets: SecretResolver,
+) -> None:
+    recorder = OPENAI.recorder("success")
+    default = OPENAI.backend("a", OPENAI.alias(), secrets, recorder)
+    reasoning = OPENAI.backend(
+        "b", OPENAI.alias(max_tokens_field="max_completion_tokens"), secrets, recorder
+    )
+    with pytest.raises(LlmError) as info:
+        asyncio.run(reasoning.send(default.render(COMPLETION), 30.0))
+    assert info.value.kind == "invalid_request"
+    assert recorder.requests == []
+
+
 def test_a_key_is_optional_and_then_no_authorization_is_sent(tmp_path: Path) -> None:
     empty = SecretResolver({}, tmp_path, environ={})
     for kind in (OPENAI, OLLAMA):
@@ -121,6 +201,7 @@ def test_a_key_is_optional_and_then_no_authorization_is_sent(tmp_path: Path) -> 
             "accept",
             "content-type",
             "content-length",
+            "accept-encoding",
             "user-agent",
         }
         assert empty.resolved() == ()
@@ -186,8 +267,8 @@ def test_openai_cached_tokens_are_recorded(secrets: SecretResolver) -> None:
     result, _ = run(OPENAI, secrets, "success_cached")
     assert isinstance(result, CompletionResult)
     usage = result.usage
-    assert (usage.tokens_in, usage.cache_read_tokens, usage.tokens_out) == (200, 1000, 10)
-    assert usage.usd == pytest.approx((200 * 3 + 1000 * 3 + 10 * 15) / 1e6)
+    assert (usage.tokens_in, usage.cache_read_tokens, usage.tokens_out) == (200, 1000, 20)
+    assert usage.usd == pytest.approx((200 * 3 + 1000 * 3 + 20 * 15) / 1e6)
 
 
 def test_openai_inconsistent_cached_tokens_are_ignored(secrets: SecretResolver) -> None:

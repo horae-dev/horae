@@ -22,7 +22,8 @@ and, on the repair retry, the schema errors, tagged and escaped as for `anthropi
 are refused, any other reason than `stop` (or none, as older servers send) is unexpected: all
 `output_invalid`, with the usage. `message.content` must be one JSON value (parsed strictly).
 Usage comes from `prompt_eval_count` / `eval_count`; when either is missing (Ollama may omit
-`prompt_eval_count` when the prompt was cached) the call is charged conservatively. Ollama is
+`prompt_eval_count` when the prompt was cached) the call is charged conservatively; a reported
+usage is floored by the request and output sizes (`_shared.floored`). Ollama is
 local: without a `price` the cost is `0` (and `horae doctor` expects none).
 
 **Errors**: the HTTP status table of `_shared.STATUS_KINDS` (Ollama's `error` is free text,
@@ -45,7 +46,7 @@ from horae.llm.backends._shared import (
     token,
     user_texts,
 )
-from horae.llm.base import Completion, CompletionResult, cost
+from horae.llm.base import Completion, CompletionResult
 from horae.secrets import SecretResolver
 
 PAYLOAD_KEYS = frozenset({"model", "stream", "messages", "format", "options"})
@@ -83,7 +84,10 @@ class OllamaBackend(JsonApiBackend):
         output = count(data.get("eval_count"))
         if prompt is None or output is None:
             return self.conservative(payload)
-        return cost(self._spec.price, prompt, output)
+        message = data.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        text = content if isinstance(content, str) else ""
+        return self._floored(payload, prompt, output, text)
 
     def _result(self, data: dict[str, Any], payload: Mapping[str, Any]) -> CompletionResult:
         usage = self._usage(data, payload)

@@ -19,7 +19,10 @@ hosts (decision 24).
 **The key** is the alias' optional `secret`, sent as `Authorization: Bearer <key>`; an alias
 without one (a local server) sends no `Authorization` header.
 
-**The request.** `model`, `max_tokens` (from the step budget), `stream: false`, and two
+**The request.** `model`, `max_tokens` (from the step budget; `max_completion_tokens`
+instead when the alias sets `max_tokens_field: max_completion_tokens`, which OpenAI's reasoning
+models require: there the limit also bounds the hidden reasoning tokens, so a low one can end
+in `length` with no output), `stream: false`, and two
 messages: `system` (Horae's `SYSTEM_PREAMBLE`, then the skill's prompt) and `user` (the input
 inside `<input>` tags and, on the repair retry, the schema errors inside `<schema_errors>`
 tags, with every `<` escaped, as for `anthropic`). **No tools**: `tools`, `tool_choice` and
@@ -32,6 +35,11 @@ tags, with every `<` escaped, as for `anthropic`). **No tools**: `tools`, `tool_
   validator checks the full schema (decision 38 G);
 - `json_object`: `response_format: {type: json_object}` (a server without JSON Schema
   support), and the schema is appended to the system prompt;
+
+(with `json_schema` the schema is *not* repeated in the prompt: it is in `response_format`,
+and a server that ignores `response_format` without saying so gets no schema text, a
+trade-off for a smaller, unambiguous request; the #31 validator still checks the output.
+OpenRouter's `provider` routing fields are not sent: a future per-alias option);
 - `none`: no `response_format`, the schema in the system prompt.
 
 **The response.** One choice whose `message.content` is one JSON value (parsed strictly: no
@@ -41,7 +49,8 @@ tool calls (`tool_calls`, `function_call`) are refused: all `output_invalid`, wi
 Usage comes from `usage.prompt_tokens` / `completion_tokens`; `prompt_tokens_details.
 cached_tokens`, when reported, is recorded as `cache_read_tokens` and taken out of `tokens_in`
 (which stays the input billed at the full price). A response without usable usage is charged
-conservatively (the input bound and the whole `max_tokens`).
+conservatively (the input bound and the whole `max_tokens`); a reported usage is floored by
+the request and output sizes (`_shared.floored`).
 
 **Errors**: the HTTP status table of `_shared.STATUS_KINDS`, with the API's error `type` (a
 short identifier, never its message text) in the message.
@@ -51,7 +60,7 @@ import json
 from collections.abc import Mapping
 from typing import Any
 
-from horae.contracts.instance import ModelAlias, StructuredOutput
+from horae.contracts.instance import MaxTokensField, ModelAlias, StructuredOutput
 from horae.contracts.run import Usage
 from horae.engine.ports import LlmBackendName, LlmError
 from horae.llm.backends._shared import (
@@ -64,15 +73,16 @@ from horae.llm.backends._shared import (
     token,
     user_texts,
 )
-from horae.llm.base import Completion, CompletionResult, cost
+from horae.llm.base import Completion, CompletionResult
 from horae.secrets import SecretResolver
 
 SCHEMA_NAME = "horae_output"
 """The `json_schema.name` sent."""
 
-BASE_KEYS = frozenset({"model", "max_tokens", "stream", "messages"})
-"""The keys of every rendered payload; `response_format` is added unless the alias'
-`structured_output` is `none`. Never `tools`, `tool_choice` or `functions`."""
+BASE_KEYS = frozenset({"model", "stream", "messages"})
+"""The keys of every rendered payload, with the alias' `max_tokens_field`; `response_format`
+is added unless the alias' `structured_output` is `none`. Never `tools`, `tool_choice` or
+`functions`."""
 
 TRUNCATED = ("length", "model_length")
 """`finish_reason`s that mean the output was cut."""
@@ -82,6 +92,15 @@ def _schema_text(schema: Mapping[str, Any]) -> str:
     return "\n\nThe output JSON Schema:\n" + json.dumps(
         plain_schema(schema), ensure_ascii=False, sort_keys=True
     )
+
+
+def _content(data: Mapping[str, Any]) -> str:
+    """The output text of a response (empty when it has none), for the usage floor."""
+    choices = data.get("choices")
+    choice = choices[0] if isinstance(choices, list) and choices else None
+    message = choice.get("message") if isinstance(choice, dict) else None
+    content = message.get("content") if isinstance(message, dict) else None
+    return content if isinstance(content, str) else ""
 
 
 class OpenAICompatibleBackend(JsonApiBackend):
@@ -96,13 +115,18 @@ class OpenAICompatibleBackend(JsonApiBackend):
     def structured_output(self) -> StructuredOutput:
         return self._spec.structured_output or "json_schema"
 
+    @property
+    def max_tokens_field(self) -> MaxTokensField:
+        return self._spec.max_tokens_field or "max_tokens"
+
     def _payload_keys(self) -> frozenset[str]:
+        keys = BASE_KEYS | {self.max_tokens_field}
         if self.structured_output == "none":
-            return BASE_KEYS
-        return BASE_KEYS | {"response_format"}
+            return keys
+        return keys | {"response_format"}
 
     def _max_tokens(self, payload: Mapping[str, Any]) -> int:
-        return int(payload["max_tokens"])
+        return int(payload[self.max_tokens_field])
 
     def render(self, completion: Completion) -> dict[str, Any]:
         """The `POST <base_url>/chat/completions` body for `completion` (pure)."""
@@ -112,7 +136,7 @@ class OpenAICompatibleBackend(JsonApiBackend):
             system += _schema_text(completion.output_schema)
         payload: dict[str, Any] = {
             "model": completion.model,
-            "max_tokens": completion.max_tokens,
+            self.max_tokens_field: completion.max_tokens,
             "stream": False,
             "messages": [
                 {"role": "system", "content": system},
@@ -136,7 +160,7 @@ class OpenAICompatibleBackend(JsonApiBackend):
         error = body.get("error") if isinstance(body, dict) else None
         return token(error.get("type")) if isinstance(error, dict) else None
 
-    def _usage(self, usage: Any, payload: Mapping[str, Any]) -> Usage:
+    def _usage(self, usage: Any, payload: Mapping[str, Any], output: str) -> Usage:
         if not isinstance(usage, dict):
             return self.conservative(payload)
         prompt = count(usage.get("prompt_tokens"))
@@ -146,11 +170,11 @@ class OpenAICompatibleBackend(JsonApiBackend):
         details = usage.get("prompt_tokens_details")
         cached = count(details.get("cached_tokens")) if isinstance(details, dict) else None
         if cached is None or cached > prompt:
-            return cost(self._spec.price, prompt, completion)
-        return cost(self._spec.price, prompt - cached, completion, cache_read=cached)
+            return self._floored(payload, prompt, completion, output)
+        return self._floored(payload, prompt - cached, completion, output, cache_read=cached)
 
     def _result(self, data: dict[str, Any], payload: Mapping[str, Any]) -> CompletionResult:
-        usage = self._usage(data.get("usage"), payload)
+        usage = self._usage(data.get("usage"), payload, _content(data))
 
         def invalid(reason: str) -> LlmError:
             return LlmError("output_invalid", reason, usage=usage)
@@ -168,7 +192,7 @@ class OpenAICompatibleBackend(JsonApiBackend):
             filtered = " (content_filter)" if finish == "content_filter" else ""
             raise invalid("the model refused" + filtered)
         if finish in TRUNCATED:
-            limit = payload["max_tokens"]
+            limit = self._max_tokens(payload)
             raise invalid(f"the output was truncated ({finish}, max_tokens {limit})")
         if message.get("tool_calls") or message.get("function_call"):
             raise invalid("the response has a tool call (no tools are allowed)")

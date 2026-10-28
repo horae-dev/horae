@@ -1116,7 +1116,7 @@ loosened later without breaking a valid file.
 
 ### Provisional decisions (#30, pending maintainer review)
 
-40. **The `openai-compatible` and `ollama` backends (#30).** One compatible v1 addition and
+40. **The `openai-compatible` and `ollama` backends (#30).** Two compatible v1 additions and
     the rules of `horae.llm.backends.openai_compatible` and `horae.llm.backends.ollama`, which
     keep every rule of decision 38 (render/send, the key only from the declared secret,
     rebuilt headers, the explicit network path, quiet loggers, strict JSON, the pre-flight
@@ -1126,6 +1126,13 @@ loosened later without breaking a valid file.
       (the default when unset), `json_object` or `none`, accepted for `backend:
       openai-compatible` only (the model and the JSON Schema both refuse it on another
       backend). It is the fallback for a server that lacks JSON Schema structured output;
+    - **contract change** (optional): `models.<alias>.max_tokens_field`, `max_tokens` (the
+      default when unset) or `max_completion_tokens`, `openai-compatible` only (refused on
+      another backend by the model and the JSON Schema), for OpenAI's reasoning models,
+      which refuse `max_tokens`. There the limit also bounds the hidden reasoning tokens, so
+      a low `tokens_out` can end in `length` with no visible output (an `output_invalid`
+      truncation, charged); the payload keys follow the field, so a payload rendered for one
+      field is refused by an alias set to the other;
     - **A. no SDK**: both talk to their API with a direct `httpx2` client (one JSON `POST`).
       The `openai` SDK would add a dependency and what the `anthropic` backend has to
       neutralise (`OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_ORG_ID` /
@@ -1143,7 +1150,8 @@ loosened later without breaking a valid file.
     - **C. the key is optional**: `secret` is optional for both; when declared it is sent as
       `Authorization: Bearer <key>` (for `ollama`, to a proxy in front of it), else no
       `Authorization` header is sent. The headers are exactly `host`, `accept`,
-      `content-type`, `content-length`, `user-agent: horae` and that one;
+      `content-type`, `content-length`, `accept-encoding: identity`, `user-agent: horae`
+      and that one (`anthropic` sends `accept-encoding: identity` too);
     - **D. `openai-compatible` request**: `model`, `max_tokens`, `stream: false` and two
       messages (`system`: the preamble, then the skill's prompt; `user`: the tagged input and
       schema errors of decision 38). `json_schema` sends `response_format: {type:
@@ -1152,8 +1160,16 @@ loosened later without breaking a valid file.
       required or that use keywords it lacks (`maxLength`, `pattern`), and the #31 validator
       checks the full schema anyway (decision 38 G). `json_object` sends `{type:
       json_object}` and `none` no `response_format`; both append the schema to the system
-      prompt. `max_tokens` (not `max_completion_tokens`) because the compatible servers
-      take it;
+      prompt. With `json_schema` the schema is **not** also put in the prompt: it is in
+      `response_format`, and repeating it would make the request larger and give the model
+      two copies to reconcile; the trade-off is that a server which silently ignores
+      `response_format` gets no schema text (the #31 validator still refuses its output;
+      such a server should use `json_object` or `none`). `strict: false` is recorded here
+      as the decision (see above). `max_tokens` by default (what the compatible servers
+      take; `max_tokens_field` above for reasoning models). OpenRouter's `provider` routing
+      fields (`order`, `allow_fallbacks`, `data_collection`...) are not sent and cannot be
+      configured: a later per-alias option, since routing decides which company sees the
+      data;
     - **E. `openai-compatible` response**: exactly one choice, `finish_reason: stop`, and
       `message.content` one JSON value. `length` / `model_length` (truncation), a non-empty
       `message.refusal` or `content_filter` (refusal), `tool_calls` / `function_call` and any
@@ -1179,4 +1195,52 @@ loosened later without breaking a valid file.
       tests over `anthropic`, `openai-compatible` and `ollama` with recorded synthetic
       responses (`tests/fixtures/llm/<backend>/`: success, truncation, refusal where the API
       has one, tool call, 401, 429, 5xx, malformed JSON, missing usage); a new backend joins
-      it by adding a `Kind` in `tests/llm_backend_kinds.py`.
+      it by adding a `Kind` in `tests/llm_backend_kinds.py`;
+    - **I. the response is bounded** (every backend, `anthropic` included, through
+      `_shared.BoundedTransport` around the client's transport): `accept-encoding: identity`
+      is sent; the cap of a call is `response_cap(max_tokens) = min(8 MiB, max(1 MiB, 64 ×
+      max_tokens))` bytes of decoded body (64 bytes a token: a token is a few bytes of text,
+      which JSON may escape up to 6 bytes a character, inside the provider's envelope). A
+      success whose `content-length` exceeds it is refused before its body is read; one that
+      grows past it while read (chunked) is refused at the cap. A server that compresses
+      anyway is inflated by Horae (`gzip`, `deflate`), at most one byte past the cap per step,
+      so a gzip bomb (305 KB inflating to 300 MiB) is refused with about one cap in memory;
+      any other `content-encoding` (or a list of them) and corrupt compressed data are
+      refused. All of these are `output_invalid` with the conservative usage (decision 38:
+      the input bound and the whole `max_tokens`), since the provider may have billed the
+      call. An error body is cut at 64 KiB (its status still maps the error);
+    - **J. the body is read strictly**: decoded as UTF-8 only (`bytes.decode("utf-8")`, no
+      charset sniffing: UTF-16, a stray `0xff` or an encoded surrogate are refused), then
+      parsed by the strict JSON parser of decision 38; it must be one JSON object. `anthropic`
+      now reads the raw response itself the same way (the SDK posts the canonical bytes with
+      `cast_to=httpx2.Response` and still maps HTTP and connection errors; no SDK model is
+      built from the response). Any exception other than an `LlmError` while reading the
+      result is `output_invalid` with the conservative usage, never a crash. An error body
+      that is not UTF-8 gives the status only;
+    - **K. reported usage is untrusted**: a token count must be an integer from 0 to `10**12`
+      (`10**400` or `10**308`, which would overflow the cost to infinity, are unusable: the
+      call is charged conservatively). A usable report is then floored: `tokens_in` (with the
+      cache tokens) at least `ceil(request bytes / 4)` and `tokens_out` at least `ceil(UTF-8
+      bytes of the output text / 4)`, the latter capped at `max_tokens` (what a provider
+      honouring the request may bill). The larger value is the one recorded, priced and
+      charged to the budget; the reported value is not kept separately (kept simple: one
+      `Usage`). A server that reports `0 / 0` is still charged for what it plainly sent;
+    - **L. `http://` is checked at connect time** (decision 24 limits the *host name*; this
+      limits where it *resolves*): for an `http://` `base_url` the transport's network backend
+      (`_shared.LanOnlyNetwork`) resolves the host when it opens a connection and refuses
+      unless **every** address is loopback (`127/8`, `::1`), RFC 1918 (`10/8`, `172.16/12`,
+      `192.168/16`) or IPv6 ULA (`fc00::/7`), an IPv4-mapped address being checked as IPv4;
+      link-local (`169.254/16`, `fe80::/10`, where cloud metadata services answer) and CGNAT
+      (`100.64/10`) are refused. It then connects to the checked address itself, so a second
+      lookup cannot rebind the name. A refusal is `host_error` ("request refused: an http
+      endpoint that resolves to a public address"), like every other refused request, and
+      nothing is sent; a failed lookup is a connection error (`host_error`, or `timeout`
+      within the step's timeout). `https://` endpoints are not restricted (TLS
+      authenticates the host);
+    - **M. `horae doctor` warns about a key over `http://`**: an alias used by a pipeline
+      with a `secret` and an `http://` `base_url` gets a warning (never a failure): the key
+      crosses the local network in clear, readable by anyone on the path;
+    - **N. the `base_url` path cannot traverse**: besides decision 24, a `base_url` whose
+      path has a `.` or `..` segment or an encoded `/`, `.` or `\` (`%2F`, `%2E`, `%5C`, any
+      case) is refused, since a server or proxy may decode it into a path the guard never
+      compared (`https://h/%2e%2e/v1`, `https://h/a%2Fb`, `https://h/v1/../x`).

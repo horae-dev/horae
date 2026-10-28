@@ -2,7 +2,9 @@
 """The `anthropic` backend: the Anthropic Messages API with an API key (PLAN.md §3.4, #28).
 
 One `ProviderBackend` per model alias (`backend: anthropic` in `horae.yaml`), built on the
-official `anthropic` SDK (`AsyncAnthropic`, `messages.create`, API version `2023-06-01`).
+official `anthropic` SDK (`AsyncAnthropic`, API version `2023-06-01`): its client posts the
+rendered payload's exact canonical JSON bytes to `/v1/messages` and returns the raw response,
+which Horae reads itself (the SDK maps the HTTP and connection errors).
 
 **Render, then send** (`horae.llm.base`). `render(completion)` is pure: it builds the
 exact `POST /v1/messages` body (no client, no secret, no I/O) and the same completion always
@@ -35,8 +37,16 @@ every request (it can override any header, `Host` and `anthropic-version` includ
 any request but `POST <base_url>/v1/messages` to the alias' origin, and replaces every header
 with exactly: `host` (from the request URL), `accept`, `content-type`, `content-length` (the
 body's length), `anthropic-version` (`ANTHROPIC_VERSION`), `user-agent` (`USER_AGENT`) and
-`x-api-key` (the declared secret, put there at the last moment). Nothing else is sent: no
-`x-stainless-*` platform or timeout header, no `accept-encoding`.
+`x-api-key` (the declared secret, put there at the last moment), plus `accept-encoding:
+identity`. Nothing else is sent: no `x-stainless-*` platform or timeout header.
+
+**The response is bounded and read strictly** (`_shared.BoundedTransport` wraps the SDK's
+transport too): a body over `_shared.response_cap(max_tokens)` bytes once decoded (a gzip
+bomb included) is `output_invalid`, an error body is cut at 64 KiB. The raw body must be
+UTF-8 and one JSON object for `_shared.parse` (no `NaN`, duplicate key or excessive
+nesting), read as plain JSON (no SDK model is built from it); anything the backend cannot
+read is `output_invalid` with the conservative usage, and a reported usage is floored by the
+request and output sizes (`_shared.floored`).
 
 **The network path is explicit** (decision 38 C). The HTTP client ignores the ambient
 environment: no `HTTP(S)_PROXY` / `ALL_PROXY`, no `.netrc`, no `SSL_CERT_FILE` /
@@ -75,22 +85,30 @@ from anthropic.types import TextBlockParam
 
 from horae.contracts.instance import ModelAlias
 from horae.contracts.run import Usage
+from horae.engine.canonical import canonical_json
 from horae.engine.ports import LlmBackendName, LlmError
 from horae.llm.backends._shared import (
     INVALID,
     LIMITS,
+    RESPONSE_CAP,
     STATUS_KINDS,
     SYSTEM_PREAMBLE,
     USER_AGENT,
     Guard,
     count,
+    floored,
     parse,
     plain_schema,
     quiet_loggers,
     refusal,
+    response_cap,
     system_text,
     token,
+    transport,
+    unreadable,
     user_texts,
+    utf8,
+    utf8_size,
 )
 from horae.llm.base import Completion, CompletionResult, cost, input_bound
 from horae.secrets import SecretError, SecretResolver
@@ -101,6 +119,9 @@ DEFAULT_BASE_URL = "https://api.anthropic.com"
 ANTHROPIC_VERSION = "2023-06-01"
 """The `anthropic-version` header sent."""
 
+MESSAGES_PATH = "/v1/messages"
+"""The only path a request goes to (under `base_url`)."""
+
 PLACEHOLDER_KEY = "horae-declared-secret"
 """What the SDK is given as its API key; the guard replaces it with the declared secret."""
 
@@ -109,6 +130,7 @@ SENT_HEADERS = (
     "accept",
     "content-type",
     "content-length",
+    "accept-encoding",
     "anthropic-version",
     "user-agent",
     "x-api-key",
@@ -134,11 +156,16 @@ def _x_api_key(key: str) -> tuple[str, str]:
 def _guard(base_url: str) -> Guard:
     return Guard(
         base_url,
-        "/v1/messages",
+        MESSAGES_PATH,
         auth=_x_api_key,
         fixed=(("anthropic-version", ANTHROPIC_VERSION),),
         api="the Messages API",
     )
+
+
+def _get(value: Any, key: str) -> Any:
+    """`value[key]` when `value` is a JSON object, else `None`."""
+    return value.get(key) if isinstance(value, dict) else None
 
 
 def _user_content(completion: Completion) -> list[TextBlockParam]:
@@ -185,13 +212,8 @@ class AnthropicBackend:
         """The SDK client, built on the first `send` (`render` needs none)."""
         quiet_sdk_loggers()
         if self._client is None:
-            transport = self._transport
-            if transport is None:
-                transport = httpx2.AsyncHTTPTransport(
-                    verify=True, trust_env=False, limits=LIMITS, retries=0
-                )
             http_client = anthropic.DefaultAsyncHttpxClient(
-                transport=transport,
+                transport=transport(self._base_url, self._transport),
                 trust_env=False,
                 follow_redirects=False,
                 limits=LIMITS,
@@ -221,28 +243,44 @@ class AnthropicBackend:
         if failure is not None:
             raise failure
 
-    def _usage(self, usage: Any, payload: Mapping[str, Any]) -> Usage:
-        """The reported usage, or, when it is not usable, a conservative one: the payload's
-        input bound and the whole `max_tokens`."""
-        tokens_in = count(getattr(usage, "input_tokens", None))
-        tokens_out = count(getattr(usage, "output_tokens", None))
+    def conservative(self, payload: Mapping[str, Any]) -> Usage:
+        """The usage charged when the response reported none usable: the payload's input
+        bound and the whole `max_tokens`."""
+        return cost(self._spec.price, input_bound(payload), int(payload["max_tokens"]))
+
+    def _usage(self, usage: Any, payload: Mapping[str, Any], output: str) -> Usage:
+        """The reported usage, floored (`_shared.floored`), or, when it is not usable,
+        `conservative`."""
+        tokens_in = count(_get(usage, "input_tokens"))
+        tokens_out = count(_get(usage, "output_tokens"))
         if tokens_in is None or tokens_out is None:
-            return cost(self._spec.price, input_bound(payload), int(payload["max_tokens"]))
-        return cost(
+            return self.conservative(payload)
+        return floored(
             self._spec.price,
+            payload,
             tokens_in,
             tokens_out,
-            cache_read=count(getattr(usage, "cache_read_input_tokens", None)),
-            cache_write=count(getattr(usage, "cache_creation_input_tokens", None)),
+            output_bytes=utf8_size(output),
+            max_tokens=int(payload["max_tokens"]),
+            cache_read=count(_get(usage, "cache_read_input_tokens")),
+            cache_write=count(_get(usage, "cache_creation_input_tokens")),
         )
 
-    def _error(self, error: Exception) -> LlmError:
+    def _invalid(self, reason: str, payload: Mapping[str, Any]) -> LlmError:
+        return LlmError(
+            "output_invalid", f"the Anthropic API {reason}", usage=self.conservative(payload)
+        )
+
+    def _error(self, error: Exception, payload: Mapping[str, Any]) -> LlmError:
         if isinstance(error, anthropic.APITimeoutError):
             return LlmError("timeout", "the Anthropic API did not answer in time")
         if isinstance(error, anthropic.APIConnectionError):
             reason = refusal(error)
             if reason is not None:
                 return LlmError("host_error", f"request refused: {reason}")
+            reason = unreadable(error)
+            if reason is not None:
+                return self._invalid(f"answered with {reason}", payload)
             return LlmError("host_error", "cannot reach the Anthropic API")
         if isinstance(error, anthropic.APIStatusError):
             status = error.status_code
@@ -275,46 +313,68 @@ class AnthropicBackend:
         self._resolve_secret()
         client = self._sdk()
         failure: LlmError | None = None
-        message: Any = None
+        response: httpx2.Response | None = None
+        cap = RESPONSE_CAP.set(response_cap(int(payload["max_tokens"])))
         try:
-            message = await client.messages.create(
-                model=payload["model"],
-                max_tokens=payload["max_tokens"],
-                system=payload["system"],
-                messages=payload["messages"],
-                output_config=payload["output_config"],
-                timeout=timeout_s,
+            response = await client.post(
+                MESSAGES_PATH,
+                cast_to=httpx2.Response,
+                content=canonical_json(payload),
+                options={"timeout": timeout_s},
             )
         except anthropic.AnthropicError as error:
-            failure = self._error(error)
-        if failure is not None:
+            failure = self._error(error, payload)
+        finally:
+            RESPONSE_CAP.reset(cap)
+        if failure is not None or response is None:
             # Raised here, outside the handler: no `__context__` leads to the SDK error.
-            raise failure
-        return self._result(message, payload)
+            raise failure or LlmError("host_error", "cannot reach the Anthropic API")
+        text = utf8(response.content)
+        if text is None:
+            raise self._invalid("answered with a body that is not UTF-8", payload)
+        data = parse(text)
+        if not isinstance(data, dict):
+            raise self._invalid("answered with a body that is not one JSON object", payload)
+        result: CompletionResult | None = None
+        try:
+            result = self._result(data, payload)
+        except LlmError:
+            raise
+        except Exception:  # any shape `_result` did not expect is refused, never a crash
+            failure = self._invalid("answered with a response Horae cannot read", payload)
+        if failure is not None or result is None:
+            raise failure or self._invalid("answered with no result", payload)
+        return result
 
-    def _result(self, message: Any, payload: Mapping[str, Any]) -> CompletionResult:
-        usage = self._usage(getattr(message, "usage", None), payload)
-        stop = token(getattr(message, "stop_reason", None))
+    def _result(self, data: dict[str, Any], payload: Mapping[str, Any]) -> CompletionResult:
+        content = data.get("content")
+        blocks: list[Any] = content if isinstance(content, list) else []
+        text = "".join(
+            block["text"]
+            for block in blocks
+            if _get(block, "type") == "text" and isinstance(block.get("text"), str)
+        )
+        usage = self._usage(data.get("usage"), payload, text)
+        stop = token(data.get("stop_reason"))
 
         def invalid(reason: str) -> LlmError:
             return LlmError("output_invalid", reason, usage=usage)
 
         if stop == "refusal":
-            details = getattr(message, "stop_details", None)
-            category = token(getattr(details, "category", None))
+            category = token(_get(data.get("stop_details"), "category"))
             raise invalid("the model refused" + (f" ({category})" if category else ""))
         if stop in ("max_tokens", "model_context_window_exceeded"):
             limit = payload["max_tokens"]
             raise invalid(f"the output was truncated ({stop}, max_tokens {limit})")
         if stop not in ("end_turn", "stop_sequence"):
             raise invalid(f"unexpected stop reason {stop or 'unknown'}")
-        texts: list[str] = []
-        for block in getattr(message, "content", None) or ():
-            if getattr(block, "type", None) != "text":
-                kind = token(getattr(block, "type", None)) or "unknown"
+        if not isinstance(content, list):
+            raise invalid("the response has no content")
+        for block in blocks:
+            if _get(block, "type") != "text":
+                kind = token(_get(block, "type")) or "unknown"
                 raise invalid(f"the response has {kind} content (no tools are allowed)")
-            texts.append(str(getattr(block, "text", "")))
-        output = parse("".join(texts))
+        output = parse(text)
         if output is INVALID:
             raise invalid("the response is not one JSON value")
         return CompletionResult(output=output, usage=usage, stop_reason=stop)

@@ -80,6 +80,8 @@ class Kind:
     """Replace the output text of a recorded response body."""
     bad_usage: Callable[[Any], None]
     """Make the usage of a recorded response body unusable."""
+    set_usage: Callable[[Any, Any, Any], None]
+    """Set the reported `(input, output)` token counts of a recorded response body."""
     retarget: Callable[[Any, str], None]
     """Point the backend's client at another URL (a tampered request)."""
     client: Callable[[Any], httpx2.AsyncClient]
@@ -111,6 +113,18 @@ def _anthropic_bad_usage(body: Any) -> None:
 
 def _anthropic_retarget(backend: Any, url: str) -> None:
     backend._sdk().base_url = httpx2.URL(url)
+
+
+def _anthropic_usage(body: Any, tokens_in: Any, tokens_out: Any) -> None:
+    body["usage"] = {"input_tokens": tokens_in, "output_tokens": tokens_out}
+
+
+def _openai_usage(body: Any, tokens_in: Any, tokens_out: Any) -> None:
+    body["usage"] = {"prompt_tokens": tokens_in, "completion_tokens": tokens_out}
+
+
+def _ollama_usage(body: Any, tokens_in: Any, tokens_out: Any) -> None:
+    body["prompt_eval_count"], body["eval_count"] = tokens_in, tokens_out
 
 
 def _openai_text(body: Any, text: str) -> None:
@@ -155,6 +169,7 @@ ANTHROPIC = Kind(
         "host": "api.anthropic.com",
         "accept": "application/json",
         "content-type": "application/json",
+        "accept-encoding": "identity",
         "anthropic-version": ANTHROPIC_VERSION,
         "user-agent": "horae",
         "x-api-key": DECLARED_VALUE,
@@ -171,6 +186,7 @@ ANTHROPIC = Kind(
     max_tokens=lambda body: int(body["max_tokens"]),
     set_text=_anthropic_text,
     bad_usage=_anthropic_bad_usage,
+    set_usage=_anthropic_usage,
     retarget=_anthropic_retarget,
     client=lambda backend: backend._sdk()._client,
     error_types={
@@ -199,6 +215,7 @@ OPENAI = Kind(
         "host": "llm-gateway.internal.test",
         "accept": "application/json",
         "content-type": "application/json",
+        "accept-encoding": "identity",
         "user-agent": "horae",
         "authorization": f"Bearer {DECLARED_VALUE}",
     },
@@ -216,6 +233,7 @@ OPENAI = Kind(
     max_tokens=lambda body: int(body["max_tokens"]),
     set_text=_openai_text,
     bad_usage=_openai_bad_usage,
+    set_usage=_openai_usage,
     retarget=_direct_retarget,
     client=lambda backend: backend._http(),
     error_types={
@@ -242,6 +260,7 @@ OLLAMA = Kind(
         "host": "ollama:11434",
         "accept": "application/json",
         "content-type": "application/json",
+        "accept-encoding": "identity",
         "user-agent": "horae",
         "authorization": f"Bearer {DECLARED_VALUE}",
     },
@@ -256,6 +275,7 @@ OLLAMA = Kind(
     max_tokens=lambda body: int(body["options"]["num_predict"]),
     set_text=_ollama_text,
     bad_usage=_ollama_bad_usage,
+    set_usage=_ollama_usage,
     retarget=_direct_retarget,
     client=lambda backend: backend._http(),
 )

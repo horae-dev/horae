@@ -105,8 +105,17 @@
           },
           "then": {
             "not": {
-              "required": [
-                "structured_output"
+              "anyOf": [
+                {
+                  "required": [
+                    "structured_output"
+                  ]
+                },
+                {
+                  "required": [
+                    "max_tokens_field"
+                  ]
+                }
               ]
             }
           }
@@ -231,6 +240,23 @@
           "default": null,
           "description": "`openai-compatible` only: how the output is constrained (`json_schema` when unset, or\n`json_object` / `none` for a server that lacks JSON Schema support). See\n`StructuredOutput`.",
           "title": "Structured Output"
+        },
+        "max_tokens_field": {
+          "anyOf": [
+            {
+              "enum": [
+                "max_tokens",
+                "max_completion_tokens"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "`openai-compatible` only: the request field of the output limit (`max_tokens` when\nunset, or `max_completion_tokens`). See `MaxTokensField`.",
+          "title": "Max Tokens Field"
         }
       },
       "required": [

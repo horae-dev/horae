@@ -18,8 +18,8 @@
     ],
     "usage": {
       "prompt_tokens": 1200,
-      "completion_tokens": 10,
-      "total_tokens": 1210,
+      "completion_tokens": 20,
+      "total_tokens": 1220,
       "prompt_tokens_details": {
         "cached_tokens": 1000
       }

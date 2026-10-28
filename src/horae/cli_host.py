@@ -134,10 +134,11 @@ at a local server (a warning, which does not fail the check; schemas decision 40
 
 def _backend_problems(instance: Instance) -> list[Problem]:
     """For each model alias used by an `llm` step: an error when its backend is not
-    implemented in this Horae (`horae.llm.backends.FACTORIES`), and a warning when it is a
+    implemented in this Horae (`horae.llm.backends.FACTORIES`), a warning when it is a
     cloud backend without a `price` (its calls are then recorded at `usd: 0` and the step's
-    `usd` budget does not bound them; schemas decision 38 A). Aliases no pipeline uses are
-    not checked."""
+    `usd` budget does not bound them; schemas decision 38 A), and a warning when it sends a
+    `secret` to an `http://` `base_url` (the key crosses the LAN in clear; decision 40).
+    Aliases no pipeline uses are not checked."""
     used = sorted(
         {
             step.llm.model
@@ -171,6 +172,23 @@ def _backend_problems(instance: Instance) -> list[Problem]:
                     f"models.{alias}.price: model alias {alias!r} (backend {spec.backend!r}) "
                     "has no price: its calls are recorded at usd 0 and the step's usd budget "
                     "does not bound them (only tokens_out does)",
+                    severity="warning",
+                )
+            )
+        if (
+            spec.backend in FACTORIES
+            and spec.secret is not None
+            and spec.base_url is not None
+            and spec.base_url.startswith("http://")
+        ):
+            problems.append(
+                Problem(
+                    CONFIG_FILE,
+                    None,
+                    None,
+                    f"models.{alias}.secret: model alias {alias!r} sends its key in clear "
+                    "text over http:// (anyone on the local network path can read it); use "
+                    "an https:// base_url, or drop the secret if the server needs none",
                     severity="warning",
                 )
             )
