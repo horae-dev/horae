@@ -53,9 +53,13 @@ process resolved, the alias' key included once its backend resolved it) before i
 `ModelBackends.send`: an `LlmError`'s message and captured stderr (raised again, as a new
 error with no `__cause__` / `__context__`), and the response's output, intents, schema
 errors and request summary. A secret found there is logged (`horae.llm`, names only). A
-skill prompt holding a secret is refused by `prepare` with `params_invalid`, naming the
-secret only, before anything is rendered or sent (a secret is never a trusted parameter;
-with #27's loader this check moves to plan time).
+skill's prompt or output schema holding a secret (in a string, an object key or as a
+number's whole value) is refused by `prepare` with `params_invalid`, naming the secret only,
+before anything is rendered, reserved or sent (a secret is never a trusted parameter). This
+check runs when the `llm` step prepares its request, **not at plan time**: until #27's skill
+loader gives the engine the prompt before the run starts, the steps before the `llm` step have
+already run when it refuses (the run then fails at that step, nothing is sent to the model);
+with the loader the check moves to the engine's `_plan`, before any step runs.
 
 **Retries.** None here: the engine owns the single repair retry (`attempt` 2). Provider
 backends disable their SDK's own retries.
@@ -458,12 +462,13 @@ class ModelBackends:
         if spec is None:
             raise LlmError("invalid_request", f"unknown model alias {request.model!r}")
         prompt = self.prompts.prompt(request)
-        _, held = current_redactor().redact_text(prompt.system)
+        held = current_redactor().find([prompt.system, dict(prompt.output_schema)])
         if held:
             names = ", ".join(sorted(held))
             raise LlmError(
                 "params_invalid",
-                f"the prompt of skill {request.skill} holds secret {names} (never a parameter)",
+                f"the prompt or output schema of skill {request.skill} holds secret {names} "
+                "(never a parameter)",
             )
         backend = self._backend(request.model, spec)
         largest = request.budget.tokens_out

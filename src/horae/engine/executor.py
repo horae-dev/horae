@@ -36,9 +36,10 @@ and every other step `skipped`, when:
 - a parameter template is invalid (`template_error`), or a rendered parameter is not plain
   JSON data (`params_invalid`: e.g. `NaN`, a date object, nesting deeper than 64);
 - a template variable (`horae run --var`) or a rendered parameter holds the value (or an
-  encoding) of a secret this process resolved (`params_invalid`, naming the secret only,
-  #53, schemas decision 43 D): a secret is never a trusted parameter. The variable's value
-  is redacted in the record's `context`;
+  encoding) of a secret this process resolved, in a string, an object key or as a number's
+  whole value (`pin: 12345678`) (`params_invalid`, naming the secret only, #53, schemas
+  decision 43 D): a secret is never a trusted parameter. The variable's value is redacted in
+  the record's `context`;
 - an `act` entry has no valid `mode`, or its binding parameters (or a `notify` entry's
   `link_prefix`) are invalid (`params_invalid`, see below);
 - the pipeline has more than `MAX_ITEMS` `collect` calls in all, or uses more than
@@ -624,7 +625,7 @@ def _plan(
     redactor = current_redactor()
     first = _kind_of(pipeline.steps[0])
     for name, value in sorted(context.vars.items()):
-        _, held = redactor.redact_text(value)
+        held = redactor.names_in(value)
         if held:
             message = f"the variable {name} holds secret {', '.join(sorted(held))}"
             error = StepError(kind="params_invalid", message=f"{message} (never a parameter)")
@@ -680,7 +681,7 @@ def _plan(
             problem = _plain_problem(rendered)
             if problem is not None:
                 fail("params_invalid", f"{ref}: the parameters {problem[1]}")
-            _, held = redactor.scrub_data(rendered)
+            held = redactor.find(rendered)  # strings, keys and whole numbers
             if held:
                 names = ", ".join(sorted(held))
                 fail("params_invalid", f"{ref}: the parameters hold secret {names}")
@@ -1266,7 +1267,9 @@ async def execute(
     - `models` (when given), `lock_digest` and `config_digest` (`horae.config.Instance`) are
       recorded as given, for replays; an invalid value raises `ValueError` before anything
       runs. The canonical pipeline definition is recorded too (`pipeline_definition`), unless
-      it is larger than `MAX_PIPELINE_BYTES`.
+      it is larger than `MAX_PIPELINE_BYTES` or holds a resolved secret's value (#53: a
+      literal secret in a pipeline file; its parameters refuse the run at plan time, and the
+      definition is not copied into the store).
     - `dry_run` is recorded only: the engine applies nothing either way.
     - `on_step(index, record)` is awaited after each step record is final; its exceptions
       propagate. `clock` gives the wall-clock timestamps, `monotonic` the durations and the
@@ -1286,6 +1289,8 @@ async def execute(
         raise ValueError(f"more than {MAX_ITEMS} model aliases")
     canonical = canonical_pipeline(pipeline)
     definition = canonical if len(canonical_json(canonical)) <= MAX_PIPELINE_BYTES else None
+    if definition is not None and current_redactor().find(definition):
+        definition = None  # a pipeline file holding a secret is not copied into the record
     records: list[StepRecord] = []
     status: RunStatus = "ok"
     run_error: str | None = None

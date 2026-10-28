@@ -29,7 +29,7 @@ included: `{"schema_version": 1, "error": {"kind", "message"}}` (usage errors to
 Nothing printed is ever a secret value: an internal error shows its exception type only,
 never its message, traceback or locals. Everything a command prints goes through `echo`,
 which redacts it with the process registry (`horae.secrets.redact.current()`, #53, schemas
-decision 43 F); a JSON document is redacted as data first (`to_json`), then as text. The
+decision 43 I); a JSON document is redacted as data first (`to_json`), then as text. The
 commands that read the instance prime the registry with every secret it names
 (`prime_secrets`, `Instance.prime_redaction`), so a value is redacted even when no plugin
 host was opened.

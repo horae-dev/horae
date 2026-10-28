@@ -75,6 +75,7 @@ from horae.apply.sink import (
 )
 from horae.contracts.run import AppliedChange, RunRecord, Violation
 from horae.contracts.types import MAX_ITEMS
+from horae.secrets.redact import current as current_redactor
 from horae.store import Store
 
 _MAX_ERROR = 4096
@@ -135,7 +136,8 @@ def _with_changes(
             f"{len(applied)} change(s) applied before it, the rest not applied"
         )
         data["status"] = "failed"
-        data["error"] = error[:_MAX_ERROR]
+        # Redacted before it is cut (#53): a secret cut in half would not match any more.
+        data["error"] = current_redactor().redact_text(error)[0][:_MAX_ERROR]
     return RunRecord.model_validate(data)
 
 

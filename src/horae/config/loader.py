@@ -116,7 +116,7 @@ class Instance:
     def prime_redaction(self) -> None:
         """Resolve every secret the instance names (`secret_names`), for redaction only, so
         that the process registry (`horae.secrets.redact`) knows them before anything is
-        run, stored, logged or printed (#53, schemas decision 43 B). A secret that cannot
+        run, stored, logged or printed (#53, schemas decision 43 A). A secret that cannot
         be resolved is skipped: what needs it fails later with its own error. The values
         are never sent anywhere; only redaction uses them."""
         redact.prime(self.secret_resolver(), self.secret_names())

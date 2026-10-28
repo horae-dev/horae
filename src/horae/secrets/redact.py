@@ -17,8 +17,10 @@ In the plugin host, the patterns are **every secret the instance resolved**
 schemas decision 35 B), not only the plugin's own: a plugin can echo data that came from
 another step or another plugin.
 
-**Long secrets** (at least `MIN_PARTIAL_BYTES`, 8 bytes, of UTF-8) are matched anywhere, as
-UTF-8, in these forms:
+**Every secret is at least `MIN_SECRET_BYTES` (8 bytes) of UTF-8** (#53, maintainer decision
+recorded in schemas decision 43 H, superseding decision 35 D): `SecretResolver` refuses a
+shorter value, and `Redactor` raises `ValueError` if it is handed one. A secret is matched
+anywhere, as UTF-8, in these forms:
 
 - the value itself;
 - its base64 (standard and URL-safe alphabets, with and without `=` padding), and the
@@ -31,14 +33,9 @@ UTF-8, in these forms:
 - its percent-encoding (`urllib.parse.quote(value, safe="")`, upper- and lower-case hex);
 - its JSON string escaping (`json.dumps`, with and without `ensure_ascii`, quotes removed).
 
-**Short secrets** (under 8 bytes) are matched by their **raw value only**, in every channel
-(stderr, messages, string leaves), and only where it is **bounded**: not preceded nor
-followed by an ASCII letter or digit (`token=abc123` and `ref: abc123` match, `xabc123y` does
-not), which limits over-matching inside longer words. Their encoded and partial forms are not
-looked for (a short value's base64 or hex core would match unrelated text everywhere). A JSON
-string or number that is exactly a short secret is matched too. Redaction of short secrets is
-therefore weaker (an encoded short secret passes through); the host warns, without the value,
-when it redacts a secret shorter than 8 bytes.
+A JSON number whose text (`json.dumps`) is exactly a secret's value (`pin: 12345678`) is a
+**numeric match**: `redact_data` replaces it, `find` reports it, and `scrub` redacts, flags or
+ignores it as asked (the store flags it without changing the number's type).
 
 Each match becomes `[REDACTED:<NAME>]` (the name is not sensitive). Patterns are tried longest
 first, so a value that contains another secret is replaced whole. **Overlaps:** when the
@@ -49,16 +46,21 @@ not a defence against a hostile one (M5).
 
 `redact_data` walks a JSON value iteratively (string and number leaves), so any nesting is
 safe. It never rewrites an object key: a key holding a secret raises `SecretInKey` (the host
-turns it into `output_invalid`, and nothing is stored).
+turns it into `output_invalid`, and nothing is stored). `scrub` (the store's and the CLI's
+variant) rewrites such a key instead; when two keys of one object redact to the same text,
+the later one is made unique (`[REDACTED:NAME]#2`, `#3`…) and the collision is reported
+(`Scrubbed.collisions`), so nothing is lost silently (schemas decision 43 G).
 """
 
 import base64
 import binascii
 import json
+import logging
 import re
 import threading
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, Any
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import quote
 
 if TYPE_CHECKING:  # `horae.secrets` imports this module: no import cycle at run time
@@ -66,8 +68,10 @@ if TYPE_CHECKING:  # `horae.secrets` imports this module: no import cycle at run
 
 MAX_EXPANSION = 6
 """How much longer than its UTF-8 value an encoded form can be (a JSON `\\u00XX` escape)."""
-MIN_PARTIAL_BYTES = 8
-"""Secrets shorter than this (UTF-8 bytes) are only matched as whole values."""
+MIN_SECRET_BYTES = 8
+"""Shortest secret value accepted, in UTF-8 bytes (`SecretResolver` refuses a shorter one)."""
+MIN_PARTIAL_BYTES = MIN_SECRET_BYTES
+"""Former name of `MIN_SECRET_BYTES` (decision 35 D, superseded by decision 43 H)."""
 
 
 def token(name: str) -> str:
@@ -111,11 +115,32 @@ def _forms(value: str) -> set[str]:
 
 
 def encodings(value: str) -> frozenset[str]:
-    """The forms of `value` the redactor looks for: every encoding for a long value, the raw
-    value only for one under `MIN_PARTIAL_BYTES` (tests assert none of them leaks)."""
-    if len(value.encode("utf-8")) < MIN_PARTIAL_BYTES:
-        return frozenset({value})
+    """The forms of `value` the redactor looks for (tests assert none of them leaks)."""
     return frozenset(_forms(value))
+
+
+def too_short(value: str) -> bool:
+    """Whether `value` is under `MIN_SECRET_BYTES` (refused: it cannot be redacted reliably)."""
+    return len(value.encode("utf-8")) < MIN_SECRET_BYTES
+
+
+NumberMode = Literal["redact", "flag", "ignore"]
+"""What `Redactor.scrub` does with a number whose text is a secret's value."""
+
+
+@dataclass(frozen=True)
+class Scrubbed:
+    """What `Redactor.scrub` returns."""
+
+    value: Any
+    """The copy, redacted."""
+    redacted: frozenset[str]
+    """The names of the secrets replaced."""
+    flagged: frozenset[str]
+    """The names of the secrets found in numbers kept as they were (`numbers="flag"`)."""
+    collisions: frozenset[str]
+    """The names of the secrets whose redaction made two keys of one object equal (the later
+    key was made unique: `[REDACTED:NAME]#2`)."""
 
 
 class Redactor:
@@ -123,45 +148,29 @@ class Redactor:
 
     def __init__(self, secrets: "Iterable[Secret]") -> None:
         owner: dict[str, str] = {}
-        bounded: set[str] = set()
-        """Forms matched only where not next to an ASCII letter or digit (short values)."""
         self._whole: dict[str, str] = {}
-        """Every value (long or short) to its name, for whole-value matches."""
-        self.short: tuple[str, ...] = ()
-        """The names of the secrets under `MIN_PARTIAL_BYTES` (weaker redaction)."""
-        short: list[str] = []
+        """Every value to its name, for numeric (whole-value) matches."""
         for secret in secrets:
             value = secret.reveal()
+            if too_short(value):
+                raise ValueError(
+                    f"secret {secret.name} is shorter than {MIN_SECRET_BYTES} bytes: "
+                    "it cannot be redacted reliably"
+                )
             self._whole.setdefault(value, secret.name)
-            if len(value.encode("utf-8")) >= MIN_PARTIAL_BYTES:
-                for form in _forms(value):
-                    owner.setdefault(form, secret.name)
-            else:
-                short.append(secret.name)
-                if value not in owner:
-                    owner[value] = secret.name
-                    bounded.add(value)
-        self.short = tuple(short)
+            for form in _forms(value):
+                owner.setdefault(form, secret.name)
         ordered = sorted(owner, key=lambda form: (-len(form.encode("utf-8")), form))
         self._names = dict(owner)
         self._bytes_names = {form.encode("utf-8"): name for form, name in owner.items()}
-
-        def text_pattern(form: str) -> str:
-            escaped = re.escape(form)
-            return rf"(?<![A-Za-z0-9]){escaped}(?![A-Za-z0-9])" if form in bounded else escaped
-
-        def bytes_pattern(form: str) -> bytes:
-            escaped = re.escape(form.encode("utf-8"))
-            if form in bounded:
-                return rb"(?<![A-Za-z0-9])" + escaped + rb"(?![A-Za-z0-9])"
-            return escaped
-
-        self._text = re.compile("|".join(map(text_pattern, ordered))) if ordered else None
-        self._bytes = re.compile(b"|".join(map(bytes_pattern, ordered))) if ordered else None
+        self._text = re.compile("|".join(map(re.escape, ordered))) if ordered else None
+        self._bytes = (
+            re.compile(b"|".join(re.escape(form.encode("utf-8")) for form in ordered))
+            if ordered
+            else None
+        )
         self.max_len = max((len(form.encode("utf-8")) for form in ordered), default=0)
-        """The longest pattern, in bytes (a bounded match looks at one more byte each side,
-        which the capture's margin of `max_len - 1` bytes past a cut does not always hold:
-        a short secret right at a cut can then be matched without its boundary check)."""
+        """The longest pattern, in bytes."""
 
     def __bool__(self) -> bool:
         return bool(self._whole)
@@ -174,6 +183,13 @@ class Redactor:
             (m.start(), m.end(), self._bytes_names[m.group(0)]) for m in self._bytes.finditer(data)
         ]
 
+    def counts(self, data: bytes) -> dict[str, int]:
+        """How many times each secret is matched in `data`, by name."""
+        found: dict[str, int] = {}
+        for _start, _end, name in self.spans(data):
+            found[name] = found.get(name, 0) + 1
+        return found
+
     def redact_bytes(self, data: bytes) -> bytes:
         """`data` with every match replaced."""
         if self._bytes is None:
@@ -182,9 +198,6 @@ class Redactor:
 
     def redact_text(self, text: str) -> tuple[str, set[str]]:
         """`text` with every match replaced, and the names of the secrets found."""
-        whole = self._whole.get(text)
-        if whole is not None:
-            return token(whole), {whole}
         if self._text is None:
             return text, set()
         found: set[str] = set()
@@ -196,29 +209,82 @@ class Redactor:
 
         return self._text.sub(replace, text), found
 
-    def _in_key(self, key: str) -> str | None:
-        whole = self._whole.get(key)
-        if whole is not None:
-            return whole
-        match = self._text.search(key) if self._text is not None else None
-        return None if match is None else self._names[match.group(0)]
+    def names_in(self, text: str) -> set[str]:
+        """The names of the secrets matched in `text`."""
+        if self._text is None:
+            return set()
+        return {self._names[m.group(0)] for m in self._text.finditer(text)}
+
+    def number(self, value: Any) -> str | None:
+        """The name of the secret whose value is the text of the JSON number `value`."""
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return self._whole.get(json.dumps(value))
+
+    def find(self, value: Any) -> set[str]:
+        """The names of the secrets anywhere in the JSON `value`: string leaves, object keys
+        and numbers (whole value). For the checks that refuse (plan time, the LLM cache)."""
+        found: set[str] = set()
+        if not self._whole:
+            return found
+        stack = [value]
+        while stack:
+            item = stack.pop()
+            if isinstance(item, str):
+                found |= self.names_in(item)
+            elif isinstance(item, dict):
+                for key, child in item.items():
+                    stack.extend((key, child))
+            elif isinstance(item, (list, tuple)):
+                stack.extend(item)
+            else:
+                name = self.number(item)
+                if name is not None:
+                    found.add(name)
+        return found
 
     def redact_data(self, value: Any) -> tuple[Any, set[str]]:
         """A copy of the JSON `value` with every string and number leaf redacted, and the
         names of the secrets found. Raises `SecretInKey` if an object key holds a secret."""
-        return self._walk(value, rewrite_keys=False, numbers=True)
+        result = self._walk(value, rewrite_keys=False, numbers="redact")
+        return result.value, set(result.redacted)
+
+    def scrub(self, value: Any, *, numbers: NumberMode = "flag") -> Scrubbed:
+        """The store's and the CLI's variant of `redact_data` (#53): string leaves **and
+        object keys** are redacted (a key holding a secret is rewritten, never raised; a key
+        that becomes equal to another key of its object is made unique, see `Scrubbed`), and
+        numbers as `numbers` says."""
+        return self._walk(value, rewrite_keys=True, numbers=numbers)
 
     def scrub_data(self, value: Any) -> tuple[Any, set[str]]:
-        """The store's variant of `redact_data` (#53): string leaves **and object keys** are
-        redacted (a key holding a secret is rewritten, never raised: the gate is fail safe),
-        numbers are kept (they are counts and amounts the core computed, or plugin data the
-        host already redacted). Returns the copy and the names found."""
-        return self._walk(value, rewrite_keys=True, numbers=False)
+        """`scrub(value, numbers="redact")`: the copy and the names of the secrets found."""
+        result = self.scrub(value, numbers="redact")
+        return result.value, set(result.redacted)
 
-    def _walk(self, value: Any, *, rewrite_keys: bool, numbers: bool) -> tuple[Any, set[str]]:
+    def _key(
+        self, key: Any, original: dict[Any, Any], mapping: dict[Any, Any], rewrite: bool
+    ) -> tuple[Any, set[str], bool]:
+        """The key `key` becomes, the names found in it, and whether it collided."""
+        if not isinstance(key, str):
+            return key, set(), False
+        new, names = self.redact_text(key)
+        if not names:
+            return key, names, False
+        if not rewrite:
+            raise SecretInKey(min(names))
+        if new not in mapping and new not in original:
+            return new, names, False
+        count = 2
+        while f"{new}#{count}" in mapping or f"{new}#{count}" in original:
+            count += 1
+        return f"{new}#{count}", names, True
+
+    def _walk(self, value: Any, *, rewrite_keys: bool, numbers: NumberMode) -> Scrubbed:
         found: set[str] = set()
+        flagged: set[str] = set()
+        collisions: set[str] = set()
         if not self._whole:
-            return value, found
+            return Scrubbed(value, frozenset(), frozenset(), frozenset())
 
         root: list[Any] = [None]
         stack: list[tuple[Any, Any, Any]] = [(value, root, 0)]
@@ -228,25 +294,14 @@ class Redactor:
                 new, names = self.redact_text(item)
                 found.update(names)
                 parent[key] = new
-            elif numbers and isinstance(item, (int, float)) and not isinstance(item, bool):
-                name = self._whole.get(json.dumps(item))
-                if name is not None:
-                    found.add(name)
-                    parent[key] = token(name)
-                else:
-                    parent[key] = item
             elif isinstance(item, dict):
                 mapping: dict[Any, Any] = {}
                 parent[key] = mapping
                 for child_key, child in item.items():
-                    new_key = child_key
-                    if isinstance(child_key, str):
-                        secret = self._in_key(child_key)
-                        if secret is not None and not rewrite_keys:
-                            raise SecretInKey(secret)
-                        if secret is not None:
-                            new_key, names = self.redact_text(child_key)
-                            found.update(names)
+                    new_key, names, collided = self._key(child_key, item, mapping, rewrite_keys)
+                    found.update(names)
+                    if collided:
+                        collisions.update(names)
                     mapping[new_key] = None
                     stack.append((child, mapping, new_key))
             elif isinstance(item, list):
@@ -254,12 +309,20 @@ class Redactor:
                 parent[key] = sequence
                 stack.extend((child, sequence, index) for index, child in enumerate(item))
             else:
-                parent[key] = item
-        return root[0], found
+                name = None if numbers == "ignore" else self.number(item)
+                if name is not None and numbers == "redact":
+                    found.add(name)
+                    parent[key] = token(name)
+                else:
+                    if name is not None:
+                        flagged.add(name)
+                    parent[key] = item
+        return Scrubbed(root[0], frozenset(found), frozenset(flagged), frozenset(collisions))
 
 
 # --- the process registry (#53) -----------------------------------------------------------
 
+_log = logging.getLogger("horae.secrets")
 _lock = threading.Lock()
 _known: "dict[tuple[str, str], Secret]" = {}
 """Every secret resolved in this process, by `(name, value)`, in resolution order."""
@@ -299,14 +362,22 @@ def redact(text: str) -> str:
 
 def prime(resolver: "SecretResolver", names: Iterable[str]) -> None:
     """Resolve `names` with `resolver`, for redaction only: a secret that cannot be resolved
-    is skipped (what needs it fails later, with its own error)."""
+    is skipped (what needs it fails later, with its own error); one refused as too short
+    (`MIN_SECRET_BYTES`) is skipped with a warning naming it (`horae.secrets`, never its
+    value or its length)."""
     from horae.secrets import SecretError
 
     for name in sorted(set(names)):
         try:
             resolver.resolve(name)
-        except SecretError:
-            continue
+        except SecretError as error:
+            if "too short" in error.reason:
+                _log.warning(
+                    "secret %s is too short for reliable redaction (min %d bytes): "
+                    "refused, so it is not primed and what needs it fails",
+                    error.name,
+                    MIN_SECRET_BYTES,
+                )
 
 
 def forget_all() -> None:
@@ -320,7 +391,10 @@ def forget_all() -> None:
 __all__ = [
     "MAX_EXPANSION",
     "MIN_PARTIAL_BYTES",
+    "MIN_SECRET_BYTES",
+    "NumberMode",
     "Redactor",
+    "Scrubbed",
     "SecretInKey",
     "current",
     "encodings",
@@ -330,4 +404,5 @@ __all__ = [
     "redact",
     "remember",
     "token",
+    "too_short",
 ]

@@ -21,6 +21,7 @@ import unicodedata
 from typing import Any
 
 from horae.apply.plan import ChangeSet, FileDiff
+from horae.secrets.redact import current as current_redactor
 
 JSON_SCHEMA_VERSION = 1
 """Version of the `horae diff --json` report."""
@@ -40,8 +41,11 @@ def _escape(char: str) -> str:
 
 
 def safe(text: str) -> str:
-    """`text` for a terminal: every control, format (bidi, zero-width…), line separator and
-    paragraph separator character escaped, except tab."""
+    """`text` for a terminal: every secret this process resolved redacted **first** (#53: a
+    secret holding a control or zero-width character would no longer match once escaped),
+    then every control, format (bidi, zero-width…), line separator and paragraph separator
+    character escaped, except tab."""
+    text = current_redactor().redact_text(text)[0]
     if text.isascii() and text.isprintable():
         return text
     return "".join(
@@ -136,10 +140,11 @@ def render_text(changes: ChangeSet, *, color: bool = False) -> str:
         lines.extend(["", _paint("HTTP calls:", _BOLD, color)])
         for http in changes.http_calls:
             body = dumps(http.call.body, separators=(",", ":"), ensure_ascii=False)
-            short = body if len(body) <= 200 else body[:200] + "…"
+            shown = safe(body)  # redacted before it is cut (#53): no half secret is shown
+            short = shown if len(shown) <= 200 else shown[:200] + "…"
             lines.append(
                 f"  {http.call.method} {safe(http.call.url)} via {safe(http.applied_by)}"
-                f" ({len(body.encode())} bytes): {safe(short)}"
+                f" ({len(body.encode())} bytes): {short}"
             )
     if changes.problems:
         lines.extend(["", _paint("Not applicable:", _BOLD, color)])

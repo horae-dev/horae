@@ -1,52 +1,47 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Redaction of log records (#24, generalised by #53, schemas decision 43 B).
+"""Redaction of log records, warnings and uncaught exceptions (#24, generalised by #53,
+schemas decision 43 E).
 
-Horae's own loggers, the MCP SDK's, the HTTP clients' and the Anthropic SDK's can all carry a
-secret: the SDK logs "Failed to validate notification" with the pydantic error as `exc_info`
-(whose text holds the offending input values), an HTTP client at `DEBUG` logs headers, and a
-core message may format a value it was handed.
+Any logger can carry a secret: the MCP SDK logs "Failed to validate notification" with the
+pydantic error as `exc_info` (whose text holds the offending input values), an HTTP client at
+`DEBUG` logs headers, `asyncio` logs a task's exception, `uvicorn` a request, `urllib3` a URL,
+and a core message may format a value it was handed. So `install()` (idempotent; called by the
+CLI entry point, by `Runner.run` and when a `PluginHost` opens) scrubs **every** record, of
+every logger, the root included:
 
-`install()` (idempotent; called by the CLI entry point, by `Runner.run` and when a
-`PluginHost` opens) wraps the logging **record factory**, so every record of the `LOGGERS`
-(and of their children) is scrubbed when it is created, before any filter or handler sees
-it, wherever that handler is attached (a handler on a logger itself, as pytest adds to
-non-propagating loggers, would bypass a handler- or propagation-based scheme):
-
-- its message is formatted and redacted with the process registry's redactor
-  (`horae.secrets.redact.current()`: every secret this process resolved) and the redactor
-  of every registered source (an open plugin host), and its `args` are dropped;
-- its `exc_info` and `stack_info` are dropped (a traceback may hold data); only the
-  exception's type name is appended to the message.
-
-The record keeps its logger name, level and location. Records of other loggers are untouched.
-`install()` also pins the `HTTP_LOGGERS` (and their children already created) to at least
-`WARNING`, so request headers are never even formatted.
+- it wraps the logging **record factory**, so a record is scrubbed when it is created, before
+  any filter or handler sees it, wherever that handler is attached (a handler on a logger
+  itself, as pytest adds to non-propagating loggers, would bypass a handler- or
+  propagation-based scheme). Its message is formatted and redacted with the process
+  registry's redactor (`horae.secrets.redact.current()`: every secret this process resolved)
+  and the redactor of every registered source (an open plugin host), and its `args` are
+  dropped; its `exc_info` and `stack_info` are dropped (a traceback may hold data) and only the
+  exception's type name is appended to the message. The record keeps its logger name, level
+  and location;
+- it calls `logging.captureWarnings(True)`, so a `warnings.warn` goes to the `py.warnings`
+  logger (hence through the factory) instead of being written to `stderr` as it is;
+- it sets `sys.excepthook` and `threading.excepthook` to redacting hooks (`excepthook`,
+  `thread_excepthook`): an uncaught exception's report (type, message and traceback, as the
+  default hooks format it) is redacted before it is written to `stderr` (only the text; the
+  exception object itself is not changed);
+- it pins the `HTTP_LOGGERS` (and their children already created) to at least `WARNING`, so
+  request headers are never even formatted.
 """
 
 import logging
+import sys
 import threading
+import traceback
+import warnings
 import weakref
+from types import TracebackType
 from typing import Any
 
 from horae.secrets.redact import Redactor, current
 
-LOGGERS = (
-    "horae",
-    "mcp",
-    "client",
-    "server",
-    "httpx",
-    "httpx2",
-    "httpcore",
-    "httpcore2",
-    "anthropic",
-)
-"""The loggers scrubbed (and their children): Horae's, the MCP SDK's (`mcp`, and the bare
-`client` and `server` loggers it also uses), the HTTP clients' and the Anthropic SDK's."""
 HTTP_LOGGERS = ("httpx", "httpx2", "httpcore", "httpcore2")
 """Pinned to `WARNING` by `install()`: at `DEBUG` they log request headers."""
 
-_PREFIXES = tuple(f"{name}." for name in LOGGERS)
 _sources: "weakref.WeakSet[Any]" = weakref.WeakSet()
 """Open plugin hosts (each has a `redactor()` method returning a `Redactor`)."""
 _lock = threading.Lock()
@@ -54,8 +49,17 @@ _installed = False
 
 
 def covered(name: str) -> bool:
-    """Whether records of logger `name` are scrubbed."""
-    return name in LOGGERS or name.startswith(_PREFIXES)
+    """Whether records of logger `name` are scrubbed: every logger is (decision 43 E)."""
+    return True
+
+
+def redact_all(text: str) -> str:
+    """`text` redacted with the process registry and every registered source."""
+    text, _ = current().redact_text(text)
+    for source in list(_sources):
+        redactor: Redactor = source.redactor()
+        text, _ = redactor.redact_text(text)
+    return text
 
 
 def scrub(record: logging.LogRecord) -> None:
@@ -66,11 +70,7 @@ def scrub(record: logging.LogRecord) -> None:
         message = str(record.msg)
     if record.exc_info and record.exc_info[0] is not None:
         message = f"{message} ({record.exc_info[0].__name__}, details withheld)"
-    message, _ = current().redact_text(message)
-    for source in list(_sources):
-        redactor: Redactor = source.redactor()
-        message, _ = redactor.redact_text(message)
-    record.msg, record.args = message, None
+    record.msg, record.args = redact_all(message), None
     record.exc_info, record.exc_text, record.stack_info = None, None, None
 
 
@@ -91,19 +91,51 @@ def pin_http_loggers() -> None:
             child.setLevel(logging.WARNING)
 
 
+def _report(
+    exc_type: type[BaseException], exc: BaseException | None, tb: TracebackType | None
+) -> str:
+    return redact_all("".join(traceback.format_exception(exc_type, exc, tb)))
+
+
+def excepthook(exc_type: type[BaseException], exc: BaseException, tb: TracebackType | None) -> None:
+    """`sys.excepthook`, redacted."""
+    sys.stderr.write(_report(exc_type, exc, tb))
+
+
+def thread_excepthook(args: threading.ExceptHookArgs) -> None:
+    """`threading.excepthook`, redacted (a `SystemExit` is ignored, as by the default)."""
+    if args.exc_type is SystemExit:
+        return
+    name = "?" if args.thread is None else args.thread.name
+    head = redact_all(f"Exception in thread {name}:\n")
+    sys.stderr.write(head + _report(args.exc_type, args.exc_value, args.exc_traceback))
+
+
+def _captured_showwarning() -> Any:
+    """The `showwarning` that `logging.captureWarnings(True)` installs."""
+    return getattr(logging, "_showwarning", None)
+
+
 def install() -> None:
-    """Wrap the record factory once and pin the HTTP loggers (see the module docstring)."""
+    """Wrap the record factory and the exception hooks once, capture warnings, and pin the
+    HTTP loggers (see the module docstring)."""
     global _installed
     pin_http_loggers()
     with _lock:
+        # Applied again on every call: a `warnings.catch_warnings()` block, or a test
+        # harness, may have restored the previous `showwarning` or hooks since.
+        if warnings.showwarning is not _captured_showwarning():
+            logging.captureWarnings(False)  # forget a stale saved `showwarning`, then
+            logging.captureWarnings(True)  # capture again (it does nothing when "on")
+        sys.excepthook = excepthook
+        threading.excepthook = thread_excepthook
         if _installed:
             return
         previous = logging.getLogRecordFactory()
 
         def factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
             record = previous(*args, **kwargs)
-            if covered(record.name):
-                scrub(record)
+            scrub(record)
             return record
 
         logging.setLogRecordFactory(factory)
@@ -122,11 +154,13 @@ def unregister(source: Any) -> None:
 
 __all__ = [
     "HTTP_LOGGERS",
-    "LOGGERS",
     "covered",
+    "excepthook",
     "install",
     "pin_http_loggers",
+    "redact_all",
     "register",
     "scrub",
+    "thread_excepthook",
     "unregister",
 ]
