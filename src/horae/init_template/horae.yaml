@@ -1,0 +1,7 @@
+# The walking-skeleton instance (#25): fixture-source -> file-sink, no LLM, no secret.
+schema_version: 1
+timezone: UTC
+state_dir: state
+plugin_defaults:
+  startup_timeout_s: 20
+  call_timeout_s: 30

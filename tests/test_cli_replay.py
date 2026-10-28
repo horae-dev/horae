@@ -247,13 +247,14 @@ def test_missing_pipeline_file(instance: Path) -> None:
     assert report["error"] == "--against-current: pipeline flow is not in the instance"
 
 
-def test_unknown_run_and_missing_store_are_usage_errors(instance: Path, tmp_path: Path) -> None:
+def test_unknown_run_and_missing_store_are_refused(instance: Path, tmp_path: Path) -> None:
+    # Exit 3 like `horae diff` and `horae undo` (decision 37; was 2 before #26).
     code, out = _invoke("no-such-run", "-i", str(instance))
-    assert code == cli.EXIT_USAGE == 2
+    assert code == cli.EXIT_UNKNOWN_RUN == 3
     assert "unknown run 'no-such-run'" in out
     missing = tmp_path / "missing.db"
     code, report = _json(RUN, "-i", str(instance), "--store", str(missing))
-    assert code == 2
+    assert code == 3
     assert report["outcome"] == "error"
     assert report["identical"] is False
     assert report["error"] == f"unknown run {RUN!r}: no store at {missing}"
@@ -406,6 +407,6 @@ def test_help_documents_the_exit_codes() -> None:
     text = " ".join(_plain(result.output).split())
     for code in ("0 identical", "1 configuration or store problem", "2 usage error"):
         assert code in text
-    assert "3 not comparable" in text
+    assert "3 unknown run (or no store) or not comparable" in text
     assert "4 different" in text
     assert "70 internal error" in text

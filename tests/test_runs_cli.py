@@ -280,13 +280,17 @@ def test_runs_invalid_config_exits_1(tmp_path: Path) -> None:
     (root / "horae.yaml").write_text("runs: { timeout_s: 0 }\n", encoding="utf-8")
     code, out = _runs("-i", str(root))
     assert code == cli.EXIT_PROBLEMS == 1
-    assert out.splitlines()[0].startswith(f"{root / 'horae.yaml'}:1:")
-    assert out.splitlines()[-1] == "1 problem found"
+    # One error line on stderr, like every command (decision 37).
+    assert out.splitlines()[0].startswith(f"horae runs: {root / 'horae.yaml'}:1:")
+    assert out.splitlines()[0].endswith("; 1 problem found")
     code, out = _runs("-i", str(tmp_path))
     assert (code, out.splitlines()) == (
         1,
-        [f"{tmp_path / 'horae.yaml'}: file not found", "1 problem found"],
+        [f"horae runs: {tmp_path / 'horae.yaml'}: file not found; 1 problem found"],
     )
+    code, out = _runs("-i", str(tmp_path), "--json")
+    assert code == 1
+    assert json.loads(out)["error"]["kind"] == "config_invalid"
 
 
 def test_runs_store_problem_exits_1(tmp_path: Path) -> None:

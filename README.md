@@ -35,12 +35,49 @@ Read the [plan](docs/PLAN.md), the [roadmap](docs/ROADMAP.md) and the [estimatio
 
 Stories, estimates and acceptance criteria are in this repository's [issues](../../issues) and on the [roadmap project](https://github.com/orgs/horae-dev/projects/1).
 
+## Getting started
+
+From a checkout (`uv sync`; nothing is published yet), the M1 walking skeleton in a new
+directory: a pipeline that reads synthetic data and writes today's owned note in the
+instance's own `vault/`, through the two built-in plugins. No LLM, no secret, no network.
+
+```sh
+uv run horae init ~/horae-demo            # horae.yaml, a pipeline, horae.lock, vault/, plugins/
+uv run horae doctor -i ~/horae-demo       # checks the configuration: "OK: 1 pipeline, 2 plugins"
+uv run horae run daily-fixture -i ~/horae-demo --dry-run   # the diff; nothing written
+uv run horae run daily-fixture -i ~/horae-demo             # writes vault/Daily/<today>.assistant.md
+uv run horae runs -i ~/horae-demo                          # runs, newest first
+uv run horae diff <run-id> -i ~/horae-demo     # what a stored (dry) run would change
+uv run horae replay <run-id> -i ~/horae-demo   # re-executes the run from its record and compares
+uv run horae undo <run-id> -i ~/horae-demo     # restores every note the run changed, byte for byte
+```
+
+`-i` defaults to the current directory (or `HORAE_INSTANCE`). Every command takes `--json`
+for scripting (one JSON document on stdout, `schema_version: 1`, errors too) and prints no
+colour unless asked. `horae run` has no LLM backend in M1: a pipeline with an `llm` step
+fails with `llm_unavailable` (M2 adds the backends). SIGINT or SIGTERM stops a run
+cooperatively and saves its partial record.
+
+**Exit codes**, the same for every command ([decision 37](schemas/README.md)):
+
+| Code | Meaning |
+|---|---|
+| 0 | ok: no problem, listed, planned, identical, undone, created |
+| 1 | a configuration, store, plugin or runtime problem (doctor found problems, the run failed or timed out) |
+| 2 | usage error |
+| 3 | unknown or refused: unknown run or pipeline, a refused run, not comparable, a non-empty `init` target |
+| 4 | different: the replay differs, the plan has problems, undo refused because a note changed |
+| 5 | locked: the pipeline is running, or another process is applying changes |
+| 70 | internal error (only its type is printed) |
+| 130 / 143 | `horae run` interrupted by SIGINT / SIGTERM |
+
 ## Examples
 
 - [`examples/walking-skeleton`](examples/walking-skeleton/): the M1 walking skeleton, an
   instance whose pipeline reads synthetic data and writes today's owned note, with dry run,
-  undo and replay. [`tests/test_e2e.py`](tests/test_e2e.py) runs it end to end with real
-  plugin subprocesses.
+  undo and replay (`horae init` writes a copy of it). [`tests/test_e2e.py`](tests/test_e2e.py)
+  runs it end to end with real plugin subprocesses, and
+  [`tests/test_cli_e2e.py`](tests/test_cli_e2e.py) through the CLI.
 - Built-in example plugins (`horae.plugins.builtin`):
   [`fixture-source`](src/horae/plugins/builtin/fixture_source/README.md), deterministic
   synthetic data from a JSON fixture file, and

@@ -1,0 +1,9 @@
+# The M1 walking skeleton: read synthetic data, write it to today's owned note. No LLM.
+# fixture-source proposes a note.replace_owned_block without a path; the core fills the path
+# from the act entry below (its trusted parameter) and file-sink applies it.
+name: daily-fixture
+steps:
+  - collect:
+      - fixture-source.serve: {}
+  - act:
+      - file-sink.write_note: { path: "Daily/{{date}}.assistant.md", mode: replace-owned }

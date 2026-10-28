@@ -1,9 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Command-line entry point for Horae."""
+"""Command-line entry point for Horae (#26): init, run, runs, diff, undo, replay, doctor.
+
+Every command shares the exit codes, error reporting and `--json` conventions of
+`horae.cli_output` (schemas decision 37): 0 ok, 1 problems, 2 usage, 3 unknown or refused,
+4 different, 5 locked, 70 internal, 130/143 interrupted (`horae run`)."""
 
 import asyncio
-import json
 import re
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
@@ -13,8 +18,28 @@ import typer
 from pydantic import ValidationError
 
 from horae import __version__
-from horae.apply import JSON_SCHEMA_VERSION, LocalSink, StaticSinks, plan_changes, to_json
-from horae.apply.render import render_text, safe
+from horae.apply import LocalSink, SinkRegistry, StaticSinks, plan_changes, to_json
+from horae.apply.render import render_text
+from horae.cli_host import host_sinks, load, uses_host
+from horae.cli_output import (
+    EXIT_DIFFERENT,
+    EXIT_INTERNAL,
+    EXIT_LOCKED,
+    EXIT_OK,
+    EXIT_PROBLEMS,
+    EXIT_REFUSED,
+    EXIT_SIGINT,
+    EXIT_SIGTERM,
+    EXIT_USAGE,
+    SCHEMA_VERSION,
+    CommandFailed,
+    JsonUsageCommand,
+    echo_json,
+    internal_message,
+    plural,
+    report_error,
+    run_command,
+)
 from horae.config import (
     CONFIG_FILE,
     STORE_FILE,
@@ -30,14 +55,28 @@ from horae.replay import LockRegistry, ReplayResult, definition_for, replay
 from horae.runner import lock_is_free
 from horae.store import MAX_LIST_RUNS, RunSummary, Store, StoreError
 
+EXIT_CODES_HELP = (
+    "Exit codes (every command): 0 ok, 1 problems (configuration, store, plugins, a failed "
+    "run), 2 usage error, 3 unknown or refused (run, pipeline, init target; not comparable), "
+    "4 different (replay differs, plan or undo refused by changes), 5 locked (pipeline or "
+    "apply lock), 70 internal error, 130/143 interrupted by SIGINT/SIGTERM (horae run). With "
+    "--json every command prints one JSON document on stdout (schema_version 1), errors too."
+)
+
 app = typer.Typer(
     name="horae",
     help="Horae: a predictable, self-hosted personal agent.",
+    epilog=EXIT_CODES_HELP,
     no_args_is_help=True,
     add_completion=False,
     # Never print local variables in tracebacks: they may hold secret values.
     pretty_exceptions_show_locals=False,
 )
+
+
+def _command(name: str | None = None) -> Callable[[Callable[..., None]], Callable[..., None]]:
+    """`app.command`, with JSON usage errors under `--json` (`JsonUsageCommand`)."""
+    return app.command(name, cls=JsonUsageCommand)
 
 
 def _version_callback(value: bool) -> None:
@@ -61,25 +100,16 @@ def main(
     """Horae: a predictable, self-hosted personal agent."""
 
 
-def _plural(count: int, word: str, plural: str | None = None) -> str:
-    return f"{count} {word if count == 1 else plural or word + 's'}"
+_plural = plural
 
-
-EXIT_OK = 0
-EXIT_PROBLEMS = 1
-EXIT_USAGE = 2
-EXIT_NOT_COMPARABLE = 3
+EXIT_UNKNOWN_RUN = EXIT_REFUSED
+"""`horae diff` / `horae replay`: the run is unknown, still running, or refused."""
+EXIT_NOT_COMPARABLE = EXIT_REFUSED
 """`horae replay`: the run could not be compared (see `replay_command`)."""
-EXIT_DIFFERENT = 4
-"""`horae replay`: the replay differs from the recorded run."""
-EXIT_UNKNOWN_RUN = 3
-"""`horae diff`: the run is unknown, still running, or refused (failed, undone, applied)."""
-EXIT_PLANNED_WITH_PROBLEMS = 4
+EXIT_PLANNED_WITH_PROBLEMS = EXIT_DIFFERENT
 """`horae diff`: the run is planned, but some intents cannot be applied."""
-EXIT_INTERNAL = 70
-"""`EX_SOFTWARE` (sysexits.h): an unexpected internal error."""
 
-REPORT_SCHEMA_VERSION = 1
+REPORT_SCHEMA_VERSION = SCHEMA_VERSION
 """Version of the `horae doctor --json` report."""
 
 
@@ -92,7 +122,7 @@ def _report(instance: Path, json_output: bool) -> int:
             "instance": str(instance),
             "problems": [problem.to_dict() for problem in result.problems],
         }
-        typer.echo(json.dumps(report, indent=2))
+        echo_json(report)
     else:
         for problem in result.problems:
             typer.echo(str(problem))
@@ -108,33 +138,30 @@ def _report(instance: Path, json_output: bool) -> int:
     return EXIT_OK if result.ok else EXIT_PROBLEMS
 
 
-@app.command()
+InstanceDir = Annotated[
+    Path,
+    typer.Option(
+        "--instance",
+        "-i",
+        envvar="HORAE_INSTANCE",
+        help="Instance directory (holds horae.yaml).",
+        file_okay=False,
+    ),
+]
+"""The `--instance` option of every command but `init`."""
+
+
+@_command()
 def doctor(
-    instance: Annotated[
-        Path,
-        typer.Option(
-            "--instance",
-            "-i",
-            envvar="HORAE_INSTANCE",
-            help="Instance directory (holds horae.yaml).",
-            file_okay=False,
-        ),
-    ] = Path(),
+    instance: InstanceDir = Path(),
     json_output: Annotated[bool, typer.Option("--json", help="Print the report as JSON.")] = False,
 ) -> None:
     """Check the instance configuration, pipelines, lockfile and secrets.
 
     Exit codes: 0 no problem, 1 problems found, 2 usage error, 70 internal error.
-    Secret values are never printed."""
-    try:
-        code = _report(instance, json_output)
-    except Exception as exc:
-        # Never print the exception, its traceback or its locals: a frame may hold a secret.
-        name = type(exc).__name__
-        del exc
-        typer.echo(f"horae doctor: internal error ({name}); please report it", err=True)
-        code = EXIT_INTERNAL
-    raise typer.Exit(code)
+    Secret values are never printed. With --json: {schema_version, ok, instance, problems};
+    an error is {schema_version, error}."""
+    run_command("doctor", json_output, lambda: _report(instance, json_output))
 
 
 RUNS_SCHEMA_VERSION = 1
@@ -229,6 +256,16 @@ def _table(header: list[str], rows: list[list[str]]) -> list[str]:
     ]
 
 
+def _config(instance: Path) -> InstanceConfig:
+    """`horae.yaml` alone (enough for the store and the locks), or `config_invalid`."""
+    try:
+        return validate(read_yaml(instance / CONFIG_FILE), InstanceConfig)
+    except ProblemsError as exc:
+        found = _plural(len(exc.problems), "problem") + " found"
+        message = "; ".join([*map(str, exc.problems), found])
+        raise CommandFailed(EXIT_PROBLEMS, "config_invalid", message) from None
+
+
 def _list_runs(
     instance: Path,
     pipeline: str | None,
@@ -236,13 +273,7 @@ def _list_runs(
     limit: int,
     json_output: bool,
 ) -> int:
-    try:
-        config = validate(read_yaml(instance / CONFIG_FILE), InstanceConfig)
-    except ProblemsError as exc:
-        for problem in exc.problems:
-            typer.echo(str(problem))
-        typer.echo(_plural(len(exc.problems), "problem") + " found")
-        return EXIT_PROBLEMS
+    config = _config(instance)
     state_dir = instance / config.state_dir
     path = state_dir / STORE_FILE
     runs: list[RunSummary] = []
@@ -256,8 +287,7 @@ def _list_runs(
                     limit=limit,
                 )
     except (StoreError, OSError) as exc:
-        typer.echo(f"horae runs: {path}: {exc}", err=True)
-        return EXIT_PROBLEMS
+        raise CommandFailed(EXIT_PROBLEMS, "store_error", f"{path}: {exc}") from None
     # A `running` row whose pipeline lock is free has no live process: the next run of the
     # pipeline will abandon it. Checked without waiting and without creating anything.
     stale = [
@@ -269,7 +299,7 @@ def _list_runs(
             "instance": str(instance.resolve()),
             "runs": [_run_json(run, s) for run, s in zip(runs, stale, strict=True)],
         }
-        typer.echo(json.dumps(report, indent=2))
+        echo_json(report)
     elif not runs:
         typer.echo("no runs")
     else:
@@ -289,18 +319,9 @@ def _list_runs(
     return EXIT_OK
 
 
-@app.command()
+@_command()
 def runs(
-    instance: Annotated[
-        Path,
-        typer.Option(
-            "--instance",
-            "-i",
-            envvar="HORAE_INSTANCE",
-            help="Instance directory (holds horae.yaml).",
-            file_okay=False,
-        ),
-    ] = Path(),
+    instance: InstanceDir = Path(),
     pipeline: Annotated[
         str | None, typer.Option("--pipeline", "-p", help="Only runs of this pipeline.")
     ] = None,
@@ -316,86 +337,72 @@ def runs(
     """List runs, newest first, with status, duration and cost.
 
     Exit codes: 0 listed (possibly none), 1 configuration or store problem, 2 usage error,
-    70 internal error."""
-    try:
-        code = _list_runs(instance, pipeline, status, limit, json_output)
-    except Exception as exc:
-        name = type(exc).__name__
-        del exc
-        typer.echo(f"horae runs: internal error ({name}); please report it", err=True)
-        code = EXIT_INTERNAL
-    raise typer.Exit(code)
+    70 internal error. With --json: {schema_version, instance, runs}; an error is
+    {schema_version, error}."""
+    run_command(
+        "runs", json_output, lambda: _list_runs(instance, pipeline, status, limit, json_output)
+    )
 
 
-class _DiffFailed(Exception):
-    def __init__(self, code: int, kind: str, message: str) -> None:
-        super().__init__(kind)
-        self.code, self.kind, self.message = code, kind, message
-
-
-def _diff_error(kind: str, message: str, json_output: bool) -> None:
-    """Report a `horae diff` error: a JSON error object on stdout, or text on stderr."""
-    if json_output:
-        error = {"schema_version": JSON_SCHEMA_VERSION, "error": {"kind": kind, "message": message}}
-        typer.echo(json.dumps(error, indent=2, ensure_ascii=True))
+@asynccontextmanager
+async def _diff_sinks(instance: Path, vault: Path | None) -> AsyncIterator[SinkRegistry]:
+    if uses_host(instance, vault):
+        async with host_sinks(load(instance)) as sinks:
+            yield sinks
     else:
-        typer.echo(f"horae diff: {safe(message)}", err=True)
+        yield StaticSinks(default=LocalSink(vault))
 
 
 def _diff(instance: Path, run_id: str, vault: Path | None, json_output: bool, color: bool) -> int:
-    try:
-        config = validate(read_yaml(instance / CONFIG_FILE), InstanceConfig)
-    except ProblemsError as exc:
-        found = _plural(len(exc.problems), "problem") + " found"
-        raise _DiffFailed(
-            EXIT_PROBLEMS, "config_invalid", "; ".join([*map(str, exc.problems), found])
-        ) from None
+    config = _config(instance)
     path = instance / config.state_dir / STORE_FILE
     if not path.exists():  # never create the store just to read it
-        raise _DiffFailed(EXIT_UNKNOWN_RUN, "unknown_run", f"unknown run {run_id!r} (no store)")
-    sinks = StaticSinks(default=LocalSink(vault))
+        raise CommandFailed(EXIT_REFUSED, "unknown_run", f"unknown run {run_id!r} (no store)")
     try:
         # Read-only: no migration, no WAL switch, no new file (schemas decision 32, D5).
         with Store.open(path, read_only=True) as store:
             record = store.get_run(run_id)
             if record is None:
-                raise _DiffFailed(
-                    EXIT_UNKNOWN_RUN, "unknown_run", f"unknown or unfinished run {run_id!r}"
+                raise CommandFailed(
+                    EXIT_REFUSED, "unknown_run", f"unknown or unfinished run {run_id!r}"
                 )
 
             def notified(key: str) -> bool:
                 return store.get_notification(key) is not None
 
-            changes = asyncio.run(plan_changes(record, sinks, notified=notified))
+            async def plan() -> Any:
+                async with _diff_sinks(instance, vault) as sinks:
+                    return await plan_changes(
+                        record,
+                        sinks,
+                        notified=notified,
+                        call_timeout_s=config.plugin_defaults.call_timeout_s,
+                    )
+
+            changes = asyncio.run(plan())
     except (StoreError, OSError) as exc:
-        raise _DiffFailed(EXIT_PROBLEMS, "store_error", f"{path}: {exc}") from None
+        raise CommandFailed(EXIT_PROBLEMS, "store_error", f"{path}: {exc}") from None
     if json_output:
         typer.echo(to_json(changes))
     else:
         typer.echo(render_text(changes, color=color), nl=False, color=color or None)
     if changes.refused is not None:
-        return EXIT_UNKNOWN_RUN
-    return EXIT_PLANNED_WITH_PROBLEMS if changes.problems else EXIT_OK
+        return EXIT_REFUSED
+    return EXIT_DIFFERENT if changes.problems else EXIT_OK
 
 
-@app.command()
+@_command()
 def diff(
     run_id: Annotated[str, typer.Argument(help="The run to show.")],
-    instance: Annotated[
-        Path,
-        typer.Option(
-            "--instance",
-            "-i",
-            envvar="HORAE_INSTANCE",
-            help="Instance directory (holds horae.yaml).",
-            file_okay=False,
-        ),
-    ] = Path(),
+    instance: InstanceDir = Path(),
     vault: Annotated[
         Path | None,
         typer.Option(
             "--vault",
-            help="Vault directory to read notes from (read only; provisional until #24).",
+            help=(
+                "Read notes from this local vault with the built-in read-only sink, instead "
+                "of through the instance's plugins."
+            ),
             file_okay=False,
             exists=True,
         ),
@@ -405,66 +412,56 @@ def diff(
 ) -> None:
     """Show what applying a stored run would change, without applying anything.
 
-    Notes are read from --vault with the built-in read-only local sink until plugin sinks are
-    available (#24). A failed, undone or already applied run is refused.
+    Notes are read through the instance's plugins (<instance>/plugins, their read-only
+    `read` operation) when it has them; --vault reads a local vault with the built-in
+    read-only sink instead. A failed, undone or already applied run is refused.
 
-    Exit codes: 0 planned, 1 configuration or store problem, 2 usage error, 3 unknown or
-    refused run, 4 planned but some intents cannot be applied, 70 internal error. With
+    Exit codes: 0 planned, 1 configuration, plugin or store problem, 2 usage error, 3 unknown
+    or refused run, 4 planned but some intents cannot be applied, 70 internal error. With
     --json, errors are a JSON object on stdout ({schema_version, error: {kind, message}})."""
-    try:
-        code = _diff(instance, run_id, vault, json_output, color)
-    except _DiffFailed as failed:
-        _diff_error(failed.kind, failed.message, json_output)
-        code = failed.code
-    except Exception as exc:
-        # Never print the exception, its traceback or its locals: a frame may hold a secret.
-        name = type(exc).__name__
-        del exc
-        _diff_error("internal", f"internal error ({name}); please report it", json_output)
-        code = EXIT_INTERNAL
-    raise typer.Exit(code)
-
-
-class _ReplayStop(Exception):
-    """`horae replay` stops before comparing; `code` is its exit code."""
-
-    def __init__(self, code: int, message: str, pipeline: str | None = None) -> None:
-        super().__init__(message)
-        self.code = code
-        self.message = message
-        self.pipeline = pipeline
+    run_command("diff", json_output, lambda: _diff(instance, run_id, vault, json_output, color))
 
 
 def _replay(instance: Path, store: Path | None, run_id: str, against_current: bool) -> ReplayResult:
     try:
         loaded = load_instance(instance)
     except InstanceError as exc:
-        problems = "\n".join(str(problem) for problem in exc.problems)
-        raise _ReplayStop(EXIT_PROBLEMS, problems) from None
+        problems = "; ".join(str(problem) for problem in exc.problems)
+        raise CommandFailed(EXIT_PROBLEMS, "config_invalid", problems) from None
     path = store if store is not None else loaded.store_path
     if not path.is_file():
-        raise _ReplayStop(EXIT_USAGE, f"unknown run {run_id!r}: no store at {path}")
+        raise CommandFailed(
+            EXIT_REFUSED, "unknown_run", f"unknown run {run_id!r}: no store at {path}"
+        )
     try:
         # Read-only: no migration, no WAL switch, no new file.
         with Store.open(path, read_only=True) as opened:
             record: RunRecord | None = opened.get_run(run_id)
     except ValidationError:
-        raise _ReplayStop(
-            EXIT_NOT_COMPARABLE, f"run {run_id!r}: its record is not a valid v1 run record"
+        raise CommandFailed(
+            EXIT_REFUSED,
+            "not_comparable",
+            f"run {run_id!r}: its record is not a valid v1 run record",
         ) from None
     except (StoreError, OSError) as exc:
-        raise _ReplayStop(EXIT_PROBLEMS, f"{path}: {exc}") from None
+        raise CommandFailed(EXIT_PROBLEMS, "store_error", f"{path}: {exc}") from None
     if record is None:
-        raise _ReplayStop(EXIT_USAGE, f"unknown run {run_id!r} (or still running, or abandoned)")
+        raise CommandFailed(
+            EXIT_REFUSED, "unknown_run", f"unknown run {run_id!r} (or still running, or abandoned)"
+        )
     current = loaded.pipelines.get(record.pipeline)
     chosen, _ = definition_for(record, current, against_current)
     registry = LockRegistry(loaded.lock, chosen, record)
     if registry.unresolved:
-        raise _ReplayStop(
-            EXIT_NOT_COMPARABLE,
-            f"{', '.join(registry.unresolved)}: resolved by no plugin of horae.lock (neither as "
-            "the run resolved it nor by namespace)",
-            record.pipeline,
+        return ReplayResult(
+            run_id=run_id,
+            pipeline=record.pipeline,
+            outcome="error",
+            against_current=against_current,
+            error=(
+                f"{', '.join(registry.unresolved)}: resolved by no plugin of horae.lock "
+                "(neither as the run resolved it nor by namespace)"
+            ),
         )
     models = {alias: spec.model for alias, spec in loaded.config.models.items()}
     return replay(
@@ -478,22 +475,38 @@ def _replay(instance: Path, store: Path | None, run_id: str, against_current: bo
     )
 
 
-_REPLAY_CODES = {"identical": EXIT_OK, "different": EXIT_DIFFERENT, "error": EXIT_NOT_COMPARABLE}
+_REPLAY_CODES = {"identical": EXIT_OK, "different": EXIT_DIFFERENT, "error": EXIT_REFUSED}
 
 
-@app.command("replay")
+def _replay_report(
+    instance: Path, store: Path | None, run_id: str, against_current: bool, json_output: bool
+) -> int:
+    try:
+        result = _replay(instance, store, run_id, against_current)
+    except CommandFailed as failed:
+        if not json_output:
+            raise
+        # Under --json a stop is the replay report itself, with outcome `error` (every key).
+        result = ReplayResult(
+            run_id=run_id,
+            pipeline=None,
+            outcome="error",
+            against_current=against_current,
+            error=failed.message,
+        )
+        echo_json(result.to_dict())
+        return failed.code
+    if json_output:
+        echo_json(result.to_dict())
+    else:
+        typer.echo(result.render())
+    return _REPLAY_CODES[result.outcome]
+
+
+@_command("replay")
 def replay_command(
     run_id: Annotated[str, typer.Argument(help="The run to replay.")],
-    instance: Annotated[
-        Path,
-        typer.Option(
-            "--instance",
-            "-i",
-            envvar="HORAE_INSTANCE",
-            help="Instance directory (holds horae.yaml).",
-            file_okay=False,
-        ),
-    ] = Path(),
+    instance: InstanceDir = Path(),
     store: Annotated[
         Path | None,
         typer.Option(
@@ -517,39 +530,42 @@ def replay_command(
     Nothing external is called: sources, transforms and the LLM are answered from the record,
     and plugins are resolved from horae.lock and the record. The store is opened read-only.
 
-    Exit codes: 0 identical; 1 configuration or store problem; 2 usage error (bad option,
-    unknown run); 3 not comparable (pipeline, horae.lock or horae.yaml changed without
-    --against-current, unresolved plugin, a call the record cannot answer, a record that is
-    not replayable); 4 different; 70 internal error."""
-    try:
-        result = _replay(instance, store, run_id, against_current)
-        code = _REPLAY_CODES[result.outcome]
-    except _ReplayStop as stop:
-        if not json_output:
-            typer.echo(f"horae replay: {stop.message}", err=True)
-            raise typer.Exit(stop.code) from None
-        result = ReplayResult(
-            run_id=run_id,
-            pipeline=stop.pipeline,
-            outcome="error",
-            against_current=against_current,
-            error=stop.message,
-        )
-        code = stop.code
-    except Exception as exc:
-        # As for doctor: only the exception type, never its message or locals.
-        name = type(exc).__name__
-        del exc
-        typer.echo(f"horae replay: internal error ({name}); please report it", err=True)
-        raise typer.Exit(EXIT_INTERNAL) from None
-    if json_output:
-        typer.echo(json.dumps(result.to_dict(), indent=2, ensure_ascii=False))
-    else:
-        typer.echo(result.render())
-    raise typer.Exit(code)
+    Exit codes: 0 identical; 1 configuration or store problem; 2 usage error (a bad option);
+    3 unknown run (or no store) or not comparable (pipeline, horae.lock or horae.yaml changed
+    without --against-current, unresolved plugin, a call the record cannot answer, a record
+    that is not replayable); 4 different; 70 internal error. With --json the report has every
+    key, also on errors (outcome `error`)."""
+    run_command(
+        "replay",
+        json_output,
+        lambda: _replay_report(instance, store, run_id, against_current, json_output),
+    )
 
 
-# `horae undo` lives in its own module (#22); registered here so `horae.cli.app` has it.
+# `horae init`, `horae run` and `horae undo` live in their own modules; registered here so
+# `horae.cli.app` has every command.
+from horae.cli_init import init as _init  # noqa: E402
+from horae.cli_run import run as _run  # noqa: E402
 from horae.cli_undo import undo as _undo  # noqa: E402
 
-app.command("undo")(_undo)
+_command("init")(_init)
+_command("run")(_run)
+_command("undo")(_undo)
+
+__all__ = [
+    "EXIT_DIFFERENT",
+    "EXIT_INTERNAL",
+    "EXIT_LOCKED",
+    "EXIT_NOT_COMPARABLE",
+    "EXIT_OK",
+    "EXIT_PLANNED_WITH_PROBLEMS",
+    "EXIT_PROBLEMS",
+    "EXIT_REFUSED",
+    "EXIT_SIGINT",
+    "EXIT_SIGTERM",
+    "EXIT_UNKNOWN_RUN",
+    "EXIT_USAGE",
+    "app",
+    "internal_message",
+    "report_error",
+]

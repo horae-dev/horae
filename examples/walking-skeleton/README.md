@@ -34,45 +34,24 @@ lines.
 
 ## Trying it
 
-`horae run` is #26. Until then, from Python (an editable checkout, `uv sync`). **Copy the
-example first** and edit the copy, so the repository's files stay as they are (the end-to-end
-test reads them) and `state/` and `plugins/` are not created inside the checkout:
+`horae init <dir>` writes a copy of this example into a new directory, with a `horae.lock`
+whose `file-sink` writes to `<dir>/vault` and the built-in plugins installed in
+`<dir>/plugins` (see the [README](../../README.md#getting-started)):
 
 ```sh
-cp -R examples/walking-skeleton /tmp/walking-skeleton
-# then set file-sink's paths.write in /tmp/walking-skeleton/horae.lock to your vault
+uv run horae init /tmp/walking-skeleton
+uv run horae run daily-fixture -i /tmp/walking-skeleton --dry-run
+uv run horae run daily-fixture -i /tmp/walking-skeleton
 ```
 
-```python
-import asyncio
-from pathlib import Path
-
-from horae.config import load_instance
-from horae.plugins.builtin import install
-from horae.runner import Runner, open_ports
-from horae.store import Store
-
-root = Path("/tmp/walking-skeleton")  # your copy, its horae.lock pointing at your vault
-install(root / "plugins")  # manifests pinned to this interpreter
-instance = load_instance(root)
-
-
-async def main(dry_run: bool) -> None:
-    async with open_ports(instance, root / "plugins") as live:
-        with Store.open(instance.store_path) as store:
-            record = await Runner(instance, store, live.ports).run("daily-fixture", dry_run=dry_run)
-            print(record.id, record.status, [c.target for c in record.changes])
-
-
-asyncio.run(main(dry_run=False))
-```
-
-Then `horae diff`, `horae replay` and `horae runs` work on the stored runs
-(`-i /tmp/walking-skeleton`). `horae undo` still writes with the built-in local sink
-(`--vault`), whose identity differs from `file-sink`'s, so it refuses (`sink_mismatch`) a run
-applied through the plugin until #26 wires undo to the plugin host: from Python, undo with
-`horae.apply.undo_run(store, run_id, live.sinks, clock=...)` inside `open_ports` (it fetches
-the sink's identity itself), as [`tests/test_e2e.py`](../../tests/test_e2e.py) does.
+To use this directory instead, **copy it first** (the end-to-end tests read these files, and
+`state/` and `plugins/` must not be created inside the checkout), set `file-sink`'s
+`paths.write` in the copy's `horae.lock` to your vault, and install the plugins:
+`python -c 'from pathlib import Path; from horae.plugins.builtin import install;
+install(Path("/tmp/copy/plugins"))'`. `horae diff`, `horae undo` and `horae run` then go
+through those plugins; `horae diff --vault` / `horae undo --vault` use the built-in local
+sinks instead (whose identity differs from `file-sink`'s, so undo refuses, `sink_mismatch`, a
+run applied through the plugin).
 
 `state/` and `plugins/` are created next to the files of your copy; they are not part of the
 example.

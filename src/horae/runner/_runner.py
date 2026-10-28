@@ -75,7 +75,8 @@ heartbeat, step write or the final save notices: the run is stopped and `RunLost
 loop's monotonic clock. Since liveness is the lock's, a wall-clock step only shifts recorded
 times (and may reorder run ids started across the step); it cannot make a live run look dead.
 
-**Not here.** The CLI `horae run` and its SIGTERM handling (#26).
+**The CLI.** `horae run` (`horae.cli_run`, #26) cancels the run on SIGINT and SIGTERM, as
+above, and exits 130 / 143.
 The ports are injected (`Ports`), so tests use `horae.engine.testing`, and the plugin host
 (#24) plugs in unchanged.
 """
