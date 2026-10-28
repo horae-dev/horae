@@ -1208,7 +1208,12 @@ loosened later without breaking a valid file.
       through a chain of `$defs` say, make one validation exponential); alternatives side by
       side (`properties`, `allOf`) do not multiply. This adds
       **`jsonschema` as a runtime dependency** (it was a dev dependency; #31 needs it to
-      validate outputs);
+      validate outputs). **Amended by #36 (decision 48 D4):** an `enum` or a `const` needs a
+      `type` beside it (`SchemaProblem` naming the JSON pointer: Anthropic's structured
+      output, `transform_schema`, refuses one without), and `horae doctor` reports a loaded
+      skill's schema that a backend's structured output still refuses (`schema_problems`,
+      with the pointer of the deepest refused subschema): an error when an alias of that
+      backend runs the skill, else a warning;
     - **(F) intents.** `intents` is a list of types or a mapping `type: max` (1 to 256, #35):
       at most `max` intents of that type per `llm` step; more is a `guard` violation that
       degrades the step (decision 46; it was `intent_rejected` before #35); a reused output
@@ -1981,10 +1986,170 @@ loosened later without breaking a valid file.
         match (wikilinks reuse the next `]]` and line end), plus one regular expression
         without nested quantifiers (`click`); a test scans 1 MiB per hostile shape.
 
+### Provisional decisions (#34, pending maintainer review)
+
+47. **De-identification before a cloud model, and no secret in a request (#34, design note
+    `docs/design/0034-deidentification.md` and the maintainer's answers on PR #98).**
+    Numbering: 46 is #35's (the action guard). Compatible v1 additions to `horae.yaml` and the run
+    record, and the rules of `horae.llm.deid`, `horae.llm.base`, the engine and the cache:
+    - **(A) local or cloud, explicit.** `models.<alias>.local: true | false` (optional,
+      strict boolean). Unset: `ollama` is local, every other backend (`anthropic`,
+      `claude-cli`, `openai-compatible`) is cloud (`LOCAL_BACKENDS`,
+      `ModelAlias.is_local`); never inferred from `base_url`. `horae doctor`'s price warning
+      now applies to every cloud alias by this rule (replacing decision 40's
+      `CLOUD_BACKENDS`): an `openai-compatible` alias with `local: true` is not warned, an
+      `ollama` alias with `local: false` is. `local` joins the alias' part of the cache's
+      stored key and `config_digest` only when set (an unset `local` is left out of both, so
+      the digests of an instance that does not use it are unchanged and old runs replay
+      without a "horae.yaml changed" error);
+    - **(B) what is declared.** Field classes in the skill's input view (#27, decision 39:
+      `path: {class: person|email|phone|place|amount|free_text}`, `amount` also
+      `buckets: [numbers]`), plus an optional **vocabulary**: `horae.yaml`
+      `deidentification: {vocabulary: <file name>}`, a file of `secrets.dir` (personal data:
+      never in the instance repository) read like a secret file (`SecretResolver.read_file`:
+      one path segment, a regular file of at most 64 KiB, opened once; not registered for
+      redaction). Its format is one `class: term` per line (`person`, `email`, `phone`,
+      `place`; `#` comments; 2 to 200 characters, no control character, at most 4096
+      terms); a plain format, not YAML, so no alias expansion and no parser echoing content.
+      Errors name the line, never the term. `horae doctor` reports an unusable vocabulary
+      as an error;
+    - **(C) the transforms** (`horae.llm.deid.pseudonymize`, a pure function of the viewed
+      input, the classes and the vocabulary): every scalar leaf **and every object key**
+      under a `person`, `email`, `phone` or `place` field becomes `[PERSON_1]`, `[EMAIL_1]`,
+      `[PHONE_1]`, `[PLACE_1]` (a value over `MAX_VALUE_CHARS`, 1 KiB, is withheld as
+      `[PERSON]`, not reversible); an `amount` becomes a bucket label (`<0`, `50-200`,
+      `>=1000`; default bounds 0, 10, 100, 1000, 10000; `[AMOUNT]` for a value that is not a
+      finite number), not reversible. **Every other string of the viewed input and every
+      object key** (`free_text` fields and unclassed ones alike: provisional B below) is
+      scanned for the known values: the vocabulary terms, the values of this input's
+      token-class fields (so "Lunch with Bob" is covered when Bob is an attendee) and each
+      name part of a `person` value or term (at least 3 letters, mapped to the whole name's
+      pseudonym: provisional C), replaced by their pseudonym; a phone's last 9 digits with
+      any `[\s.\-()]` separators and up to 4 digits of prefix; an amount's renderings
+      (provisional D), replaced by its bucket label. **Matching**: the string is NFKC-
+      normalized and stripped of format characters (zero-width, bidi controls, soft
+      hyphen), cut into tokens (letter runs `[^\W\d_]+`, digit runs, white-space runs, other
+      single characters), and compared token by token with the known values (letters
+      case-folded on both sides, `STRAUSS` = `Strauß`; any white-space run, NBSP and
+      ideographic space included, equals any other): a known value matches whole letter
+      runs only (`Alice` in `alice_smith`, `user_alice`, `alice123`; not in `Malice`),
+      leftmost then longest. A trie over the tokens, at most `MAX_TERM_TOKENS` (48) deep:
+      linear in the text whatever the number of terms (600 KB and 4096 terms well under a
+      second). A string in which nothing is found is sent byte-identical. Text of the input
+      shaped like a pseudonym (`[PERSON_1]`, any case, fullwidth brackets after NFKC) is
+      first **neutralized** to `(PERSON_1)` (counted `neutralized`), so the model can never
+      be handed a pseudonym that re-identification would turn into a real value. Two keys
+      of one object that are the same once pseudonymized fail closed (`deid_unavailable`).
+      A classed path under another classed path is refused (`DeidError`, a defence in depth:
+      the skill contract already refuses overlapping view paths);
+    - **(D) stable per run, no key** (maintainer answer 3). Pseudonyms are numbered per
+      class in order of first occurrence: the classed leaves and keys in canonical order
+      (sorted keys, array order), then the matches in scanned strings; the same value
+      (the same tokens) keeps its pseudonym. The same input always gives byte-identical
+      requests, so a replay or a cache hit recomputes the same mapping. Cross-run stability
+      (keyed HMAC) is a later option. `DEID_VERSION` is 2 (the matching of the privacy
+      review);
+    - **(E) where it runs and what is stored.** The engine applies it (`execute(deid=...)`,
+      the `horae.engine.ports.Deidentifier` port, `horae.llm.deid.Deidentifier` built by the
+      runner and by `horae replay` from `horae.yaml`), for a skill with classes and a cloud
+      alias (on by default, no opt-out in v1: answer 7), because the engine is the one
+      place that sees the three paths (a call, a cache hit, a replay). Order: input view →
+      pseudonymize (in a worker thread, within the step's `timeout_s`) → `LlmRequest` (`input` pseudonymized, `classified`, `deidentified` = the
+      summary) → `ModelBackends` renders (appends `DEID_NOTE`: copy placeholders verbatim)
+      → T10 check → send → schema validation → the attempt is recorded in `llm[]` and its
+      usage spent → **re-identify** the accepted output and raw intents (the growth is
+      summed first, `Pseudonyms.growth`: past `MAX_REIDENTIFIED_BYTES`, 256 KiB, the step
+      degrades with `output_too_large` and nothing is substituted; the call and its cost
+      stay recorded) → the permission check, the action guard (decision 46) and routing, all on the
+      **re-identified** intents and against the **real** viewed input (`guard_for(viewed)`):
+      a URL or note link present in the real input matches, and no pseudonym reaches the
+      guard's link and tag rules (they are put back first; an unresolved one is left as the
+      model wrote it and judged as any other text). The mapping lives only in memory: `llm[].response` and `llm[].intents`
+      are what the provider returned (pseudonymized), `llm[].input_hash` the hash of what
+      was sent, `llm[].request.deid` `{version, input_sha256, counts, unresolved}` (a digest
+      of what was sent, never one of the mapping or of a value, which could be guessed);
+      the step output and the routed intents carry real values. The LLM cache stores the
+      pseudonymized output (from `llm[]`) and the digest of what was sent
+      (`deid_input_sha256`), re-identified on a hit; the usage ledger holds no data. A
+      reused output (`PreviousLlm`: a cache hit, or a replay's recorded reuse, whose
+      `request.deid.input_sha256` is kept) is reused only when its `deid_input_sha256`
+      equals this run's de-identified digest (`None` on both sides without
+      de-identification): otherwise a miss, and a replay reports a mismatch ("the
+      de-identified input differs (vocabulary changed…)"). Both checks of `ModelBackends`
+      (`deid_required` and T10) live in `ModelBackends` only: an engine given another
+      `LlmBackend` (a test double, the replay tape) has neither, so the runner always wires
+      `ModelBackends`. **For #29 (`claude-cli`, PR #105)**: the subprocess' argv and stdin
+      must be derived only from the decoded frozen body (`RenderedRequest.body()`), never
+      from the `Completion` or the request, so the bytes checked are the bytes sent. As a backstop, `ModelBackends.prepare` refuses a `classified` request to a
+      cloud alias that was not de-identified (`deid_required`, an engine given no policy);
+      a policy that cannot de-identify (unreadable vocabulary) degrades the step
+      (`deid_unavailable`) before anything is sent. Both are not billed;
+    - **(F) the cache key** (decision 45 G). For a cloud alias, the stored key adds
+      `deid: {version, vocabulary}` (`DEID_VERSION`, the vocabulary file's SHA-256, or
+      `"unavailable"`), so another vocabulary or transform version is a miss and an entry is
+      only re-identified with the mapping that made it; a local alias' key is unchanged.
+      `LLM_KEY_VERSION` is not bumped (the preamble is unchanged; `DEID_NOTE` is part of a
+      de-identified request only, and those keys changed anyway). Entries of cloud aliases
+      written before #34 are therefore a miss once;
+    - **(G) unresolved pseudonyms are left and noted** (answer 4): a pseudonym the input
+      never issued, or a mangled one (`Person 1`, `PERSON1`, `[person_1]`), stays as the
+      model wrote it and is listed in `llm[].request.deid.unresolved` (at most 16, 40
+      characters each); no repair retry. Re-identification puts back the original value's
+      **text** (`_text(value)`): a string stays a string, also when it is exactly one
+      pseudonym of a number (a phone given as a number comes back as `"33612345678"`), so
+      the validated output keeps its types (finding 5);
+    - **(H) no secret in a request (T10, the #14 addition).** `ModelBackends.send` scans the
+      exact frozen body (`RenderedRequest.body()`) with the process registry
+      (`horae.secrets.redact.current()`), primed once with **every secret the instance
+      declares** (`ModelBackends.redaction_names` = `Instance.redaction_names()`, the #53 set:
+      `secrets.refs`, the lockfile's plugin secrets, the aliases' `secret`), not only those
+      this process resolved: the raw bytes and the decoded JSON (strings, object keys,
+      whole numbers), every encoding of decision 43. For **every** backend, local ones
+      too (a secret in a request is never legitimate, and a local endpoint may log it).
+      A match raises `secret_in_request` naming the secrets (never a value; the log
+      line gives only their count) before the provider backend is called: nothing is sent, the usage ledger
+      releases the reservation (`NOT_BILLED`, decision 41), the step is `degraded` and the
+      engine records a `secret_in_request` **violation** (run record v1, a compatible
+      addition to `violations[].kind`: answer 6);
+    - **(I) after the privacy review (provisional, pending maintainer review).** The
+      maintainer's answers on PR #98 stand (1: explicit `local:`, never inferred from
+      `base_url`; 2: classes in the input view plus a vocabulary in `secrets.dir`; 3: per
+      run; 4: leave and note; 5: render then send; 6: a `secret_in_request` violation;
+      7: on by default). Provisional answers to the review's open questions:
+      - **A**: `local` stays explicit and is never inferred; `horae doctor` **warns** when
+        an `ollama` alias leaves `local` unset and its `base_url` host is neither loopback,
+        private, single-label nor a local name (`.localhost`, `.local`, `.lan`,
+        `.internal`, `.home.arpa`), or its model tag ends with `-cloud`;
+      - **B**: once a skill declares any class, the known-value matcher runs over every
+        string of the viewed input (not only `free_text` fields) and every object key;
+      - **C**: each name part (at least 3 letters) of a `person` value or term is a term
+        mapped to the same pseudonym as the whole name (privacy over meaning: `[PERSON_1]`
+        for "Bob" is put back as "Bob Martin");
+      - **D**: an amount's renderings (`1234.56`, `1234,56`, `1,234.56`, `1.234,56`,
+        `1 234,56`, `1'234.56`, the whole part `1234`; at least 3 digits, not all zeros) in
+        a string become its bucket label (not reversible, not a pseudonym; counted in
+        `amount`); object keys under a token-class field become pseudonyms (and are put
+        back by re-identification);
+      - **E**: bucket bounds written by the skill are accepted as they are (skills are
+        trusted code, reviewed with their plugin): a skill could choose narrow buckets
+        that reveal an amount, as it could simply not classify the field;
+      - **F**: the T10 check scans every secret the instance declares (the primed #53
+        registry), not only the ones this process resolved (see H);
+      - **G**: `input_hash` (the engine's cache key, decision 47 E) stays an unsalted
+        SHA-256 of the real viewed input: it is stored locally only (run record, cache),
+        never sent, and a salt would break replay and the cache across processes; a
+        dictionary attack on it needs the store, which holds the real outputs anyway;
+    - **limits**: matching misses nicknames, initials, typos and transliterations, and
+      over-matches a known value that is also a common word; a value of more than 48
+      tokens is not looked for in text; values in unclassed fields that equal no known value
+      are sent as they are (the input view stays the primary control);
+    - **follow-ups**: per-instance pseudonyms by keyed HMAC; NER-assisted detection in
+      `free_text`; de-identification of data sent to plugins.
+
 ### Provisional decisions (#36, pending maintainer review)
 
 48. **Skill evaluation harness: golden cases, recorded responses, `horae eval` (#36).**
-    Numbering: 46 is #35's, 47 is held by #34 (de-identification). Two new contracts,
+    Numbering: 46 is #35's, 47 is #34's (de-identification). Two new contracts,
     `schemas/eval-case/v1.json` (`horae.contracts.evals.EvalCase`) and
     `schemas/eval-recorded/v1.json` (`RecordedResponse`), and the rules of `horae.evals` and
     `horae.cli_eval`:
@@ -2032,53 +2197,127 @@ loosened later without breaking a valid file.
       and the built-in plugins);
     - **(E) the skill** comes from the instance's installed plugins (`<instance>/plugins`,
       checked against `horae.lock`, `plugins_invalid` 1) or, with `--plugin-dir`, a plugin
-      folder or a folder of plugins (folders without a valid `plugin.yaml` are skipped); it is
+      folder or a folder of plugins (folders without `plugin.yaml` are skipped; see M); it is
       loaded as the engine loads it (`load_skill` with the plugin's `permissions.intents`,
       `skill_invalid` 1). An unknown skill is `unknown_skill` (3), a malformed name a usage
       error (2), an unknown `--case` `unknown_case` (3), an invalid case or recording
       `eval_invalid` (1), a skill without cases `no_cases` (1);
-    - **(F) `--live` spends money, explicitly.** It needs the instance (its alias and secret;
-      `--alias`, required when the instance has more than one, `unknown_alias` 3). Every case is
-      rendered first and the eval's worst case (the sum of `ModelBackends.worst_case`, what the
-      usage ledger would reserve) is shown on stderr. It must fit `--max-usd` and what the
-      instance's `budgets.daily` has left today (`Store.day_spend` of the usage ledger, read
-      only, when the store exists; the whole ceiling otherwise), else `budget_exceeded` (3),
-      nothing sent. **`--max-usd` is required when no daily budget bounds the eval** (usage, 2).
-      Then `--yes`, or a confirmation on a terminal (refused: `not_confirmed`, 3; not a terminal
-      without `--yes`: usage, 2). Each case is sent **once** (no repair retry: the eval reports
+    - **(F) `--live` spends money, explicitly, and records it** (D1, review findings 1 to 4).
+      It needs the instance (its alias and secret; `--alias`, required when the instance has
+      more than one, `unknown_alias` 3). Every case is rendered first and the eval's worst
+      case (the sum of `ModelBackends.worst_case`, what the usage ledger reserves) is shown on
+      stderr. A **cloud alias without a `price`** (`ModelAlias.is_local` false, decision 47 A)
+      is refused (`unpriced_alias`, 3) unless `--allow-unpriced` (D3); `--max-usd` must be a
+      finite amount over 0 (usage, 2). The worst case must fit `--max-usd` and what the
+      instance's `budgets.daily` has left today (`Store.day_spend`), else `budget_exceeded`
+      (3), nothing sent. **`--max-usd` is required unless a daily `usd` ceiling bounds the
+      eval** (a `tokens_out`-only ceiling does not bound the cost: usage, 2). Then `--yes`, or
+      a confirmation on a terminal (refused: `not_confirmed`, 3; not a terminal without
+      `--yes`: usage, 2), then **the allowance is read again** (it may have changed while the
+      confirmation waited). Each case is sent **once** (no repair retry: the eval reports
       validity, it does not repair) with the alias' declared key, through a provider backend
-      that keeps the raw result for `--record`. **The eval is not a run**: it records nothing in
-      the store, its ledger or the LLM cache (provisional; recording eval spend in the ledger
-      needs a run row, a follow-up). A report is written to
-      `<state_dir>/evals/<namespace>/<skill>/<UTC timestamp>.json` (the `--json` document, with
-      `report` set) and a `.txt` summary beside it (folders 0700, files opened `x`). Each live
-      case also carries its `usage`, `worst_case` and `recorded_diff` (the unified diff against
-      the recorded output, both redacted);
-    - **(G) `--record`** (with `--live` only) replaces each answered case's recording,
-      atomically (a temporary file in the same folder, then `rename`). The output and stop
-      reason are redacted with the process registry first (decision 43: the instance's secrets
-      are primed by `load`, the alias' key once resolved), so a key echoed by the model is
-      written `[REDACTED:<NAME>]`; a recording that cannot be written is reported on stderr and
-      the eval goes on;
+      that keeps the raw result for `--record`. A report is written to
+      `<state_dir>/evals/<namespace>/<skill>/<UTC timestamp>.json` (the `--json` document,
+      with `report` set) and a `.txt` summary beside it;
+    - **(G) `--record`** (D2, findings 6 and 12) needs `--live` **and `--plugin-dir`** (a
+      plugin's own folder: never the instance's installed plugins, which `horae.lock` pins;
+      usage, 2). It replaces the recording of each case **whose live answer passes the case**
+      (so a case expecting `schema_valid: false` or `guard: violation` records the bad answer
+      it proves is caught); any other answer is not written and the case says why
+      (`recorded_skipped`). The output and stop reason are redacted with the process registry
+      first (decision 43). A recording is written atomically and durably (finding 11):
+      `mkstemp` in the backend folder (`O_EXCL`, random name, 0600), written, `fsync`ed,
+      `chmod` 0644, `os.replace`d, then the folder `fsync`ed; a recording that cannot be
+      written is reported on stderr and the eval goes on;
     - **(H) results and exit codes** (decision 37). Each case (per backend) is `pass`, `fail` (a
-      check failed) or `error` (it could not be evaluated: `no_recording`, `input_invalid`, a
-      backend or validator error). Exit `0` every case passed, `4` some failed, `1` some could
-      not be evaluated (or any problem above), `2` usage, `3` unknown or refused, `70` internal.
-      `--json`: `{schema_version, mode, skill, skill_version, skill_digest, plugin, alias, cases:
-      [{case, backend, model, status, schema_valid, schema_errors, intents_error, guard
-      (pass | violation | not_run), guard_detail, stale, checks: [{name, ok, message, diff}],
-      usage, worst_case, recorded_diff, recorded_path, error}], summary: {cases, passed, failed,
-      errors, stale, usage}, estimate, report, error}` (`error` is `eval_failed` or
-      `eval_errors` with a count, else `null`); a command error is `{schema_version, error}`.
-      Diffs are unified diffs of indented canonical JSON (sorted keys, ASCII), at most 400
-      lines; text output escapes untrusted characters (`safe`). Schema errors and guard details
-      stay content-free (decisions 44 and 46);
+      check failed) or `error` (it could not be evaluated: `no_recording`, `input_invalid`,
+      `eval_invalid`, `deid_unavailable`, `case_failed`, a backend or validator error). Exit
+      `0` every case passed, `4` some failed, `1` some could not be evaluated, the report could
+      not be written, or any problem above, `2` usage, `3` unknown or refused, `70` internal,
+      `130` interrupted. `--json`: `{schema_version, mode, skill, skill_version,
+      skill_digest, plugin, alias, run, cases: [{case, backend, model, status, schema_valid,
+      schema_errors, intents_error, guard (pass | violation | not_run), guard_detail, stale,
+      checks: [{name, ok, message, diff}], usage, worst_case, recorded_diff, recorded_path,
+      recorded_skipped, stop_reason, error}], summary: {cases, passed, failed, errors, stale,
+      usage}, estimate, report, report_error, error}` (`error` is `eval_failed`,
+      `eval_errors` or `interrupted`, else `null`); a command error is `{schema_version,
+      error}`. **The report has its own version, `EVAL_REPORT_SCHEMA_VERSION` = 1**
+      (finding 14), not the CLI error envelope's. Diffs are unified diffs of indented
+      canonical JSON (sorted keys, ASCII), at most 400 lines; text output escapes untrusted
+      characters (`safe`). Schema errors and guard details stay content-free (decisions 44
+      and 46);
     - **(I) `pack-daily-brief`** ships three cases for `daily-brief/rank-and-word` with
       `anthropic` recordings (synthetic): `overdue-first` (assertions, one note), `tasks-only`
       (exact output, no intent) and `injected-embed` (a recorded output that obeyed an injected
-      image embed; the guard must refuse it). Rendering them for `anthropic` showed that the
-      fixture's output schema could not be used for structured output (`transform_schema`
-      needs a `type` beside `enum` and `const`): the fixture now declares `"type": "string"`
-      there;
-    - **follow-ups**: recording live eval spend in the usage ledger; a `--repair` live mode
-      that exercises the repair retry; `horae eval --all` over every installed skill.
+      image embed; the guard must refuse it). The fixture pack satisfies the issue's "used by
+      pack-daily-brief" for now (D7): a real `pack-daily-brief` repository adopting the cases
+      is future work. Rendering them for `anthropic` showed that the fixture's output schema
+      could not be used for structured output (`transform_schema` needs a `type` beside
+      `enum` and `const`): the fixture now declares `"type": "string"` there, and the loader
+      requires it (D4);
+    - **(J) a live eval is a run of its own** (D1). Under its own lock
+      (`<state_dir>/locks/_eval-<sha256 of the pipeline, 16 hex>.lock`: another live eval of
+      the skill is `eval_busy`, 3) the eval opens the store **for writing** (created when
+      missing, as a run does), abandons a dead eval's `running` row (`recover_pipeline`), and,
+      once the gate passed, `begin_run`s a row of pipeline **`eval:<skill>`** (a pipeline name
+      never holds `:`; a skill name too long for the store's 64 characters keeps its start and
+      ends with a digest). Each case is then sent through **`LedgerLlm.complete`**, like a
+      run's `llm` step: prepared, reserved atomically against the daily ceilings inside
+      `BEGIN IMMEDIATE` (`MIN_OUTPUT_TOKENS` floor; a ceiling another process spent since the
+      pre-flight refuses the case, `budget_exceeded`, nothing sent), sent, then settled or
+      released; each case is its own `step` of the row. `Store.finish_bare_run` then marks
+      the row `ok` (every case sent) or `failed` (interrupted), with the cases' cost; the row
+      never gets a run record. **Migration 7** rebuilds the `runs` table so that a finished
+      `eval:` row may have no record (its CHECK allows `substr(pipeline, 1, 5) = 'eval:'`).
+      `horae runs` hides `eval:*` rows unless `--all` (or `--pipeline eval:<skill>`); `horae
+      usage` and the daily ceilings count them like any other pipeline's;
+    - **(K) failures midway** (finding 5). A case whose sending raises anything but a
+      cancellation is an error result (`case_failed`, the exception's type only) and the next
+      case is sent. Each result is kept as soon as it is known: an interruption (Ctrl-C) or a
+      bug midway still finishes the run row (`failed`), settles what the ledger can (an
+      interrupted call keeps its reservation, `estimated`), writes the report of the cases
+      sent (`error: interrupted`), then exits 130 (or 70). A report that cannot be written is
+      said on stderr and in `report_error`, the JSON document is still printed, and the exit
+      code is at least 1;
+    - **(L) report files** (finding 10). Each folder level under the state directory
+      (`evals/`, the namespace, the skill) is created 0700 and must be a real directory (not
+      a link); the `.json` and `.txt` are written 0600 to new temporary names (`O_CREAT |
+      O_EXCL | O_NOFOLLOW`), `fsync`ed, then renamed into place, the `.txt` first and the
+      `.json` last; an existing report is never replaced;
+    - **(M) eval files** (findings 7 and 13). Dotfiles (`.DS_Store`, editors' swap files,
+      temporary recordings) in `evals/`, `recorded/` and the backend folders are skipped. A
+      case file whose name is not a case name, an invalid case and an invalid recording are
+      **error results of that case** (`eval_invalid`, the file named), the other cases still
+      run; `--case` must be a case name (usage, 2). With `--plugin-dir`, an invalid
+      `plugin.yaml` of the folder itself is `plugins_invalid` (1); in a folder of plugins, a
+      skill no valid manifest provides is `plugins_invalid` when some manifest is invalid
+      (it may be that one's), else `unknown_skill`; **two plugins providing the skill are
+      refused** (`plugins_invalid`);
+    - **(N) the judge shares the engine's rules** (D5, findings 8 and 9). `_Replay` is kept
+      (offline renders with the real backend and replays the recording), but a case **fails**
+      (`stop_reason` check) when the recorded or live stop reason is a refusal or a
+      truncation (`horae.llm.backends.UNUSABLE_STOP_REASONS` = `REFUSAL_STOP_REASONS`
+      `{refusal, content_filter}` | `TRUNCATION_STOP_REASONS` `{max_tokens,
+      model_context_window_exceeded, length, model_length}`, shared by the backends). The
+      engine's `fill_target(payload, binds)` fills omitted targets (from the case's
+      `targets`) and `check_task_fingerprints(typed, shown)` refuses a `task.update_status`
+      of a task the model was not shown (`intents_error`), both used by `_Run.propose` and by
+      the eval. A case also fails when its usage is over its budget (`usage_within_budget`).
+      `budget_from: <pipeline>` (a case taking a pipeline's `llm` step budget) is not done:
+      a follow-up;
+    - **(O) de-identification** (decision 47). A classified skill's viewed input is
+      pseudonymized for a cloud alias before it is rendered (offline and live, with the
+      instance's policy when an instance is loaded, else the alias' own with no vocabulary),
+      the request says so (`classified`, `deidentified`), and the output and intents are
+      re-identified before they are judged, as a run does; a vocabulary that cannot be used
+      is `deid_unavailable` and nothing is sent. A recording holds what the provider saw (the
+      pseudonymized output), never the real values; offline, the same pseudonymization gives
+      the same request digests (not stale);
+    - **D4** (amends decision 39 E): the skill loader requires a `type` beside `enum` /
+      `const`; CI renders every fixture and built-in skill through every backend in
+      `FACTORIES` (render only, never sent, `tests/test_evals.py`); `horae doctor` reports a
+      schema a backend's structured output refuses, with the offending JSON pointer, and the
+      Anthropic render's error now carries that pointer and its cause;
+    - **follow-ups**: `budget_from`; a `--repair` live mode that exercises the repair retry;
+      `horae eval --all` over every installed skill; a JSON Schema for the eval report
+      (`schemas/eval-report/v1.json`); a real `pack-daily-brief` repository with its cases.

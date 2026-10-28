@@ -45,7 +45,7 @@ from horae.contracts.plugin import PluginManifest
 from horae.contracts.run import Usage
 from horae.engine import TARGET_FIELDS, check_task_fingerprints, fill_target
 from horae.engine.guard import check_intents
-from horae.engine.ports import LlmError, LlmRequest, LlmResponse
+from horae.engine.ports import DeidUnavailable, LlmError, LlmRequest, LlmResponse
 from horae.evals._cases import LoadedCase
 from horae.intents import IntentRejected, validate_intents
 from horae.llm.backends import FACTORIES, UNUSABLE_STOP_REASONS
@@ -58,6 +58,7 @@ from horae.llm.base import (
     Validator,
     production_validator,
 )
+from horae.llm.deid import Deidentifier, Pseudonymized, field_classes
 from horae.llm.validate import validate_output
 from horae.secrets import SecretResolver
 from horae.secrets.redact import current as current_redactor
@@ -364,15 +365,49 @@ def judge_intents(sue: SkillUnderEval, loaded: LoadedCase, viewed: Any, result: 
 # --- requests ---------------------------------------------------------------------------------
 
 
+def classified(sue: SkillUnderEval) -> bool:
+    """Whether the skill's input view names a field class (#34)."""
+    return bool(field_classes(sue.skill.view_options))
+
+
+def deidentify(
+    sue: SkillUnderEval, policy: Deidentifier, alias: str, viewed: Any, result: CaseResult
+) -> tuple[bool, Pseudonymized | None]:
+    """`(ok, pseudonymized viewed input)` as the engine's `llm` step makes it before a cloud
+    alias (schemas decision 47; `None`: a local alias, or a skill without classes); not ok
+    (and `result` an error, `deid_unavailable`) when it cannot be done: nothing is sent."""
+    try:
+        return True, policy.pseudonymize(alias, sue.skill.view_options, viewed)
+    except DeidUnavailable as error:
+        result.fail("deid_unavailable", f"{sue.skill.name}: {str(error)[:200]}")
+        return False, None
+
+
+def reidentify(pseudo: Pseudonymized | None, result: CaseResult) -> None:
+    """Put the real values back into the result's output and intents (the engine does it
+    after validation, before routing and the guard)."""
+    if pseudo is None:
+        return
+    result.output, _ = pseudo.reidentify(result.output)
+    intents, _ = pseudo.reidentify(result.intents)
+    result.intents = list(intents) if isinstance(intents, list) else []
+
+
 def request_for(
-    sue: SkillUnderEval, alias: str, loaded: LoadedCase, viewed: Any, timeout_s: float
+    sue: SkillUnderEval,
+    alias: str,
+    loaded: LoadedCase,
+    viewed: Any,
+    timeout_s: float,
+    pseudo: Pseudonymized | None = None,
 ) -> LlmRequest:
-    """The one attempt of a case, as the engine builds it for the `llm` step."""
+    """The one attempt of a case, as the engine builds it for the `llm` step: the viewed
+    input, or its pseudonymized copy for a cloud alias (`deidentify`)."""
     skill = sue.skill
     return LlmRequest(
         skill.name,
         alias,
-        viewed,
+        viewed if pseudo is None else pseudo.data,
         loaded.case.budget or DEFAULT_BUDGET,
         timeout_s,
         1,
@@ -380,6 +415,8 @@ def request_for(
         output_schema=skill.output_schema,
         skill_version=skill.version,
         skill_digest=skill.digest,
+        classified=classified(sue),
+        deidentified=None if pseudo is None else pseudo.summary(),
     )
 
 
@@ -512,9 +549,12 @@ async def run_offline(
     timeout_s: float = DEFAULT_TIMEOUT_S,
     factories: Mapping[str, BackendFactory] = FACTORIES,
     validate: Validator | None = None,
+    deid: Deidentifier | None = None,
 ) -> list[CaseResult]:
     """Every case against its recorded responses: one result per recorded backend, or only
-    for the backend of `alias` (`(name, spec)` from the instance's models)."""
+    for the backend of `alias` (`(name, spec)` from the instance's models). A classified
+    skill's input is de-identified for a cloud alias as a run does it (`deid`: the instance's
+    policy; without one, the alias' own, with no vocabulary)."""
     checker = validate or validate_output
     results: list[CaseResult] = []
     for loaded in cases:
@@ -528,7 +568,9 @@ async def run_offline(
             continue
         for backend in backends:
             results.append(
-                await _offline_case(sue, loaded, backend, alias, timeout_s, factories, checker)
+                await _offline_case(
+                    sue, loaded, backend, alias, timeout_s, factories, checker, deid
+                )
             )
     return results
 
@@ -541,6 +583,7 @@ async def _offline_case(
     timeout_s: float,
     factories: Mapping[str, BackendFactory],
     validate: Validator,
+    deid: Deidentifier | None = None,
 ) -> CaseResult:
     result = CaseResult(loaded.name, backend)
     recorded = loaded.recorded.get(backend)
@@ -550,12 +593,17 @@ async def _offline_case(
     if viewed is None:
         return result
     name, spec = alias if alias is not None else ("eval", offline_alias(backend, recorded.model))
+    policy = Deidentifier({name: spec}) if deid is None else deid
+    ok, pseudo = deidentify(sue, policy, name, viewed, result)
+    if not ok:
+        return result
     backends = _offline_backends(name, spec, recorded, factories, validate)
     try:
-        rendered = backends.render(request_for(sue, name, loaded, viewed, timeout_s))
+        rendered = backends.render(request_for(sue, name, loaded, viewed, timeout_s, pseudo))
         result.stale = staleness(sue, rendered, recorded)
         result.stop_reason = recorded.stop_reason
         absorb(await backends.send(rendered), result)
+        reidentify(pseudo, result)
     except LlmError as error:
         return result.fail(error.kind, error.message)
     finally:
@@ -639,13 +687,21 @@ class Planned:
     request: LlmRequest
     rendered: RenderedRequest
     worst_case: Usage
+    pseudo: Pseudonymized | None = None
+    """The case's pseudonymized input for a cloud alias (in memory only)."""
 
 
 def plan_live(
-    live: LiveEval, sue: SkillUnderEval, cases: Sequence[LoadedCase], timeout_s: float
+    live: LiveEval,
+    sue: SkillUnderEval,
+    cases: Sequence[LoadedCase],
+    timeout_s: float,
+    deid: Deidentifier | None = None,
 ) -> tuple[list[Planned], list[CaseResult]]:
     """Render every case (no I/O: `prepare` reads nothing but the request) and bound what it
-    can cost (`ModelBackends.worst_case`); cases that cannot be rendered are errors."""
+    can cost (`ModelBackends.worst_case`); cases that cannot be rendered (or de-identified
+    for a cloud alias, `deid`: the instance's policy) are errors."""
+    policy = Deidentifier(live.backends.models) if deid is None else deid
     planned: list[Planned] = []
     errors: list[CaseResult] = []
     for loaded in cases:
@@ -654,14 +710,18 @@ def plan_live(
         if viewed is None:
             errors.append(result)
             continue
-        request = request_for(sue, live.alias, loaded, viewed, timeout_s)
+        ok, pseudo = deidentify(sue, policy, live.alias, viewed, result)
+        if not ok:
+            errors.append(result)
+            continue
+        request = request_for(sue, live.alias, loaded, viewed, timeout_s, pseudo)
         try:
             rendered = live.backends.render(request)
         except LlmError as error:
             errors.append(result.fail(error.kind, error.message))
             continue
         worst = live.backends.worst_case(rendered)
-        planned.append(Planned(loaded, viewed, request, rendered, worst))
+        planned.append(Planned(loaded, viewed, request, rendered, worst, pseudo))
     return planned, errors
 
 
@@ -743,6 +803,7 @@ async def send_live(
             out.append(result.fail("case_failed", message))
             continue
         absorb(response, result)
+        reidentify(item.pseudo, result)
         raw = None if capture is None else capture.last
         if raw is not None:
             result.stop_reason = raw.stop_reason

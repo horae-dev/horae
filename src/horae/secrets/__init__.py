@@ -257,6 +257,15 @@ class SecretResolver:
         redact.remember(secret)
         return secret
 
+    def read_file(self, file_name: str) -> bytes:
+        """The bytes of the private file `file_name` of the secrets directory (e.g. the
+        de-identification vocabulary, #34), read with the same checks as a secret file: one
+        path segment, a regular file of at most `MAX_SECRET_BYTES`, opened once. Not a
+        secret: it is not remembered for redaction. Raises `SecretError` (never the content)."""
+        if not file_name or "/" in file_name or "\\" in file_name or file_name.startswith("."):
+            raise SecretError(safe_excerpt(file_name, 32), "invalid file name")
+        return self._read(file_name, self._directory / file_name)
+
     def _from_env(self, name: str, variable: str) -> Secret:
         if variable not in self._environ:
             raise SecretError(name, f"environment variable {variable} is not set")

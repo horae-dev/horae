@@ -128,6 +128,7 @@ from horae.engine import (
     make_context,
     pipeline_digest,
 )
+from horae.llm.deid import load_deidentifier
 from horae.runner._budget import LedgerLlm
 from horae.runner._cache import StoreLlmCache
 from horae.runner._lock import PipelineLock, try_acquire_apply_lock
@@ -425,12 +426,12 @@ class Runner:
         lock = await self._lock(name)
         try:
             self._recover(name)
+            config = self.instance.config
+            deid = load_deidentifier(
+                config.models, self.instance.secret_resolver(), config.deidentification.vocabulary
+            )
             llm_cache = StoreLlmCache(
-                self.store,
-                self.instance.config.cache,
-                self.clock,
-                read=cache,
-                models=self.instance.config.models,
+                self.store, config.cache, self.clock, read=cache, models=config.models, deid=deid
             )
             if not dry_run:
                 llm_cache.purge()
@@ -687,6 +688,7 @@ class Runner:
                 config_digest=self.instance.config_digest(),
                 on_step=on_step,
                 clock=self.clock,
+                deid=llm_cache.deid,
             )
         )
         task.add_done_callback(_retrieve)

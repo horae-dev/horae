@@ -311,3 +311,37 @@ def test_doctor_loads_the_skills_of_the_pipelines(tmp_path: Path) -> None:
     assert text.exit_code == cli.EXIT_PROBLEMS
     assert chr(0x202E) not in text.output
     assert "skill_invalid" in text.output
+
+
+def test_doctor_reports_a_schema_a_backend_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Schemas decision 48 D4: a loaded skill whose output schema a backend's structured
+    # output refuses is reported with the offending pointer; an error when an alias of that
+    # backend runs the skill, a warning otherwise.
+    import horae.llm.backends as backends
+
+    root = _with_skill(tmp_path)
+    monkeypatch.setitem(
+        backends.SCHEMA_CHECKS,
+        "anthropic",
+        lambda schema: "#/properties/x: ValueError: refused",
+    )
+    code, report = _report(root)
+    assert code == cli.EXIT_PROBLEMS
+    (message,) = _messages(report)
+    assert message == (
+        f"plugins/pack-daily-brief/skills/{SKILL}/output.schema.json: output schema unusable "
+        "for anthropic structured output: #/properties/x: ValueError: refused"
+    )
+    monkeypatch.delitem(backends.SCHEMA_CHECKS, "anthropic")
+    monkeypatch.setitem(
+        backends.SCHEMA_CHECKS,
+        "ollama",
+        lambda schema: "#: refused",
+    )
+    code, report = _report(root)
+    assert code == 0, report
+    problems = report["problems"]
+    assert isinstance(problems, list)
+    assert [p["severity"] for p in problems] == ["warning"]

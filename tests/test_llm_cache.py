@@ -24,6 +24,7 @@ from horae.config import Instance, load_instance
 from horae.contracts import CacheConfig, InstanceConfig, RunRecord
 from horae.engine import LlmRequest, LlmResponse, PreviousLlm
 from horae.engine.testing import FakeLlm, llm_response
+from horae.llm.deid import Deidentifier
 from horae.replay import replay
 from horae.runner import Ports, Runner, StoreLlmCache, accepted_entry
 from horae.secrets import Secret, redact
@@ -86,6 +87,7 @@ def _run(
 
 
 def _cache(inst: Instance, store: Store, **kwargs: Any) -> StoreLlmCache:
+    kwargs.setdefault("deid", Deidentifier(inst.config.models))  # as the runner builds it
     return StoreLlmCache(
         store, inst.config.cache, Clock(), read=True, models=inst.config.models, **kwargs
     )

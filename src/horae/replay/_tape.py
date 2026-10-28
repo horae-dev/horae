@@ -23,6 +23,7 @@ from horae.engine.ports import (
     PreviousLlm,
     ToolCallError,
     ToolResult,
+    deid_digest,
 )
 from horae.engine.template import TemplateError
 
@@ -203,6 +204,7 @@ def recorded_previous(record: RunRecord) -> PreviousLlm | None:
                 model=call.model,
                 backend=call.backend,
                 source_run=_source_run(call.request.get("source_run")),
+                deid_input_sha256=deid_digest(call.request),
             )
     return None
 
@@ -252,6 +254,11 @@ class RecordedLlm:
         if call.model_alias != request.model:
             raise self._mismatch(f"{attempt}: the model alias differs")
         if call.input_hash != sha256_hex(request.input):
+            if deid_digest(call.request) is not None or request.deidentified is not None:
+                raise self._mismatch(
+                    f"{attempt}: the de-identified input differs (vocabulary changed, or "
+                    "de-identification was not applied the same way)"
+                )
             raise self._mismatch(f"{attempt}: the input differs")
         if list(request.repair) != call.repair:
             raise self._mismatch(f"{attempt}: the repair errors differ")

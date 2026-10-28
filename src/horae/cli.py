@@ -57,6 +57,7 @@ from horae.config import (
     validate,
 )
 from horae.contracts import InstanceConfig, RunRecord
+from horae.llm.deid import load_deidentifier
 from horae.replay import LockRegistry, ReplayResult, definition_for, replay
 from horae.runner import lock_is_free
 from horae.secrets import logs
@@ -530,6 +531,11 @@ def _replay(instance: Path, store: Path | None, run_id: str, against_current: bo
         lock_digest=loaded.lock_digest(),
         config_digest=loaded.config_digest(),
         skills=skills,
+        deid=load_deidentifier(
+            loaded.config.models,
+            loaded.secret_resolver(),
+            loaded.config.deidentification.vocabulary,
+        ),
     )
 
 

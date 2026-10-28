@@ -16,6 +16,7 @@ from typer.testing import CliRunner
 
 import horae.cli_eval as cli_eval
 from horae.cli import app
+from horae.cli_output import CommandFailed
 from horae.contracts.evals import EvalAssertion, EvalCase
 from horae.evals import (
     EvalError,
@@ -1197,8 +1198,8 @@ def test_report_links_are_refused(instance: Path, tmp_path: Path) -> None:
     elsewhere.mkdir()
     (instance / "state").mkdir()
     (instance / "state" / "evals").symlink_to(elsewhere)
-    document = {"skill": SKILL, "cases": [], "summary": {}, "report": None}
-    with pytest.raises(cli_eval.CommandFailed):
+    document: dict[str, Any] = {"skill": SKILL, "cases": [], "summary": {}, "report": None}
+    with pytest.raises(CommandFailed):
         cli_eval.write_report(instance / "state", document, datetime.now(UTC))
     assert list(elsewhere.iterdir()) == []
 
@@ -1481,3 +1482,81 @@ def test_the_anthropic_render_error_names_the_schema_path() -> None:
         _schema(schema)
     assert raised.value.__cause__ is not None
     assert schema_problem({"type": "object", "properties": {}}) is None
+
+
+# --- de-identification (decision 47) on the eval's path ----------------------------------------
+
+
+def _classed_pack(pack: Path) -> None:
+    """The pack's skill with its task titles classed `person`."""
+    view = {
+        "tasks[].title": {"class": "person"},
+        "tasks[].due": None,
+        "events[].start": None,
+        "events[].summary": None,
+    }
+    skill = pack / "skills" / "daily-brief" / "rank-and-word" / "skill.yaml"
+    _edit_yaml(skill, lambda d: d.update(input_view=view))
+
+
+def test_a_cloud_alias_is_sent_the_pseudonymized_input(
+    instance: Path, provider: Callable[..., FakeProvider], pack: Path
+) -> None:
+    _classed_pack(pack)
+    pseudonymous = {
+        "summary": "One task is due today.",
+        "ranked": [
+            {"title": "[PERSON_1]", "why": "today"},
+            {"title": "[PERSON_2]", "why": "later"},
+        ],
+    }
+    fake = provider(pseudonymous)
+    args = ("--plugin-dir", str(pack), "--case", "tasks-only", "--record")
+    code, document, _ = _invoke(*_live_args(instance, *args))
+    assert code == 0, document  # re-identified before it is compared: the real titles
+    (request,) = fake.requests
+    assert b"Book the train tickets" not in request.content
+    assert b"[PERSON_1]" in request.content
+    # The recording keeps what the provider saw, never the real values.
+    text = _recorded(pack, "tasks-only").read_text()
+    assert "[PERSON_1]" in text
+    assert "Book the train tickets" not in text
+    # Offline, the same pseudonymization gives the same request: not stale, and it passes.
+    code, document, _ = _invoke(SKILL, "--plugin-dir", str(pack), "--case", "tasks-only", "--json")
+    assert code == 0, document
+    assert document["cases"][0]["stale"] == []
+
+
+def test_a_local_alias_is_sent_the_viewed_input(pack: Path) -> None:
+    from horae.contracts.instance import ModelAlias
+    from horae.evals import CaseResult as Result
+    from horae.evals import offline_alias
+    from horae.evals._harness import deidentify
+    from horae.llm.deid import Deidentifier
+
+    _classed_pack(pack)
+    sue = cli_eval.locate(SKILL, None, pack).sue
+    local = ModelAlias.model_validate(
+        {"backend": "ollama", "model": "m", "base_url": "http://ollama:11434"}
+    )
+    case = load_cases(_evals(pack), "tasks-only")[0]
+    viewed = sue.skill.view(case.case.input)
+    assert deidentify(sue, Deidentifier({"x": local}), "x", viewed, Result("c")) == (True, None)
+    cloud = Deidentifier({"x": offline_alias("anthropic", "m")})
+    ok, pseudo = deidentify(sue, cloud, "x", viewed, Result("c"))
+    assert ok
+    assert pseudo is not None
+    assert "Book the train tickets" not in json.dumps(pseudo.data)
+
+
+def test_an_unreadable_vocabulary_sends_nothing(
+    tmp_path: Path, provider: Callable[..., FakeProvider], pack: Path
+) -> None:
+    _classed_pack(pack)
+    root = _instance(tmp_path / "instance", deidentification={"vocabulary": "missing-vocab"})
+    fake = provider(_recorded_outputs()["tasks-only"])
+    args = ("--plugin-dir", str(pack), "--case", "tasks-only")
+    code, document, _ = _invoke(*_live_args(root, *args))
+    assert code == 1, document
+    assert document["cases"][0]["error"]["kind"] == "deid_unavailable"
+    assert fake.requests == []

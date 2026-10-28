@@ -52,7 +52,7 @@ from typing import Annotated, Any
 import typer
 from pydantic import TypeAdapter, ValidationError
 
-from horae.cli_host import CLOUD_BACKENDS, load, plugins_dir
+from horae.cli_host import load, plugins_dir
 from horae.cli_output import (
     EXIT_DIFFERENT,
     EXIT_OK,
@@ -93,6 +93,7 @@ from horae.evals import (
     write_recorded,
 )
 from horae.evals._harness import DEFAULT_TIMEOUT_S
+from horae.llm.deid import Deidentifier, load_deidentifier
 from horae.plugins.host import HostRegistry, RegistryError
 from horae.runner import PipelineLock, lock_path, recover_pipeline
 from horae.runner._budget import LedgerLlm, local_day
@@ -544,7 +545,7 @@ class _Session:
         """Unpriced, budget, confirmation, budget again (it may have changed while the
         confirmation waited), then the run row: nothing is sent before it all passes."""
         self.worst = worst
-        unpriced = self.spec.backend in CLOUD_BACKENDS and self.spec.price is None
+        unpriced = not self.spec.is_local and self.spec.price is None
         if unpriced and not self.allow_unpriced:
             raise CommandFailed(
                 EXIT_REFUSED,
@@ -603,6 +604,15 @@ class _Session:
             echo(f"horae eval: the eval's run row cannot be finished ({exc})", err=True)
 
 
+def _policy(instance: Instance) -> Deidentifier:
+    """The instance's de-identification policy, as a run loads it (decision 47): a cloud
+    alias is sent the pseudonymized viewed input of a classified skill."""
+    config = instance.config
+    return load_deidentifier(
+        config.models, instance.secret_resolver(), config.deidentification.vocabulary
+    )
+
+
 async def _live(
     live: LiveEval,
     located: Located,
@@ -613,7 +623,8 @@ async def _live(
     """Plan every case, pass the gate, then send them (each result into `session.results`
     as soon as it is known); the backends are closed after."""
     try:
-        planned, errors = plan_live(live, located.sue, cases, timeout_s)
+        policy = _policy(session.instance)
+        planned, errors = plan_live(live, located.sue, cases, timeout_s, policy)
         session.results.extend(errors)
         worst = total([item.worst_case for item in planned])
         session.worst = worst
@@ -802,7 +813,13 @@ def _eval(
     if not live:
         chosen = None if alias is None or instance is None else _alias(instance, alias)
         results = asyncio.run(
-            run_offline(located.sue, cases, alias=chosen, timeout_s=options.timeout_s)
+            run_offline(
+                located.sue,
+                cases,
+                alias=chosen,
+                timeout_s=options.timeout_s,
+                deid=None if instance is None else _policy(instance),
+            )
         )
         results = [*broken, *results]
         _emit(_document(located, "offline", alias, results), json_output)
