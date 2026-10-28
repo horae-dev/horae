@@ -27,6 +27,63 @@
       "title": "AppliedChange",
       "type": "object"
     },
+    "CallRecord": {
+      "additionalProperties": false,
+      "description": "One tool call of a `transform` step, recorded for replays.",
+      "properties": {
+        "call": {
+          "description": "Index of the call in its step's list of calls.",
+          "minimum": 0,
+          "title": "Call",
+          "type": "integer"
+        },
+        "ref": {
+          "maxLength": 128,
+          "pattern": "^[a-z][a-z0-9-]*\\.[a-z][a-z0-9_]*$",
+          "title": "Ref",
+          "type": "string"
+        },
+        "params": {
+          "additionalProperties": true,
+          "description": "The rendered (trusted) parameters.",
+          "title": "Params",
+          "type": "object"
+        },
+        "input_hash": {
+          "description": "SHA-256 of the canonical JSON of the input the call was given.",
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Input Hash",
+          "type": "string"
+        },
+        "intents": {
+          "default": null,
+          "description": "The raw intents the call returned, as proposed (`null` or absent: none).",
+          "title": "Intents"
+        },
+        "error_kind": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z][a-z0-9_.-]{0,63}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Why the call failed (the step's `error` has the message); absent when it returned.",
+          "title": "Error Kind"
+        }
+      },
+      "required": [
+        "call",
+        "ref",
+        "params",
+        "input_hash"
+      ],
+      "title": "CallRecord",
+      "type": "object"
+    },
     "HttpPost": {
       "additionalProperties": false,
       "description": "POST a JSON body to an https URL.\n\nThe core checks `url_host(url)` against the proposer's `permissions.network`, using\nexactly that parsed host (any port is allowed on a declared host), and caps the compact\nJSON body at 1 MiB (`horae.intents`). The sink must never follow redirects, or must\nre-check the host of every hop with `url_host` against the same list.",
@@ -83,6 +140,25 @@
         "data": {
           "description": "The source's output, as returned.",
           "title": "Data"
+        },
+        "call": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Index of the source in its step's list of calls.",
+          "title": "Call"
+        },
+        "intents": {
+          "default": null,
+          "description": "The raw intents the source returned with `data`, as proposed (before the core fills a\ntarget or validates them; `null` or absent: none). Plain JSON data of any shape: the\nengine validates it. Recorded for replays; the accepted intents are in\n`RunRecord.intents`.",
+          "title": "Intents"
         }
       },
       "required": [
@@ -166,7 +242,75 @@
           "description": "Whether the response validated against the skill's output schema.",
           "title": "Schema Valid"
         },
+        "model_alias": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "pattern": "^[^\\x00-\\x20\\x7f]+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The model alias the pipeline asked for (set by the engine).",
+          "title": "Model Alias"
+        },
+        "input_hash": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "SHA-256 of the canonical JSON of the input sent with this attempt (set by the engine,\nwhatever `request` holds). Not the cache key: that is `RunRecord.input_hash`.",
+          "title": "Input Hash"
+        },
+        "repair": {
+          "anyOf": [
+            {
+              "items": {
+                "maxLength": 4096,
+                "minLength": 1,
+                "type": "string"
+              },
+              "maxItems": 256,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The schema errors sent with this attempt for the repair retry (empty on the first\nattempt; set by the engine).",
+          "title": "Repair"
+        },
+        "schema_errors": {
+          "anyOf": [
+            {
+              "items": {
+                "maxLength": 4096,
+                "minLength": 1,
+                "type": "string"
+              },
+              "maxItems": 256,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Why `response` failed the skill's output schema (empty when it is valid; set by the\nengine, each error capped at 4096 characters, at most 256).",
+          "title": "Schema Errors"
+        },
         "request": {
+          "description": "The request as the backend reports it (its own shape), or the engine's\n`{skill, model, input, attempt, repair}` when the backend reports none. Informational:\nreplays check `model_alias`, `input_hash` and `repair`.",
           "title": "Request"
         },
         "response": {
@@ -390,6 +534,34 @@
           "default": null,
           "description": "Pinned commit, for plugins installed from git.",
           "title": "Commit"
+        },
+        "provides": {
+          "anyOf": [
+            {
+              "items": {
+                "anyOf": [
+                  {
+                    "maxLength": 128,
+                    "pattern": "^[a-z][a-z0-9-]*\\.[a-z][a-z0-9_]*$",
+                    "type": "string"
+                  },
+                  {
+                    "maxLength": 128,
+                    "pattern": "^[a-z][a-z0-9-]*/[a-z][a-z0-9_-]*$",
+                    "type": "string"
+                  }
+                ]
+              },
+              "maxItems": 256,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The tools (`<namespace>.<tool>`) and skills (`<namespace>/<skill>`) of the pipeline that\nthe run resolved to this plugin, sorted. Recorded so that a replay resolves them the same\nway (a namespace need not be the plugin's name).",
+          "title": "Provides"
         }
       },
       "required": [
@@ -674,6 +846,23 @@
           "default": null,
           "description": "Standard error of the plugins the step called, capped at 64 KiB.",
           "title": "Stderr"
+        },
+        "calls": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/CallRecord"
+              },
+              "maxItems": 256,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "For a `transform` step that ran: each call made, in order (the last one may have\nfailed). Intermediate outputs are not recorded, only the step's final `output`.",
+          "title": "Calls"
         }
       },
       "required": [
@@ -957,7 +1146,7 @@
         }
       ],
       "default": null,
-      "description": "SHA-256 of `horae.lock` at run time.",
+      "description": "SHA-256 of the canonical JSON of `horae.lock` at run time\n(`horae.config.Instance.lock_digest`).",
       "title": "Lock Digest"
     },
     "config_digest": {
@@ -971,8 +1160,47 @@
         }
       ],
       "default": null,
-      "description": "SHA-256 of the effective `horae.yaml` at run time.",
+      "description": "SHA-256 of the canonical JSON of the `models` and `plugins` sections of `horae.yaml` at\nrun time (`horae.config.Instance.config_digest`).",
       "title": "Config Digest"
+    },
+    "models": {
+      "anyOf": [
+        {
+          "maxProperties": 256,
+          "patternProperties": {
+            "^[^\\x00-\\x20\\x7f]+$": {
+              "maxLength": 128,
+              "pattern": "^[^\\x00-\\x20\\x7f]+$",
+              "type": "string"
+            }
+          },
+          "propertyNames": {
+            "maxLength": 128
+          },
+          "type": "object",
+          "additionalProperties": false
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Model alias to concrete model, as given to the engine (part of the LLM cache key).",
+      "title": "Models"
+    },
+    "pipeline_definition": {
+      "anyOf": [
+        {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "The canonical pipeline definition that ran (`horae.engine.canonical_pipeline`, whose\nSHA-256 is `pipeline_digest`), at most `MAX_PIPELINE_BYTES` as compact JSON; omitted when\nlarger. A valid pipeline named `pipeline` (checked by the pydantic model only).",
+      "title": "Pipeline Definition"
     },
     "input_hash": {
       "anyOf": [

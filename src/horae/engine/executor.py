@@ -33,10 +33,13 @@ and every other step `skipped`, when:
 
 - `collect` calls each source with `input=None`; its output is the list
   `[{"source": <ref>, "params": {...}, "data": <output>}, ...]` of the sources that succeeded,
-  in declaration order, each also recorded as an `InputSnapshot` (a later `collect` step starts
-  a new list). The step record's `output` lists the sources that failed,
-  `[{"source", "params", "error_kind"}]` (`None` when none did);
-- each `transform` receives the current value and its output replaces it (a fold);
+  in declaration order, each also recorded as an `InputSnapshot` with its position (`call`)
+  and the raw intents it proposed (a later `collect` step starts a new list; a source whose
+  proposals fail the step is recorded too). The step record's `output` lists the sources that
+  failed, `[{"source", "call", "params", "error_kind"}]` (`None` when none did);
+- each `transform` receives the current value and its output replaces it (a fold); each call
+  is recorded in `StepRecord.calls` (position, ref, params, the SHA-256 of its input, its raw
+  intents or its error kind), the step's `output` is the final value;
 - `llm` receives the current value and its schema-valid output replaces it;
 - `act` and `notify` do not change it.
 
@@ -109,6 +112,16 @@ whole step is accepted, an intent enters `RunRecord.intents` only when the step 
 runs, and the run-wide total is capped at `MAX_RUN_INTENTS` (`run_intents_exceeded`). Nothing
 is applied here: that is #21/#22, which must not apply a `failed` run.
 
+**Replays** (#23). Besides the raw proposals above, the record keeps what `horae.replay`
+needs to re-execute the run from the record alone: the canonical definition
+(`pipeline_definition`), the model alias targets (`models`), the `lock_digest` and
+`config_digest` the caller gives, the refs each plugin was resolved for
+(`plugins[].provides`), and for each LLM attempt the engine's own view of the request
+(`model_alias`, `input_hash` of the input, `repair`) and of the response (`schema_errors`,
+each capped at 4096 characters, at most 256: the repair retry is sent these same errors),
+whatever the backend reports as `request`. `planned_calls` is the engine's rendering of
+every call, shared with replay.
+
 **The LLM step.** Its cache key, recorded as `RunRecord.input_hash` once the output is
 accepted, is the SHA-256 of the canonical JSON of `{skill, plugin: {name, version, commit},
 model, input}`, where `model` is the alias's target from `models` when the caller knows it, else
@@ -180,7 +193,9 @@ from horae.contracts.pipeline import (
     TransformStep,
 )
 from horae.contracts.run import (
+    MAX_PIPELINE_BYTES,
     MAX_RUN_INTENTS,
+    CallRecord,
     ErrorKind,
     InputSnapshot,
     LlmCall,
@@ -196,8 +211,8 @@ from horae.contracts.run import (
     Usage,
     Violation,
 )
-from horae.contracts.types import MAX_ITEMS, HttpsUrl, NotePath
-from horae.engine.canonical import pipeline_digest, sha256_hex
+from horae.contracts.types import MAX_ITEMS, HttpsUrl, NotePath, Sha256Hex, Token
+from horae.engine.canonical import canonical_json, canonical_pipeline, pipeline_digest, sha256_hex
 from horae.engine.ports import (
     EngineCallError,
     LlmBackend,
@@ -252,6 +267,8 @@ _BINDING_TYPES: dict[str, TypeAdapter[str]] = {
     "url": TypeAdapter(HttpsUrl),
 }
 _ERROR_KIND: TypeAdapter[str] = TypeAdapter(ErrorKind)
+_DIGEST: TypeAdapter[str] = TypeAdapter(Sha256Hex)
+_MODELS: TypeAdapter[dict[str, str]] = TypeAdapter(dict[Token, Token])
 
 _MAX_MESSAGE = 4096
 _MAX_STDERR = 65536
@@ -293,6 +310,11 @@ def _kind(kind: object) -> str:
         return _ERROR_KIND.validate_python(kind)
     except ValidationError:
         return "host_error"
+
+
+def _raw(intents: Any) -> Any:
+    """Raw proposals as recorded: `None` for "none" (an empty list), anything else as is."""
+    return None if isinstance(intents, list) and not intents else intents
 
 
 def _intent_list(raw: Any) -> Any:
@@ -371,10 +393,51 @@ def _json_copy(value: Any, what: str = "output") -> Any:
 
 
 @dataclass(frozen=True)
+class PlannedCall:
+    """One plugin call of a pipeline, with its parameters rendered (`planned_calls`)."""
+
+    step: int
+    """Index of the step in the pipeline."""
+    call: int
+    """Index of the call in its step's list of calls."""
+    kind: StepKind
+    ref: str
+    params: dict[str, Any] | None
+    """The rendered parameters; `None` when a template is invalid (see `error`)."""
+    error: str | None = None
+    """Why the parameters could not be rendered (`TemplateError`)."""
+
+
+def planned_calls(pipeline: Pipeline, context: RunContext) -> list[PlannedCall]:
+    """Every `collect`, `transform`, `act` and `notify` call of `pipeline`, in declaration order,
+    with its parameters rendered from `context` exactly as `execute` renders them (it uses this
+    function). Rendering is pure: nothing is resolved or called.
+
+    `execute` calls the `collect` / `transform` calls of this list in this order (a prefix of
+    them when a step stops the run, none when planning fails). Raises `TemplateError` when the
+    context's variables themselves are invalid."""
+    names = variables(context)
+    planned: list[PlannedCall] = []
+    for index, step in enumerate(pipeline.steps):
+        kind = _kind_of(step)
+        for position, call in enumerate(_calls_of(step)):
+            ref, params = (call, {}) if isinstance(call, str) else next(iter(call.items()))
+            try:
+                rendered = render(copy.deepcopy(params), names)
+            except TemplateError as error:
+                planned.append(PlannedCall(index, position, kind, ref, None, str(error)))
+                continue
+            planned.append(PlannedCall(index, position, kind, ref, rendered))
+    return planned
+
+
+@dataclass(frozen=True)
 class _Call:
     ref: str
     params: dict[str, Any]
     plugin: ResolvedPlugin
+    position: int = 0
+    """Index of the call in its step's list of calls."""
 
 
 @dataclass(frozen=True)
@@ -439,7 +502,7 @@ def _calls_of(step: Step) -> list[PluginCall]:
         return step.notify
     if isinstance(step, TransformStep):
         return step.transform
-    return []  # pragma: no cover (the llm step calls no plugin tool)
+    return []  # the llm step calls no plugin tool
 
 
 def _clean_path(path: str, *, prefix: bool) -> bool:
@@ -534,7 +597,7 @@ def _plan(
     used: set[str] = set()
     collect_calls = 0
     try:
-        names = variables(context)
+        rendered_calls = {(c.step, c.call): c for c in planned_calls(pipeline, context)}
     except TemplateError as error:
         first = _kind_of(pipeline.steps[0])
         raise _PlanError(0, first, StepError(kind="template_error", message=str(error))) from None
@@ -565,8 +628,9 @@ def _plan(
             continue
         calls: list[_Call] = []
         entries: list[_Entry] = []
-        for position, call in enumerate(_calls_of(step)):
-            ref, params = (call, {}) if isinstance(call, str) else next(iter(call.items()))
+        for position in range(len(_calls_of(step))):
+            planned_call = rendered_calls[(index, position)]
+            ref = planned_call.ref
             if kind == "collect":
                 collect_calls += 1
                 if collect_calls > MAX_ITEMS:
@@ -578,10 +642,9 @@ def _plan(
             if ref not in getattr(plugin.manifest.provides, _PROVIDES[kind]):
                 fail("tool_not_provided", f"{ref} is not in the plugin's {_PROVIDES[kind]}")
             use(plugin)
-            try:
-                rendered = render(copy.deepcopy(params), names)
-            except TemplateError as error:
-                fail("template_error", f"{ref}: {error}")
+            rendered = planned_call.params
+            if rendered is None:
+                fail("template_error", f"{ref}: {planned_call.error}")
             problem = _plain_problem(rendered)
             if problem is not None:
                 fail("params_invalid", f"{ref}: the parameters {problem[1]}")
@@ -592,7 +655,7 @@ def _plan(
                     fail("params_invalid", str(error))
                 entries.append(_Entry(index, position, ref, rendered, plugin, types, binds))
             else:
-                calls.append(_Call(ref, rendered, plugin))
+                calls.append(_Call(ref, rendered, plugin, position))
         planned.append(_Planned(index, kind, calls=tuple(calls), entries=tuple(entries)))
     return tuple(planned)
 
@@ -619,6 +682,7 @@ class _Outcome:
     output: Any = None
     intents: list[ProposedIntent] = field(default_factory=list)
     stop: bool = False
+    calls: list[CallRecord] | None = None
 
 
 @dataclass
@@ -822,21 +886,37 @@ async def _collect(run: _Run, step: _Planned) -> _Outcome:
     for call in step.calls:
         result = await run.call(call, None)
         if isinstance(result, _Failure):
-            failed.append({"source": call.ref, "params": call.params, "error_kind": result.kind})
+            failed.append(
+                {
+                    "source": call.ref,
+                    "call": call.position,
+                    "params": call.params,
+                    "error_kind": result.kind,
+                }
+            )
             messages.append(result.message)
             continue
         name = call.plugin.manifest.name
         seen = (*(entry["data"] for entry in collected), result.data)
+        snapshots.append(
+            InputSnapshot(
+                step=step.index,
+                call=call.position,
+                source=call.ref,
+                params=call.params,
+                data=result.data,
+                intents=_raw(result.intents),
+            )
+        )
         accepted, rejected = run.propose(
             result.intents, call.plugin, name, step.index, call.ref, len(kept), seen
         )
         if rejected is not None:
+            # Recorded, with the rejected proposals, so that a replay re-validates them.
+            run.inputs.extend(snapshots)
             return _Outcome("failed", rejected, output=failed or None)
         kept.extend(accepted)
         collected.append({"source": call.ref, "params": call.params, "data": result.data})
-        snapshots.append(
-            InputSnapshot(step=step.index, source=call.ref, params=call.params, data=result.data)
-        )
     run.data = collected
     run.inputs.extend(snapshots)
     if not failed:
@@ -850,19 +930,40 @@ async def _collect(run: _Run, step: _Planned) -> _Outcome:
 
 async def _transform(run: _Run, step: _Planned) -> _Outcome:
     kept: list[ProposedIntent] = []
+    calls: list[CallRecord] = []
     for call in step.calls:
+        input_hash = sha256_hex(run.data)
         result = await run.call(call, run.data)
         if isinstance(result, _Failure):
-            return _Outcome("failed", StepError(kind=result.kind, message=_cap(result.message)))
+            calls.append(
+                CallRecord(
+                    call=call.position,
+                    ref=call.ref,
+                    params=call.params,
+                    input_hash=input_hash,
+                    error_kind=result.kind,
+                )
+            )
+            error = StepError(kind=result.kind, message=_cap(result.message))
+            return _Outcome("failed", error, calls=calls)
+        calls.append(
+            CallRecord(
+                call=call.position,
+                ref=call.ref,
+                params=call.params,
+                input_hash=input_hash,
+                intents=_raw(result.intents),
+            )
+        )
         name = call.plugin.manifest.name
         accepted, rejected = run.propose(
             result.intents, call.plugin, name, step.index, call.ref, len(kept)
         )
         if rejected is not None:
-            return _Outcome("failed", rejected)
+            return _Outcome("failed", rejected, calls=calls)
         kept.extend(accepted)
         run.data = result.data
-    return _Outcome("ok", output=run.data, intents=kept)
+    return _Outcome("ok", output=run.data, intents=kept, calls=calls)
 
 
 async def _apply_step(run: _Run, step: _Planned) -> _Outcome:
@@ -922,6 +1023,8 @@ def _reuse(
             model=previous.model,
             cached=True,
             schema_valid=True,
+            model_alias=spec.model,
+            input_hash=sha256_hex(run.data),
             request={"skill": spec.skill, "model": spec.model, "reused_input_hash": key},
             response=output,
             intents=raw,
@@ -999,7 +1102,8 @@ async def _llm_step(run: _Run, step: _Planned) -> _Outcome:
             if not isinstance(response.usage, Usage):
                 raise _DataError("output_invalid", "the LLM usage is not a Usage")
             usage = _ZERO if response.cached is True else response.usage
-            errors = tuple(str(error) for error in response.schema_errors)
+            # Capped like the record's messages; the repair retry is sent these same errors.
+            errors = tuple(_cap(str(error)) for error in response.schema_errors)[:MAX_ITEMS]
             llm_call = LlmCall(
                 step=step.index,
                 skill=spec.skill,
@@ -1009,6 +1113,10 @@ async def _llm_step(run: _Run, step: _Planned) -> _Outcome:
                 cached=response.cached,
                 attempt=attempt,
                 schema_valid=not errors,
+                model_alias=spec.model,
+                input_hash=sha256_hex(request.input),
+                repair=list(repair),
+                schema_errors=list(errors),
                 request=recorded,
                 response=output,
                 intents=raw,
@@ -1058,6 +1166,8 @@ async def execute(
     dry_run: bool = False,
     previous: PreviousLlm | None = None,
     models: Mapping[str, str] | None = None,
+    lock_digest: str | None = None,
+    config_digest: str | None = None,
     on_step: StepHook | None = None,
     clock: Callable[[], datetime.datetime] = _utc_now,
     monotonic: Callable[[], float] = time.monotonic,
@@ -1072,6 +1182,10 @@ async def execute(
     - `previous`: the last accepted LLM output (`Store.last_accepted_llm`), for the
       unchanged-input path. `models`: model alias to concrete model (`horae.yaml`), part of
       the LLM cache key.
+    - `models` (when given), `lock_digest` and `config_digest` (`horae.config.Instance`) are
+      recorded as given, for replays; an invalid value raises `ValueError` before anything
+      runs. The canonical pipeline definition is recorded too (`pipeline_definition`), unless
+      it is larger than `MAX_PIPELINE_BYTES`.
     - `dry_run` is recorded only: the engine applies nothing either way.
     - `on_step(index, record)` is awaited after each step record is final; its exceptions
       propagate. `clock` gives the wall-clock timestamps, `monotonic` the durations and the
@@ -1080,6 +1194,17 @@ async def execute(
     Raises `RunCancelled` (an `asyncio.CancelledError`) with the partial record if cancelled.
     Persistence, locking and the run timeout are the caller's (#19)."""
     digest = pipeline_digest(pipeline)
+    try:
+        for value in (lock_digest, config_digest):
+            if value is not None:
+                _DIGEST.validate_python(value)
+        recorded_models = None if models is None else _MODELS.validate_python(dict(models))
+    except ValidationError:
+        raise ValueError("`lock_digest`, `config_digest` or `models` is invalid") from None
+    if recorded_models is not None and len(recorded_models) > MAX_ITEMS:
+        raise ValueError(f"more than {MAX_ITEMS} model aliases")
+    canonical = canonical_pipeline(pipeline)
+    definition = canonical if len(canonical_json(canonical)) <= MAX_PIPELINE_BYTES else None
     records: list[StepRecord] = []
     status: RunStatus = "ok"
     run_error: str | None = None
@@ -1104,6 +1229,14 @@ async def execute(
     used = {c.plugin.manifest.name: c.plugin for p in plan for c in p.calls}
     used.update({e.plugin.manifest.name: e.plugin for e in run.entries})
     used.update({p.skill_plugin.manifest.name: p.skill_plugin for p in plan if p.skill_plugin})
+    resolved: dict[str, set[str]] = {}
+    for p in plan:
+        for c in p.calls:
+            resolved.setdefault(c.plugin.manifest.name, set()).add(c.ref)
+        for e in p.entries:
+            resolved.setdefault(e.plugin.manifest.name, set()).add(e.ref)
+        if p.skill_plugin is not None and p.llm is not None:
+            resolved.setdefault(p.skill_plugin.manifest.name, set()).add(p.llm.skill)
 
     def record(final: RunStatus, error: str | None, steps: list[StepRecord]) -> RunRecord:
         return RunRecord(
@@ -1112,13 +1245,21 @@ async def execute(
             pipeline=pipeline.name,
             pipeline_digest=digest,
             context=context,
+            lock_digest=lock_digest,
+            config_digest=config_digest,
+            models=recorded_models,
+            pipeline_definition=definition,
             input_hash=run.input_hash,
             dry_run=dry_run,
             started_at=started_at,
             finished_at=max(clock(), started_at),
             status=final,
             plugins={
-                name: PluginVersion(version=p.manifest.version, commit=p.commit)
+                name: PluginVersion(
+                    version=p.manifest.version,
+                    commit=p.commit,
+                    provides=sorted(resolved.get(name, ())),
+                )
                 for name, p in used.items()
             },
             inputs=run.inputs,
@@ -1157,6 +1298,7 @@ async def execute(
                     finished_at=max(clock(), step_start),
                     stderr=_join_stderr(run.stderr),
                     duration_ms=int(elapsed * 1000),
+                    calls=outcome.calls,
                 )
                 if outcome.status != "failed":
                     for intent in outcome.intents:
@@ -1193,7 +1335,9 @@ __all__ = [
     "MAX_LLM_ATTEMPTS",
     "MAX_OUTPUT_BYTES",
     "TARGET_FIELDS",
+    "PlannedCall",
     "RunCancelled",
     "StepHook",
     "execute",
+    "planned_calls",
 ]

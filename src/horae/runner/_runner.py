@@ -16,7 +16,10 @@
    id on `RunExists`). The store's unique index on running runs stays as a second guard:
    `PipelineBusy` there is reported as `PipelineLocked` too.
 4. **Execute** (`horae.engine.execute`) with the last accepted LLM output
-   (`Store.last_accepted_llm`, read after `begin_run`) for the unchanged-input path. Each
+   (`Store.last_accepted_llm`, read after `begin_run`) for the unchanged-input path, the
+   model alias targets of `horae.yaml`, and the digests of `horae.lock` and of `horae.yaml`'s
+   `models` and `plugins` sections (`Instance.lock_digest`, `Instance.config_digest`), which
+   the record keeps so that `horae replay` can tell what changed since the run. Each
    finished step is persisted (`on_step` → `Store.record_step`), and a heartbeat
    (`Store.heartbeat`) is written every `heartbeat_s` seconds. Heartbeats are for
    observability (`horae runs`); the lock, not the heartbeat, decides whether a run is alive.
@@ -486,6 +489,8 @@ class Runner:
                 dry_run=dry_run,
                 previous=previous,
                 models=models,
+                lock_digest=self.instance.lock_digest(),
+                config_digest=self.instance.config_digest(),
                 on_step=on_step,
                 clock=self.clock,
             )

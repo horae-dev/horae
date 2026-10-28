@@ -14,9 +14,11 @@ from horae.engine.executor import (
     MAX_LLM_ATTEMPTS,
     MAX_OUTPUT_BYTES,
     TARGET_FIELDS,
+    PlannedCall,
     RunCancelled,
     StepHook,
     execute,
+    planned_calls,
 )
 from horae.engine.ports import (
     EngineCallError,
@@ -46,6 +48,7 @@ __all__ = [
     "LlmError",
     "LlmRequest",
     "LlmResponse",
+    "PlannedCall",
     "PluginRegistry",
     "PreviousLlm",
     "ResolvedPlugin",
@@ -61,6 +64,7 @@ __all__ = [
     "execute",
     "make_context",
     "pipeline_digest",
+    "planned_calls",
     "render",
     "render_string",
     "variables",

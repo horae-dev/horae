@@ -10,12 +10,23 @@ from pathlib import Path
 from typing import Annotated, Any
 
 import typer
+from pydantic import ValidationError
 
 from horae import __version__
 from horae.apply import JSON_SCHEMA_VERSION, LocalSink, StaticSinks, plan_changes, to_json
 from horae.apply.render import render_text, safe
-from horae.config import CONFIG_FILE, STORE_FILE, ProblemsError, check_instance, read_yaml, validate
-from horae.contracts import InstanceConfig
+from horae.config import (
+    CONFIG_FILE,
+    STORE_FILE,
+    InstanceError,
+    ProblemsError,
+    check_instance,
+    load_instance,
+    read_yaml,
+    validate,
+)
+from horae.contracts import InstanceConfig, RunRecord
+from horae.replay import LockRegistry, ReplayResult, definition_for, replay
 from horae.runner import lock_is_free
 from horae.store import MAX_LIST_RUNS, RunSummary, Store, StoreError
 
@@ -57,6 +68,10 @@ def _plural(count: int, word: str, plural: str | None = None) -> str:
 EXIT_OK = 0
 EXIT_PROBLEMS = 1
 EXIT_USAGE = 2
+EXIT_NOT_COMPARABLE = 3
+"""`horae replay`: the run could not be compared (see `replay_command`)."""
+EXIT_DIFFERENT = 4
+"""`horae replay`: the replay differs from the recorded run."""
 EXIT_UNKNOWN_RUN = 3
 """`horae diff`: the run is unknown, still running, or refused (failed, undone, applied)."""
 EXIT_PLANNED_WITH_PROBLEMS = 4
@@ -407,4 +422,128 @@ def diff(
         del exc
         _diff_error("internal", f"internal error ({name}); please report it", json_output)
         code = EXIT_INTERNAL
+    raise typer.Exit(code)
+
+
+class _ReplayStop(Exception):
+    """`horae replay` stops before comparing; `code` is its exit code."""
+
+    def __init__(self, code: int, message: str, pipeline: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.pipeline = pipeline
+
+
+def _replay(instance: Path, store: Path | None, run_id: str, against_current: bool) -> ReplayResult:
+    try:
+        loaded = load_instance(instance)
+    except InstanceError as exc:
+        problems = "\n".join(str(problem) for problem in exc.problems)
+        raise _ReplayStop(EXIT_PROBLEMS, problems) from None
+    path = store if store is not None else loaded.store_path
+    if not path.is_file():
+        raise _ReplayStop(EXIT_USAGE, f"unknown run {run_id!r}: no store at {path}")
+    try:
+        # Read-only: no migration, no WAL switch, no new file.
+        with Store.open(path, read_only=True) as opened:
+            record: RunRecord | None = opened.get_run(run_id)
+    except ValidationError:
+        raise _ReplayStop(
+            EXIT_NOT_COMPARABLE, f"run {run_id!r}: its record is not a valid v1 run record"
+        ) from None
+    except (StoreError, OSError) as exc:
+        raise _ReplayStop(EXIT_PROBLEMS, f"{path}: {exc}") from None
+    if record is None:
+        raise _ReplayStop(EXIT_USAGE, f"unknown run {run_id!r} (or still running, or abandoned)")
+    current = loaded.pipelines.get(record.pipeline)
+    chosen, _ = definition_for(record, current, against_current)
+    registry = LockRegistry(loaded.lock, chosen, record)
+    if registry.unresolved:
+        raise _ReplayStop(
+            EXIT_NOT_COMPARABLE,
+            f"{', '.join(registry.unresolved)}: resolved by no plugin of horae.lock (neither as "
+            "the run resolved it nor by namespace)",
+            record.pipeline,
+        )
+    models = {alias: spec.model for alias, spec in loaded.config.models.items()}
+    return replay(
+        record,
+        current,
+        plugins=registry,
+        models=models,
+        against_current=against_current,
+        lock_digest=loaded.lock_digest(),
+        config_digest=loaded.config_digest(),
+    )
+
+
+_REPLAY_CODES = {"identical": EXIT_OK, "different": EXIT_DIFFERENT, "error": EXIT_NOT_COMPARABLE}
+
+
+@app.command("replay")
+def replay_command(
+    run_id: Annotated[str, typer.Argument(help="The run to replay.")],
+    instance: Annotated[
+        Path,
+        typer.Option(
+            "--instance",
+            "-i",
+            envvar="HORAE_INSTANCE",
+            help="Instance directory (holds horae.yaml).",
+            file_okay=False,
+        ),
+    ] = Path(),
+    store: Annotated[
+        Path | None,
+        typer.Option(
+            "--store", help=f"SQLite store (default: <state_dir>/{STORE_FILE}).", dir_okay=False
+        ),
+    ] = None,
+    against_current: Annotated[
+        bool,
+        typer.Option(
+            "--against-current",
+            help=(
+                "Replay the recorded data through the current pipeline definition, and accept "
+                "a changed horae.lock or horae.yaml (noted)."
+            ),
+        ),
+    ] = False,
+    json_output: Annotated[bool, typer.Option("--json", help="Print the report as JSON.")] = False,
+) -> None:
+    """Re-execute a recorded run from its inputs and LLM responses, and compare its intents.
+
+    Nothing external is called: sources, transforms and the LLM are answered from the record,
+    and plugins are resolved from horae.lock and the record. The store is opened read-only.
+
+    Exit codes: 0 identical; 1 configuration or store problem; 2 usage error (bad option,
+    unknown run); 3 not comparable (pipeline, horae.lock or horae.yaml changed without
+    --against-current, unresolved plugin, a call the record cannot answer, a record that is
+    not replayable); 4 different; 70 internal error."""
+    try:
+        result = _replay(instance, store, run_id, against_current)
+        code = _REPLAY_CODES[result.outcome]
+    except _ReplayStop as stop:
+        if not json_output:
+            typer.echo(f"horae replay: {stop.message}", err=True)
+            raise typer.Exit(stop.code) from None
+        result = ReplayResult(
+            run_id=run_id,
+            pipeline=stop.pipeline,
+            outcome="error",
+            against_current=against_current,
+            error=stop.message,
+        )
+        code = stop.code
+    except Exception as exc:
+        # As for doctor: only the exception type, never its message or locals.
+        name = type(exc).__name__
+        del exc
+        typer.echo(f"horae replay: internal error ({name}); please report it", err=True)
+        raise typer.Exit(EXIT_INTERNAL) from None
+    if json_output:
+        typer.echo(json.dumps(result.to_dict(), indent=2, ensure_ascii=False))
+    else:
+        typer.echo(result.render())
     raise typer.Exit(code)

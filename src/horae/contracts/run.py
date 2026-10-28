@@ -5,11 +5,21 @@ PLAN.md §3.1 (inputs snapshot, step outputs, intents, applied changes, cost and
 §2.1.6 (inputs, plugin versions and the LLM request and response, for exact replays).
 """
 
+import json
 from typing import Annotated, Any, Literal, Self
 
-from pydantic import ConfigDict, Field, Strict, StringConstraints, model_validator
+from pydantic import (
+    AfterValidator,
+    ConfigDict,
+    Field,
+    Strict,
+    StringConstraints,
+    ValidationError,
+    model_validator,
+)
 
 from horae.contracts.intents import Intent
+from horae.contracts.pipeline import Pipeline
 from horae.contracts.types import (
     MAX_ITEMS,
     BoundedList,
@@ -60,9 +70,29 @@ Target = Annotated[
 ]
 
 
+MAX_PIPELINE_BYTES = 65536
+"""Largest `RunRecord.pipeline_definition` (the canonical pipeline definition), as compact
+UTF-8 JSON."""
+
+
 def _ordered(started: Any, finished: Any) -> None:
     if started is not None and finished is not None and finished < started:
         raise ValueError("`finished_at` is before `started_at`")
+
+
+def _pipeline_definition(value: dict[str, Any]) -> dict[str, Any]:
+    try:
+        text = json.dumps(value, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+        size = len(text.encode())
+    except (TypeError, ValueError):
+        raise ValueError("`pipeline_definition` is not plain JSON data") from None
+    if size > MAX_PIPELINE_BYTES:
+        raise ValueError(f"`pipeline_definition` is larger than {MAX_PIPELINE_BYTES} bytes")
+    try:
+        Pipeline.model_validate(value)
+    except ValidationError:
+        raise ValueError("`pipeline_definition` is not a valid pipeline") from None
+    return value
 
 
 class PluginVersion(Contract):
@@ -71,6 +101,10 @@ class PluginVersion(Contract):
     version: SemVer
     commit: CommitSha | None = None
     """Pinned commit, for plugins installed from git."""
+    provides: BoundedList[PluginRef | SkillRef] | None = None
+    """The tools (`<namespace>.<tool>`) and skills (`<namespace>/<skill>`) of the pipeline that
+    the run resolved to this plugin, sorted. Recorded so that a replay resolves them the same
+    way (a namespace need not be the plugin's name)."""
 
 
 class RunContext(Contract):
@@ -93,6 +127,13 @@ class InputSnapshot(Contract):
     params: dict[str, Any]
     data: Any
     """The source's output, as returned."""
+    call: StepIndex | None = None
+    """Index of the source in its step's list of calls."""
+    intents: Any = None
+    """The raw intents the source returned with `data`, as proposed (before the core fills a
+    target or validates them; `null` or absent: none). Plain JSON data of any shape: the
+    engine validates it. Recorded for replays; the accepted intents are in
+    `RunRecord.intents`."""
 
 
 class StepError(Contract):
@@ -100,6 +141,22 @@ class StepError(Contract):
 
     kind: ErrorKind
     message: Message
+
+
+class CallRecord(Contract):
+    """One tool call of a `transform` step, recorded for replays."""
+
+    call: StepIndex
+    """Index of the call in its step's list of calls."""
+    ref: PluginRef
+    params: dict[str, Any]
+    """The rendered (trusted) parameters."""
+    input_hash: Sha256Hex
+    """SHA-256 of the canonical JSON of the input the call was given."""
+    intents: Any = None
+    """The raw intents the call returned, as proposed (`null` or absent: none)."""
+    error_kind: ErrorKind | None = None
+    """Why the call failed (the step's `error` has the message); absent when it returned."""
 
 
 class StepRecord(Contract):
@@ -115,6 +172,9 @@ class StepRecord(Contract):
     duration_ms: Count | None = None
     stderr: Stderr | None = None
     """Standard error of the plugins the step called, capped at 64 KiB."""
+    calls: BoundedList[CallRecord] | None = None
+    """For a `transform` step that ran: each call made, in order (the last one may have
+    failed). Intermediate outputs are not recorded, only the step's final `output`."""
 
     @model_validator(mode="after")
     def _times_ordered(self) -> Self:
@@ -147,7 +207,21 @@ class LlmCall(Contract):
     """1 for the first call, 2 for the repair retry."""
     schema_valid: StrictBool | None = None
     """Whether the response validated against the skill's output schema."""
+    model_alias: Token | None = None
+    """The model alias the pipeline asked for (set by the engine)."""
+    input_hash: Sha256Hex | None = None
+    """SHA-256 of the canonical JSON of the input sent with this attempt (set by the engine,
+    whatever `request` holds). Not the cache key: that is `RunRecord.input_hash`."""
+    repair: BoundedList[Message] | None = None
+    """The schema errors sent with this attempt for the repair retry (empty on the first
+    attempt; set by the engine)."""
+    schema_errors: BoundedList[Message] | None = None
+    """Why `response` failed the skill's output schema (empty when it is valid; set by the
+    engine, each error capped at 4096 characters, at most 256)."""
     request: Any
+    """The request as the backend reports it (its own shape), or the engine's
+    `{skill, model, input, attempt, repair}` when the backend reports none. Informational:
+    replays check `model_alias`, `input_hash` and `repair`."""
     response: Any
     intents: BoundedList[Any] | None = None
     """The raw intents returned with `response`, as proposed (before the core fills a target
@@ -227,9 +301,19 @@ class RunRecord(Contract):
     """SHA-256 of the canonical pipeline definition that ran."""
     context: RunContext
     lock_digest: Sha256Hex | None = None
-    """SHA-256 of `horae.lock` at run time."""
+    """SHA-256 of the canonical JSON of `horae.lock` at run time
+    (`horae.config.Instance.lock_digest`)."""
     config_digest: Sha256Hex | None = None
-    """SHA-256 of the effective `horae.yaml` at run time."""
+    """SHA-256 of the canonical JSON of the `models` and `plugins` sections of `horae.yaml` at
+    run time (`horae.config.Instance.config_digest`)."""
+    models: Annotated[dict[Token, Token], Field(max_length=MAX_ITEMS)] | None = None
+    """Model alias to concrete model, as given to the engine (part of the LLM cache key)."""
+    pipeline_definition: Annotated[dict[str, Any], AfterValidator(_pipeline_definition)] | None = (
+        None
+    )
+    """The canonical pipeline definition that ran (`horae.engine.canonical_pipeline`, whose
+    SHA-256 is `pipeline_digest`), at most `MAX_PIPELINE_BYTES` as compact JSON; omitted when
+    larger. A valid pipeline named `pipeline` (checked by the pydantic model only)."""
     input_hash: Sha256Hex | None = None
     """The LLM step's cache key (`horae.engine`), used for the unchanged-input skip. Set only
     when the LLM output was accepted, or reused unchanged from the previous run."""
@@ -267,6 +351,9 @@ class RunRecord(Contract):
                 raise ValueError(f"change refers to intent {change.intent}, out of range")
         for index, intent in enumerate(self.intents):
             _check_route(index, intent, self.steps)
+        definition = self.pipeline_definition
+        if definition is not None and definition.get("name") != self.pipeline:
+            raise ValueError("`pipeline_definition` is the definition of another pipeline")
         _ordered(self.started_at, self.finished_at)
         return self
 

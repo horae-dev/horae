@@ -87,7 +87,13 @@ class ResolvedPlugin:
 
 
 class PluginRegistry(Protocol):
-    """Resolves `<namespace>.<tool>` and `<namespace>/<skill>` to installed plugins."""
+    """Resolves `<namespace>.<tool>` and `<namespace>/<skill>` to installed plugins.
+
+    Resolution is plain data lookup: an implementation may read local files (manifests,
+    `horae.lock`) but performs no other I/O, starts no process and opens no connection. Only
+    `ToolCaller` reaches a plugin. `horae.replay` relies on this: it resolves every ref of the
+    pipeline once, up front, into a frozen snapshot, and `horae replay` resolves with
+    `horae.replay.LockRegistry` (`horae.lock` and the run record), never with a live host."""
 
     def plugin_for_tool(self, ref: str) -> ResolvedPlugin:
         """The plugin serving tool `ref`; raises `UnknownPlugin`."""
@@ -153,7 +159,9 @@ class LlmResponse:
     """The concrete model the alias resolved to."""
     skill_version: str
     request: Any = None
-    """The request as sent, recorded for replays."""
+    """The request as the backend sent it (its own shape), recorded as `LlmCall.request` for
+    information. Replays do not rely on it: the engine records its own `model_alias`,
+    `input_hash` and `repair` for each attempt."""
     cached: bool = False
     """The response came from the backend's cache: its usage counts towards neither the cost
     nor the budget."""
