@@ -47,6 +47,16 @@ record's data, and a prompt can be long).
 the skill's output object: when present it must be a list, and `ModelBackends` moves it into
 `LlmResponse.intents` (after validating the whole output), removing it from `output`.
 
+**Redaction** (#53, schemas decision 43 E). What comes back from a provider backend is
+redacted with the process registry (`horae.secrets.redact.current()`: every secret this
+process resolved, the alias' key included once its backend resolved it) before it leaves
+`ModelBackends.send`: an `LlmError`'s message and captured stderr (raised again, as a new
+error with no `__cause__` / `__context__`), and the response's output, intents, schema
+errors and request summary. A secret found there is logged (`horae.llm`, names only). A
+skill prompt holding a secret is refused by `prepare` with `params_invalid`, naming the
+secret only, before anything is rendered or sent (a secret is never a trusted parameter;
+with #27's loader this check moves to plan time).
+
 **Retries.** None here: the engine owns the single repair retry (`attempt` 2). Provider
 backends disable their SDK's own retries.
 
@@ -78,6 +88,7 @@ backends disable their SDK's own retries.
 
 import hashlib
 import json
+import logging
 import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -88,6 +99,9 @@ from horae.contracts.run import Usage
 from horae.engine.canonical import canonical_json
 from horae.engine.ports import LlmBackendName, LlmError, LlmRequest, LlmResponse
 from horae.secrets import SecretResolver
+from horae.secrets.redact import current as current_redactor
+
+_log = logging.getLogger("horae.llm")
 
 MAX_ERROR_CHARS = 200
 """Longest provider detail kept in an `LlmError` message."""
@@ -444,6 +458,13 @@ class ModelBackends:
         if spec is None:
             raise LlmError("invalid_request", f"unknown model alias {request.model!r}")
         prompt = self.prompts.prompt(request)
+        _, held = current_redactor().redact_text(prompt.system)
+        if held:
+            names = ", ".join(sorted(held))
+            raise LlmError(
+                "params_invalid",
+                f"the prompt of skill {request.skill} holds secret {names} (never a parameter)",
+            )
         backend = self._backend(request.model, spec)
         largest = request.budget.tokens_out
         if spec.max_output_tokens is not None:
@@ -537,11 +558,18 @@ class ModelBackends:
         if not unchanged:
             raise LlmError("invalid_request", "the payload was changed after it was rendered")
         backend = self._backend(rendered.alias, spec)
-        result = await backend.send(json.loads(body), rendered.timeout_s)
+        failure: LlmError | None = None
+        try:
+            result = await backend.send(json.loads(body), rendered.timeout_s)
+        except LlmError as error:
+            failure = redacted_error(error, rendered.alias)
+        if failure is not None:
+            raise failure  # outside the handler: no `__context__` leads to the original
         errors: tuple[str, ...] = ()
         if self.validate is not None:
             errors = tuple(self.validate(result.output, rendered.output_schema))
         output, intents = split_intents(result.output, result.usage)
+        output, intents, errors = _redacted_response(output, intents, errors, rendered.alias)
         return LlmResponse(
             output=output,
             schema_errors=errors,
@@ -564,6 +592,42 @@ class ModelBackends:
             await backend.aclose()
 
 
+def _found(names: set[str], where: str, alias: str) -> None:
+    if names:
+        shown = ", ".join(sorted(names))
+        _log.warning("secret %s found in %s of model alias %s; redacted", shown, where, alias)
+
+
+def redacted_error(error: LlmError, alias: str) -> LlmError:
+    """`error` with its message and stderr redacted (process registry), as a new `LlmError`
+    of the same kind and usage (the caller raises it outside its handler)."""
+    redactor = current_redactor()
+    message, in_message = redactor.redact_text(error.message)
+    stderr, in_stderr = error.stderr, set[str]()
+    if stderr is not None:
+        stderr, in_stderr = redactor.redact_text(stderr)
+    _found(in_message | in_stderr, "an error", alias)
+    return LlmError(error.kind, message, stderr=stderr, usage=error.usage)
+
+
+def _redacted_response(
+    output: Any, intents: list[Any], errors: tuple[str, ...], alias: str
+) -> tuple[Any, list[Any], tuple[str, ...]]:
+    redactor = current_redactor()
+    if not redactor:
+        return output, intents, errors
+    output, in_output = redactor.scrub_data(output)
+    intents, in_intents = redactor.scrub_data(intents)
+    cleaned = []
+    in_errors: set[str] = set()
+    for error in errors:
+        text, names = redactor.redact_text(error)
+        cleaned.append(text)
+        in_errors |= names
+    _found(in_output | in_intents | in_errors, "a response", alias)
+    return output, intents, tuple(cleaned)
+
+
 __all__ = [
     "ERROR_KINDS",
     "INPUT_TOKEN_MARGIN",
@@ -584,6 +648,7 @@ __all__ = [
     "input_bound",
     "input_price",
     "max_tokens",
+    "redacted_error",
     "split_intents",
     "summary",
 ]

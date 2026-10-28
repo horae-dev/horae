@@ -56,6 +56,7 @@ NOT_BILLED = frozenset(
         "budget_exceeded",
         "backend_unavailable",
         "skill_unavailable",
+        "params_invalid",
         "invalid_request",
         "auth_failed",
         "rate_limited",

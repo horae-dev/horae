@@ -9,12 +9,40 @@ past the timeout the store raises `StoreBusy`.
 
 Errors: every failure is a `StoreError` subclass (see `horae.store._errors`); `ValueError` is
 raised only for programming errors, i.e. arguments that are wrong whatever the database holds.
+
+**The secret gate** (#53, schemas decision 43 C): the store is the last line of defence
+against a producer that forgot to redact. Every text or JSON value it writes passes the
+redactor of every secret this process resolved (`horae.secrets.redact.current()`) just
+before the `INSERT` / `UPDATE`, in every table:
+
+- **redacted and flagged**: the run record (`runs.record`, `runs.error`), the step rows,
+  the journal's `target`, `applied_by` and `sink_identity`, a task's `title` and `target`,
+  a notification's dedupe key, the usage ledger's `alias`, `backend` and `model`, a run's
+  `host` and an abandoned run's `error`. A match becomes `[REDACTED:<NAME>]` and is logged
+  (`horae.store`, names only); for a run that gets a record it is recorded on that record as
+  a `secret_in_output` violation ("the store redacted secret X in ... (a producer did not
+  redact it)") when the record is saved: a step row or journal entry written while the run
+  is running is flagged on the record this same `Store` saves later. JSON values are
+  redacted in their string leaves and object keys (`Redactor.scrub_data`); numbers are kept;
+- **refused** (`SecretRefused`, nothing written): an LLM cache entry holding a secret (a
+  cache hit would replay it into later runs), an identifier that cannot be rewritten (a task
+  `fingerprint` or `source`), and a record that would no longer validate once redacted;
+- **exempt, flagged**: the journalled `after` bytes and the `actual_after` bytes a sink
+  wrote (blobs): the note as Horae wrote it, needed byte for byte to tell a change from a
+  later edit and to undo it. A secret there is recorded as a violation and logged, and the
+  bytes are kept (the producers, the plugin host and the LLM layer, have already redacted
+  what they were handed);
+- **exempt**: the journalled `before` bytes and the bytes a forced undo `overwrote` (the
+  user's own note as it was in the vault: undo must restore it byte for byte), and the
+  identifiers the core generates or validates (run ids, pipeline names, digests, cache keys,
+  timestamps, statuses, the blobs' digest and size).
 """
 
 import fcntl
 import functools
 import hashlib
 import json
+import logging
 import os
 import random
 import re
@@ -37,6 +65,7 @@ from horae.contracts import RunRecord, StepRecord, Usage
 from horae.contracts.intents import INTENT_TYPES, ClockTime, IntentType
 from horae.contracts.run import RunId, Target
 from horae.contracts.types import (
+    MAX_ITEMS,
     Contract,
     Fingerprint,
     IanaTimezone,
@@ -46,6 +75,7 @@ from horae.contracts.types import (
     Title,
 )
 from horae.engine.ports import PreviousLlm
+from horae.secrets.redact import current as current_redactor
 from horae.store._errors import (
     InvalidRow,
     JournalTooLarge,
@@ -55,6 +85,7 @@ from horae.store._errors import (
     RunNotStale,
     SchemaTooNewError,
     SchemaTooOldError,
+    SecretRefused,
     StoreBusy,
     StoreError,
     UnknownJournalEntry,
@@ -65,6 +96,8 @@ from horae.store._errors import (
     translate,
 )
 from horae.store._schema import SCHEMA_VERSION, migrate, user_version
+
+_log = logging.getLogger("horae.store")
 
 StoreRunStatus = Literal["running", "ok", "noop", "degraded", "failed", "undone"]
 """A run record's status, plus `running` while the run has no record yet."""
@@ -505,6 +538,9 @@ class Store:
         self._path = _path
         self._read_only = _read_only
         self._beat: sqlite3.Connection | None = None
+        self._flags: dict[str, list[str]] = {}
+        """Per run, what the secret gate found in its step rows and journal, recorded as
+        violations when its record is saved (#53)."""
 
     @classmethod
     def _from_connection(cls, conn: sqlite3.Connection, *, _path: Path | None = None) -> Self:
@@ -728,6 +764,90 @@ class Store:
         if status != "running":
             raise RunNotRunning(run_id, status)
 
+    # --- the secret gate (#53) ------------------------------------------------------------
+
+    def _flag(self, run_id: str | None, names: set[str], where: str, *, kept: bool = False) -> None:
+        """Log (names only) that the gate found `names` in `where`, and remember it as a
+        violation for `run_id`'s record."""
+        if not names:
+            return
+        shown = ", ".join(sorted(names))
+        _log.warning(
+            "secret %s found in %s%s by the store; %s",
+            shown,
+            where,
+            "" if run_id is None else f" of run {run_id}",
+            "kept as written (exempt)" if kept else "redacted",
+        )
+        if run_id is not None:
+            verb = "found" if kept else "redacted"
+            detail = f"the store {verb} secret {shown} in {where} (a producer did not redact it)"
+            details = self._flags.setdefault(run_id, [])
+            if detail not in details:
+                details.append(detail)
+
+    def _text(self, value: str, run_id: str | None, where: str) -> str:
+        new, names = current_redactor().redact_text(value)
+        self._flag(run_id, names, where)
+        return new
+
+    def _opt_text(self, value: str | None, run_id: str | None, where: str) -> str | None:
+        return None if value is None else self._text(value, run_id, where)
+
+    @staticmethod
+    def _identifier(value: str | None, where: str) -> None:
+        """Refuse an identifier holding a secret: it cannot be rewritten."""
+        if value is None:
+            return
+        _, names = current_redactor().redact_text(value)
+        if names:
+            name = ", ".join(sorted(names))
+            _log.warning("secret %s found in %s by the store; refused", name, where)
+            raise SecretRefused(name, where)
+
+    def _kept(self, data: bytes | None, run_id: str | None, where: str) -> None:
+        """Flag, without altering them, the secrets in exempt-with-flag bytes."""
+        if data is None:
+            return
+        names = {name for _start, _end, name in current_redactor().spans(data)}
+        self._flag(run_id, names, where, kept=True)
+
+    def _clean_record(self, record: RunRecord) -> RunRecord:
+        """`record` with every secret redacted, and what the gate found (in it, its step rows
+        and its journal) recorded as `secret_in_output` violations."""
+        redactor = current_redactor()
+        if not redactor and not self._flags.get(record.id):
+            return record
+        data, names = redactor.scrub_data(record.model_dump(mode="json"))
+        self._flag(record.id, names, "the run record")
+        details = self._flags.get(record.id, [])
+        if not details:
+            return record
+        violations = data["violations"]
+        have = {v.get("detail") for v in violations if isinstance(v, dict)}
+        for detail in details:
+            if detail not in have and len(violations) < MAX_ITEMS:
+                violations.append({"kind": "secret_in_output", "detail": detail})
+        try:
+            return RunRecord.model_validate_json(json.dumps(data))
+        except ValidationError:
+            name = ", ".join(sorted(names)) or "?"
+            raise SecretRefused(name, f"run record {record.id!r}") from None
+
+    def _step_json(self, run_id: str, index: int, step: StepRecord) -> str:
+        redactor = current_redactor()
+        if not redactor:
+            return step.model_dump_json()
+        data, names = redactor.scrub_data(step.model_dump(mode="json"))
+        if not names:
+            return step.model_dump_json()
+        self._flag(run_id, names, f"step {index}")
+        try:
+            return StepRecord.model_validate_json(json.dumps(data)).model_dump_json()
+        except ValidationError:
+            name = ", ".join(sorted(names))
+            raise SecretRefused(name, f"step {index} of run {run_id!r}") from None
+
     @_api
     def begin_run(
         self,
@@ -747,6 +867,7 @@ class Store:
         started = _ts(started_at)
         owner_pid = os.getpid() if pid is None else pid
         owner_host = (socket.gethostname() or None) if host is None else host
+        owner_host = self._opt_text(owner_host, None, "the run's host")
         with self.transaction():
             if self._conn.execute("SELECT 1 FROM runs WHERE id = ?", (run_id,)).fetchone():
                 raise RunExists(run_id)
@@ -836,6 +957,7 @@ class Store:
         it was read (else `RunNotStale`)."""
         stamp = _ts(at)
         before = None if heartbeat_before is None else _ts(heartbeat_before)
+        error = self._text(error, None, f"the error of abandoned run {run_id}")
         with self.transaction():
             cur = self._conn.execute(
                 "UPDATE runs SET status = 'failed', finished_at = ?, abandoned_at = ?, "
@@ -857,7 +979,9 @@ class Store:
         """Insert or replace a run's record (also its step rows).
 
         Replacing keeps the pipeline, `dry_run` and `started_at` (a mismatch raises
-        `InvalidRow`), e.g. to mark a run `undone`. An abandoned run cannot get a record."""
+        `InvalidRow`), e.g. to mark a run `undone`. An abandoned run cannot get a record.
+        Secrets are redacted and flagged first (the secret gate, see the module docstring)."""
+        record = self._clean_record(record)
         started = _ts(record.started_at)
         values = (
             record.status,
@@ -899,6 +1023,7 @@ class Store:
             self._conn.execute("DELETE FROM steps WHERE run_id = ?", (record.id,))
             for index, step in enumerate(record.steps):
                 self._insert_step(record.id, index, step)
+        self._flags.pop(record.id, None)
 
     @_api
     def get_run(self, run_id: str) -> RunRecord | None:
@@ -1009,7 +1134,7 @@ class Store:
                 _opt_ts(step.started_at),
                 _opt_ts(step.finished_at),
                 step.duration_ms,
-                step.model_dump_json(),
+                self._step_json(run_id, index, step),
             ),
         )
 
@@ -1142,6 +1267,12 @@ class Store:
             raise ValueError("an undoable change needs `before` or `after`")
         for content in (before, after):
             self._check_size(content)
+        # The secret gate: `before` is exempt (the user's note, restored byte for byte by
+        # undo), `after` is exempt but flagged, the other columns are redacted.
+        target = self._text(target, run_id, "a journal target")
+        applied_by = self._opt_text(applied_by, run_id, "a journal entry's sink")
+        sink_identity = self._opt_text(sink_identity, run_id, "a journal entry's sink identity")
+        self._kept(after, run_id, f"the content Horae wrote to {target}")
         with self.transaction():
             self._require_running(run_id)
             before_sha = self._put_blob(before)
@@ -1174,6 +1305,12 @@ class Store:
         """Record that a change was applied; `actual_after`: the bytes the sink really wrote,
         when they are not the journalled `after` (kept as a blob, for undo)."""
         self._check_size(actual_after)
+        if actual_after is not None and current_redactor().spans(actual_after):
+            row = self._conn.execute(
+                "SELECT run_id, target FROM journal WHERE id = ?", (entry_id,)
+            ).fetchone()
+            if row is not None:
+                self._kept(actual_after, row[0], f"the content a sink wrote to {row[1]}")
         with self.transaction():
             actual = self._put_blob(actual_after)
             cur = self._conn.execute(
@@ -1279,7 +1416,13 @@ class Store:
         at: datetime,
         expires_at: datetime | None = None,
     ) -> None:
-        """Insert or replace the response for a request hash."""
+        """Insert or replace the response for a request hash. An entry holding a secret is
+        refused (`SecretRefused`, nothing stored): a hit would replay it into later runs."""
+        _, names = current_redactor().scrub_data([skill, skill_version, model, response])
+        if names:
+            name = ", ".join(sorted(names))
+            _log.warning("secret %s found in an LLM cache entry by the store; refused", name)
+            raise SecretRefused(name, "the LLM cache entry")
         with self.transaction():
             self._conn.execute(
                 "INSERT OR REPLACE INTO llm_cache (key, skill, skill_version, model, response, "
@@ -1330,6 +1473,10 @@ class Store:
         """Insert or replace a task by fingerprint (`created_at` is kept)."""
         stamp = _ts(at)
         until, tz, wake = _snooze(task.status, task.snoozed_until, task.snooze_tz)
+        self._identifier(task.fingerprint, "a task fingerprint")
+        self._identifier(task.source, "a task source")
+        title = self._text(task.title, task.run_id, "a task title")
+        target = self._opt_text(task.target, task.run_id, "a task target")
         with self.transaction():
             self._require_run(task.run_id)
             self._conn.execute(
@@ -1344,14 +1491,14 @@ class Store:
                 "updated_at = excluded.updated_at",
                 (
                     task.fingerprint,
-                    task.title,
+                    title,
                     task.status,
                     None if task.due is None else task.due.isoformat(),
                     task.time,
                     until,
                     tz,
                     wake,
-                    task.target,
+                    target,
                     task.source,
                     task.run_id,
                     stamp,
@@ -1444,6 +1591,7 @@ class Store:
     ) -> NotificationState:
         """Record a send for a dedupe key and return the updated state."""
         stamp = _ts(at)
+        key = self._text(key, run_id, "a notification key")
         with self.transaction():
             self._require_run(run_id)
             (row,) = self._conn.execute(
@@ -1510,6 +1658,9 @@ class Store:
             raise ValueError("step must be an int >= 0 and attempt an int >= 1")
         if not usd >= 0 or tokens_out < 0 or tokens_in < 0:
             raise ValueError("a reservation is not negative")
+        alias = self._text(alias, run_id, "the usage ledger")
+        backend = self._opt_text(backend, run_id, "the usage ledger")
+        model = self._opt_text(model, run_id, "the usage ledger")
         with self.transaction():
             self._require_running(run_id)
             (pipeline,) = self._conn.execute(
@@ -1557,6 +1708,8 @@ class Store:
         Returns an `Overrun` when the call cost more (`usd` or `tokens_out`) than it
         reserved; the row is then marked `over_reservation` (the caller logs it)."""
         stamp = _ts(at)
+        backend = self._opt_text(backend, None, "the usage ledger")
+        model = self._opt_text(model, None, "the usage ledger")
         with self.transaction():
             if usage is None:
                 self._conn.execute(

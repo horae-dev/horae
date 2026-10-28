@@ -35,6 +35,7 @@ from pydantic_core import CoreSchema, core_schema
 
 from horae.contracts.instance import EnvSecretRef, SecretRef
 from horae.contracts.types import SecretName
+from horae.secrets import redact
 
 REDACTED = "[REDACTED]"
 """What a secret looks like wherever it is printed, logged or serialized."""
@@ -199,7 +200,9 @@ class SecretResolver:
     in `directory` only, never from the environment.
 
     The resolver remembers every secret it handed out (`resolved()`), so that the plugin
-    host can redact all of them from captured output.
+    host can redact all of them from captured output, and adds each one to the process
+    registry (`horae.secrets.redact.remember`), so that the store, the logs, the LLM layer
+    and the CLI redact it too (#53).
     """
 
     def __init__(
@@ -240,6 +243,7 @@ class SecretResolver:
         else:
             secret = self._from_file(name, self._directory / name)
         self._resolved[name] = secret
+        redact.remember(secret)
         return secret
 
     def _from_env(self, name: str, variable: str) -> Secret:

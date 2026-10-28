@@ -52,6 +52,7 @@ from horae.cli_output import (
     EXIT_REFUSED,
     SCHEMA_VERSION,
     CommandFailed,
+    echo,
     echo_json,
     run_command,
     safe,
@@ -293,16 +294,16 @@ def _init(directory: Path, json_output: bool) -> int:
         echo_json(report)
     else:
         root = report["instance"]
-        typer.echo(f"created a Horae instance in {safe(root)}")
-        typer.echo(f"  vault: {safe(report['vault'])}")
-        typer.echo(f"  pipeline: {PIPELINE}; plugins: {', '.join(report['plugins'])}")
-        typer.echo(
+        echo(f"created a Horae instance in {safe(root)}")
+        echo(f"  vault: {safe(report['vault'])}")
+        echo(f"  pipeline: {PIPELINE}; plugins: {', '.join(report['plugins'])}")
+        echo(
             "  not relocatable: horae.lock holds absolute paths and plugins/ this "
             "interpreter; to move it, run `horae init` again (`horae doctor` checks)"
         )
-        typer.echo("next:")
+        echo("next:")
         for step in ("doctor", f"run {PIPELINE} --dry-run", f"run {PIPELINE}", "runs"):
-            typer.echo(f"  horae {step} -i {safe(root)}")
+            echo(f"  horae {step} -i {safe(root)}")
     return EXIT_OK
 
 

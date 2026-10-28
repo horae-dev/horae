@@ -16,7 +16,7 @@ from horae.contracts.instance import InstanceConfig, LlmBackend, ModelAlias, Plu
 from horae.contracts.lockfile import Lockfile
 from horae.contracts.pipeline import LlmStep, Pipeline
 from horae.engine.canonical import sha256_hex
-from horae.secrets import Secret, SecretError, SecretResolver
+from horae.secrets import Secret, SecretError, SecretResolver, redact
 
 CONFIG_FILE = "horae.yaml"
 LOCK_FILE = "horae.lock"
@@ -86,6 +86,23 @@ class Instance:
         """A resolver for this instance's secrets. `environ` (default: `os.environ`) is read
         only for the secrets that have an explicit `{env: VAR}` reference."""
         return SecretResolver(self.config.secrets.refs, self.secrets_dir, environ)
+
+    def secret_names(self) -> tuple[str, ...]:
+        """Every secret the instance names, sorted: `secrets.refs`, the secrets `horae.lock`
+        grants its plugins and the model aliases' `secret`."""
+        names = set(self.config.secrets.refs)
+        for plugin in self.lock.plugins.values():
+            names.update(plugin.permissions.secrets)
+        names.update(spec.secret for spec in self.config.models.values() if spec.secret)
+        return tuple(sorted(names))
+
+    def prime_redaction(self) -> None:
+        """Resolve every secret the instance names (`secret_names`), for redaction only, so
+        that the process registry (`horae.secrets.redact`) knows them before anything is
+        run, stored, logged or printed (#53, schemas decision 43 B). A secret that cannot
+        be resolved is skipped: what needs it fails later with its own error. The values
+        are never sent anywhere; only redaction uses them."""
+        redact.prime(self.secret_resolver(), self.secret_names())
 
     def plugin_timeouts(self, plugin: str) -> PluginDefaults:
         """The effective startup and call timeouts of `plugin` (for the plugin host)."""

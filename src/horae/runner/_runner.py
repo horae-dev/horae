@@ -82,6 +82,11 @@ heartbeat, step write or the final save notices: the run is stopped and `RunLost
 loop's monotonic clock. Since liveness is the lock's, a wall-clock step only shifts recorded
 times (and may reorder run ids started across the step); it cannot make a live run look dead.
 
+**Redaction** (#53). `run` installs the log record scrubber (`horae.secrets.logs`) and
+resolves every secret the instance names (`Instance.prime_redaction`) before it takes the
+lock, so the store's secret gate, the engine's plan-time refusal of a secret in a `--var` or
+a parameter, the LLM layer and the logs know them all from the start.
+
 **The CLI.** `horae run` (`horae.cli_run`, #26) cancels the run on SIGINT and SIGTERM, as
 above, and exits 130 / 143; `on_begin(run_id)` tells it the run's id as soon as the row
 exists, so it can name the run whatever happens next.
@@ -123,6 +128,7 @@ from horae.engine import (
 )
 from horae.runner._budget import LedgerLlm
 from horae.runner._lock import PipelineLock, try_acquire_apply_lock
+from horae.secrets import logs
 from horae.store import (
     MAX_LIST_RUNS,
     InvalidRow,
@@ -403,6 +409,10 @@ class Runner:
         `RunLost`, `OSError` (the lock file cannot be created), or what crashed the run (it is
         then abandoned)."""
         pipeline = self._pipeline(name)
+        # Redaction first (#53): the log scrubber, and every secret the instance names
+        # known to the process registry before anything is run, stored or logged.
+        logs.install()
+        self.instance.prime_redaction()
         lock = await self._lock(name)
         try:
             self._recover(name)

@@ -98,6 +98,18 @@ class UnknownJournalEntry(StoreError):
         self.entry_id = entry_id
 
 
+class SecretRefused(InvalidRow):
+    """A write was refused because it holds the value of a resolved secret where the store
+    cannot redact it (#53): an LLM cache entry, an identifier (a task fingerprint, a plugin
+    ref), or a record that would no longer be valid once redacted. Only the secret's name is
+    kept, never its value."""
+
+    def __init__(self, name: str, where: str) -> None:
+        super().__init__(f"{where} holds secret {name}: not stored")
+        self.name = name
+        self.where = where
+
+
 class JournalTooLarge(StoreError):
     """A journalled content is larger than `MAX_JOURNAL_BYTES`."""
 

@@ -25,9 +25,11 @@ from horae.cli_output import (
     EXIT_PROBLEMS,
     EXIT_USAGE,
     CommandFailed,
+    echo,
     echo_json,
     io_failed,
     plural,
+    prime_secrets,
     run_command,
     safe,
 )
@@ -131,11 +133,13 @@ def summarize(
 
 def _config(instance: Path) -> InstanceConfig:
     try:
-        return validate(read_yaml(instance / CONFIG_FILE), InstanceConfig)
+        config = validate(read_yaml(instance / CONFIG_FILE), InstanceConfig)
     except ProblemsError as exc:
         found = plural(len(exc.problems), "problem") + " found"
         message = "; ".join([*map(str, exc.problems), found])
         raise CommandFailed(EXIT_PROBLEMS, "config_invalid", message) from None
+    prime_secrets(instance, config)
+    return config
 
 
 def _groups(
@@ -216,30 +220,30 @@ def _report(
         )
         return EXIT_OK
     if not rows:
-        typer.echo("no LLM usage")
+        echo("no LLM usage")
         return EXIT_OK
     header = [*(name.upper() for name in fields), "CALLS", "TOKENS IN/OUT", "CACHE R/W", "USD"]
     table = [[*(safe(part or "-") for part in key), *_cells(total)] for key, total in rows]
     table.append(["TOTAL", *([""] * (len(fields) - 1)), *_cells(grand)])
     for line in _table(header, table):
-        typer.echo(line)
+        echo(line)
     if grand.unpriced:
-        typer.echo(
+        echo(
             f"* {plural(grand.unpriced, 'call')} of a model alias without `price`: "
             "their cost is not included"
         )
     if grand.in_flight:
-        typer.echo(
+        echo(
             f"+ {plural(grand.in_flight, 'call')} in flight (or whose run was not recovered "
             "yet), counted at the most they can cost"
         )
     if grand.estimated:
-        typer.echo(
+        echo(
             f"~ {plural(grand.estimated, 'call')} settled at the most they could cost "
             "(no usage reported, or the run was abandoned)"
         )
     if grand.over_reservation:
-        typer.echo(
+        echo(
             f"! {plural(grand.over_reservation, 'call')} cost more than reserved "
             "(the provider reported more than the bound)"
         )

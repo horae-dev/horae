@@ -8,8 +8,9 @@
 - `horae.plugins.host.transport`: spawn (argv, exact env, new session), JSON-RPC pipes,
   shutdown;
 - `horae.plugins.host.session`: one process, its MCP session and tool calls;
-- `horae.plugins.host.capture` and `horae.plugins.host.redact`: stderr capture and redaction;
-- `horae.plugins.host.logs`: redaction of the MCP SDK's own log records;
+- `horae.plugins.host.capture`: stderr capture; `horae.plugins.host.redact` re-exports the
+  shared redactor (`horae.secrets.redact`, #53);
+- `horae.plugins.host.logs` re-exports the log scrubber (`horae.secrets.logs`, #53);
 - `horae.plugins.host.errors`: the error kinds.
 
 **Not enforced until M5** (ADR 0003, "declared" tier). A plugin runs as the same user as Horae:
