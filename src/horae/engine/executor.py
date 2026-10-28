@@ -1424,7 +1424,7 @@ def _shown(step: _Planned, viewed: Any, source: str) -> dict[str, Any]:
     return guard if step.skill is None else {**guard, "shown": (viewed,)}
 
 
-def _secrets_in_viewed(viewed: Any) -> set[str]:
+def secrets_in_viewed(viewed: Any) -> set[str]:
     """The names of the resolved secrets (process registry) in the real viewed input: in its
     canonical JSON bytes (every encoding) and in its strings, object keys and whole numbers,
     as `horae.llm.base.secrets_in` checks a rendered request (T10)."""
@@ -1460,7 +1460,7 @@ async def _llm_step(run: _Run, step: _Planned) -> _Outcome:
     # the rest of it is sent. The real viewed input is checked first; the backend keeps its
     # check of the rendered bytes (defence in depth).
     try:
-        held = _secrets_in_viewed(viewed)
+        held = secrets_in_viewed(viewed)
     except Exception as error:  # a port bug must not crash the run, nor send unchecked
         return degraded("host_error", f"unexpected {type(error).__name__} checking for secrets")
     if held:
@@ -1873,4 +1873,5 @@ __all__ = [
     "execute",
     "fill_target",
     "planned_calls",
+    "secrets_in_viewed",
 ]

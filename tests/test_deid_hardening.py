@@ -531,7 +531,7 @@ def test_a_failing_pre_check_sends_nothing(
     def broken(viewed: Any) -> set[str]:
         raise RuntimeError("port bug")
 
-    monkeypatch.setattr(executor, "_secrets_in_viewed", broken)
+    monkeypatch.setattr(executor, "secrets_in_viewed", broken)
     provider = Provider("anthropic", _answer())
     record = _run(_backends(provider, CLOUD, tmp_path), pack, deid=_policy())
     error = record.steps[2].error

@@ -22,6 +22,7 @@ from horae.engine.executor import (
     execute,
     fill_target,
     planned_calls,
+    secrets_in_viewed,
 )
 from horae.engine.ports import (
     Deidentifier,
@@ -91,5 +92,6 @@ __all__ = [
     "planned_calls",
     "render",
     "render_string",
+    "secrets_in_viewed",
     "variables",
 ]

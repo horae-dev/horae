@@ -2149,7 +2149,10 @@ loosened later without breaking a valid file.
         `secrets_in`) for every resolved or primed secret **before** it is pseudonymized,
         and before the LLM cache is consulted; a match degrades the step with
         `secret_in_request` and records the same violation (naming the secrets, never a
-        value), nothing is sent and nothing is billed;
+        value), nothing is sent and nothing is billed; `horae eval` (#36, decision 48) runs
+        the same check (`horae.engine.secrets_in_viewed`) on each case's viewed input, offline
+        and live, before de-identifying: the case is an error (`secret_in_request`) and
+        nothing is rendered or sent;
       - `ModelBackends.send` keeps its check of the rendered bytes (defence in depth: the
         prompt, the schema and anything added when rendering);
       - belt and braces, the pseudonymizer replaces no known value, phone or amount
