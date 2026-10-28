@@ -40,16 +40,27 @@ A sink must treat them as data, never as markup to interpret, commands or furthe
 The target itself (note `path`, `http.post` `url`, notification `link`) was bound by the
 engine to a trusted pipeline parameter (schemas decision 30).
 
-A read or apply that cannot be done raises `SinkError`, with a machine-readable `kind`.
+A read or apply that cannot be done raises `SinkError`, with a machine-readable `kind`
+(`^[a-z_]{1,32}$`; the core reports any other kind as `host_error`).
+
+**Identity** (optional, #22). A sink may have an `identity` attribute: a short, stable string
+naming *where* it writes (e.g. a local vault's real path, device and inode), at most
+`MAX_IDENTITY` characters. The journal records it with each change, and `horae undo` refuses
+to restore through a sink whose identity differs (`sink_mismatch`): a note path alone does not
+tell one vault from another. Reading it may raise `SinkError` (e.g. `vault_unset`).
 """
 
+import re
 from dataclasses import dataclass, field
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, runtime_checkable
 
 from horae.contracts.intents import Intent
 
 MAX_NOTE_BYTES = 16 * 1024 * 1024
 """The largest note read or written through a sink (16 MiB)."""
+MAX_IDENTITY = 512
+"""The longest sink identity (`sink_identity`)."""
+_KIND = re.compile(r"^[a-z_]{1,32}$")
 
 
 class SinkError(Exception):
@@ -59,6 +70,24 @@ class SinkError(Exception):
         super().__init__(kind, message)
         self.kind = kind
         self.message = message
+
+
+def error_kind(kind: object) -> str:
+    """A sink's error kind if it is well-formed (`^[a-z_]{1,32}$`), else `host_error`."""
+    return kind if isinstance(kind, str) and _KIND.fullmatch(kind) else "host_error"
+
+
+def sink_identity(sink: object) -> str | None:
+    """The sink's `identity` (see the module docstring), `None` when it has none.
+
+    Raises `SinkError` when the sink raises it, or when the identity is not a string of 1 to
+    `MAX_IDENTITY` characters (`identity_invalid`)."""
+    identity = getattr(sink, "identity", None)
+    if identity is None:
+        return None
+    if not isinstance(identity, str) or not 1 <= len(identity) <= MAX_IDENTITY:
+        raise SinkError("identity_invalid", "the sink's identity is not a short string")
+    return identity
 
 
 @dataclass(frozen=True)
@@ -149,6 +178,36 @@ class Sink(Protocol):
     async def apply(self, call: SinkCall, *, expected_before_sha256: str | None) -> Applied:
         """Apply `call` (#22 only, never during a dry run) if the target is still as planned
         (`target_changed` otherwise); raises `SinkError`."""
+        ...
+
+
+@runtime_checkable
+class RestorableSink(Sink, Protocol):
+    """A sink whose note changes `horae undo` can revert (#22, schemas decision 34).
+
+    Undo restores **bytes**, not intents: the closed intent set (ADR 0002) has no "write
+    exactly these bytes" or "delete this note" intent, and a run abandoned mid-apply has no
+    record to rebuild a `SinkCall` from. So undo goes through these two target-keyed methods
+    instead of a synthetic `apply`. Both resolve `target` (a note path) exactly as `read` and
+    `apply` do (no symlink on any component, a single hard link, a regular file)."""
+
+    async def read_target(self, target: str) -> bytes | None:
+        """The current bytes of note `target` (`None`: it does not exist). Side-effect free;
+        raises `SinkError`."""
+        ...
+
+    async def parent_exists(self, target: str) -> bool:
+        """Whether the directory note `target` would be in exists (side-effect free): undo
+        never takes a missing note for "already removed" when its directory is missing too
+        (a wrong vault, most likely). Raises `SinkError`."""
+        ...
+
+    async def restore(
+        self, target: str, content: bytes | None, *, expected_sha256: str | None
+    ) -> None:
+        """Make note `target` hold exactly `content` (`None`: remove it), a compare-and-swap:
+        if its current bytes do not have SHA-256 `expected_sha256` (`None`: it must not
+        exist), nothing changes and `SinkError("target_changed")` is raised."""
         ...
 
 

@@ -547,3 +547,9 @@ def replay_command(
     else:
         typer.echo(result.render())
     raise typer.Exit(code)
+
+
+# `horae undo` lives in its own module (#22); registered here so `horae.cli.app` has it.
+from horae.cli_undo import undo as _undo  # noqa: E402
+
+app.command("undo")(_undo)
