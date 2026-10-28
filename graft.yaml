@@ -16,6 +16,7 @@ sensitive_paths:
   - ".github/workflows/**"
   - "Dockerfile"
   - "deploy/**"
+  - "docs/security.md"
 
 # When nothing else matches: one human.
 default:
