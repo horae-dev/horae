@@ -1,0 +1,11 @@
+{
+  "status": 529,
+  "body": {
+    "type": "error",
+    "error": {
+      "type": "overloaded_error",
+      "message": "Synthetic: Overloaded"
+    },
+    "request_id": "req_01Synthetic"
+  }
+}

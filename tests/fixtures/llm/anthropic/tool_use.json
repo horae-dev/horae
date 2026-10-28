@@ -1,0 +1,23 @@
+{
+  "status": 200,
+  "body": {
+    "id": "msg_01SyntheticFixture000000",
+    "type": "message",
+    "role": "assistant",
+    "model": "claude-fixture-1",
+    "content": [
+      {
+        "type": "tool_use",
+        "id": "toolu_01Synthetic",
+        "name": "fetch",
+        "input": {}
+      }
+    ],
+    "stop_reason": "tool_use",
+    "stop_sequence": null,
+    "usage": {
+      "input_tokens": 1200,
+      "output_tokens": 20
+    }
+  }
+}

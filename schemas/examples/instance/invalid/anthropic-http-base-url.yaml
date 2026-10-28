@@ -1,0 +1,8 @@
+# A cloud backend's endpoint must be https: the API key and the data never travel in clear,
+# even to a private address (decision 38 C).
+models:
+  default:
+    backend: anthropic
+    model: claude-sonnet-4-5
+    secret: ANTHROPIC_API_KEY
+    base_url: "http://10.0.0.5:8080"

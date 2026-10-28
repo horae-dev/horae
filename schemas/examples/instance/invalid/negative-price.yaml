@@ -1,0 +1,7 @@
+# A price is a non-negative number of US dollars per million tokens.
+models:
+  default:
+    backend: anthropic
+    model: claude-sonnet-4-5
+    secret: ANTHROPIC_API_KEY
+    price: { input_per_mtok: -1, output_per_mtok: 15 }

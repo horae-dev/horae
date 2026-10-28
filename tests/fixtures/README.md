@@ -28,3 +28,11 @@ Synthetic plugins for the plugin host tests (#24), both run with the test interp
 - `raw/raw_server.py`: a hand-written JSON-RPC server that misbehaves on purpose (junk and
   oversized messages, error responses, a sampling request, a startup that never answers, a
   process that ignores `SIGTERM`).
+
+## llm/anthropic/
+
+Recorded-response fixtures for the `anthropic` backend tests (#28,
+`tests/test_llm_anthropic.py`): synthetic Messages API answers, each `{status, body}`, served
+by an `httpx2.MockTransport` (no network). Success (with and without prompt-cache tokens),
+refusal, `max_tokens` truncation, tool use, text that is not JSON, and the error bodies of
+HTTP 400, 401, 429, 500 and 529. Ids, texts and token counts are invented.
