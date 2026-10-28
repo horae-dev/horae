@@ -972,7 +972,9 @@ class _Prompts:
         return Prompt(self.system, request.input, self.schema, "1")
 
 
-def _backends(provider: _Provider, prompts: _Prompts, tmp_path: Path) -> ModelBackends:
+def _backends(
+    provider: _Provider, prompts: _Prompts, tmp_path: Path, *, valid: bool = False
+) -> ModelBackends:
     spec = ModelAlias.model_validate(
         {"backend": "ollama", "model": "fixture-model", "base_url": "http://localhost:11434"}
     )
@@ -981,7 +983,7 @@ def _backends(provider: _Provider, prompts: _Prompts, tmp_path: Path) -> ModelBa
         SecretResolver({}, tmp_path),
         {"ollama": lambda alias, spec, secrets: provider},
         prompts,
-        validate=lambda output, schema: [f"bad value {LONG}"],
+        validate=lambda output, schema, *, timeout_s: [] if valid else [f"bad value {LONG}"],
     )
 
 
@@ -997,8 +999,12 @@ def test_an_llm_response_is_redacted(
     caplog.set_level(logging.DEBUG)
     response = asyncio.run(_backends(_Provider(), _Prompts(), tmp_path).complete(_request()))
     assert response.output == {"summary": "key [REDACTED:LONG_TOKEN]", token("LONG_TOKEN"): 1}
-    assert response.intents == [{"type": "notify.push", "title": token("PIN_CODE")}]
+    assert response.intents == []  # an invalid output proposes nothing (decision 44)
     assert response.schema_errors == ("bad value [REDACTED:LONG_TOKEN]",)
+    valid = _backends(_Provider(), _Prompts(), tmp_path, valid=True)
+    accepted = asyncio.run(valid.complete(_request()))
+    assert accepted.intents == [{"type": "notify.push", "title": token("PIN_CODE")}]
+    assert accepted.schema_errors == ()
     assert LONG not in json.dumps(response.request)
     assert "secret LONG_TOKEN, PIN_CODE found in a response of model alias default" in caplog.text
     assert _leaks(caplog.text.encode(), LONG, PIN) == []

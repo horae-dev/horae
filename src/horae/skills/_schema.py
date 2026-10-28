@@ -33,7 +33,10 @@ so the bound holds for what it stores. Rules, beyond the draft 2020-12 metaschem
   an extreme of 10^15 or more (the longest `repr` of a finite float); `true` / `false` 5,
   `null` 4;
 - the bound is at most `MAX_OUTPUT_BYTES`, and the schema nests at most `MAX_SCHEMA_DEPTH`
-  levels of JSON.
+  levels of JSON;
+- the `anyOf` / `oneOf` branch counts multiply to at most `MAX_COMBINATOR_FANOUT` along any
+  path, `$ref`s followed (a validator tries every branch: nested alternatives, through a
+  chain of `$defs` say, make one validation exponential; #31).
 
 A value satisfies every keyword of its schema, so a schema's bound is the smallest of what
 its `type`, `enum` / `const`, `$ref` and combinators allow (`anyOf` / `oneOf`: the largest
@@ -66,6 +69,10 @@ MAX_SCHEMA_DEPTH = 64
 """Deepest JSON nesting of an output schema file (like `horae.config` YAML documents)."""
 MAX_REF_HOPS = 32
 """Longest chain of `$ref`s followed while bounding."""
+MAX_COMBINATOR_FANOUT = 1024
+"""Largest product of `anyOf` / `oneOf` branch counts along one path of the schema, `$ref`s
+followed: a validator tries every branch, and keeps every failing branch's errors, so nested
+alternatives multiply the work of one validation (#31, decision 39 E)."""
 MAX_FLOAT_REPR = 25
 """More than the longest `repr` of a finite float (`-1.7976931348623157e+308`, 24)."""
 INTENTS_PROPERTY = INTENTS_KEY
@@ -99,6 +106,8 @@ _ONE = (
 )
 _MAP = ("properties", "$defs", "definitions", "dependentSchemas")
 _LIST = ("allOf", "anyOf", "oneOf", "prefixItems")
+_LIST_ONCE = ("allOf", "prefixItems")
+"""The list keywords whose subschemas are each checked once (not alternatives)."""
 _SCALAR = {"boolean": 5, "null": 4}
 _PLAIN_FLOAT = 10**15
 """Below this magnitude an integral float's `repr` is its digits and `.0`."""
@@ -158,7 +167,9 @@ def _value_bytes(value: Any) -> int:
     raise SchemaProblem(f"not a JSON value: {type(value).__name__}")  # pragma: no cover
 
 
-def _subschemas(node: Mapping[str, Any], where: str) -> list[tuple[Any, str]]:
+def _subschemas(
+    node: Mapping[str, Any], where: str, lists: tuple[str, ...] = _LIST
+) -> list[tuple[Any, str]]:
     found: list[tuple[Any, str]] = []
     for key in _ONE:
         if key in node:
@@ -166,7 +177,7 @@ def _subschemas(node: Mapping[str, Any], where: str) -> list[tuple[Any, str]]:
     for key in _MAP:
         if isinstance(node.get(key), dict):
             found.extend((v, f"{where}/{key}/{k}") for k, v in node[key].items())
-    for key in _LIST:
+    for key in lists:
         if isinstance(node.get(key), list):
             found.extend((v, f"{where}/{key}/{i}") for i, v in enumerate(node[key]))
     return found
@@ -335,6 +346,42 @@ class _Bounder:
         return target
 
 
+class _Fanout:
+    """The largest product of `anyOf` / `oneOf` branch counts along one path from a
+    subschema, `$ref`s followed (memoised per `$ref`: a chain of definitions that each
+    branch twice to the next is linear to check, and exponential to validate). Capped at
+    `MAX_COMBINATOR_FANOUT + 1`. Runs after the bound, so `$ref`s resolve and have no cycle."""
+
+    def __init__(self, bounder: _Bounder) -> None:
+        self.bounder = bounder
+        self.refs: dict[str, int] = {}
+
+    def of(self, node: Any, where: str) -> int:
+        if not isinstance(node, dict):
+            return 1
+        worst = 1
+        for key in ("anyOf", "oneOf"):
+            branches = node.get(key)
+            if isinstance(branches, list) and branches:
+                inner = max(self.of(b, f"{where}/{key}/{i}") for i, b in enumerate(branches))
+                worst = max(worst, len(branches) * inner)
+        for child, place in _subschemas(node, where, _LIST_ONCE):
+            worst = max(worst, self.of(child, place))
+        ref = node.get("$ref")
+        if isinstance(ref, str):
+            if ref not in self.refs:
+                self.refs[ref] = 1  # no cycle (refused by the bound); a guard all the same
+                self.refs[ref] = self.of(self.bounder._resolve(ref, where), ref)
+            worst = max(worst, self.refs[ref])
+        if worst > MAX_COMBINATOR_FANOUT:
+            raise SchemaProblem(
+                f"{where}: the `anyOf` / `oneOf` alternatives multiply to more than "
+                f"{MAX_COMBINATOR_FANOUT} along one path (`$ref`s followed): validating an "
+                "output could take exponential time and memory"
+            )
+        return worst
+
+
 def _definitions_bounded(bounder: _Bounder, schema: dict[str, Any]) -> None:
     """Every subschema under a `$defs` / `definitions`, referenced or not, must be bounded:
     a definition the bound never visited cannot widen what the validator accepts."""
@@ -408,6 +455,7 @@ def _check(schema: Any, proposes_intents: bool | None) -> int:
     bounder = _Bounder(schema)
     size = bounder.bound(schema, "#", ())
     _definitions_bounded(bounder, schema)
+    _Fanout(bounder).of(schema, "#")
     if size > MAX_OUTPUT_BYTES:
         raise SchemaProblem(
             f"the output schema accepts documents of up to {size} bytes "
