@@ -73,6 +73,9 @@ enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
 testpaths = ["tests"]
 addopts = "-ra --strict-config --strict-markers"
 xfail_strict = true
+markers = [
+    "live: runs against a real external program (e.g. Claude Code); skipped unless enabled, never in CI",
+]
 filterwarnings = ["error"]
 
 [tool.coverage.run]

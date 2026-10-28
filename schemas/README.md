@@ -1333,7 +1333,7 @@ loosened later without breaking a valid file.
       the instance's time zone (a 23- or 25-hour day is one day);
     - **provider prompt caches**: a `ProviderBackend` declares `may_write_cache` (default
       `False`; `anthropic` is `False`, since Horae sends no `cache_control`; `claude-cli`
-      #29 is expected to be `True`). For such a backend the input bound is priced at the
+      is `True`, decision 42). For such a backend the input bound is priced at the
       cache write price (`cache_write_per_mtok`, else twice the input price) in both
       `max_tokens` and `worst_case`, so a settled call never exceeds its reservation; a
       backend without it that reports cache writes beyond the bound is flagged
@@ -1349,3 +1349,95 @@ loosened later without breaking a valid file.
     - **follow-ups**: a monthly ceiling; provider-side spend limits (#63); calling
       `prune_usage` from a retention setting.
 
+
+### Provisional decisions (#29, pending maintainer review)
+
+42. **The `claude-cli` backend with isolation (#29, the design note on
+    [#97](https://github.com/horae-dev/horae/pull/97); every recommendation accepted).**
+    One compatible v1 addition and the rules of `horae.llm.backends.claude_cli`. **Not a legal
+    assessment**: personal headless use of `claude -p` on your own plan is PLAN.md's ⚠️
+    unverified reading (risk #70); this backend is "personal use under your plan's terms",
+    and `anthropic` with an API key stays the recommended backend for published setups
+    ([ADR 0005](../docs/adr/0005-claude-cli-backend-and-its-terms.md)).
+    - **contract change** (optional): `models.<alias>.command`, an absolute path (no control
+      characters, at most 1024 characters), accepted for `backend: claude-cli` only (the model
+      and the JSON Schema both refuse it on another backend). Unset, `claude` is looked up on
+      the fixed child `PATH` (`/usr/local/bin:/usr/bin:/bin`), **never** Horae's own `PATH`
+      (answer 6). The native installer puts `claude` in `~/.local/bin`, which is not on it:
+      such setups set `command`. Symlinks are resolved when the backend first runs it, so one
+      run uses one release;
+    - **token mode only (answer 1)**: the alias' `secret` (a `CLAUDE_CODE_OAUTH_TOKEN` made
+      with `claude setup-token`) is passed as `CLAUDE_CODE_OAUTH_TOKEN`, revealed into the
+      child's mapping only. The contract keeps `secret` optional (a login mode may come
+      later), but an alias without it is refused at the first call (`backend_unavailable`,
+      nothing runs) and by `horae doctor` (an error). A secret that cannot be resolved, or
+      holds a NUL, is `auth_failed`. Checked locally on 2.1.284: with an empty `HOME` and no
+      token the CLI answers "Not logged in" (no ambient login, keychain included, is used);
+    - **render, then send** (decision 38): the payload is `{argv, stdin, max_tokens}`;
+      `argv` is fixed but for the model and the system prompt, `stdin` holds the untrusted
+      input and the repair errors (fenced and escaped as for every backend; never in `argv`,
+      which `ps` shows), `max_tokens` the output budget (the CLI takes no output limit, so it
+      only sizes the usage floor and the conservative charge). `send` refuses any other
+      payload (`invalid_request`). The system prompt (`SYSTEM_PREAMBLE`, then the skill's
+      trusted prompt) goes in `--system-prompt`, at most 64 KiB (`invalid_request`);
+    - **the flags (answer 3)**: `-p --output-format json --model <model> --tools ""
+      --strict-mcp-config --mcp-config {"mcpServers":{}} --setting-sources ""
+      --no-session-persistence --disable-slash-commands --permission-mode dontAsk
+      --max-turns 1 --system-prompt <system>`. On 2.1.284 every flag is listed by `claude
+      --help` but `--max-turns` (hidden), and every one is **accepted** by the parser (checked
+      locally with an empty `HOME`: an unknown option fails with `unknown option`, these do
+      not). Their **behaviour** is verified by the live test
+      (`tests/test_llm_claude_cli_live.py`, `@pytest.mark.live`, skipped unless
+      `HORAE_LIVE_CLAUDE=1` and a token are given, never in CI): no tool runs and none is
+      reported, user settings and their hooks are not loaded, user and project MCP servers
+      do not start, no `CLAUDE.md` reaches the model, the system prompt replaces the default
+      one, no transcript is written, no ambient login is used. **TODO (not yet run
+      live)**: the first live run's output goes into this PR's body before the flag set is
+      final. `--bare` is not used: its help says OAuth and the keychain are never read under
+      it, which seems to exclude token auth; `--restricted` is not used either; the live test
+      prints what both do with the token (evaluation only);
+    - **the environment**: exactly `PATH` (the fixed one), `HOME` and `TMPDIR` (fresh empty
+      per-call directories, 0700), `LANG=C.UTF-8`, `TZ=UTC`, `DISABLE_AUTOUPDATER=1`,
+      `DISABLE_TELEMETRY=1`, `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` and the token;
+      nothing is inherited (`ANTHROPIC_*`, `*_PROXY`, `NODE_OPTIONS`, `CLAUDE_CONFIG_DIR`
+      never reach it), built on the plugin host's `base_env`. **TODO**: that the three
+      switches stop auto-update, telemetry and non-essential traffic on the pinned release
+      is not verified (no live check yet), nor whether `CLAUDE_CODE_MAX_OUTPUT_TOKENS` bounds
+      the output (it is not set);
+    - **the process** (the plugin host's posture, decision 35): an argument list (no shell),
+      the working directory an empty per-call directory, umask 077, a new session (its own
+      process group), the per-call directories removed afterwards. The step's timeout, then
+      `SIGTERM` to the group and `SIGKILL` 2 s later (`timeout`, no usage: the ledger keeps
+      the reservation as an estimate); stdout at most 8 MiB (`output_invalid`, charged
+      conservatively, the group killed at once); stderr captured head and tail (64 KiB) and
+      redacted with every resolved secret before it reaches an `LlmError`;
+    - **the version pin (answers 2, 7)**: `CLAUDE_CODE_VERSION_RANGE = ">=2.1.284,<2.2"`
+      (2.1.284 is the release checked). `<command> --version` runs once per backend (one per
+      alias per run), in the same isolated environment without the token; its output must be
+      `X.Y.Z (Claude Code)`. Outside the range, or unreadable, the alias is
+      `backend_unavailable` for the rest of the run and nothing is sent; `horae doctor` runs
+      the same check (an error). Bumping the range needs the live test's output for the new
+      release in the bump PR's body and the version in `docs/security.md` T11;
+    - **the result (answer 5)**: stdout must be UTF-8 and one JSON object (strict parsing)
+      with `type: "result"`. `is_error` (anything but `false`): `api_error_status` through the
+      HTTP status table, `error_max_turns` → `output_invalid`, `error_max_budget_usd` →
+      `budget_exceeded`, a result starting "Not logged in" → `auth_failed`, else `host_error`;
+      the usage is attached only when the result reports spend (so a refusal releases its
+      reservation, decision 41). A non-zero exit without a result is `host_error`. A
+      success needs `num_turns: 1`, no `permission_denials`, a stop reason other than
+      `tool_use` or `max_tokens`, and a `result` that parses as one JSON value (no fence
+      stripping; `--json-schema` is not used, schema validation is #31's). Messages are
+      Horae's; the CLI's text never is;
+    - **usage and cost (answer 4)**: tokens from `usage` (`input_tokens`, `output_tokens`,
+      cache reads and writes), floored as decision 40 K, charged conservatively when missing
+      or unusable. `total_cost_usd` (a finite number from 0 to 10⁶, else ignored) is notional
+      under a subscription but **counts** against the step and daily budgets: `usd` is the
+      larger of it and the alias' `price` applied to the tokens, and `priced` is `true` when
+      either is known. `may_write_cache` is `true` (decision 41: Claude Code caches by itself),
+      so the input bound is priced at the cache write price. Without a `price` nothing is
+      reserved in dollars before a call (only `tokens_out` sizes it) and each notional cost
+      settles `over_reservation`; `horae doctor` warns about it. **TODO**: pass the remaining
+      step `usd` as `--max-budget-usd` (a second fence) once `Completion` carries it;
+    - **conformance**: `claude-cli` joins the backend-agnostic tests of
+      `tests/test_llm_backends_shared.py` with a fake `claude` (`tests/claude_cli_fake.py`);
+      the HTTP-only ones are skipped there with their reason.

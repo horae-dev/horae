@@ -17,13 +17,14 @@ import pytest
 import yaml
 from typer.testing import CliRunner
 
+from claude_cli_fake import make_fake
 from horae.cli import app
 from horae.config import Instance
 from horae.contracts import InstanceConfig, Lockfile, RunRecord
 from horae.contracts.instance import ModelAlias
 from horae.engine import LlmRequest
 from horae.llm import ModelBackends, Prompt
-from horae.llm.backends import AnthropicBackend
+from horae.llm.backends import FACTORIES, AnthropicBackend
 from horae.runner import Ports, Runner, open_ports, uses_llm
 from horae.secrets import SecretResolver
 from horae.store import Store
@@ -277,7 +278,12 @@ def _doctor(root: Path) -> tuple[int, dict[str, Any]]:
     return result.exit_code, json.loads(result.stdout)
 
 
-def test_doctor_reports_an_unavailable_backend(tmp_path: Path) -> None:
+def test_doctor_reports_an_unavailable_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Every built-in backend is implemented now: hide one to see the problem.
+    without = {name: f for name, f in FACTORIES.items() if name != "claude-cli"}
+    monkeypatch.setattr("horae.cli_host.FACTORIES", without)
     models = {"default": {"backend": "claude-cli", "model": "sonnet"}, "spare": ANTHROPIC}
     root = _write(tmp_path / "instance", models, [LLM_STEP])
     code, report = _doctor(root)
@@ -295,6 +301,48 @@ def test_doctor_accepts_an_anthropic_alias_with_its_secret(tmp_path: Path) -> No
     root = _write(tmp_path / "instance", {"default": ANTHROPIC, "unused": unused}, [LLM_STEP])
     assert _doctor(root) == (0, _doctor(root)[1])
     assert _doctor(root)[1]["ok"] is True
+
+
+def _claude_cli(tmp_path: Path, **overrides: Any) -> tuple[Path, Any]:
+    fake = make_fake(tmp_path / "bin")
+    spec = {
+        "backend": "claude-cli",
+        "model": "sonnet",
+        "secret": "CLAUDE_CODE_OAUTH_TOKEN",
+        "command": fake.command,
+        "price": {"input_per_mtok": 3.0, "output_per_mtok": 15.0},
+        **overrides,
+    }
+    spec = {key: value for key, value in spec.items() if value is not None}
+    root = _write(tmp_path / "instance", {"default": spec}, [LLM_STEP])
+    (root / "secrets" / "CLAUDE_CODE_OAUTH_TOKEN").write_text("synthetic-token-0123", "utf-8")
+    return root, fake
+
+
+def test_doctor_accepts_a_claude_cli_alias_at_a_supported_version(tmp_path: Path) -> None:
+    root, fake = _claude_cli(tmp_path)
+    assert _doctor(root) == (0, _doctor(root)[1])
+    assert len(fake.versions()) >= 1  # the version was checked
+    assert fake.calls() == []  # nothing was asked of the model
+
+
+def test_doctor_reports_a_claude_cli_version_outside_the_range(tmp_path: Path) -> None:
+    root, fake = _claude_cli(tmp_path)
+    fake.behave(version="2.2.0 (Claude Code)")
+    code, report = _doctor(root)
+    assert code == 1
+    [problem] = report["problems"]
+    assert problem["message"].startswith("models.default.command: Claude Code 2.2.0 is outside")
+    assert "supported: Claude Code >=2.1.284,<2.2" in problem["message"]
+
+
+def test_doctor_reports_a_claude_cli_alias_without_a_secret_or_price(tmp_path: Path) -> None:
+    root, _ = _claude_cli(tmp_path, secret=None, price=None)
+    code, report = _doctor(root)
+    assert code == 1
+    messages = {p["severity"]: p["message"] for p in report["problems"]}
+    assert messages["error"].startswith("models.default.secret: backend 'claude-cli' needs")
+    assert "notional total_cost_usd is counted" in messages["warning"]
 
 
 def test_doctor_reports_a_missing_alias_secret(tmp_path: Path) -> None:

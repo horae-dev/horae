@@ -30,7 +30,7 @@ from horae.llm import (
     cost,
     max_tokens,
 )
-from horae.llm.backends import FACTORIES, AnthropicBackend, model_backends
+from horae.llm.backends import FACTORIES, AnthropicBackend
 from horae.llm.backends._shared import BoundedTransport
 from horae.llm.backends.anthropic import (
     ANTHROPIC_VERSION,
@@ -713,14 +713,15 @@ def test_an_unknown_alias_is_an_invalid_request(secrets: SecretResolver) -> None
 
 def test_a_backend_without_a_factory_is_unavailable(secrets: SecretResolver) -> None:
     spec = ModelAlias(backend="claude-cli", model="sonnet")
-    llm = model_backends({"default": spec}, secrets, prompts=StaticPrompts(SCHEMA))
+    factories = {name: f for name, f in FACTORIES.items() if name != "claude-cli"}
+    llm = ModelBackends({"default": spec}, secrets, factories, StaticPrompts(SCHEMA))
     error = fails(llm)
     assert error.kind == "backend_unavailable"
     assert "claude-cli" in error.message
 
 
 def test_the_builtin_factories() -> None:
-    assert set(FACTORIES) == {"anthropic", "openai-compatible", "ollama"}
+    assert set(FACTORIES) == {"anthropic", "openai-compatible", "ollama", "claude-cli"}
 
 
 def test_request_prompts_need_the_skill_fields(secrets: SecretResolver) -> None:
