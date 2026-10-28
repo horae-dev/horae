@@ -13,12 +13,17 @@ one `horae undo`), everything the runner needs from the installed plugins:
 - `McpSinks`, the `SinkRegistry` that applies routed intents through the plugins' sink
   operations (`horae.plugins.host.sink`).
 
-`LivePorts.ports` is the runner's `Ports(plugins=registry, tools=host, sinks=sinks,
-skills=...)`, the skills read from `<plugins_dir>/<name>/skills/` (`DirectorySkills`, #27).
-`llm` is `None` until M2 wires a backend. Where `horae plugin add` installs plugins (the
-`plugins_dir`) is M4's (#44); the walking skeleton and the tests write it with
-`horae.plugins.builtin.install`. `horae run`, `horae diff` and `horae undo` open it on
-`<instance>/plugins` (`horae.cli_host`, #26).
+`LivePorts.ports` is the runner's `Ports(plugins=registry, tools=host, llm=llm, sinks=sinks,
+skills=skills)`, the skills read from `<plugins_dir>/<name>/skills/` (`DirectorySkills`, #27).
+`llm` is the caller's backend when given; otherwise, when a pipeline of the instance has an
+`llm` step, a `horae.llm.ModelBackends` over the instance's model aliases
+(`horae.llm.backends.model_backends`, #28), sharing the host's `SecretResolver`. It is lazy:
+an alias' provider backend is built and its secret resolved on its first call, so a run that
+makes no LLM call never reads an API key. Its connections are closed with the block.
+
+Where `horae plugin add` installs plugins (the `plugins_dir`) is M4's (#44); the walking
+skeleton and the tests write it with `horae.plugins.builtin.install`. `horae run`,
+`horae diff` and `horae undo` open it on `<instance>/plugins` (`horae.cli_host`, #26).
 
 Raises `ProblemsError` for an invalid manifest and `RegistryError` for one that does not
 match `horae.lock`, before any process starts.
@@ -30,7 +35,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from horae.config import Instance
+from horae.contracts.pipeline import LlmStep
 from horae.engine import LlmBackend
+from horae.llm import ModelBackends
+from horae.llm.backends import model_backends
 from horae.plugins.host import HostRegistry, McpSinks, PluginHost, host_for_instance
 from horae.runner._runner import Ports
 from horae.secrets import SecretResolver
@@ -57,11 +65,28 @@ async def open_ports(
 ) -> AsyncIterator[LivePorts]:
     """The live ports of one run (see the module docstring)."""
     registry = HostRegistry.from_directory(instance.lock, plugins_dir)
-    async with host_for_instance(instance, registry, secrets=secrets) as host:
-        sinks = McpSinks(registry, host)
-        skills = DirectorySkills({p.manifest.name: p.root for p in registry.plugins()})
-        ports = Ports(plugins=registry, tools=host, llm=llm, sinks=sinks, skills=skills)
-        yield LivePorts(registry, host, sinks, ports)
+    secrets = secrets or instance.secret_resolver()
+    owned: ModelBackends | None = None
+    if llm is None and uses_llm(instance):
+        llm = owned = model_backends(instance.config.models, secrets)
+    try:
+        async with host_for_instance(instance, registry, secrets=secrets) as host:
+            sinks = McpSinks(registry, host)
+            skills = DirectorySkills({p.manifest.name: p.root for p in registry.plugins()})
+            ports = Ports(plugins=registry, tools=host, llm=llm, sinks=sinks, skills=skills)
+            yield LivePorts(registry, host, sinks, ports)
+    finally:
+        if owned is not None:
+            await owned.aclose()
 
 
-__all__ = ["LivePorts", "open_ports"]
+def uses_llm(instance: Instance) -> bool:
+    """Whether a pipeline of `instance` has an `llm` step."""
+    return any(
+        isinstance(step, LlmStep)
+        for pipeline in instance.pipelines.values()
+        for step in pipeline.steps
+    )
+
+
+__all__ = ["LivePorts", "open_ports", "uses_llm"]

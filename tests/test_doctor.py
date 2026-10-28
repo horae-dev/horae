@@ -271,8 +271,13 @@ def _with_skill(tmp_path: Path) -> Path:
         "permissions": {"intents": ["note.create"]},
     }
     (root / "horae.lock").write_text(yaml.safe_dump(lock), encoding="utf-8")
+    (root / "secrets").mkdir()
+    (root / "secrets" / "ANTHROPIC_API_KEY").write_text("fixture-key", encoding="utf-8")
     with (root / "horae.yaml").open("a", encoding="utf-8") as config:
-        config.write("models:\n  default: { backend: claude-cli, model: fixture-m }\n")
+        config.write(
+            "secrets: { dir: secrets }\nmodels:\n  default: { backend: anthropic, model: m, "
+            "secret: ANTHROPIC_API_KEY, price: { input_per_mtok: 1, output_per_mtok: 1 } }\n"
+        )
     pipeline = {
         "name": "brief",
         "steps": [

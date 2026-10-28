@@ -1057,6 +1057,7 @@
       "description": "Tokens and money spent.",
       "properties": {
         "tokens_in": {
+          "description": "Input tokens billed at the full input price (for the Anthropic API, `input_tokens`:\ncache reads and writes are counted apart).",
           "minimum": 0,
           "title": "Tokens In",
           "type": "integer"
@@ -1067,9 +1068,51 @@
           "type": "integer"
         },
         "usd": {
+          "description": "What the tokens cost, from the model alias' `price` in `horae.yaml`; `0` when it has\nnone (then `priced` is `false`).",
           "minimum": 0,
           "title": "Usd",
           "type": "number"
+        },
+        "cache_read_tokens": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Input tokens read from the provider's prompt cache, when it reports them.",
+          "title": "Cache Read Tokens"
+        },
+        "cache_write_tokens": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Input tokens written to the provider's prompt cache, when it reports them.",
+          "title": "Cache Write Tokens"
+        },
+        "priced": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "`false` when the model alias has no `price`, so `usd` is `0` and does not reflect the\nreal cost; absent when unknown (e.g. records written before decision 38).",
+          "title": "Priced"
         }
       },
       "required": [

@@ -124,7 +124,8 @@ def _report(instance: Path, json_output: bool) -> int:
     problems = list(result.problems)
     if result.instance is not None:
         problems.extend(instance_problems(result.instance))
-    ok = not problems
+    ok = not any(problem.severity == "error" for problem in problems)
+    warnings = sum(problem.severity == "warning" for problem in problems)
     if json_output:
         report = {
             "schema_version": REPORT_SCHEMA_VERSION,
@@ -142,9 +143,10 @@ def _report(instance: Path, json_output: bool) -> int:
                 f"OK: {_plural(len(loaded.pipelines), 'pipeline')}, "
                 f"{_plural(len(loaded.lock.plugins), 'plugin')}, "
                 f"{_plural(len(loaded.config.models), 'model alias', 'model aliases')}"
+                + (f" ({_plural(warnings, 'warning')})" if warnings else "")
             )
         else:
-            typer.echo(_plural(len(problems), "problem") + " found")
+            typer.echo(_plural(len(problems) - warnings, "problem") + " found")
     return EXIT_OK if ok else EXIT_PROBLEMS
 
 
@@ -173,7 +175,11 @@ def doctor(
     instance is reported), and, with a plugins/ directory, that the plugins are installed
     as horae.lock pins them and their commands (interpreters) are executable.
 
-    Exit codes: 0 no problem, 1 problems found, 2 usage error, 70 internal error.
+    Warnings (e.g. a cloud model alias without a price, whose usd budget is then
+    ineffective) are reported but do not fail the check.
+
+    Exit codes: 0 no problem (warnings allowed), 1 problems found, 2 usage error, 70 internal
+    error.
     Secret values are never printed. With --json: {schema_version, ok, instance, problems};
     an error is {schema_version, error}."""
     run_command("doctor", json_output, lambda: _report(instance, json_output))

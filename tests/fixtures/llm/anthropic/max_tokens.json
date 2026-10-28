@@ -1,0 +1,21 @@
+{
+  "status": 200,
+  "body": {
+    "id": "msg_01SyntheticFixture000000",
+    "type": "message",
+    "role": "assistant",
+    "model": "claude-fixture-1",
+    "content": [
+      {
+        "type": "text",
+        "text": "{\"items\": [\"Review PR"
+      }
+    ],
+    "stop_reason": "max_tokens",
+    "stop_sequence": null,
+    "usage": {
+      "input_tokens": 1200,
+      "output_tokens": 2000
+    }
+  }
+}

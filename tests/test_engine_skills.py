@@ -9,11 +9,12 @@ import datetime
 import json
 import shutil
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 
-from horae.contracts import Pipeline, RunRecord
+from horae.contracts import Pipeline, RunRecord, Usage
+from horae.contracts.instance import ModelAlias
 from horae.engine import (
     LlmRequest,
     PreviousLlm,
@@ -23,8 +24,11 @@ from horae.engine import (
     make_context,
 )
 from horae.engine.testing import FakeLlm, FixturePlugins, llm_response
+from horae.llm import ModelBackends
+from horae.llm.base import Completion, CompletionResult
 from horae.replay import replay
-from horae.skills import DirectorySkills, Skill, skill_dir
+from horae.secrets import SecretResolver
+from horae.skills import INTENTS_PROPERTY, DirectorySkills, Skill, skill_dir
 
 FIXTURE = Path(__file__).parent / "fixtures" / "plugins" / "pack-daily-brief"
 SKILL = "daily-brief/rank-and-word"
@@ -536,3 +540,53 @@ def test_editing_the_input_view_invalidates_the_cache(pack: Path) -> None:
     assert len(llm.requests) == 1
     assert "summary" not in json.dumps(llm.requests[0].input["events"])
     assert record.input_hash != previous.input_hash
+
+
+# --- end to end with #28's ModelBackends: the reserved `intents` output property ------------
+
+
+ALIAS = {"backend": "anthropic", "model": "fixture-model", "secret": "ANTHROPIC_API_KEY"}
+
+
+class _Provider:
+    """A provider backend that answers with the skill's output, intents included."""
+
+    name: Literal["anthropic"] = "anthropic"
+
+    def __init__(self, output: Any) -> None:
+        self.output = output
+        self.completions: list[Completion] = []
+
+    def render(self, completion: Completion) -> dict[str, Any]:
+        self.completions.append(completion)
+        return {"system": completion.system, "input": completion.input}
+
+    async def send(self, payload: Any, timeout_s: float) -> CompletionResult:
+        return CompletionResult(self.output, Usage(tokens_in=10, tokens_out=5, usd=0.0))
+
+    async def aclose(self) -> None:
+        return None
+
+
+def test_intents_in_the_reserved_output_property_are_routed(pack: Path, tmp_path: Path) -> None:
+    skill = _skills(pack).load_skill(SKILL, _plugins().plugin_for_skill(SKILL))
+    assert INTENTS_PROPERTY in skill.output_schema["properties"]  # the skill declares intents
+    provider = _Provider({**OUTPUT, INTENTS_PROPERTY: [NOTE]})
+    backends = ModelBackends(
+        {"default": ModelAlias.model_validate(ALIAS)},
+        SecretResolver({}, tmp_path),
+        {"anthropic": lambda alias, spec, secrets: provider},
+    )
+    record = _run(_plugins(), backends, _skills(pack))
+    assert record.status == "ok", record.steps[2].error
+    completion = provider.completions[-1]
+    assert completion.system == skill.prompt
+    assert completion.output_schema["properties"][INTENTS_PROPERTY]["type"] == "array"
+    assert "private notes" not in json.dumps(completion.input)  # the viewed input only
+    # The backend moved the intents out of the output; the engine validated and routed them.
+    assert record.llm[0].response == OUTPUT
+    assert record.llm[0].intents == [NOTE]
+    assert record.llm[0].skill_digest == skill.digest
+    assert [(i.intent.type, i.applied_by) for i in record.intents] == [
+        ("note.create", "obsidian.write_note")
+    ]

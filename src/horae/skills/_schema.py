@@ -51,6 +51,8 @@ from typing import Any
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
 
+from horae.llm.base import INTENTS_KEY
+
 DIALECT = "https://json-schema.org/draft/2020-12/schema"
 MAX_OUTPUT_BYTES = 256 * 1024
 """Largest size bound of an output schema, in UTF-8 bytes of compact JSON."""
@@ -60,8 +62,9 @@ MAX_REF_HOPS = 32
 """Longest chain of `$ref`s followed while bounding."""
 MAX_FLOAT_REPR = 25
 """More than the longest `repr` of a finite float (`-1.7976931348623157e+308`, 24)."""
-INTENTS_PROPERTY = "intents"
-"""The reserved top-level output property that carries the LLM's proposed intents (#28)."""
+INTENTS_PROPERTY = INTENTS_KEY
+"""The reserved top-level output property that carries the LLM's proposed intents: the one
+`horae.llm.ModelBackends` extracts into `LlmResponse.intents` (#28)."""
 
 _FORBIDDEN = (
     "$id",

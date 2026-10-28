@@ -186,8 +186,19 @@ class Usage(Contract):
     """Tokens and money spent."""
 
     tokens_in: Count
+    """Input tokens billed at the full input price (for the Anthropic API, `input_tokens`:
+    cache reads and writes are counted apart)."""
     tokens_out: Count
     usd: Annotated[StrictFloat, Field(ge=0)]
+    """What the tokens cost, from the model alias' `price` in `horae.yaml`; `0` when it has
+    none (then `priced` is `false`)."""
+    cache_read_tokens: Count | None = None
+    """Input tokens read from the provider's prompt cache, when it reports them."""
+    cache_write_tokens: Count | None = None
+    """Input tokens written to the provider's prompt cache, when it reports them."""
+    priced: StrictBool | None = None
+    """`false` when the model alias has no `price`, so `usd` is `0` and does not reflect the
+    real cost; absent when unknown (e.g. records written before decision 38)."""
 
 
 class LlmCall(Contract):

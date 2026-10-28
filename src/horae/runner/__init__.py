@@ -13,7 +13,7 @@ from horae.runner._lock import (
     lock_path,
     try_acquire_apply_lock,
 )
-from horae.runner._ports import LivePorts, open_ports
+from horae.runner._ports import LivePorts, open_ports, uses_llm
 from horae.runner._runner import (
     APPLY_LOCK_WAIT_S,
     DEFAULT_HEARTBEAT_S,
@@ -53,4 +53,5 @@ __all__ = [
     "open_ports",
     "recover_pipeline",
     "try_acquire_apply_lock",
+    "uses_llm",
 ]

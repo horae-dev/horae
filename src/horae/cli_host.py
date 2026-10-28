@@ -18,10 +18,11 @@ from pathlib import Path
 
 from horae.apply import SinkRegistry
 from horae.cli_output import EXIT_PROBLEMS, CommandFailed, plural
-from horae.config import Instance, InstanceError, Problem, ProblemsError, load_instance
+from horae.config import CONFIG_FILE, Instance, InstanceError, Problem, ProblemsError, load_instance
 from horae.contracts.pipeline import LlmStep
 from horae.contracts.plugin import StdioRuntime
 from horae.engine import UnknownPlugin
+from horae.llm.backends import FACTORIES
 from horae.plugins.host import HostRegistry, PluginCallError, RegistryError
 from horae.plugins.host.host import resolve_command
 from horae.runner import LivePorts, open_ports
@@ -127,6 +128,55 @@ def _command_problems(registry: HostRegistry) -> list[Problem]:
     return problems
 
 
+CLOUD_BACKENDS = frozenset({"anthropic"})
+"""Backends billed per token, whose aliases `horae doctor` expects to have a `price`."""
+
+
+def _backend_problems(instance: Instance) -> list[Problem]:
+    """For each model alias used by an `llm` step: an error when its backend is not
+    implemented in this Horae (`horae.llm.backends.FACTORIES`), and a warning when it is a
+    cloud backend without a `price` (its calls are then recorded at `usd: 0` and the step's
+    `usd` budget does not bound them; schemas decision 38 A). Aliases no pipeline uses are
+    not checked."""
+    used = sorted(
+        {
+            step.llm.model
+            for pipeline in instance.pipelines.values()
+            for step in pipeline.steps
+            if isinstance(step, LlmStep)
+        }
+    )
+    problems: list[Problem] = []
+    for alias in used:
+        spec = instance.config.models.get(alias)
+        if spec is None:
+            continue
+        if spec.backend not in FACTORIES:
+            available = ", ".join(sorted(FACTORIES))
+            problems.append(
+                Problem(
+                    CONFIG_FILE,
+                    None,
+                    None,
+                    f"models.{alias}.backend: backend {spec.backend!r} is not available in "
+                    f"this version of Horae (available: {available})",
+                )
+            )
+        elif spec.backend in CLOUD_BACKENDS and spec.price is None:
+            problems.append(
+                Problem(
+                    CONFIG_FILE,
+                    None,
+                    None,
+                    f"models.{alias}.price: model alias {alias!r} (backend {spec.backend!r}) "
+                    "has no price: its calls are recorded at usd 0 and the step's usd budget "
+                    "does not bound them (only tokens_out does)",
+                    severity="warning",
+                )
+            )
+    return problems
+
+
 def _skill_problems(instance: Instance, registry: HostRegistry) -> list[Problem]:
     """Each skill an `llm` step of a pipeline uses that does not load (`SkillError`), as the
     engine would load it (with the plugin's locked `permissions.intents`)."""
@@ -156,11 +206,12 @@ def _skill_problems(instance: Instance, registry: HostRegistry) -> list[Problem]
 
 def instance_problems(instance: Instance) -> list[Problem]:
     """What `horae doctor` checks beyond the configuration (`check_instance`): the lock's
-    paths exist, the instance's own `vault/` is the one the lock writes to, and, when the
-    instance has a `plugins/` directory, the plugins are installed as the lock pins them
-    (`check_plugins`), each command (its interpreter) exists and is executable, and every
-    skill an `llm` step uses loads (`horae.skills.load_skill`)."""
-    problems = _path_problems(instance)
+    paths exist, the instance's own `vault/` is the one the lock writes to, each model alias
+    an `llm` step uses has an available backend (and, for a cloud backend, a `price`, else a
+    warning), and, when the instance has a `plugins/` directory, the plugins are installed
+    as the lock pins them (`check_plugins`), each command (its interpreter) exists and is
+    executable, and every skill an `llm` step uses loads (`horae.skills.load_skill`)."""
+    problems = _path_problems(instance) + _backend_problems(instance)
     if plugins_dir(instance.root).is_dir():
         try:
             registry = _registry(instance)

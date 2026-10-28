@@ -1,0 +1,11 @@
+{
+  "status": 401,
+  "body": {
+    "type": "error",
+    "error": {
+      "type": "authentication_error",
+      "message": "Synthetic: invalid x-api-key"
+    },
+    "request_id": "req_01Synthetic"
+  }
+}
