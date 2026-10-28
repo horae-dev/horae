@@ -1338,6 +1338,14 @@ loosened later without breaking a valid file.
       `max_tokens` and `worst_case`, so a settled call never exceeds its reservation; a
       backend without it that reports cache writes beyond the bound is flagged
       `over_reservation` (and logged);
+    - **untrusted usage (decision 40 K)**: a backend's floored usage (input at least a
+      quarter of the request bytes, output at least a quarter of the output bytes but at
+      most `max_tokens`) and its conservative charge (`input_bound` of the payload sent plus
+      the whole `max_tokens`) stay within the reservation: `ModelBackends.prepare` sizes the
+      input bound on the payload at the largest `max_tokens` the request allows (its
+      `tokens_out`, capped by the alias' `max_output_tokens`), so the payload actually sent,
+      with a `max_tokens` no larger, is never bigger. A count a provider reports above the
+      bound but under `10**12` is kept (decision 40) and flagged `over_reservation`;
     - **follow-ups**: a monthly ceiling; provider-side spend limits (#63); calling
       `prune_usage` from a retention setting.
 

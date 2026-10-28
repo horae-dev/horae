@@ -397,7 +397,11 @@ class PreparedRequest:
     spec: ModelAlias
     backend: ProviderBackend
     probe: Completion
-    """The completion with `max_tokens=1` (its payload sizes the input bound)."""
+    """The completion at the largest `max_tokens` the request allows (its budget's
+    `tokens_out`, capped by the alias' `max_output_tokens`): its payload sizes the input
+    bound, which then bounds the payload of any smaller `max_tokens` too (decision 41: a
+    backend's conservative charge, `input_bound` of the payload sent, and its usage floor
+    stay within the reservation)."""
     skill_version: str
     input_bound: int
     may_write_cache: bool = False
@@ -441,12 +445,15 @@ class ModelBackends:
             raise LlmError("invalid_request", f"unknown model alias {request.model!r}")
         prompt = self.prompts.prompt(request)
         backend = self._backend(request.model, spec)
+        largest = request.budget.tokens_out
+        if spec.max_output_tokens is not None:
+            largest = min(largest, spec.max_output_tokens)
         probe = Completion(
             model=spec.model,
             system=prompt.system,
             input=prompt.input,
             output_schema=prompt.output_schema,
-            max_tokens=1,
+            max_tokens=max(1, largest),
             timeout_s=request.timeout_s,
             repair=request.repair,
         )
@@ -475,12 +482,15 @@ class ModelBackends:
     ) -> RenderedRequest:
         """The attempt `request`, rendered (pure: no I/O and no secret; see the module
         docstring). `prepared` is `prepare` of `request` (or of a request that differs from
-        it only in its budget), made now when not given. Raises `LlmError`: an unknown alias,
-        an unavailable backend or skill, or `budget_exceeded` when the attempt cannot afford
-        one output token."""
+        it only in a budget no larger), made now when not given. Raises `LlmError`: an
+        unknown alias, an unavailable backend or skill, or `budget_exceeded` when the attempt
+        cannot afford one output token."""
         if prepared is None:
             prepared = self.prepare(request)
         limit = self.output_limit(request, prepared)
+        if limit > prepared.probe.max_tokens:  # a larger budget than prepared: size it again
+            prepared = self.prepare(request)
+            limit = self.output_limit(request, prepared)
         completion = replace(prepared.probe, max_tokens=limit)
         backend = prepared.backend
         payload = backend.render(completion)

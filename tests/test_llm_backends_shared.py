@@ -19,6 +19,7 @@ import tracemalloc
 import zlib
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -26,7 +27,7 @@ import httpcore2
 import httpx2
 import pytest
 
-from horae.contracts.instance import ModelAlias
+from horae.contracts.instance import BudgetsConfig, ModelAlias
 from horae.contracts.pipeline import Budget
 from horae.engine import LlmError, LlmRequest
 from horae.llm import Completion, ModelBackends, Prompt, RenderedRequest
@@ -45,7 +46,9 @@ from horae.llm.backends._shared import (
     system_resolver,
     transport,
 )
+from horae.runner._budget import LedgerLlm
 from horae.secrets import SecretResolver
+from horae.store import Store
 from llm_backend_kinds import (
     AMBIENT,
     DECLARED_VALUE,
@@ -962,6 +965,52 @@ def test_the_output_floor_is_capped_at_max_tokens(kind: Kind, secrets: SecretRes
 
     usage = complete(backends(kind, secrets, kind.recorder(answer(kind, change)))).usage
     assert usage.tokens_out == 2000  # 10 000 by size, but at most max_tokens
+
+
+def _floored_change(kind: Kind) -> Callable[[Any], None]:
+    def change(body: Any) -> None:
+        kind.set_text(body, json.dumps({"items": ["x" * 40_000]}))
+        kind.set_usage(body, 0, 0)
+
+    return change
+
+
+@pytest.mark.parametrize(
+    "how",
+    [
+        "floored",  # a zero usage floored by the request size and a huge output
+        "conservative",  # an unusable usage: the input bound and the whole max_tokens
+        "absurd",  # counts above 10**12: charged conservatively
+    ],
+)
+def test_a_floored_or_conservative_charge_stays_within_the_ledger_reservation(
+    kind: Kind, secrets: SecretResolver, tmp_path: Path, how: str
+) -> None:
+    # Decision 41 with #30's untrusted usage: the floor never exceeds `max_tokens` nor the
+    # input bound, so a settled call never costs more than `worst_case` reserved.
+    changes: dict[str, Callable[[Any], None]] = {
+        "floored": _floored_change(kind),
+        "conservative": kind.bad_usage,
+        "absurd": lambda body: kind.set_usage(body, 10**13, 10**13),
+    }
+    recorder = kind.recorder(answer(kind, changes[how]))
+    llm = backends(kind, secrets, recorder)
+    budgets = BudgetsConfig.model_validate({"daily": {"usd": 0.02}})
+    at = datetime(2026, 10, 28, 6, 0, tzinfo=UTC)
+    with Store.open(tmp_path / "horae.db") as store:
+        store.begin_run("run-a", "brief", at)
+        ledger = LedgerLlm(llm, store, "run-a", "brief", 1, budgets, "Europe/Paris", lambda: at)
+        capped = request(budget=Budget(usd=0.02, tokens_out=2000))
+        reserved = llm.worst_case(llm.render(capped))
+        response = asyncio.run(ledger.complete(request()))
+        (group,) = store.usage_report()
+    sent = recorder.body()
+    assert kind.max_tokens(sent) < 2000  # the daily ceiling lowered it
+    assert response.usage.tokens_out <= kind.max_tokens(sent)
+    assert response.usage.tokens_in <= reserved.tokens_in
+    assert group.over_reservation == 0
+    assert group.usd == pytest.approx(response.usage.usd)
+    assert group.usd <= reserved.usd <= 0.02
 
 
 def test_an_unexpected_failure_reading_the_result_is_output_invalid(
