@@ -167,7 +167,10 @@ miss) the LLM is called. A hit calls no backend, so no usage is reserved or char
 decision 45). A reused run re-proposes the same intents, including `notify.push`: appliers
 must deduplicate notifications (e.g. by `input_hash` and intent).
 `timeout_s` (default `DEFAULT_LLM_TIMEOUT_S`) is one deadline for both attempts. The budget
-counts what every attempt cost, including the `usage` of a failed attempt (`LlmError.usage`);
+counts what every attempt cost, including the `usage` of a failed attempt (`LlmError.usage`,
+also of one whose output could not be validated, `validator_unavailable`, which is not
+repaired; and of one cancelled by the deadline while its output was being validated,
+`horae.engine.ports.attached_usage`);
 a backend's cached response costs nothing and counts towards neither the cost nor the budget.
 
 **Step policy** (step status, then the effect on the run; the run status is the worst of
@@ -179,13 +182,15 @@ a backend's cached response costs nothing and counts towards neither the cost no
 | collect | some sources fail, at least one succeeds | degraded | degraded | run (1) |
 | collect | every source fails | failed | failed | skipped |
 | transform | a transform fails | failed | failed | skipped |
-| llm | backend error, timeout, budget, invalid output, schema x2 | degraded | degraded | skipped |
+| llm | backend or validator error, timeout, budget, schema x2 (3) | degraded | degraded | skipped |
 | llm | unchanged input, previous output reused | ok | ok or noop (2) | run |
 | act | after a degraded `collect` (`partial_input`) | skipped | (degraded) | run |
 | act, notify | otherwise | ok | ok | run |
 
 "Proposer" is any `collect`, `transform` or `llm` step. (1) On the partial data, except that
-every `act` step is skipped. (2) `noop` when the run records no intent at all.
+every `act` step is skipped. (2) `noop` when the run records no intent at all. (3) Also a
+response that is not a valid `LlmResponse` (`output_invalid`); an output the validator could
+not check (`validator_unavailable`) degrades the step at once, without a repair.
 
 Rationale: a write is never made from partial or unvalidated data (a degraded `collect` skips
 every `act` step, whose intents are dropped, while `notify` still runs: telling the user about
@@ -265,6 +270,7 @@ from horae.engine.ports import (
     ToolCaller,
     ToolResult,
     UnknownPlugin,
+    attached_usage,
 )
 from horae.engine.template import TemplateError, render, variables
 from horae.intents import MAX_BODY_DEPTH, IntentRejected, safe_excerpt, validate_intents
@@ -1307,7 +1313,12 @@ async def _llm_step(run: _Run, step: _Planned) -> _Outcome:
         try:
             async with asyncio.timeout(remaining):
                 response = await backend.complete(request)
-        except TimeoutError:
+        except TimeoutError as error:
+            # Cancelled while its output was being validated, the attempt was billed: its
+            # usage travels with the cancellation (schemas decision 44 E).
+            billed = attached_usage(error)
+            if billed is not None:
+                run.spend(billed)
             return degraded("timeout", f"the LLM step took longer than {timeout} s")
         except LlmError as error:
             usage = getattr(error, "usage", None)

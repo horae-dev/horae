@@ -23,6 +23,7 @@ from horae.contracts.pipeline import LlmStep
 from horae.contracts.plugin import StdioRuntime
 from horae.engine import UnknownPlugin
 from horae.llm.backends import FACTORIES
+from horae.llm.validate import worker_problem
 from horae.plugins.host import HostRegistry, PluginCallError, RegistryError
 from horae.plugins.host.host import resolve_command
 from horae.runner import LivePorts, open_ports
@@ -265,6 +266,23 @@ def _skill_problems(instance: Instance, registry: HostRegistry) -> list[Problem]
     return problems
 
 
+def _validator_problems(instance: Instance) -> list[Problem]:
+    """When a pipeline has an `llm` step: an error when the output validator's worker cannot
+    run here (`horae.llm.validate.worker_problem`: the interpreter and the worker script exist
+    and a trivial validation works), since every LLM output would then be unvalidated and
+    the step degraded (schemas decision 44)."""
+    if not any(
+        isinstance(step, LlmStep)
+        for pipeline in instance.pipelines.values()
+        for step in pipeline.steps
+    ):
+        return []
+    problem = worker_problem()
+    if problem is None:
+        return []
+    return [Problem(CONFIG_FILE, None, None, f"llm validator: {problem}")]
+
+
 def instance_problems(instance: Instance) -> list[Problem]:
     """What `horae doctor` checks beyond the configuration (`check_instance`): the lock's
     paths exist, the instance's own `vault/` is the one the lock writes to, each model alias
@@ -272,8 +290,10 @@ def instance_problems(instance: Instance) -> list[Problem]:
     warning; a warning too for a `usd` daily ceiling over such an unpriced alias), and,
     when the instance has a `plugins/` directory, the plugins are installed as the lock
     pins them (`check_plugins`), each command (its interpreter) exists and is executable,
-    and every skill an `llm` step uses loads (`horae.skills.load_skill`)."""
+    and every skill an `llm` step uses loads (`horae.skills.load_skill`); with an `llm` step,
+    the output validator's worker runs (`horae.llm.validate.worker_problem`)."""
     problems = _path_problems(instance) + _backend_problems(instance) + _budget_problems(instance)
+    problems.extend(_validator_problems(instance))
     if plugins_dir(instance.root).is_dir():
         try:
             registry = _registry(instance)

@@ -55,6 +55,7 @@ from horae.skills._loader import (
 )
 from horae.skills._schema import (
     INTENTS_PROPERTY,
+    MAX_COMBINATOR_FANOUT,
     MAX_OUTPUT_BYTES,
     MAX_REF_HOPS,
     MAX_SCHEMA_DEPTH,
@@ -65,6 +66,7 @@ from horae.skills._view import InputView
 
 __all__ = [
     "INTENTS_PROPERTY",
+    "MAX_COMBINATOR_FANOUT",
     "MAX_OUTPUT_BYTES",
     "MAX_PROMPT_BYTES",
     "MAX_REF_HOPS",
