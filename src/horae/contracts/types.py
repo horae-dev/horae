@@ -16,6 +16,7 @@ ECMA-262 and pydantic reject it. See ``schemas/README.md``.
 
 import datetime
 import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Annotated, Any, Literal, TypeVar
 
@@ -40,6 +41,10 @@ MAX_ITEMS = 256
 
 MAX_CONTENT = 1024 * 1024
 """Upper bound for note content: 1 MiB, counted in Unicode code points (characters)."""
+
+MAX_BODY = 1024 * 1024
+"""Upper bound for an `http.post` body: 1 MiB, counted in UTF-8 bytes of its compact JSON
+serialization (`json.dumps(body, allow_nan=False, separators=(",", ":"))`)."""
 
 
 class Contract(BaseModel):
@@ -236,9 +241,39 @@ def _is_localhost(host: str) -> bool:
     return host == "localhost" or host.endswith(".localhost")
 
 
+_IDNA_PREFIX = "xn--"
+_U_LABEL_CATEGORIES = frozenset({"Ll", "Lo", "Lm", "Mn", "Mc", "Nd"})
+"""Unicode categories a decoded IDN label may use (besides `-`): lowercase and other letters,
+combining marks and decimal digits. An approximation of IDNA2008 `PVALID` (RFC 5892) that
+rejects symbols, punctuation and emoji, which IDNA2003 (the stdlib codec) still allows."""
+
+
+def _valid_a_label(label: str) -> bool:
+    """Whether an `xn--` label is a well-formed IDNA A-label.
+
+    Uses the stdlib `idna` codec (IDNA2003, RFC 3490) for the round trip, so no runtime
+    dependency is needed: the label must decode (Punycode) and re-encode to exactly itself.
+    IDNA2003 still accepts code points that IDNA2008 (RFC 5891/5892, what registries and
+    browsers use) disallows, e.g. emoji (`xn--ls8h`), so the decoded label must also be made
+    of letters, marks, digits and `-` only. This is stricter than IDNA2003 and close to, but
+    not exactly, IDNA2008: resolving a name is still the egress proxy's job."""
+    try:
+        decoded = label.encode("ascii").decode("idna")
+        if decoded.encode("idna").decode("ascii") != label:
+            return False
+    except UnicodeError:
+        return False
+    return decoded != label and all(
+        char == "-" or unicodedata.category(char) in _U_LABEL_CATEGORIES for char in decoded
+    )
+
+
 def _check_host(host: str) -> str:
     if _is_localhost(host):
         raise ValueError("localhost is not an allowed host")
+    for label in host.split("."):
+        if label.startswith(_IDNA_PREFIX) and not _valid_a_label(label):
+            raise ValueError("an `xn--` label is not a valid IDNA A-label")
     return host
 
 
@@ -252,7 +287,8 @@ Hostname = Annotated[
 """A lowercase DNS host name, without scheme, port or wildcard, e.g. `api.github.com`.
 
 Single-label names (`coach`, a Docker or Coolify service name) are allowed. IP literals,
-`localhost` and `*.localhost` are rejected."""
+`localhost` and `*.localhost` are rejected. A label starting with `xn--` must be a valid
+IDNA A-label (Punycode that round-trips; see `_valid_a_label`), checked by the model only."""
 
 _PORT = r"(6553[0-5]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|[1-5][0-9]{4}|[1-9][0-9]{0,3})"
 _URL_REST = r"[^\x00-\x20\x7f\\#]"
@@ -281,8 +317,11 @@ HttpsUrl = Annotated[
     JsonSchemaExtra({"not": {"pattern": _URL_LOCALHOST}}),
 ]
 """An absolute `https` URL whose host is a `Hostname` (no IP literal, no `localhost`), with
-an optional port. No user info, fragment, backslash, whitespace or control characters.
-Kept as a plain string, never normalised; use `url_host` to read the host."""
+an optional port. No user info, fragment, backslash, whitespace or control characters. An
+`xn--` label in the host must be a valid IDNA A-label, as for `Hostname`. Kept as a plain
+string, never normalised; use `url_host` to read the host.
+
+Any port is accepted on a declared host (schemas README, decision 10)."""
 
 # --- paths -----------------------------------------------------------------------------------
 

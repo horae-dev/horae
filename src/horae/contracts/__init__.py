@@ -57,6 +57,7 @@ from horae.contracts.plugin import (
     VersionSpecifier,
 )
 from horae.contracts.run import (
+    MAX_RUN_INTENTS,
     AppliedChange,
     InputSnapshot,
     LlmCall,
@@ -95,6 +96,7 @@ from horae.contracts.types import (
 __all__ = [
     "INTENT_MODELS",
     "INTENT_TYPES",
+    "MAX_RUN_INTENTS",
     "AbsolutePath",
     "ActStep",
     "AppliedChange",
