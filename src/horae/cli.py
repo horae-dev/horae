@@ -2,6 +2,7 @@
 """Command-line entry point for Horae."""
 
 import json
+import re
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
@@ -12,6 +13,7 @@ import typer
 from horae import __version__
 from horae.config import CONFIG_FILE, STORE_FILE, ProblemsError, check_instance, read_yaml, validate
 from horae.contracts import InstanceConfig
+from horae.runner import lock_is_free
 from horae.store import MAX_LIST_RUNS, RunSummary, Store, StoreError
 
 app = typer.Typer(
@@ -143,12 +145,26 @@ def _duration(value: timedelta | None) -> str:
     return f"{hours}h{minutes:02d}m"
 
 
-def _run_json(run: RunSummary) -> dict[str, Any]:
+MAX_ERROR_COLUMN = 60
+"""Characters of a run's error shown in the `horae runs` table (`--json` has all of it)."""
+_UNSAFE = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029\u200b-\u200f\u202a-\u202e\u2066-\u2069]+")
+
+
+def _reason(error: str | None) -> str:
+    """A run's error for one table cell: control and bidi characters collapsed, capped."""
+    if not error:
+        return ""
+    text = " ".join(_UNSAFE.sub(" ", error).split())
+    return text if len(text) <= MAX_ERROR_COLUMN else text[: MAX_ERROR_COLUMN - 1] + "…"
+
+
+def _run_json(run: RunSummary, stale: bool) -> dict[str, Any]:
     duration = run.duration
     return {
         "id": run.id,
         "pipeline": run.pipeline,
         "status": run.status,
+        "stale": stale,
         "dry_run": run.dry_run,
         "abandoned": run.abandoned_at is not None,
         "started_at": _iso(run.started_at),
@@ -163,8 +179,10 @@ def _run_json(run: RunSummary) -> dict[str, Any]:
     }
 
 
-def _run_row(run: RunSummary) -> list[str]:
+def _run_row(run: RunSummary, stale: bool) -> list[str]:
     status = str(run.status)
+    if stale:
+        status += " (stale?)"
     if run.abandoned_at is not None:
         status += " (abandoned)"
     if run.dry_run:
@@ -177,6 +195,7 @@ def _run_row(run: RunSummary) -> list[str]:
         _duration(run.duration),
         f"${run.cost.usd:.4f}",
         f"{run.cost.tokens_in}/{run.cost.tokens_out}",
+        _reason(run.error),
     ]
 
 
@@ -202,31 +221,48 @@ def _list_runs(
             typer.echo(str(problem))
         typer.echo(_plural(len(exc.problems), "problem") + " found")
         return EXIT_PROBLEMS
-    path = instance / config.state_dir / STORE_FILE
+    state_dir = instance / config.state_dir
+    path = state_dir / STORE_FILE
     runs: list[RunSummary] = []
-    if path.exists():  # never create the store just to list it
-        try:
-            with Store.open(path) as store:
+    try:
+        if path.exists():  # never create the store just to list it
+            # Read-only: no migration, no WAL switch, no new file.
+            with Store.open(path, read_only=True) as store:
                 runs = store.list_runs(
                     pipeline=pipeline,
                     status=None if status is None else status.value,
                     limit=limit,
                 )
-        except StoreError as exc:
-            typer.echo(f"horae runs: {path}: {exc}", err=True)
-            return EXIT_PROBLEMS
+    except (StoreError, OSError) as exc:
+        typer.echo(f"horae runs: {path}: {exc}", err=True)
+        return EXIT_PROBLEMS
+    # A `running` row whose pipeline lock is free has no live process: the next run of the
+    # pipeline will abandon it. Checked without waiting and without creating anything.
+    stale = [
+        run.status == "running" and lock_is_free(state_dir, run.pipeline) is True for run in runs
+    ]
     if json_output:
         report = {
             "schema_version": RUNS_SCHEMA_VERSION,
-            "instance": str(instance),
-            "runs": [_run_json(run) for run in runs],
+            "instance": str(instance.resolve()),
+            "runs": [_run_json(run, s) for run, s in zip(runs, stale, strict=True)],
         }
         typer.echo(json.dumps(report, indent=2))
     elif not runs:
         typer.echo("no runs")
     else:
-        header = ["RUN", "PIPELINE", "STATUS", "STARTED", "DURATION", "COST", "TOKENS IN/OUT"]
-        for line in _table(header, [_run_row(run) for run in runs]):
+        header = [
+            "RUN",
+            "PIPELINE",
+            "STATUS",
+            "STARTED",
+            "DURATION",
+            "COST",
+            "TOKENS IN/OUT",
+            "ERROR",
+        ]
+        rows = [_run_row(run, s) for run, s in zip(runs, stale, strict=True)]
+        for line in _table(header, rows):
             typer.echo(line)
     return EXIT_OK
 

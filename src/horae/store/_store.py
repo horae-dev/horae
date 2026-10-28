@@ -50,6 +50,9 @@ from horae.store._errors import (
     PipelineBusy,
     RunExists,
     RunNotRunning,
+    RunNotStale,
+    SchemaTooNewError,
+    SchemaTooOldError,
     StoreBusy,
     StoreError,
     UnknownJournalEntry,
@@ -66,6 +69,9 @@ StoreRunStatus = Literal["running", "ok", "noop", "degraded", "failed", "undone"
 TaskStatus = Literal["todo", "done", "cancelled", "snoozed"]
 
 DEFAULT_BUSY_TIMEOUT_MS = 5000
+HEARTBEAT_BUSY_TIMEOUT_MS = 100
+"""How long a heartbeat waits for the write lock: a heartbeat never blocks the event loop for
+long, and a busy store only skips a beat."""
 MIN_SQLITE = (3, 37, 0)
 """STRICT tables need SQLite 3.37."""
 MAX_JOURNAL_BYTES = 16 * 1024 * 1024
@@ -363,14 +369,24 @@ def _enable_wal(path: Path, timeout: float) -> None:
 class Store:
     """Typed access to the Horae state database. Create it with `Store.open`."""
 
-    def __init__(self, conn: sqlite3.Connection, *, _token: object = None) -> None:
+    def __init__(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        _token: object = None,
+        _path: Path | None = None,
+        _read_only: bool = False,
+    ) -> None:
         if _token is not _PRIVATE:
             raise TypeError("use Store.open(path) to create a Store")
         self._conn = conn
         self._depth = 0
+        self._path = _path
+        self._read_only = _read_only
+        self._beat: sqlite3.Connection | None = None
 
     @classmethod
-    def _from_connection(cls, conn: sqlite3.Connection) -> Self:
+    def _from_connection(cls, conn: sqlite3.Connection, *, _path: Path | None = None) -> Self:
         """Wrap a connection configured and migrated as `open` does (checked)."""
         if conn.autocommit is not True:
             raise ValueError("the store needs a connection opened with autocommit=True")
@@ -380,15 +396,71 @@ class Store:
             raise ValueError("the store needs WAL mode")
         if user_version(conn) != SCHEMA_VERSION:
             raise ValueError(f"the store needs schema version {SCHEMA_VERSION}")
-        return cls(conn, _token=_PRIVATE)
+        return cls(conn, _token=_PRIVATE, _path=_path)
+
+    @property
+    def read_only(self) -> bool:
+        """Whether the store was opened with `open(read_only=True)`."""
+        return self._read_only
 
     @classmethod
-    def open(cls, path: str | Path, *, busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS) -> Self:
+    def _open_read_only(cls, path: Path, timeout: float) -> Self:
+        """See `open(read_only=True)`."""
+        if not path.is_file():
+            raise StoreError(f"no database at {path}")
+        # With no `-wal` file, every committed change is in the main file: open it immutable,
+        # so SQLite creates no `-wal` / `-shm` (a read-only connection would otherwise create
+        # them, with the database file's permissions, and could not remove them). A writer
+        # that starts meanwhile appends to its own WAL, so this one-shot read sees the last
+        # checkpoint. With a `-wal`, a writer is (or was) active: open it read-only, sharing
+        # the existing `-shm`.
+        wal = path.with_name(path.name + "-wal")
+        query = "mode=ro" if wal.exists() else "mode=ro&immutable=1"
+        try:
+            conn = sqlite3.connect(
+                f"{path.resolve().as_uri()}?{query}", uri=True, timeout=timeout, autocommit=True
+            )
+        except sqlite3.Error as exc:
+            raise translate(exc) from exc
+        try:
+            conn.execute("PRAGMA query_only = ON")
+            version = user_version(conn)
+            if version > SCHEMA_VERSION:
+                raise SchemaTooNewError(
+                    f"database schema version {version} is newer than this Horae ({SCHEMA_VERSION})"
+                )
+            if version < SCHEMA_VERSION:
+                raise SchemaTooOldError(
+                    f"database schema version {version} is older than this Horae "
+                    f"({SCHEMA_VERSION}); run `horae run` once to migrate it"
+                )
+            return cls(conn, _token=_PRIVATE, _path=path, _read_only=True)
+        except sqlite3.Error as exc:
+            conn.close()
+            raise translate(exc) from exc
+        except BaseException:
+            conn.close()
+            raise
+
+    @classmethod
+    def open(
+        cls,
+        path: str | Path,
+        *,
+        busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
+        read_only: bool = False,
+    ) -> Self:
         """Open (creating it if needed) and migrate the database at `path`.
 
         A new state directory is created 0700 and a new database file 0600; the umask is
         0077 while the connection opens, so `-wal` and `-shm` are private too (the umask is
-        process-wide: open stores before starting threads that create files)."""
+        process-wide: open stores before starting threads that create files).
+
+        `read_only=True` (for listings such as `horae runs`) creates nothing, switches
+        nothing and never migrates: the database must exist (else `StoreError`), and a schema
+        older than this Horae raises `SchemaTooOldError` (newer: `SchemaTooNewError`). Writes
+        then fail with a `StoreError`. When no writer is active, no `-wal` / `-shm` file is
+        created either."""
         if sqlite3.sqlite_version_info < MIN_SQLITE:
             raise UnsupportedSQLite(
                 f"SQLite {sqlite3.sqlite_version} is too old; Horae needs 3.37 or later"
@@ -397,6 +469,8 @@ class Store:
             raise ValueError("busy_timeout_ms must be an int >= 0")
         path = Path(path)
         timeout = busy_timeout_ms / 1000
+        if read_only:
+            return cls._open_read_only(path, timeout)
         old_umask = os.umask(0o077)
         try:
             _prepare_files(path)
@@ -409,7 +483,7 @@ class Store:
                 conn.execute("PRAGMA foreign_keys = ON")
                 conn.execute("PRAGMA synchronous = NORMAL")
                 migrate(conn)
-                return cls._from_connection(conn)
+                return cls._from_connection(conn, _path=path)
             except sqlite3.Error as exc:
                 conn.close()
                 raise translate(exc) from exc
@@ -420,6 +494,9 @@ class Store:
             os.umask(old_umask)
 
     def close(self) -> None:
+        if self._beat is not None:
+            self._beat.close()
+            self._beat = None
         self._conn.close()
 
     def __enter__(self) -> Self:
@@ -549,14 +626,46 @@ class Store:
 
     @_api
     def heartbeat(self, run_id: str, at: datetime) -> None:
-        """Record that a running run's process is alive (`RunNotRunning` once it is not)."""
-        with self.transaction():
-            cur = self._conn.execute(
-                "UPDATE runs SET heartbeat_at = ? WHERE id = ? AND status = 'running'",
-                (_ts(at), run_id),
+        """Record that a running run's process is alive (`RunNotRunning` once it is not).
+
+        It waits at most `HEARTBEAT_BUSY_TIMEOUT_MS` for the write lock (on a second
+        connection with that busy timeout), then raises `StoreBusy`: a heartbeat must not
+        block the event loop for long. Heartbeats are for observability (`horae runs`): the
+        runner's pipeline lock, not the heartbeat, decides whether a run is alive."""
+        stamp = _ts(at)
+        if self._path is None or self._read_only or self._depth:
+            with self.transaction():
+                cur = self._conn.execute(
+                    "UPDATE runs SET heartbeat_at = ? WHERE id = ? AND status = 'running'",
+                    (stamp, run_id),
+                )
+                if cur.rowcount != 1:
+                    self._require_running(run_id)
+            return
+        if self._beat is None:
+            self._beat = sqlite3.connect(
+                self._path, timeout=HEARTBEAT_BUSY_TIMEOUT_MS / 1000, autocommit=True
             )
+        beat = self._beat
+        beat.execute("BEGIN IMMEDIATE")
+        try:
+            cur = beat.execute(
+                "UPDATE runs SET heartbeat_at = ? WHERE id = ? AND status = 'running'",
+                (stamp, run_id),
+            )
+            row = None
             if cur.rowcount != 1:
-                self._require_running(run_id)
+                row = beat.execute("SELECT status FROM runs WHERE id = ?", (run_id,)).fetchone()
+            beat.execute("COMMIT")
+        except BaseException:
+            if beat.in_transaction:
+                with suppress(sqlite3.Error):
+                    beat.execute("ROLLBACK")
+            raise
+        if cur.rowcount != 1:
+            if row is None:
+                raise UnknownRun(run_id)
+            raise RunNotRunning(run_id, str(row[0]))
 
     @_api
     def stale_runs(self, older_than: datetime) -> list[RunSummary]:
@@ -571,19 +680,33 @@ class Store:
         return [self._summary(row) for row in rows]
 
     @_api
-    def abandon_run(self, run_id: str, *, at: datetime, error: str) -> None:
+    def abandon_run(
+        self,
+        run_id: str,
+        *,
+        at: datetime,
+        error: str,
+        heartbeat_before: datetime | None = None,
+    ) -> None:
         """Mark a running run whose process died as `failed`, without a run record.
 
-        This releases the pipeline's lock. Its journal stays, for undo."""
+        This releases the store's pipeline guard. Its journal stays, for undo. It is a
+        compare-and-set: it changes run `run_id` only while it is still `running` (else
+        `RunNotRunning` / `UnknownRun`) and, with `heartbeat_before`, only if its last
+        heartbeat (or its start) is not later than that, i.e. the row has not changed since
+        it was read (else `RunNotStale`)."""
         stamp = _ts(at)
+        before = None if heartbeat_before is None else _ts(heartbeat_before)
         with self.transaction():
             cur = self._conn.execute(
                 "UPDATE runs SET status = 'failed', finished_at = ?, abandoned_at = ?, "
-                "error = ? WHERE id = ? AND status = 'running'",
-                (stamp, stamp, error, run_id),
+                "error = ? WHERE id = ? AND status = 'running' "
+                "AND (? IS NULL OR coalesce(heartbeat_at, started_at) <= ?)",
+                (stamp, stamp, error, run_id, before, before),
             )
             if cur.rowcount != 1:
                 self._require_running(run_id)
+                raise RunNotStale(run_id)
 
     @_api
     def save_run(self, record: RunRecord) -> None:

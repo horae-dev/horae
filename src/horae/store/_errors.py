@@ -19,6 +19,10 @@ class SchemaTooNewError(StoreError):
     """The database was written by a newer Horae (its schema version is unknown here)."""
 
 
+class SchemaTooOldError(StoreError):
+    """The database has an older schema and was opened read-only, so it cannot be migrated."""
+
+
 class UnsupportedSQLite(StoreError):
     """The SQLite library is too old (the schema needs 3.37+ for STRICT tables)."""
 
@@ -58,6 +62,14 @@ class RunNotRunning(StoreError):
         super().__init__(f"run {run_id!r} is {status}, not running")
         self.run_id = run_id
         self.status = status
+
+
+class RunNotStale(StoreError):
+    """`abandon_run` with `heartbeat_before`: the run is running and heartbeat since then."""
+
+    def __init__(self, run_id: str) -> None:
+        super().__init__(f"run {run_id!r} is still running and has heartbeat since it was read")
+        self.run_id = run_id
 
 
 class PipelineBusy(StoreError):
