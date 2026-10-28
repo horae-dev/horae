@@ -4,7 +4,7 @@
   "$defs": {
     "HttpPost": {
       "additionalProperties": false,
-      "description": "POST a JSON body to an https URL.\n\nThe runtime must check `url_host(url)` against the plugin's `permissions.network`, using\nexactly that parsed host, and caps the serialized body size.",
+      "description": "POST a JSON body to an https URL.\n\nThe core checks `url_host(url)` against the proposer's `permissions.network`, using\nexactly that parsed host (any port is allowed on a declared host), and caps the compact\nJSON body at 1 MiB (`horae.intents`). The sink must never follow redirects, or must\nre-check the host of every hop with `url_host` against the same list.",
       "properties": {
         "type": {
           "const": "http.post",

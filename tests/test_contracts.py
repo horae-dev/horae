@@ -16,6 +16,8 @@ from pydantic import ValidationError as ModelError
 
 from horae.contracts import (
     INTENT_TYPES,
+    Hostname,
+    HttpsUrl,
     Lockfile,
     Pipeline,
     PluginManifest,
@@ -526,6 +528,42 @@ def test_url_host() -> None:
     assert url_host("https://coach.example.org:8443/mcp?x") == "coach.example.org"
     with pytest.raises(ValueError, match="https"):
         url_host("http://coach.example.org/")
+
+
+_HOSTNAME: TypeAdapter[str] = TypeAdapter(Hostname)
+_HTTPS_URL: TypeAdapter[str] = TypeAdapter(HttpsUrl)
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "xn--bcher-kva.example",  # bücher
+        "xn--nxasmq6b.example",  # greek
+        "xn--55qx5d.example",  # CJK
+        "api.xn--bcher-kva.example",
+    ],
+)
+def test_valid_a_labels_are_accepted(host: str) -> None:
+    assert _HOSTNAME.validate_python(host) == host
+    assert _HTTPS_URL.validate_python(f"https://{host}:8443/x") == f"https://{host}:8443/x"
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        pytest.param("xn--a.example", id="not-punycode"),
+        pytest.param("xn--ls8h.example", id="emoji-idna2003-only"),
+        pytest.param("xn--zz.example", id="incomplete"),
+        pytest.param("xn--g6h.example", id="symbol-idna2003-only"),
+        pytest.param("a.xn--a", id="last-label"),
+        pytest.param("xn--zca.example", id="does-not-round-trip"),  # ß, mapped to ss,
+    ],
+)
+def test_invalid_a_labels_are_rejected(host: str) -> None:
+    with pytest.raises(ModelError, match="IDNA"):
+        _HOSTNAME.validate_python(host)
+    with pytest.raises(ModelError, match="IDNA"):
+        _HTTPS_URL.validate_python(f"https://{host}/")
 
 
 def test_python_date_objects_are_accepted() -> None:
