@@ -10,6 +10,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -157,6 +158,30 @@ def _until_value(text: str | None) -> date | datetime | None:
     return _dt(text) if "T" in text else date.fromisoformat(text)
 
 
+def _enable_wal(conn: sqlite3.Connection, timeout: float) -> None:
+    """Switch to WAL (persistent in the file).
+
+    The switch needs an exclusive lock and SQLite does not always wait for it with the busy
+    handler, so concurrent first opens of a new database retry here until `timeout`."""
+    deadline = time.monotonic() + timeout
+    delay = 0.005
+    while True:
+        try:
+            (mode,) = conn.execute("PRAGMA journal_mode").fetchone()
+            if mode != "wal":
+                (mode,) = conn.execute("PRAGMA journal_mode = WAL").fetchone()
+            break
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc) and "busy" not in str(exc):  # pragma: no cover
+                raise
+            if time.monotonic() >= deadline:
+                raise StoreError(f"cannot enable WAL mode: {exc}") from exc
+            time.sleep(delay)
+            delay = min(delay * 2, 0.1)
+    if mode != "wal":  # pragma: no cover - e.g. a filesystem without shared memory
+        raise StoreError(f"cannot enable WAL mode (got {mode!r})")
+
+
 class Store:
     """Typed access to the Horae state database."""
 
@@ -173,10 +198,7 @@ class Store:
         try:
             conn.execute("PRAGMA foreign_keys = ON")
             conn.execute("PRAGMA synchronous = NORMAL")
-            if conn.execute("PRAGMA journal_mode").fetchone()[0] != "wal":
-                (mode,) = conn.execute("PRAGMA journal_mode = WAL").fetchone()
-                if mode != "wal":  # pragma: no cover - e.g. a filesystem without shared memory
-                    raise StoreError(f"cannot enable WAL mode (got {mode!r})")
+            _enable_wal(conn, busy_timeout_ms / 1000)
             migrate(conn)
         except BaseException:
             conn.close()

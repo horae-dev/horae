@@ -481,12 +481,12 @@ def test_concurrent_processes_write_different_runs(db: Path) -> None:
             stderr=subprocess.PIPE,
             text=True,
         )
-        for n in range(4)
+        for n in range(8)
     ]
     stderr = [p.communicate(timeout=60)[1] for p in procs]
-    assert [p.returncode for p in procs] == [0] * 4, stderr
+    assert [p.returncode for p in procs] == [0] * 8, stderr
     with Store.open(db) as s:
-        assert len(s.list_runs(limit=1000)) == 4 * 20
+        assert len(s.list_runs(limit=1000)) == 8 * 20
 
 
 def test_a_writer_waits_for_the_lock_instead_of_failing(db: Path) -> None:
@@ -514,3 +514,37 @@ def test_busy_timeout_expiry_is_a_store_error(db: Path) -> None:
     finally:
         holder.execute("ROLLBACK")
         holder.close()
+
+
+def _rollback_journal_db_with_reader(db: Path) -> sqlite3.Connection:
+    """A database still in rollback-journal mode, with a reader holding a shared lock."""
+    db.parent.mkdir(parents=True)
+    setup = sqlite3.connect(db, autocommit=True)
+    setup.execute("CREATE TABLE t (a INTEGER)")
+    setup.close()
+    reader = sqlite3.connect(db, autocommit=True, check_same_thread=False)
+    reader.execute("BEGIN")
+    reader.execute("SELECT * FROM t").fetchall()
+    return reader
+
+
+def test_switching_to_wal_waits_for_readers(db: Path) -> None:
+    reader = _rollback_journal_db_with_reader(db)
+    released = threading.Timer(0.2, reader.execute, args=("COMMIT",))
+    released.start()
+    try:
+        with Store.open(db, busy_timeout_ms=5000) as s:
+            assert s.pragma("journal_mode") == "wal"
+    finally:
+        released.join()
+        reader.close()
+
+
+def test_switching_to_wal_gives_up_after_the_busy_timeout(db: Path) -> None:
+    reader = _rollback_journal_db_with_reader(db)
+    try:
+        with pytest.raises(StoreError, match="WAL"):
+            Store.open(db, busy_timeout_ms=50)
+    finally:
+        reader.execute("COMMIT")
+        reader.close()
