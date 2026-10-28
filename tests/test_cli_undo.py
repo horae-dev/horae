@@ -16,7 +16,7 @@ from horae.apply import LocalFileSink, StaticSinks, apply_changes, plan_changes
 from horae.apply.testing import FixtureSink
 from horae.cli import app
 from horae.config import STORE_FILE
-from horae.runner import PipelineLock
+from horae.runner import PipelineLock, try_acquire_apply_lock
 from horae.store import Store
 
 runner = CliRunner()
@@ -146,3 +146,85 @@ def test_undo_store_and_internal_errors(
     assert result.exit_code == cli_undo.EXIT_INTERNAL
     assert "internal error (RuntimeError)" in result.stderr
     assert "s3cr3t" not in result.output
+
+
+def _apply_to(instance_dir: Path, vault: Path, run_id: str = RUN_ID, *, save: bool = True) -> None:
+    """Apply the synthetic run to `vault`; without `save` the process "dies" before saving it
+    (`kill -9`): its row stays running."""
+    run = record(dry_run=False).model_copy(update={"id": run_id})
+    other = FixtureSink()
+    sinks = StaticSinks(
+        sinks={"vault.tasks": other, "hooks.post": other, "ntfy.push": other},
+        default=LocalFileSink(vault),
+    )
+    with Store.open(instance_dir / "state" / STORE_FILE) as store:
+        store.begin_run(run.id, run.pipeline, run.started_at)
+
+        async def go() -> Any:
+            planned = await plan_changes(run, sinks)
+            return await apply_changes(run, planned, sinks, store, clock=lambda: START)
+
+        result = asyncio.run(go())
+        assert result.failure is None
+        if save:
+            store.save_run(result.record)
+
+
+def test_undo_recovers_a_run_killed_after_applying(instance_dir: Path, vault: Path) -> None:
+    _apply_to(instance_dir, vault, save=False)
+    result = _undo(RUN_ID, "-i", str(instance_dir), "--vault", str(vault), "--json")
+    assert result.exit_code == cli_undo.EXIT_OK, result.output
+    data = json.loads(result.stdout)
+    assert data["run"]["abandoned"] is True
+    assert data["run"]["status"] == "failed"
+    assert data["complete"] is True
+    assert (vault / INBOX).read_bytes() == INBOX_BYTES
+    assert not (vault / DAILY).exists()
+
+
+def test_undo_refuses_another_vault(applied: Path, vault: Path, tmp_path: Path) -> None:
+    empty = tmp_path / "empty-vault"
+    empty.mkdir()
+    copy = tmp_path / "copy-vault"
+    copy.mkdir()
+    (copy / INBOX).write_bytes((vault / INBOX).read_bytes())
+    for wrong in (empty, copy):
+        for extra in ([], ["--force"]):
+            result = _undo(RUN_ID, "-i", str(applied), "--vault", str(wrong), "--json", *extra)
+            assert result.exit_code == cli_undo.EXIT_PROBLEMS, result.output
+            assert json.loads(result.stdout)["refused"]["kind"] == "sink_mismatch"
+    assert list(empty.iterdir()) == []
+    assert (copy / INBOX).read_bytes() != INBOX_BYTES
+    assert (vault / DAILY).exists()
+    ok = _undo(RUN_ID, "-i", str(applied), "--vault", str(vault))
+    assert ok.exit_code == cli_undo.EXIT_OK, ok.output
+
+
+def test_undo_never_runs_during_an_apply(applied: Path, vault: Path) -> None:
+    held = try_acquire_apply_lock(applied / "state")
+    assert held is not None
+    with held:
+        result = _undo(RUN_ID, "-i", str(applied), "--vault", str(vault), "--json")
+    assert result.exit_code == cli_undo.EXIT_PROBLEMS
+    assert json.loads(result.stdout)["error"]["kind"] == "apply_locked"
+    assert (vault / DAILY).exists()
+
+
+def test_undo_of_a_run_that_changed_no_note(instance_dir: Path) -> None:
+    with Store.open(instance_dir / "state" / STORE_FILE) as store:
+        store.save_run(record(dry_run=False))
+    result = _undo(RUN_ID, "-i", str(instance_dir), "--json")
+    assert result.exit_code == cli_undo.EXIT_UNKNOWN_RUN
+    assert json.loads(result.stdout)["refused"]["kind"] == "nothing_to_undo"
+
+
+def test_undo_refuses_when_a_later_run_changed_the_note(applied: Path, vault: Path) -> None:
+    _apply_to(applied, vault, "later-run")
+    refused = _undo(RUN_ID, "-i", str(applied), "--vault", str(vault), "--json")
+    assert refused.exit_code == cli_undo.EXIT_CHANGED
+    data = json.loads(refused.stdout)
+    assert data["refused"]["kind"] == "newer_run"
+    assert "later-run" in data["refused"]["message"]
+    assert _undo("later-run", "-i", str(applied), "--vault", str(vault)).exit_code == 0
+    assert _undo(RUN_ID, "-i", str(applied), "--vault", str(vault)).exit_code == 0
+    assert (vault / INBOX).read_bytes() == INBOX_BYTES

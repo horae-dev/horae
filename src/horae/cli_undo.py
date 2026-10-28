@@ -2,13 +2,18 @@
 """`horae undo <run-id>` (#22): restore every note a run changed (`horae.apply.undo`).
 
 Registered on the `horae` app by `horae.cli`. Notes are written with the provisional local
-sink (`LocalFileSink`, `--vault`) until plugin sinks exist (#24). The pipeline's lock is held
-while undoing, so a run of the same pipeline cannot apply changes meanwhile.
+sink (`LocalFileSink`, `--vault`) until plugin sinks exist (#24). The pipeline's lock and the
+instance's apply lock (`<state_dir>/locks/_apply.lock`) are held while undoing, so no run can
+apply changes meanwhile. With the pipeline's lock held, its `running` rows are dead (their
+process was killed): they are abandoned first (`horae.runner.recover_pipeline`), so a run
+killed mid-apply can be undone at once.
 
 Exit codes follow `horae diff`: 0 undone (or nothing left to undo), 1 configuration, store,
-lock or sink problem (what was restored stays restored; run it again), 2 usage error, 3
-unknown, running or dry run, 4 refused because a note changed since the run (nothing
-written; `--force` restores it anyway), 70 internal error.
+lock or sink problem, or another vault than the run's (`sink_mismatch`; what was restored
+stays restored; run it again), 2 usage error, 3 unknown, running or dry run, or a run with
+no note to undo, 4 refused because a note changed since the run or a later run changed it
+too (nothing written; `--force` restores it anyway), 70 internal error. Aligning them with
+`horae replay` is left to #26.
 """
 
 import asyncio
@@ -24,15 +29,15 @@ from horae.apply.render import safe
 from horae.apply.undo import UNDO_SCHEMA_VERSION, UndoResult, render_undo_text, undo_to_dict
 from horae.config import CONFIG_FILE, STORE_FILE, ProblemsError, read_yaml, validate
 from horae.contracts import InstanceConfig
-from horae.runner import PipelineLock
+from horae.runner import PipelineLock, recover_pipeline, try_acquire_apply_lock
 from horae.store import Store, StoreError, UnknownRun
 
 EXIT_OK = 0
 EXIT_PROBLEMS = 1
 EXIT_UNKNOWN_RUN = 3
-"""Unknown run, still running, or a dry run."""
+"""Unknown run, still running, a dry run, or nothing to undo."""
 EXIT_CHANGED = 4
-"""Refused: a note changed since the run (use `--force`)."""
+"""Refused: a note changed since the run, or a later run changed it (use `--force`)."""
 EXIT_INTERNAL = 70
 
 
@@ -52,8 +57,14 @@ def _error(kind: str, message: str, json_output: bool) -> None:
 
 def _code(result: UndoResult) -> int:
     if result.refused is not None:
-        return EXIT_CHANGED if result.refused.kind == "changed" else EXIT_UNKNOWN_RUN
+        if result.refused.kind in {"changed", "newer_run"}:
+            return EXIT_CHANGED
+        return EXIT_PROBLEMS if result.refused.kind == "sink_mismatch" else EXIT_UNKNOWN_RUN
     return EXIT_OK if result.complete else EXIT_PROBLEMS
+
+
+def _now() -> datetime:
+    return datetime.now(UTC)
 
 
 def _undo(instance: Path, run_id: str, vault: Path | None, force: bool) -> UndoResult:
@@ -77,9 +88,22 @@ def _undo(instance: Path, run_id: str, vault: Path | None, force: bool) -> UndoR
                 message = f"pipeline {summary.pipeline!r} is running; undo it when it has finished"
                 raise _UndoFailed(EXIT_PROBLEMS, "pipeline_locked", message)
             with lock:
-                return asyncio.run(
-                    undo_run(store, run_id, sinks, force=force, clock=lambda: datetime.now(UTC))
-                )
+                applying = try_acquire_apply_lock(state_dir)
+                if applying is None:
+                    message = "another process is applying changes; try again when it has finished"
+                    raise _UndoFailed(EXIT_PROBLEMS, "apply_locked", message)
+                with applying:
+                    recover_pipeline(store, summary.pipeline, clock=_now)
+                    return asyncio.run(
+                        undo_run(
+                            store,
+                            run_id,
+                            sinks,
+                            force=force,
+                            clock=_now,
+                            call_timeout_s=config.plugin_defaults.call_timeout_s,
+                        )
+                    )
     except UnknownRun:
         raise _UndoFailed(EXIT_UNKNOWN_RUN, "unknown_run", f"unknown run {run_id!r}") from None
     except (StoreError, OSError) as exc:
@@ -114,13 +138,16 @@ def undo(
 ) -> None:
     """Restore every note a run changed, byte for byte, and mark the run undone.
 
-    A note the run created is removed. Refused when a note changed since the run, unless
-    --force. Tasks, notifications and HTTP calls cannot be undone: they are listed. Running
-    it again after an interruption continues where it stopped.
+    A note the run created is removed. Refused when a note changed since the run, or a later
+    run changed it too, unless --force (the overwritten bytes are kept in the journal);
+    always refused when --vault is another vault than the run's. Tasks, notifications and
+    HTTP calls cannot be undone: they are listed. Running it again after an interruption
+    continues where it stopped.
 
-    Exit codes: 0 undone, 1 configuration, store, lock or sink problem, 2 usage error,
-    3 unknown, running or dry run, 4 refused (a note changed since the run), 70 internal
-    error. With --json, errors are a JSON object on stdout ({schema_version, error})."""
+    Exit codes: 0 undone, 1 configuration, store, lock or sink problem (or another vault),
+    2 usage error, 3 unknown, running or dry run (or nothing to undo), 4 refused (a note
+    changed since the run, or by a later run), 70 internal error. With --json, errors are a
+    JSON object on stdout ({schema_version, error})."""
     try:
         result = _undo(instance, run_id, vault, force)
     except _UndoFailed as failed:

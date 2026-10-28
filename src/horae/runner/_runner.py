@@ -7,11 +7,11 @@
    `<state_dir>/locks/<pipeline>.lock`) without waiting, and holds it for the whole run. If
    another process (or task) holds it, `PipelineLocked` names the run that holds it (read from
    the store) and nothing is written. Dry runs take the lock too.
-2. **Recovery.** With the lock held, no other process can be running this pipeline, so any
-   `running` row of *this* pipeline was left by a process that died (crash, `kill -9`, OOM,
-   power loss): it is abandoned (`Store.abandon_run`: `failed`, no record, journal kept for
-   undo), as a compare-and-set on its id and last heartbeat. Other pipelines are recovered
-   when they next start.
+2. **Recovery** (`recover_pipeline`, also used by `horae undo`). With the lock held, no other
+   process can be running this pipeline, so any `running` row of *this* pipeline was left by
+   a process that died (crash, `kill -9`, OOM, power loss): it is abandoned
+   (`Store.abandon_run`: `failed`, no record, journal kept for undo), as a compare-and-set on
+   its id and last heartbeat. Other pipelines are recovered when they next start.
 3. **Begin.** A sortable run id (`new_run_id`) and `Store.begin_run` (retried once with a fresh
    id on `RunExists`). The store's unique index on running runs stays as a second guard:
    `PipelineBusy` there is reported as `PipelineLocked` too.
@@ -27,12 +27,18 @@
    `degraded` within its timeout, and `Ports.sinks` is set, its routed intents are planned
    (`horae.apply.plan_changes`, with the notifications already sent) and applied
    (`horae.apply.apply_changes`: journal first, then the sink, then mark applied) while the
-   run's row is still `running`. The record gets its `changes`; if a change cannot be
-   applied the run becomes `failed` (the changes before it stay applied and journalled, the
-   rest are not applied). Without `Ports.sinks` nothing is applied (the intents are only
-   recorded, as before #22). The apply is not under the run timeout (each sink call is bounded
-   by the plugin host's per-call timeout, #24); a crash or cancellation during it abandons the
-   run, and its journal still lets `horae undo` revert what was written.
+   run's row is still `running`, holding the instance's apply lock
+   (`<state_dir>/locks/_apply.lock`, also held by `horae undo`; waited for at most
+   `APPLY_LOCK_WAIT_S`, else the run fails `apply_locked` with nothing applied) and with the
+   heartbeat still running. The record gets its `changes`; if a change cannot be applied the
+   run becomes `failed` (the changes before it stay applied and journalled, the rest are not
+   applied, and nothing is rolled back: `horae undo` is the remedy). Without `Ports.sinks`
+   nothing is applied (the intents are only recorded, as before #22). The apply is not under
+   the run timeout; each sink call is bounded by `plugin_defaults.call_timeout_s` (kind
+   `timeout`). A crash or cancellation during it abandons the run, and its journal still lets
+   `horae undo` revert what was written. A run whose caller cancels it after its steps
+   finished but before the apply is saved `failed` ("cancelled before apply"), nothing
+   applied.
 6. **Persist** the record (`Store.save_run`), call `on_record(record)` if given, and release
    the lock. The status is the engine's (`ok`, `noop`, `degraded` or `failed`), or `failed`
    when the apply failed.
@@ -106,7 +112,7 @@ from horae.engine import (
     make_context,
     pipeline_digest,
 )
-from horae.runner._lock import PipelineLock
+from horae.runner._lock import PipelineLock, try_acquire_apply_lock
 from horae.store import (
     MAX_LIST_RUNS,
     InvalidRow,
@@ -128,6 +134,10 @@ STOP_GRACE_S = 5.0
 LOCK_RETRY_S = 0.2
 """How long a busy lock with no running row is retried (a run starting or finishing, or a
 `horae runs` probing the lock) before `PipelineLocked`."""
+APPLY_LOCK_WAIT_S = 30.0
+"""How long a run waits for the instance's apply lock (held by `horae undo` or another run's
+apply) before it fails `apply_locked`, nothing applied."""
+_APPLY_LOCK_POLL_S = 0.05
 
 
 def _utc_now() -> datetime:
@@ -251,6 +261,35 @@ def _timed_out(record: RunRecord, timeout_s: float) -> RunRecord:
     return RunRecord.model_validate(data)
 
 
+def _failed(record: RunRecord, error: str) -> RunRecord:
+    """`record`, `failed` with `error`, nothing applied."""
+    return record.model_copy(update={"status": "failed", "error": error})
+
+
+def recover_pipeline(
+    store: Store, pipeline: str, *, clock: Callable[[], datetime]
+) -> list[RunSummary]:
+    """Abandon the `running` rows of `pipeline`, whose lock the caller holds: they are dead.
+
+    Each is a compare-and-set on its last heartbeat (`Store.abandon_run(heartbeat_before=)`);
+    a row that finished meanwhile is skipped, one that beats meanwhile (a process that does not
+    take the lock) is logged and left alone. Returns the rows abandoned."""
+    recovered: list[RunSummary] = []
+    for run in store.list_runs(pipeline=pipeline, status="running", limit=MAX_LIST_RUNS):
+        seen = run.heartbeat_at or run.started_at
+        why = f"abandoned: its process died (last heartbeat {_stamp(seen)})"
+        try:
+            store.abandon_run(run.id, at=clock(), error=why, heartbeat_before=seen)
+        except (RunNotRunning, UnknownRun):
+            continue  # it finished meanwhile
+        except RunNotStale:
+            # A heartbeat while we hold the lock: a process that does not take it.
+            _log.warning("run %s is running without the pipeline lock; left alone", run.id)
+            continue
+        recovered.append(run)
+    return recovered
+
+
 def _retrieve(task: asyncio.Task[RunRecord]) -> None:
     """Mark a finished task's exception as retrieved (a stray task is never awaited)."""
     if not task.cancelled():
@@ -305,20 +344,7 @@ class Runner:
 
     def _recover(self, name: str) -> list[RunSummary]:
         """Abandon the `running` rows of `name` (the caller holds its lock: they are dead)."""
-        recovered: list[RunSummary] = []
-        for run in self.store.list_runs(pipeline=name, status="running", limit=MAX_LIST_RUNS):
-            seen = run.heartbeat_at or run.started_at
-            why = f"abandoned: its process died (last heartbeat {_stamp(seen)})"
-            try:
-                self.store.abandon_run(run.id, at=self.clock(), error=why, heartbeat_before=seen)
-            except (RunNotRunning, UnknownRun):
-                continue  # it finished meanwhile
-            except RunNotStale:
-                # A heartbeat while we hold the lock: a process that does not take it.
-                _log.warning("run %s is running without the pipeline lock; left alone", run.id)
-                continue
-            recovered.append(run)
-        return recovered
+        return recover_pipeline(self.store, name, clock=self.clock)
 
     def _begin(self, name: str, started_at: datetime, dry_run: bool) -> str:
         for attempt in range(2):
@@ -402,7 +428,9 @@ class Runner:
                 type(failure).__name__,
             )
 
-    async def _heartbeat(self, state: _State, task: asyncio.Task[RunRecord]) -> None:
+    async def _heartbeat(self, state: _State, task: asyncio.Task[RunRecord] | None) -> None:
+        """Beat every `heartbeat_s`; once the row is no longer running, mark the run lost and
+        cancel `task` (if any)."""
         warned = False
         while True:
             await asyncio.sleep(self.heartbeat_s)
@@ -410,7 +438,8 @@ class Runner:
                 self.store.heartbeat(state.run_id, self.clock())
             except RunNotRunning:
                 state.lost = True
-                task.cancel()
+                if task is not None:
+                    task.cancel()
                 return
             except Exception as exc:
                 # E.g. busy: skip this beat. Logged once per run (type only, no message).
@@ -471,19 +500,62 @@ class Runner:
         if on_record is not None:
             on_record(record)
 
-    async def _apply(self, record: RunRecord) -> RunRecord:
+    def _applies(self, record: RunRecord) -> bool:
+        """Whether the apply phase has something to do for `record`."""
+        return (
+            self.ports.sinks is not None
+            and not record.dry_run
+            and record.status in {"ok", "noop", "degraded"}
+            and bool(record.intents)
+        )
+
+    async def _apply_lock(self) -> PipelineLock | None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + APPLY_LOCK_WAIT_S
+        while True:
+            lock = try_acquire_apply_lock(self.instance.state_dir)
+            if lock is not None or loop.time() >= deadline:
+                return lock
+            await asyncio.sleep(_APPLY_LOCK_POLL_S)
+
+    async def _apply(self, state: _State, record: RunRecord) -> RunRecord:
         """Plan and apply the record's intents (see the module docstring, step 5)."""
         sinks = self.ports.sinks
-        if sinks is None or record.dry_run or record.status not in {"ok", "noop", "degraded"}:
-            return record
-        if not record.intents:
+        if sinks is None or not self._applies(record):
             return record
 
         def notified(key: str) -> bool:
             return self.store.get_notification(key) is not None
 
-        planned = await plan_changes(record, sinks, notified=notified)
-        result = await apply_changes(record, planned, sinks, self.store, clock=self.clock)
+        beating = asyncio.create_task(self._heartbeat(state, None))
+        try:
+            lock = await self._apply_lock()
+            if lock is None:
+                return _failed(
+                    record,
+                    "apply_locked: another process (horae undo, or the apply of another run) "
+                    f"held the instance's apply lock for {APPLY_LOCK_WAIT_S:g} s; nothing was "
+                    "applied",
+                )
+            with lock:
+                timeout_s = self.instance.config.plugin_defaults.call_timeout_s
+                planned = await plan_changes(
+                    record, sinks, notified=notified, call_timeout_s=timeout_s
+                )
+                result = await apply_changes(
+                    record, planned, sinks, self.store, clock=self.clock, call_timeout_s=timeout_s
+                )
+        except RunNotRunning:
+            state.settled = True
+            raise RunLost(state.run_id) from None
+        finally:
+            beating.cancel()
+            await asyncio.wait({beating})
+            if not beating.cancelled():
+                beating.exception()
+        if state.lost:
+            state.settled = True
+            raise RunLost(state.run_id)
         return result.record
 
     async def _drive(
@@ -580,7 +652,10 @@ class Runner:
         if timed_out:
             record = _timed_out(record, timeout)
         elif not cancelled:
-            record = await self._apply(record)
+            record = await self._apply(state, record)
+        elif self._applies(record):
+            message = "cancelled before apply: the run was cancelled after its steps finished"
+            record = _failed(record, f"{message}; nothing was applied")
         self._save(state, record, on_record)
         if timed_out:
             raise RunTimedOut(run_id, timeout, record)
@@ -591,6 +666,7 @@ class Runner:
 
 
 __all__ = [
+    "APPLY_LOCK_WAIT_S",
     "DEFAULT_HEARTBEAT_S",
     "LOCK_RETRY_S",
     "STOP_GRACE_S",
@@ -602,4 +678,5 @@ __all__ = [
     "RunnerError",
     "UnknownPipeline",
     "new_run_id",
+    "recover_pipeline",
 ]

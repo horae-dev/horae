@@ -42,6 +42,7 @@ identical notifications (decision 30), so the applier (#22) sends a key once
 `duplicate`. A duplicate is information, not a problem.
 """
 
+import asyncio
 import copy
 import difflib
 import hashlib
@@ -58,6 +59,7 @@ from horae.apply.sink import (
     SinkError,
     SinkRegistry,
     TaskChange,
+    error_kind,
 )
 from horae.contracts.intents import Intent, NotifyPush, TaskCreate, TaskUpdateStatus
 from horae.contracts.run import ProposedIntent, RunRecord
@@ -294,11 +296,13 @@ async def plan_changes(
     sinks: SinkRegistry,
     *,
     notified: Callable[[str], bool] | None = None,
+    call_timeout_s: float | None = None,
 ) -> ChangeSet:
     """Plan every routed intent of `record`; never applies anything.
 
-    Only `Sink.read` is called, for `note.*` intents. `notified(key)` says whether a
-    notification's `dedupe_key` was already sent."""
+    Only `Sink.read` is called, for `note.*` intents, each bounded by `call_timeout_s`
+    (`None`: unbounded; past it the intent is a `timeout` problem). `notified(key)` says
+    whether a notification's `dedupe_key` was already sent."""
     base = ChangeSet(record.id, record.pipeline, record.status, record.dry_run)
     if record.status in _REFUSED_STATUSES:
         return replace(base, refused=_REFUSED_STATUSES[record.status])
@@ -355,9 +359,14 @@ async def plan_changes(
                     record.input_hash,
                 )
                 try:
-                    before = await sink.read(call)
+                    async with asyncio.timeout(call_timeout_s):
+                        before = await sink.read(call)
                 except SinkError:
                     raise
+                except TimeoutError:
+                    message = f"the sink read took longer than {call_timeout_s:g} s"
+                    problems.append(Problem(index, tool, "timeout", message))
+                    continue
                 except Exception:
                     problems.append(Problem(index, tool, "host_error", "the sink read failed"))
                     continue
@@ -371,7 +380,7 @@ async def plan_changes(
             if len(after) > MAX_NOTE_BYTES:
                 raise _too_large(intent.path)
         except SinkError as error:
-            problems.append(Problem(index, tool, str(error.kind), str(error.message)))
+            problems.append(Problem(index, tool, error_kind(error.kind), str(error.message)))
             continue
         pending[slot] = (after, index)
         files.append(_file_diff(index, tool, intent.path, before, after, follows))

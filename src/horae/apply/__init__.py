@@ -29,6 +29,7 @@ from horae.apply.plan import (
 )
 from horae.apply.render import JSON_SCHEMA_VERSION, render_text, to_dict, to_json
 from horae.apply.sink import (
+    MAX_IDENTITY,
     MAX_NOTE_BYTES,
     Applied,
     FileChange,
@@ -42,6 +43,8 @@ from horae.apply.sink import (
     SinkRegistry,
     StaticSinks,
     TaskChange,
+    error_kind,
+    sink_identity,
 )
 from horae.apply.undo import (
     NoteUndo,
@@ -55,6 +58,7 @@ from horae.apply.undo import (
 __all__ = [
     "JSON_SCHEMA_VERSION",
     "MAX_DIFF_BYTES",
+    "MAX_IDENTITY",
     "MAX_NOTE_BYTES",
     "Applied",
     "ApplyFailure",
@@ -89,8 +93,10 @@ __all__ = [
     "dedupe_key",
     "describe",
     "entry_params",
+    "error_kind",
     "plan_changes",
     "render_text",
+    "sink_identity",
     "to_dict",
     "to_json",
     "undo_run",

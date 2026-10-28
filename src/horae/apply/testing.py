@@ -9,6 +9,8 @@ records what it sent (`sent`, with each notification's `dedupe_key` in `dedupe_k
 never touches the filesystem or the network. Set `fail` to make the read (and apply) of some
 intent indices raise a given `SinkError`. It is a `RestorableSink` too: `read_target` and
 `restore` (a compare-and-swap on `files`, recorded in `restored`) serve `horae undo` (#22).
+Its `identity` defaults to `"fixture"` (two fixtures with the same identity count as the same
+place); `parent_exists` is `False` for a target whose directory is in `missing_dirs`.
 """
 
 import hashlib
@@ -31,6 +33,11 @@ class FixtureSink:
     sent: list[Notification | HttpCall] = field(default_factory=list)
     dedupe_keys: list[str | None] = field(default_factory=list)
     restored: list[tuple[str, bytes | None]] = field(default_factory=list)
+    identity: str | None = "fixture"
+    missing_dirs: set[str] = field(default_factory=set)
+
+    async def parent_exists(self, target: str) -> bool:
+        return target.rpartition("/")[0] not in self.missing_dirs
 
     async def read_target(self, target: str) -> bytes | None:
         return self.files.get(target)

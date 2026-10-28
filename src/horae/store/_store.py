@@ -263,6 +263,13 @@ class JournalEntry:
     created_at: datetime
     applied_by: str | None = None
     """The sink that applies the change (`ProposedIntent.applied_by`), when recorded."""
+    sink_identity: str | None = None
+    """Where that sink writes (`horae.apply.sink_identity`), when it says."""
+    actual_after_sha256: str | None = None
+    """Digest of the bytes the sink really wrote, when they differ from `after_sha256`
+    (`apply_mismatch`)."""
+    undo_overwrote_sha256: str | None = None
+    """Digest of the bytes a forced undo overwrote (kept as a blob)."""
 
 
 @dataclass(frozen=True)
@@ -917,7 +924,11 @@ class Store:
             self._conn.execute(
                 "DELETE FROM blobs WHERE NOT EXISTS "
                 "(SELECT 1 FROM journal WHERE journal.before_sha256 = blobs.sha256) "
-                "AND NOT EXISTS (SELECT 1 FROM journal WHERE journal.after_sha256 = blobs.sha256)"
+                "AND NOT EXISTS (SELECT 1 FROM journal WHERE journal.after_sha256 = blobs.sha256) "
+                "AND NOT EXISTS "
+                "(SELECT 1 FROM journal WHERE journal.actual_after_sha256 = blobs.sha256) "
+                "AND NOT EXISTS "
+                "(SELECT 1 FROM journal WHERE journal.undo_overwrote_sha256 = blobs.sha256)"
             )
         return pruned
 
@@ -939,7 +950,17 @@ class Store:
             undone_at=_opt_dt(row[10]),
             created_at=_dt(row[11]),
             applied_by=row[12],
+            sink_identity=row[13],
+            actual_after_sha256=row[14],
+            undo_overwrote_sha256=row[15],
         )
+
+    @staticmethod
+    def _check_size(content: bytes | None) -> None:
+        if content is not None and len(content) > MAX_JOURNAL_BYTES:
+            raise JournalTooLarge(
+                f"journalled content of {len(content)} bytes exceeds {MAX_JOURNAL_BYTES}"
+            )
 
     def _put_blob(self, data: bytes | None) -> str | None:
         if data is None:
@@ -964,6 +985,7 @@ class Store:
         after: bytes | None = None,
         undoable: bool | None = None,
         applied_by: str | None = None,
+        sink_identity: str | None = None,
         at: datetime,
     ) -> JournalEntry:
         """Record a change of a running run before applying it; `journal_mark_applied` after.
@@ -971,7 +993,8 @@ class Store:
         `undoable` defaults to what the intent type allows: `notify.push` and `http.post`
         cannot be undone (and `True` is refused for them); an undoable change needs a `before`
         or an `after`. Each content is at most `MAX_JOURNAL_BYTES` (`JournalTooLarge`).
-        `applied_by` names the sink applying it (so undo can find it again)."""
+        `applied_by` names the sink applying it (so undo can find it again) and
+        `sink_identity` where it writes (so undo can tell another vault from this one)."""
         if intent_type not in INTENT_TYPES:
             raise ValueError(f"unknown intent type {intent_type!r}")
         if undoable is None:
@@ -981,21 +1004,19 @@ class Store:
         if undoable and before is None and after is None:
             raise ValueError("an undoable change needs `before` or `after`")
         for content in (before, after):
-            if content is not None and len(content) > MAX_JOURNAL_BYTES:
-                raise JournalTooLarge(
-                    f"journalled content of {len(content)} bytes exceeds {MAX_JOURNAL_BYTES}"
-                )
+            self._check_size(content)
         with self.transaction():
             self._require_running(run_id)
             before_sha = self._put_blob(before)
             after_sha = self._put_blob(after)
             (row,) = self._conn.execute(
                 "INSERT INTO journal (run_id, seq, intent, intent_type, target, before_sha256, "
-                "after_sha256, undoable, created_at, applied_by) VALUES (:run_id, "
+                "after_sha256, undoable, created_at, applied_by, sink_identity) VALUES (:run_id, "
                 "(SELECT coalesce(max(seq) + 1, 0) FROM journal WHERE run_id = :run_id), "
-                ":intent, :intent_type, :target, :before, :after, :undoable, :at, :applied_by) "
-                "RETURNING id, run_id, seq, intent, intent_type, target, before_sha256, "
-                "after_sha256, undoable, applied, undone_at, created_at, applied_by",
+                ":intent, :intent_type, :target, :before, :after, :undoable, :at, :applied_by, "
+                ":sink_identity) RETURNING id, run_id, seq, intent, intent_type, target, "
+                "before_sha256, after_sha256, undoable, applied, undone_at, created_at, "
+                "applied_by, sink_identity, actual_after_sha256, undo_overwrote_sha256",
                 {
                     "run_id": run_id,
                     "intent": intent,
@@ -1006,25 +1027,38 @@ class Store:
                     "undoable": int(undoable),
                     "at": _ts(at),
                     "applied_by": applied_by,
+                    "sink_identity": sink_identity,
                 },
             ).fetchall()
         return self._entry(row)
 
     @_api
-    def journal_mark_applied(self, entry_id: int) -> None:
+    def journal_mark_applied(self, entry_id: int, *, actual_after: bytes | None = None) -> None:
+        """Record that a change was applied; `actual_after`: the bytes the sink really wrote,
+        when they are not the journalled `after` (kept as a blob, for undo)."""
+        self._check_size(actual_after)
         with self.transaction():
-            cur = self._conn.execute("UPDATE journal SET applied = 1 WHERE id = ?", (entry_id,))
+            actual = self._put_blob(actual_after)
+            cur = self._conn.execute(
+                "UPDATE journal SET applied = 1, actual_after_sha256 = ? WHERE id = ?",
+                (actual, entry_id),
+            )
             if cur.rowcount != 1:
                 raise UnknownJournalEntry(entry_id)
 
     @_api
-    def journal_mark_undone(self, entry_id: int, *, at: datetime) -> None:
-        """Record that an undoable change was reverted (once)."""
+    def journal_mark_undone(
+        self, entry_id: int, *, at: datetime, overwrote: bytes | None = None
+    ) -> None:
+        """Record that an undoable change was reverted (once); `overwrote`: the bytes a forced
+        undo replaced (kept as a blob, so they can be recovered)."""
+        self._check_size(overwrote)
         with self.transaction():
+            overwrote_sha = self._put_blob(overwrote)
             cur = self._conn.execute(
-                "UPDATE journal SET undone_at = ? "
+                "UPDATE journal SET undone_at = ?, undo_overwrote_sha256 = ? "
                 "WHERE id = ? AND undoable = 1 AND undone_at IS NULL",
-                (_ts(at), entry_id),
+                (_ts(at), overwrote_sha, entry_id),
             )
             if cur.rowcount == 1:
                 return
@@ -1042,9 +1076,24 @@ class Store:
         """A run's journal, in the order the changes were recorded."""
         rows = self._conn.execute(
             "SELECT id, run_id, seq, intent, intent_type, target, before_sha256, after_sha256, "
-            "undoable, applied, undone_at, created_at, applied_by FROM journal "
+            "undoable, applied, undone_at, created_at, applied_by, sink_identity, "
+            "actual_after_sha256, undo_overwrote_sha256 FROM journal "
             "WHERE run_id = ? ORDER BY seq",
             (run_id,),
+        )
+        return [self._entry(row) for row in rows.fetchall()]
+
+    @_api
+    def journal_later(self, run_id: str, target: str, after_id: int) -> list[JournalEntry]:
+        """Undoable entries of *other* runs for `target` recorded after entry `after_id`, not
+        undone, in the order they were recorded (undo is last-in, first-out per note)."""
+        rows = self._conn.execute(
+            "SELECT id, run_id, seq, intent, intent_type, target, before_sha256, after_sha256, "
+            "undoable, applied, undone_at, created_at, applied_by, sink_identity, "
+            "actual_after_sha256, undo_overwrote_sha256 FROM journal "
+            "WHERE target = ? AND id > ? AND undoable = 1 AND run_id <> ? "
+            "AND undone_at IS NULL ORDER BY id",
+            (target, after_id, run_id),
         )
         return [self._entry(row) for row in rows.fetchall()]
 

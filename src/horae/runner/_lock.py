@@ -30,6 +30,10 @@ except ImportError:  # pragma: no cover - Windows
 
 LOCKS_DIR = "locks"
 """The lock directory, inside the state directory."""
+APPLY_LOCK = "_apply"
+"""The instance-wide apply lock, `<state_dir>/locks/_apply.lock` (#22, decision 34): held by a
+run's apply phase and by `horae undo`, in addition to the pipeline lock, so that no two
+processes change notes at the same time. A pipeline name never starts with `_`."""
 
 
 class LocksUnsupported(OSError):
@@ -44,6 +48,12 @@ def lock_path(state_dir: Path, pipeline: str) -> Path:
 def _require_flock() -> None:
     if not _FLOCK:  # pragma: no cover - Windows
         raise LocksUnsupported("pipeline locks need fcntl.flock: Horae runs on POSIX systems")
+
+
+def try_acquire_apply_lock(state_dir: Path) -> "PipelineLock | None":
+    """Take the instance's apply lock (`APPLY_LOCK`) without waiting; `None` when it is held.
+    Raises like `PipelineLock.try_acquire`."""
+    return PipelineLock.try_acquire(state_dir, APPLY_LOCK)
 
 
 class PipelineLock:
@@ -122,4 +132,12 @@ def lock_is_free(state_dir: Path, pipeline: str) -> bool | None:
     return True
 
 
-__all__ = ["LOCKS_DIR", "LocksUnsupported", "PipelineLock", "lock_is_free", "lock_path"]
+__all__ = [
+    "APPLY_LOCK",
+    "LOCKS_DIR",
+    "LocksUnsupported",
+    "PipelineLock",
+    "lock_is_free",
+    "lock_path",
+    "try_acquire_apply_lock",
+]
