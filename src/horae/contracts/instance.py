@@ -267,8 +267,9 @@ class ModelAlias(Contract):
     `json_object` / `none` for a server that lacks JSON Schema support). See
     `StructuredOutput`."""
     command: CommandPath | None = None
-    """`claude-cli` only: the absolute path of the `claude` executable (symlinks are
-    resolved when the backend first runs it). Unset, `claude` is looked up on the fixed
+    """`claude-cli` only: the absolute path of the native `claude` executable (not the npm
+    package's `#!/usr/bin/env node` script, whose `node` is not on the child `PATH`; symlinks
+    are resolved when the backend first runs it). Unset, `claude` is looked up on the fixed
     child `PATH` (`/usr/local/bin:/usr/bin:/bin`), never on Horae's own `PATH` (schemas
     decision 42)."""
     max_tokens_field: MaxTokensField | None = None

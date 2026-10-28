@@ -140,9 +140,10 @@ def _backend_problems(instance: Instance) -> list[Problem]:
     `usd` budget does not bound them; schemas decision 38 A), and a warning when it sends a
     `secret` to an `http://` `base_url` (the key crosses the LAN in clear; decision 40).
     A `claude-cli` alias (decision 42) needs its `secret` (token mode), an executable found at
-    a supported version (`claude_cli.check`, which runs `<command> --version`), and gets a
-    warning without a `price` (its notional cost is counted after each call, but nothing is
-    reserved before it). Aliases no pipeline uses are not checked."""
+    a supported version (`claude_cli.check`, which runs `<command> --version`) and a `price`
+    (decision 42 A: the backend refuses to run without one, so that every call has a dollar
+    reservation), and gets a warning when administrator-managed Claude Code settings exist
+    (decision 42 D: no flag turns them off). Aliases no pipeline uses are not checked."""
     used = sorted(
         {
             step.llm.model
@@ -232,9 +233,22 @@ def _claude_cli_problems(alias: str, spec: ModelAlias) -> list[Problem]:
                 CONFIG_FILE,
                 None,
                 None,
-                f"models.{alias}.price: model alias {alias!r} (backend 'claude-cli') has no "
-                "price: its notional total_cost_usd is counted after each call, but nothing "
-                "bounds a call before it is made (only tokens_out sizes the reservation)",
+                f"models.{alias}.price: backend 'claude-cli' needs `price` (the notional "
+                "total_cost_usd is known only after a call; the price reserves each call's "
+                "dollars before it is made)",
+            )
+        )
+    managed = claude_cli.managed_settings()
+    if managed:
+        problems.append(
+            Problem(
+                CONFIG_FILE,
+                None,
+                None,
+                f"models.{alias}: administrator-managed Claude Code settings exist "
+                f"({', '.join(managed)}): they apply to every `claude` run, Horae's included, "
+                "and may add hooks, environment variables or MCP servers that no flag turns "
+                "off (not read by Horae; see docs/security.md T11)",
                 severity="warning",
             )
         )

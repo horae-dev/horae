@@ -369,7 +369,7 @@
             }
           ],
           "default": null,
-          "description": "`claude-cli` only: the absolute path of the `claude` executable (symlinks are\nresolved when the backend first runs it). Unset, `claude` is looked up on the fixed\nchild `PATH` (`/usr/local/bin:/usr/bin:/bin`), never on Horae's own `PATH` (schemas\ndecision 42).",
+          "description": "`claude-cli` only: the absolute path of the native `claude` executable (not the npm\npackage's `#!/usr/bin/env node` script, whose `node` is not on the child `PATH`; symlinks\nare resolved when the backend first runs it). Unset, `claude` is looked up on the fixed\nchild `PATH` (`/usr/local/bin:/usr/bin:/bin`), never on Horae's own `PATH` (schemas\ndecision 42).",
           "title": "Command"
         },
         "max_tokens_field": {

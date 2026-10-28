@@ -19,6 +19,8 @@ one `horae undo`), everything the runner needs from the installed plugins:
 (`horae.llm.backends.model_backends`, #28), sharing the host's `SecretResolver`. It is lazy:
 an alias' provider backend is built and its secret resolved on its first call, so a run that
 makes no LLM call never reads an API key. Its connections are closed with the block.
+`claude-cli` makes its per-call workspaces under `<state_dir>/llm-runs` (schemas decision 42
+C).
 
 Where `horae plugin add` installs plugins (the `plugins_dir`) is M4's (#44); the walking
 skeleton and the tests write it with `horae.plugins.builtin.install`. `horae run`,
@@ -38,6 +40,7 @@ from horae.contracts.pipeline import LlmStep
 from horae.engine import LlmBackend
 from horae.llm import ModelBackends
 from horae.llm.backends import model_backends
+from horae.llm.backends.claude_cli import LLM_RUNS_DIR
 from horae.plugins.host import HostRegistry, McpSinks, PluginHost, host_for_instance
 from horae.runner._runner import Ports
 from horae.secrets import SecretResolver
@@ -66,7 +69,9 @@ async def open_ports(
     secrets = secrets or instance.secret_resolver()
     owned: ModelBackends | None = None
     if llm is None and uses_llm(instance):
-        llm = owned = model_backends(instance.config.models, secrets)
+        llm = owned = model_backends(
+            instance.config.models, secrets, work_dir=instance.state_dir / LLM_RUNS_DIR
+        )
     try:
         async with host_for_instance(instance, registry, secrets=secrets) as host:
             sinks = McpSinks(registry, host)

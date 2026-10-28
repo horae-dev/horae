@@ -3,7 +3,9 @@
 records each invocation (argv, environment, working directory, umask, stdin, process group,
 what its `HOME` and working directory hold) as one JSON line in `calls.jsonl`, then behaves as
 `behaviour.json` says: answer `--version`, print a canned JSON result, raw bytes, a flood, or
-sleep (with a child process) until it is killed.
+sleep (with a child process) until it is killed. It honours `CLAUDE_CODE_MAX_OUTPUT_TOKENS`
+as Claude Code does: with `over_limit: N`, it reports `output_tokens` N above that limit
+(`0` reports exactly the limit), so a test sees the limit it was given echoed back.
 
 No network and no real Claude Code: the script never reads anything but its own files."""
 
@@ -55,8 +57,12 @@ if stderr:
     sys.stderr.write(stderr)
     sys.stderr.flush()
 mode = b.get("mode", "result")
+result = b["result"]
+if b.get("over_limit") is not None and isinstance(result.get("usage"), dict):
+    limit = int(os.environ["CLAUDE_CODE_MAX_OUTPUT_TOKENS"])
+    result["usage"]["output_tokens"] = limit + b["over_limit"]
 if mode == "result":
-    text = json.dumps(b["result"]).replace("{{TOKEN}}", token)
+    text = json.dumps(result).replace("{{TOKEN}}", token)
     sys.stdout.write(text + "\\n")
 elif mode == "raw":
     sys.stdout.buffer.write(base64.b64decode(b["raw"]))
@@ -72,6 +78,11 @@ elif mode == "sleep":
         json.dump([os.getpid(), child.pid], f)
     time.sleep(60)
 sys.stdout.flush()
+after = b.get("stderr_after", "")
+if after:
+    # a grandchild keeps stderr open and writes the tail after this process has exited
+    code = "import sys, time; time.sleep(0.3); sys.stderr.write(sys.argv[1])"
+    subprocess.Popen([sys.executable, "-I", "-c", code, after], stdout=subprocess.DEVNULL)
 sys.exit(b.get("exit", 0))
 """
 

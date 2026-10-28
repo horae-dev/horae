@@ -7,6 +7,8 @@ implemented. `horae doctor` reports a model alias used by a pipeline whose backe
 version)."""
 
 from collections.abc import Mapping
+from functools import partial
+from pathlib import Path
 
 from horae.contracts.instance import ModelAlias
 from horae.llm.backends.anthropic import AnthropicBackend, anthropic_backend
@@ -34,12 +36,17 @@ def model_backends(
     *,
     prompts: PromptSource | None = None,
     validate: Validator | None = None,
+    work_dir: Path | None = None,
 ) -> ModelBackends:
-    """A `ModelBackends` with the built-in `FACTORIES`."""
+    """A `ModelBackends` with the built-in `FACTORIES`; `work_dir` is where `claude-cli`
+    makes its per-call workspaces (`<state_dir>/llm-runs` in a run, schemas decision 42 C)."""
+    factories: Mapping[str, BackendFactory] = FACTORIES
+    if work_dir is not None:
+        factories = {**FACTORIES, "claude-cli": partial(claude_cli_backend, work_dir=work_dir)}
     return ModelBackends(
         models=models,
         secrets=secrets,
-        factories=FACTORIES,
+        factories=factories,
         prompts=prompts or RequestPrompts(),
         validate=validate,
     )

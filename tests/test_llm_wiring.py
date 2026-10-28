@@ -24,7 +24,7 @@ from horae.contracts import InstanceConfig, Lockfile, RunRecord
 from horae.contracts.instance import ModelAlias
 from horae.engine import LlmRequest
 from horae.llm import ModelBackends, Prompt
-from horae.llm.backends import FACTORIES, AnthropicBackend
+from horae.llm.backends import FACTORIES, AnthropicBackend, claude_cli
 from horae.runner import Ports, Runner, open_ports, uses_llm
 from horae.secrets import SecretResolver
 from horae.store import Store
@@ -157,6 +157,23 @@ def test_open_ports_builds_the_backends_lazily(inst: Instance, tmp_path: Path) -
             assert isinstance(live.ports.llm, ModelBackends)
             assert live.ports.llm.models == inst.config.models
             assert secrets.resolved() == ()  # no key read before a call
+
+    asyncio.run(go())
+
+
+def test_open_ports_puts_claude_cli_workspaces_in_the_state_dir(
+    inst: Instance, tmp_path: Path
+) -> None:
+    """Schemas decision 42 C: `<state_dir>/llm-runs`, not the system temporary directory."""
+    spec = ModelAlias(backend="claude-cli", model="sonnet", secret="T", command="/opt/claude")  # noqa: S106
+
+    async def go() -> None:
+        async with open_ports(inst, tmp_path / "plugins") as live:
+            assert isinstance(live.ports.llm, ModelBackends)
+            factory = live.ports.llm.factories["claude-cli"]
+            backend = factory("x", spec, inst.secret_resolver({}))
+            assert isinstance(backend, claude_cli.ClaudeCliBackend)
+            assert backend._work_dir == inst.state_dir / claude_cli.LLM_RUNS_DIR
 
     asyncio.run(go())
 
@@ -303,6 +320,13 @@ def test_doctor_accepts_an_anthropic_alias_with_its_secret(tmp_path: Path) -> No
     assert _doctor(root)[1]["ok"] is True
 
 
+@pytest.fixture(autouse=True)
+def _no_managed_settings(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """This machine's administrator-managed Claude Code settings, if any, stay out of the
+    doctor tests (the test below plants its own)."""
+    monkeypatch.setattr(claude_cli, "MANAGED_SETTINGS", (str(tmp_path / "no-managed.json"),))
+
+
 def _claude_cli(tmp_path: Path, **overrides: Any) -> tuple[Path, Any]:
     fake = make_fake(tmp_path / "bin")
     spec = {
@@ -340,9 +364,30 @@ def test_doctor_reports_a_claude_cli_alias_without_a_secret_or_price(tmp_path: P
     root, _ = _claude_cli(tmp_path, secret=None, price=None)
     code, report = _doctor(root)
     assert code == 1
-    messages = {p["severity"]: p["message"] for p in report["problems"]}
-    assert messages["error"].startswith("models.default.secret: backend 'claude-cli' needs")
-    assert "notional total_cost_usd is counted" in messages["warning"]
+    errors = [p["message"] for p in report["problems"] if p["severity"] == "error"]
+    assert errors[0].startswith("models.default.secret: backend 'claude-cli' needs")
+    # decision 42 A: a price is required (an error, not a warning)
+    assert errors[1].startswith("models.default.price: backend 'claude-cli' needs `price`")
+
+
+def test_doctor_warns_about_managed_claude_code_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Decision 42 D: checked by name only, never read; a warning (exit 0)."""
+    root, _ = _claude_cli(tmp_path)
+    managed = tmp_path / "managed-settings.json"
+    managed.write_text('{"hooks": {}}', encoding="utf-8")
+    managed.chmod(0o000)
+    monkeypatch.setattr(
+        claude_cli, "MANAGED_SETTINGS", (str(managed), str(tmp_path / "managed-mcp.json"))
+    )
+    code, report = _doctor(root)
+    assert code == 0
+    [problem] = report["problems"]
+    assert problem["severity"] == "warning"
+    assert "administrator-managed Claude Code settings exist" in problem["message"]
+    assert str(managed) in problem["message"]
+    assert "managed-mcp.json" not in problem["message"]
 
 
 def test_doctor_reports_a_missing_alias_secret(tmp_path: Path) -> None:

@@ -7,11 +7,13 @@ Code and no network; the live check against the real binary is
 import asyncio
 import json
 import os
+import stat
 import sys
 import time
 from pathlib import Path
 from typing import Any
 
+import anyio
 import pytest
 from pydantic import ValidationError
 
@@ -20,17 +22,18 @@ from horae.contracts.instance import ModelAlias, ModelPrice
 from horae.contracts.pipeline import Budget
 from horae.engine import LlmError, LlmRequest
 from horae.llm import Completion, ModelBackends, Prompt
-from horae.llm.backends import FACTORIES, claude_cli
-from horae.llm.backends._shared import SYSTEM_PREAMBLE
+from horae.llm.backends import FACTORIES, claude_cli, model_backends
+from horae.llm.backends._shared import SYSTEM_PREAMBLE, response_cap
 from horae.llm.backends.claude_cli import (
     CLAUDE_CODE_VERSION_RANGE,
     EMPTY_MCP,
-    MAX_STDOUT_BYTES,
+    LLM_RUNS_DIR,
     MAX_SYSTEM_BYTES,
     ClaudeCliBackend,
     argv,
     check,
     parse_version,
+    script_hint,
     version_ok,
 )
 from horae.secrets import SecretResolver
@@ -50,8 +53,15 @@ EXPECTED_KEYS = {
     "DISABLE_AUTOUPDATER",
     "DISABLE_TELEMETRY",
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+    "CLAUDE_CODE_DISABLE_CLAUDE_MDS",
+    "CLAUDE_CODE_DISABLE_AUTO_MEMORY",
+    "GIT_CEILING_DIRECTORIES",
+    "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
     "CLAUDE_CODE_OAUTH_TOKEN",
 }
+PRICE = {"input_per_mtok": 3.0, "output_per_mtok": 15.0}
+PRICED_USD = (1200 * 3.0 + 45 * 15.0) / 1_000_000
+"""What the default fake result costs at `PRICE` (below its notional 0.0123)."""
 HOSTILE = {
     "ANTHROPIC_API_KEY": AMBIENT,
     "ANTHROPIC_BASE_URL": "https://ambient.invalid",
@@ -92,6 +102,7 @@ def alias(fake: Fake, **overrides: Any) -> ModelAlias:
         "model": "sonnet",
         "secret": "CLAUDE_CODE_OAUTH_TOKEN",
         "command": fake.command,
+        "price": PRICE,
         **overrides,
     }
     return ModelAlias.model_validate({k: v for k, v in data.items() if v is not None})
@@ -204,6 +215,13 @@ def test_an_oversized_system_prompt_is_refused(fake: Fake, secrets: SecretResolv
         lambda p: p.update(max_tokens=0),
         lambda p: p.update(stdin=1),
         lambda p: p.update(argv="-p"),
+        lambda p: p.update(argv=["-p", "x"]),
+        lambda p: p.update(argv=p["argv"][:4]),
+        lambda p: p.update(argv=p["argv"][:5]),
+        lambda p: p.update(argv=[]),
+        lambda p: p["argv"].append("--verbose"),
+        lambda p: p["argv"].__delitem__(9),
+        lambda p: p.update(argv=[*p["argv"][:-2], "--append-system-prompt", p["argv"][-1]]),
     ],
 )
 def test_send_refuses_a_payload_render_did_not_make(
@@ -257,9 +275,15 @@ def test_the_environment_is_exactly_the_allowlist(
     assert env["CLAUDE_CODE_OAUTH_TOKEN"] == TOKEN  # the declared secret, not the ambient one
     assert AMBIENT not in json.dumps(call["env"])
     assert env["HOME"] != os.environ.get("HOME")
-    # the version check runs isolated too, without the token
+    assert env["CLAUDE_CODE_DISABLE_CLAUDE_MDS"] == env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1"
+    assert env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "2000"  # the step's max_tokens (F)
+    assert Path(env["HOME"]).parent.parent == Path(env["GIT_CEILING_DIRECTORIES"])
+    # the version check runs isolated too, without the token or an output limit
     [version] = fake.versions()
-    assert set(env_of(version)) == EXPECTED_KEYS - {"CLAUDE_CODE_OAUTH_TOKEN"}
+    assert set(env_of(version)) == EXPECTED_KEYS - {
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+    }
 
 
 def test_home_tmp_and_cwd_are_private_empty_and_removed(
@@ -482,11 +506,13 @@ def test_a_timeout_kills_the_whole_group(fake: Fake, secrets: SecretResolver) ->
 
 
 def test_an_oversized_stdout_is_refused(fake: Fake, secrets: SecretResolver) -> None:
-    fake.behave(mode="flood", chunks=MAX_STDOUT_BYTES // 65536 + 2)
+    cap = response_cap(2000)  # the step's max_tokens sizes the cap, as for an HTTP body
+    assert cap == 1 << 20
+    fake.behave(mode="flood", chunks=cap // 65536 + 2)
     started = time.monotonic()
     error = fails(fake, secrets)
     assert error.kind == "output_invalid"
-    assert f"more than {MAX_STDOUT_BYTES} bytes" in error.message
+    assert f"more than {cap} bytes" in error.message
     assert error.usage is not None
     assert error.usage.tokens_out == 2000
     assert time.monotonic() - started < 10  # killed, not waited for
@@ -544,7 +570,7 @@ def test_a_failed_exit_with_a_success_result_is_a_host_error(
         ({"api_error_status": 529}, "overloaded", "HTTP 529"),
         ({"api_error_status": 500}, "host_error", "HTTP 500"),
         ({"subtype": "error_max_turns"}, "output_invalid", "error_max_turns"),
-        ({"subtype": "error_max_budget_usd"}, "budget_exceeded", "error_max_budget_usd"),
+        ({"subtype": "error_max_budget_usd"}, "host_error", "error_max_budget_usd"),
         ({"subtype": "error_during_execution"}, "host_error", "error_during_execution"),
         ({"is_error": "yes"}, "host_error", "reported an error"),
     ],
@@ -608,7 +634,7 @@ def test_an_unusable_notional_cost_is_ignored(
 ) -> None:
     fake.behave(result=success(OUTPUT, total_cost_usd=total))
     usage = run(fake, secrets).usage
-    assert (usage.usd, usage.priced) == (0.0, False)
+    assert (usage.usd, usage.priced) == (pytest.approx(PRICED_USD), True)
 
 
 @pytest.mark.parametrize(
@@ -622,7 +648,7 @@ def test_missing_or_unusable_usage_is_charged_conservatively(
     result = run(fake, secrets)
     assert result.usage.tokens_out == 2000
     assert result.usage.tokens_in > 1000
-    assert result.usage.usd == pytest.approx(0.0123)
+    assert result.usage.usd >= 2000 * 15.0 / 1_000_000  # the whole output budget, priced
 
 
 def test_a_zero_usage_is_floored(fake: Fake, secrets: SecretResolver) -> None:
@@ -678,3 +704,197 @@ def test_through_model_backends(fake: Fake, secrets: SecretResolver) -> None:
     assert response.backend == "claude-cli"
     assert TOKEN not in json.dumps(response.request)
     asyncio.run(llm.aclose())
+
+
+# --- the security review's findings (decision 42 A-F) ----------------------------------------
+
+
+def test_an_alias_without_a_price_runs_nothing(fake: Fake, secrets: SecretResolver) -> None:
+    """Decision 42 A: no price, no dollar reservation, no call."""
+    llm = ClaudeCliBackend("personal", alias(fake, price=None), secrets)
+    payload = llm.render(completion())  # rendering (sizing, prepare) still works
+    with pytest.raises(LlmError) as info:
+        asyncio.run(llm.send(payload, 10.0))
+    assert info.value.kind == "backend_unavailable"
+    assert "needs `price`" in info.value.message
+    assert fake.calls() == []
+    assert fake.versions() == []
+
+
+def test_the_output_limit_is_passed_and_honoured(fake: Fake, secrets: SecretResolver) -> None:
+    """Decision 42 F: `CLAUDE_CODE_MAX_OUTPUT_TOKENS` is the step's `max_tokens`; the fake
+    honours it and reports exactly the limit, which is accepted."""
+    fake.behave(result=success(OUTPUT), over_limit=0)
+    result = run(fake, secrets, completion(max_tokens=321))
+    [call] = fake.calls()
+    assert env_of(call)["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "321"
+    assert result.usage.tokens_out == 321
+
+
+def test_an_output_over_the_limit_is_output_invalid_with_its_usage(
+    fake: Fake, secrets: SecretResolver
+) -> None:
+    """Reported `output_tokens` above `max_tokens` (the limit was not honoured): refused,
+    and charged at what was reported (conservative: above the reservation, flagged)."""
+    fake.behave(result=success(OUTPUT), over_limit=1)
+    error = fails(fake, secrets, completion(max_tokens=300))
+    assert error.kind == "output_invalid"
+    assert "over the max_tokens limit" in error.message
+    assert error.usage is not None
+    assert error.usage.tokens_out == 301
+
+
+@pytest.mark.parametrize("subtype", ["error_during_execution", "partial", None, 1])
+def test_a_success_needs_the_success_subtype(
+    fake: Fake, secrets: SecretResolver, subtype: Any
+) -> None:
+    fake.behave(result=success(OUTPUT, subtype=subtype))
+    error = fails(fake, secrets)
+    assert error.kind == "output_invalid"
+    assert "not a success" in error.message
+    assert error.usage is not None
+
+
+def test_the_stderr_tail_is_drained_after_the_exit(fake: Fake, secrets: SecretResolver) -> None:
+    """A tail written after the process exited (by a grandchild holding stderr) is kept."""
+    fake.behave(mode="raw", raw=b"", exit=4, stderr="head\n", stderr_after="tail: the reason\n")
+    error = fails(fake, secrets)
+    assert error.kind == "host_error"
+    assert error.stderr is not None
+    assert "tail: the reason" in error.stderr
+
+
+def test_the_workspace_is_under_the_private_work_dir(
+    fake: Fake, secrets: SecretResolver, tmp_path: Path
+) -> None:
+    """Decision 42 C: per-call directories under `<state_dir>/llm-runs` (0700), not the system
+    temporary directory; `GIT_CEILING_DIRECTORIES` is that root."""
+    root = tmp_path / "state" / LLM_RUNS_DIR
+    llm = ClaudeCliBackend("personal", alias(fake), secrets, work_dir=root)
+    asyncio.run(llm.complete(completion()))
+    [call] = fake.calls()
+    env = env_of(call)
+    assert Path(call["cwd"]).resolve().parent.parent == root.resolve()
+    assert Path(env["HOME"]).parent.parent == root
+    assert env["GIT_CEILING_DIRECTORIES"] == str(root)
+    assert stat.S_IMODE(root.stat().st_mode) == 0o700
+    assert list(root.iterdir()) == []  # removed after the call
+    assert fake.versions()[0]["env"]["GIT_CEILING_DIRECTORIES"] == str(root)
+
+
+def test_a_loose_work_dir_is_made_private(
+    fake: Fake, secrets: SecretResolver, tmp_path: Path
+) -> None:
+    root = tmp_path / LLM_RUNS_DIR
+    root.mkdir(mode=0o755)
+    root.chmod(0o755)
+    llm = ClaudeCliBackend("personal", alias(fake), secrets, work_dir=root)
+    asyncio.run(llm.complete(completion()))
+    assert stat.S_IMODE(root.stat().st_mode) == 0o700
+
+
+def test_a_symlinked_work_dir_is_refused(
+    fake: Fake, secrets: SecretResolver, tmp_path: Path
+) -> None:
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    root = tmp_path / LLM_RUNS_DIR
+    root.symlink_to(elsewhere)
+    llm = ClaudeCliBackend("personal", alias(fake), secrets, work_dir=root)
+    with pytest.raises(LlmError) as info:
+        asyncio.run(llm.complete(completion()))
+    assert info.value.kind == "backend_unavailable"
+    assert fake.calls() == []
+
+
+def test_model_backends_wires_the_work_dir(
+    fake: Fake, secrets: SecretResolver, tmp_path: Path
+) -> None:
+    root = tmp_path / "state" / LLM_RUNS_DIR
+    llm = model_backends({"default": alias(fake)}, secrets, prompts=StaticPrompts(), work_dir=root)
+    req = LlmRequest(
+        skill="pack/brief",
+        model="default",
+        input=INPUT,
+        budget=Budget(usd=0.05, tokens_out=2000),
+        timeout_s=20.0,
+        attempt=1,
+    )
+    asyncio.run(llm.send(llm.render(req)))
+    [call] = fake.calls()
+    assert env_of(call)["GIT_CEILING_DIRECTORIES"] == str(root)
+    asyncio.run(llm.aclose())
+
+
+@pytest.mark.parametrize(
+    ("shebang", "hinted"),
+    [
+        ("#!/usr/bin/env horae-no-such-interpreter\n", "'horae-no-such-interpreter'"),
+        ("#!/usr/bin/env -S horae-no-such-interpreter --flag\n", "'horae-no-such-interpreter'"),
+        ("#!/nonexistent/node\n", "'/nonexistent/node'"),
+        ("#!/usr/bin/env n\u0007de\n", "its interpreter"),
+    ],
+)
+def test_a_script_command_names_the_likely_cause(
+    tmp_path: Path, secrets: SecretResolver, fake: Fake, shebang: str, hinted: str
+) -> None:
+    """Finding 9: the npm `claude` (`#!/usr/bin/env node`) with `node` off the fixed PATH."""
+    script = tmp_path / "npm-claude"
+    script.write_text(shebang + "console.log('2.1.284 (Claude Code)')\n", encoding="utf-8")
+    script.chmod(0o755)
+    error = fails(fake, secrets, command=str(script))
+    assert error.kind == "backend_unavailable"
+    assert f"a script run by {hinted}" in error.message
+    assert "set `command` to the native Claude Code binary" in error.message
+    assert "\u0007" not in error.message
+
+
+def test_no_hint_for_a_native_binary_or_a_found_interpreter(fake: Fake, tmp_path: Path) -> None:
+    binary = tmp_path / "native"
+    binary.write_bytes(b"\x7fELF\x02\x01")
+    found = tmp_path / "sh-script"
+    found.write_text("#!/usr/bin/env sh\n", encoding="utf-8")
+    empty = tmp_path / "empty-shebang"
+    empty.write_text("#!\n", encoding="utf-8")
+    assert script_hint(str(binary)) == ""
+    assert script_hint(str(found)) == ""
+    assert script_hint(str(empty)) == ""
+    assert script_hint(str(tmp_path / "missing")) == ""
+    assert script_hint(fake.command) == ""  # the fake's interpreter is an absolute python
+
+
+def test_a_cancelled_call_kills_the_group_and_removes_the_workspace(
+    fake: Fake, secrets: SecretResolver
+) -> None:
+    """Finding 10: the caller cancels mid-call (a run stopped, a step cancelled)."""
+    fake.behave(mode="sleep")
+    llm = backend(fake, secrets)
+
+    async def cancelled() -> bool:
+        with anyio.move_on_after(1.5) as scope:
+            await llm.complete(completion(timeout_s=30.0))
+        return scope.cancelled_caught
+
+    started = time.monotonic()
+    assert asyncio.run(cancelled()) is True
+    assert time.monotonic() - started < 10
+    deadline = time.monotonic() + 5
+    while not all(_gone(pid) for pid in fake.pids()) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert all(_gone(pid) for pid in fake.pids())
+    [call] = fake.calls()
+    env = env_of(call)
+    for path in (env["HOME"], env["TMPDIR"], call["cwd"]):
+        assert not Path(path).exists()
+
+
+def test_managed_settings_are_found_by_name_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    present = tmp_path / "managed-settings.json"
+    present.write_text("{not even json", encoding="utf-8")
+    present.chmod(0o000)  # never read: an unreadable file is still reported
+    monkeypatch.setattr(
+        claude_cli, "MANAGED_SETTINGS", (str(present), str(tmp_path / "managed-mcp.json"))
+    )
+    assert claude_cli.managed_settings() == [str(present)]
