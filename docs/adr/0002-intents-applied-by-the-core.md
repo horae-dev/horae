@@ -83,6 +83,11 @@ notification links, one-line titles, size limits); the runtime still checks mean
   provenance so that untrusted data cannot pick a URL or recipient is left to the M2 guards
   ([#35, Untrusted-content tagging and action
   guard](https://github.com/horae-dev/horae/issues/35)).
+  Until then, the engine's routing ([schemas decision 30](../../schemas/README.md#decisions))
+  binds every target to a trusted pipeline parameter: a note `path` or `http.post` `url` to the
+  entry's, a notification `link` to the entry's `link_prefix`, and a task status change to a
+  fingerprint the run collected. Titles and bodies stay untrusted text that appliers treat as
+  data.
 
 ## Alternatives considered
 

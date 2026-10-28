@@ -4,7 +4,7 @@
   "$defs": {
     "ActStep": {
       "additionalProperties": false,
-      "description": "Sinks, which apply the intents. The core first validates every intent against the\nproposing plugin's `permissions.intents`, shows it in a dry run and journals it.",
+      "description": "Sinks, which apply the intents routed to them after the run's steps. The core first\nvalidates every intent against the proposing plugin's `permissions.intents`, routes it to\nthe one entry whose sink may apply it and whose trusted parameters (a required `mode`, and\n`path` or `url`) bind its target, shows it in a dry run and journals it (rules in\n`horae.engine.executor`).",
       "properties": {
         "act": {
           "items": {
@@ -175,7 +175,7 @@
     },
     "NotifyStep": {
       "additionalProperties": false,
-      "description": "Notifiers.",
+      "description": "Notifiers, which apply the `notify.push` intents routed to them. Their parameters\n(`topic`, `when`…) are trusted metadata for the notifier; a proposed `link` is routed only\nto an entry whose trusted `link_prefix` it starts with.",
       "properties": {
         "notify": {
           "items": {

@@ -149,16 +149,47 @@ class LlmCall(Contract):
     """Whether the response validated against the skill's output schema."""
     request: Any
     response: Any
+    intents: BoundedList[Any] | None = None
+    """The raw intents returned with `response`, as proposed (before the core fills a target
+    from the act entry's parameters). Recorded for replays and for reuse on unchanged input;
+    the validated, routed intents are in `RunRecord.intents`."""
     usage: Usage
 
 
 class ProposedIntent(Contract):
-    """An intent proposed during the run, with where it came from."""
+    """An intent proposed during the run, with where it came from and which entry applies it."""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "dependentRequired": {
+                "applied_by": ["applied_by_step", "applied_by_call"],
+                "applied_by_step": ["applied_by", "applied_by_call"],
+                "applied_by_call": ["applied_by", "applied_by_step"],
+            }
+        }
+    )
 
     step: StepIndex
     """Index of the step that proposed it."""
-    proposed_by: PluginRef
+    proposed_by: PluginRef | SkillRef
+    """The tool (`<namespace>.<tool>`) or, for the `llm` step, the skill (`<namespace>/<skill>`)
+    that proposed it."""
     intent: Intent
+    applied_by: PluginRef | None = None
+    """The sink or notifier that will apply the intent: the tool of the `act` or `notify`
+    entry it was routed to. Set by the engine for every intent it records; an intent without
+    it must not be applied."""
+    applied_by_step: StepIndex | None = None
+    """Index of the `act` or `notify` step of that entry."""
+    applied_by_call: StepIndex | None = None
+    """Index of that entry in its step's list of calls."""
+
+    @model_validator(mode="after")
+    def _route_complete(self) -> Self:
+        route = (self.applied_by, self.applied_by_step, self.applied_by_call)
+        if any(part is None for part in route) and any(part is not None for part in route):
+            raise ValueError("`applied_by`, `applied_by_step` and `applied_by_call` go together")
+        return self
 
 
 class AppliedChange(Contract):
@@ -200,7 +231,8 @@ class RunRecord(Contract):
     config_digest: Sha256Hex | None = None
     """SHA-256 of the effective `horae.yaml` at run time."""
     input_hash: Sha256Hex | None = None
-    """Hash of the normalised LLM input, used for the unchanged-input skip."""
+    """The LLM step's cache key (`horae.engine`), used for the unchanged-input skip. Set only
+    when the LLM output was accepted, or reused unchanged from the previous run."""
     dry_run: StrictBool
     """A dry run applies nothing: `changes` is empty."""
     started_at: Timestamp
@@ -214,7 +246,11 @@ class RunRecord(Contract):
     """One record per pipeline step, in order."""
     llm: BoundedList[LlmCall]
     intents: Annotated[list[ProposedIntent], Field(max_length=MAX_RUN_INTENTS)]
-    """Intents proposed and accepted during the run, at most `MAX_RUN_INTENTS` in all."""
+    """Intents proposed and accepted during the run, at most `MAX_RUN_INTENTS` in all. A routed
+    intent's entry must exist (checked by the pydantic model only): `step` and
+    `applied_by_step` index `steps`, the entry's step comes after the proposer's and is a
+    `notify` step for `notify.push`, an `act` step otherwise, and when that step recorded its
+    entries (`output`), entry `applied_by_call` is `applied_by` and lists this intent."""
     changes: BoundedList[AppliedChange]
     violations: BoundedList[Violation] = Field(default_factory=list)
     cost: Usage
@@ -229,5 +265,34 @@ class RunRecord(Contract):
         for change in self.changes:
             if change.intent >= len(self.intents):
                 raise ValueError(f"change refers to intent {change.intent}, out of range")
+        for index, intent in enumerate(self.intents):
+            _check_route(index, intent, self.steps)
         _ordered(self.started_at, self.finished_at)
         return self
+
+
+def _check_route(index: int, intent: ProposedIntent, steps: list[StepRecord]) -> None:
+    """`intent` (at `index` in `RunRecord.intents`) names an entry the run really has."""
+    if intent.step >= len(steps):
+        raise ValueError(f"intent {index}: step {intent.step} is out of range")
+    target, call = intent.applied_by_step, intent.applied_by_call
+    if target is None or call is None:
+        return
+    if not intent.step < target < len(steps):
+        raise ValueError(f"intent {index}: applied_by_step {target} is not a later step")
+    kind = "notify" if intent.intent.type == "notify.push" else "act"
+    if steps[target].kind != kind:
+        raise ValueError(
+            f"intent {index}: {intent.intent.type} must be applied by a step of kind {kind}"
+        )
+    output = steps[target].output
+    if output is None:
+        return
+    entry = output[call] if isinstance(output, list) and call < len(output) else None
+    if (
+        not isinstance(entry, dict)
+        or entry.get("call") != intent.applied_by
+        or not isinstance(entry.get("intents"), list)
+        or index not in entry["intents"]
+    ):
+        raise ValueError(f"intent {index}: entry {call} of step {target} does not list it")

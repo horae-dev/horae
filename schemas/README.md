@@ -105,7 +105,9 @@ Contracts constrain shape, not meaning. The runtime still has to:
 JSON Schema cannot express these; the models enforce them and the tests pin the difference:
 
 - `run-record`: `changes[].intent` is an index into `intents`; `finished_at` is not before
-  `started_at` (run and step records).
+  `started_at` (run and step records); `intents[].applied_by`, `applied_by_step` and
+  `applied_by_call` are all set or all absent (the JSON Schema's `dependentRequired` checks
+  presence, the model also rejects an explicit `null` next to a value).
 - `plugin-manifest`: the host of an `mcp-http` `runtime.url` is listed in `permissions.network`.
 - Hosts (`permissions.network`, every `https` URL): a label starting with `xn--` must be a valid
   IDNA A-label. It must round-trip through Python's `idna` codec (IDNA2003, so no runtime
@@ -200,12 +202,14 @@ conservative option, so loosening one later is a compatible change.
     syntax; the schema validates the parsed document (the example is YAML) and adds the git
     `repo` (https only). Permission lists are written sorted.
 21. **Run record.** v1 requires `pipeline_digest` (SHA-256, hex, of the canonical pipeline
-    definition; the canonical form, e.g. RFC 8785 JSON, is for the engine to fix) and `context`
+    definition; the canonical form is fixed by the engine, see `horae.engine.canonical`) and `context`
     (`now`, IANA `timezone`, rendered template `vars`). Optional: `lock_digest`, `config_digest`,
     `input_hash`, per-step `error` / timings / capped `stderr`, LLM `attempt` and `schema_valid`,
     and `violations` (`egress_blocked`, `guard`, `undeclared_secret`, `undeclared_path`). Statuses:
     run `ok`, `noop`, `degraded`, `failed`, `undone`; step `ok`, `skipped`, `degraded`, `failed`.
     A dry run has no `changes`. Untrusted-content tagging is not part of v1.
+    `intents[].proposed_by` is the proposing tool (`<namespace>.<tool>`) or, for intents of the
+    `llm` step, the skill (`<namespace>/<skill>`) (added with #17, a compatible loosening).
 22. **`$id` host.** `raw.githubusercontent.com/horae-dev/horae/main/schemas/…`, which this project
     controls and which serves the files once merged. A custom domain can come later as `v<N+1>`.
 
@@ -271,3 +275,39 @@ loosened later without breaking a valid file.
     wrong place. Messages never show a regular expression, and a union (a pipeline step, a
     secret reference) gives a single problem, e.g. `unknown step kind 'colect' (expected one
     of: collect, transform, llm, act, notify)`.
+30. **Intent routing in the run record (#17, maintainer decision D1).** Following ADR 0002,
+    sources, transforms and the LLM step propose intents; `act` / `notify` entries are never
+    called during a run, they name the sink or notifier that applies the intents later
+    (#21/#22). Each recorded intent says which entry: `intents[].applied_by` (the entry's
+    `<namespace>.<tool>`), `applied_by_step` (its step) and `applied_by_call` (its index in the
+    step). The three are optional in v1 (a compatible addition) but go together, and the
+    engine sets them on every intent it records; an applier must refuse an intent without
+    them. `llm[].intents` records the raw intents returned with the response, before the core
+    fills a target from the entry's parameters, for replays and for reuse on unchanged input
+    (D2). `input_hash` is the LLM step's cache key (`horae.engine`), set only when the LLM output
+    was accepted or reused. The routing and binding rules are the engine's, documented in
+    `horae.engine.executor`; in short:
+    - every `act` entry has a **required** `mode` (`create`, `append-section`,
+      `replace-owned`, `tasks`, `post`); the note modes bind `path` and `post` binds `url`,
+      compared as exact strings (no case, Unicode or URL normalisation);
+    - a `notify.push` `link` is routed only to a `notify` entry whose trusted `link_prefix` it
+      falls under; without `link_prefix` a proposed link is never routed. A prefix is an
+      `https://` or `obsidian://` link with a host, no user info, query or fragment, and a
+      clean path that ends with `/` (e.g. `obsidian://vault/Main/`), else `params_invalid`.
+      Both are parsed (`urlsplit`), not compared as strings: same scheme, exactly the same
+      netloc, and a link path under the prefix path whose rest has no empty, `.` or `..`
+      segment, backslash, or `%2e` / `%2f` / `%5c` / `%25` (so no `/notes/../admin`, no
+      `host.evil` or `host@evil`). The link may add its own query and fragment;
+    - a `task.update_status` is routed only if its `task` fingerprint appears as a string value
+      in the run's collected input; `task.create` binds no target;
+    - two entries that may apply the same type to the same target make every such intent
+      `intent_ambiguous`, by design: untrusted data never chooses between trusted entries;
+    - the proposer's permissions are checked before routing (`intent_rejected` wins);
+    - the run record model checks that a route names a real, later entry of the right kind
+      that lists the intent.
+
+    Routing binds where an intent goes, not what it says: note content, task titles,
+    notification titles and bodies, and `http.post` bodies stay untrusted text, which appliers
+    must treat as data. Reusing an unchanged input re-proposes identical intents, `notify.push`
+    included, so appliers (#21/#22) must deduplicate notifications (e.g. by `input_hash` and
+    intent); reused intents that no longer route are a cache miss and the LLM is called.
