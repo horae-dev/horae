@@ -729,12 +729,16 @@ loosened later without breaking a valid file.
       or straddle `: `), then the body of the redacted `<ref>: <message>` is also matched
       as a whole value.
       The host logs a warning (name only) for each secret under 8 bytes it redacts, since its
-      encodings are not redacted. Object keys
+      encodings are not redacted. *Superseded for short secrets by decision 43 H (#53): a
+      secret under 8 bytes is now refused when it is resolved, so the bounded raw-value
+      matching and this warning are gone; the rest of D (keys, messages, overlaps, numbers)
+      stands.* Object keys
       are never rewritten: a key holding a secret fails the call with `output_invalid` and
       nothing is stored. When the matches of two secrets overlap, only the leftmost one is
       replaced (documented limit). A JSON number whose `json.dumps` is a secret becomes the
       token string; the SDK's own log records (`mcp.*`, `client`, `server`) are scrubbed when
-      created: message redacted, arguments, traceback and stack dropped;
+      created: message redacted, arguments, traceback and stack dropped (every logger since
+      decision 43 E);
     - **E. umask.** Every plugin process starts with umask `0o077`;
     - **F. Stderr window.** The per-call stderr window keeps its quiet-window heuristic
       (stderr and stdout are separate pipes, so nothing orders them); tests wait for a
@@ -1353,12 +1357,17 @@ loosened later without breaking a valid file.
 ### Provisional decisions (#53, pending maintainer review)
 
 43. **Secret redaction in logs and run records (#53, design note and maintainer answers on
-    #100).** (39 and 42 are taken by #27 and #29.) No contract change: the store's findings
-    reuse the `secret_in_output` violation of decision 35 (so a replay leaves them out of the
-    compared violations, as it does for the host's). Rules of `horae.secrets`, the store, the
-    engine, the LLM layer and the CLI:
+    #100; security review findings and maintainer decisions on #106).** (39 and 42 are taken
+    by #27 and #29.) Contract change: none; a store migration (`0005_secret_flags`). The
+    store's findings reuse the `secret_in_output` violation of decision 35 (so a replay leaves
+    them out of the compared violations, as it does for the host's). **Maintainer
+    decisions** (binding, on #106): the journalled `after` / `actual_after` bytes are exempt
+    and flagged only for a secret new compared to `before` (C), and secrets under 8 bytes are
+    refused (H). **Provisional**, pending maintainer review: B (identifiers exempt and
+    flagged), E (every logger, warnings, exception hooks), F (`secure_delete`), G (key
+    collisions). Rules of `horae.secrets`, the store, the engine, the LLM layer and the CLI:
     - **A. one shared redactor and a process registry.** `Redactor`, `token`, `SecretInKey`
-      and the encodings of decision 35 C/D moved to `horae.secrets.redact` (re-exported by
+      and the encodings of decision 35 C moved to `horae.secrets.redact` (re-exported by
       `horae.plugins.host.redact`); the log scrubber to `horae.secrets.logs` (re-exported by
       `horae.plugins.host.logs`). Every `SecretResolver.resolve` adds the secret to a
       process registry (`remember`; `current()` is a `Redactor` of every secret this process
@@ -1369,53 +1378,96 @@ loosened later without breaking a valid file.
       read the instance call it first; those that read `horae.yaml` alone (`runs`, `diff`,
       `usage`, `undo`) prime the same names (`horae.config.loader.secret_names(config,
       lock)`, shared with the instance), reading `horae.lock` best effort (an absent or
-      invalid lock adds nothing). A provider backend still resolves its own key lazily, through its own
-      resolver (no key is read by `open_ports` before a call);
-    - **B. logs.** `horae.secrets.logs.install()` (the CLI entry point, `Runner.run`, an
-      opening `PluginHost`; idempotent) wraps the log record factory: every record of the
-      `horae`, `mcp`, `client`, `server`, `httpx`, `httpx2`, `httpcore`, `httpcore2` and
-      `anthropic` loggers (and their children) is redacted when it is created (message
-      formatted and redacted with the registry and every open host, `args` dropped,
-      `exc_info` and `stack_info` replaced by the exception's type name), whatever handler
-      sees it. The HTTP loggers are pinned to `WARNING`;
-    - **C. the store's secret gate (answers 1–3), fail safe.** Every table: just before
-      writing, text values are redacted and JSON values scrubbed (string leaves and object
-      keys; numbers are kept) with the registry's redactor. **Redacted and flagged**: the run
-      record and `error`, step rows, the journal's `target`, `applied_by` and
-      `sink_identity`, task titles and targets, notification keys, the usage ledger's
-      `alias`, `backend` and `model`, a run's `host`, an abandoned run's `error`; each hit is
-      logged (`horae.store`, names only) and, for a run that gets a record, recorded on it as
-      `secret_in_output` ("the store redacted secret X in <where> (a producer did not redact
-      it)") when it is saved, also for the step rows and journal entries written by the same
-      `Store` while it was running. **Refused** (`SecretRefused`, an `InvalidRow`, nothing
-      written, name only): an LLM cache entry holding a secret (answer 3), an identifier that
-      cannot be rewritten (a task `fingerprint` or `source`, like an object key in decision
-      35 D), and a record or step that would no longer validate once redacted (a secret in a
-      plugin name, an error kind...). **Exempt, flagged** (answer 2): the journalled `after`
-      bytes and a sink's `actual_after` bytes, the note as Horae wrote it, kept byte for byte
-      (the digests of apply mismatch and undo depend on them; the producers already redacted
-      what they were handed), a hit recorded as a violation ("the store found secret X in the
-      content Horae wrote to <target>"). **Exempt** (answer 2): the journalled `before` bytes
-      and the bytes a forced undo `overwrote`, the user's own note, which undo restores byte
-      for byte (docs/security.md T09), and the identifiers the core generates or validates
-      (run ids, pipeline names, digests, cache keys, timestamps, statuses, blob digests and
-      sizes);
-    - **D. trusted inputs are refused at plan time (answer 4).** The engine fails the run
+      invalid lock adds nothing). A provider backend still resolves its own key lazily,
+      through its own resolver. A JSON number whose `json.dumps` is a secret's value is a
+      **numeric match** (`pin: 12345678`): the checks that refuse see it (`Redactor.find`),
+      the host and the CLI redact it, the store flags it without changing its type;
+    - **B. what is redacted, and identifiers (provisional).** Only **free text** is
+      rewritten. **Identifiers the system needs are exempt and flagged** (kept as written,
+      neither refused nor rewritten; a hit is a `secret_in_output` violation): run ids,
+      pipeline names, timestamps, statuses, kinds, plugin names and refs, tokens, digests,
+      the journal's `target`, `applied_by` and `sink_identity`, a task's `fingerprint`,
+      `source` and `target`, notification keys, the usage ledger's `alias`, `backend` and
+      `model`, a run's `host`, the pipeline definition. Rewriting them made the record
+      invalid (a run refused for a secret that happened to equal a word of its own
+      structure), broke undo (a redacted journal target no longer names the note) and
+      replay. Only the LLM cache refuses. The free-text allowlist (`horae.store._gate`): step
+      `output`, `error.message`, `stderr`, call `params` and `intents`; input `params`,
+      `data` and `intents`; the intent payload fields `content`, `heading`, `title`, `body`;
+      `context.vars` values; LLM `request`, `response`, `intents`, `repair`,
+      `schema_errors`; violation details; the run's `error`; a task's `title`; an abandoned
+      run's `error`. A pipeline definition holding a secret's value is not copied into the
+      record (`pipeline_definition` is `None`; its parameters refuse the run at plan time);
+    - **C. the store's secret gate (answers 1–3), fail safe.** Every table, just before
+      writing, with the registry's redactor: free text redacted (JSON: string leaves and
+      object keys), identifiers and numeric matches flagged (B). **Refused**
+      (`SecretRefused`, an `InvalidRow`, nothing written, name only): an LLM cache entry
+      holding a secret in any string, key or number (answer 3; callers treat it as "do not
+      cache", `Store.cache_put_safe`, for #32), and, as a residual, a record or step that
+      would no longer validate once its free text is redacted (a token longer than the room
+      its field has left). **The journalled `after` bytes and a sink's `actual_after`
+      bytes: exempt, and flagged only when the secret is new** (maintainer decision on
+      #106): kept byte for byte (apply's mismatch check and undo depend on them); a hit is
+      recorded only when the secret occurs more often than in the journalled `before` ("the
+      store found secret X in the content Horae wrote to <target>, not in the note before"),
+      so a secret the user already had in their note is not flagged. **Exempt** (answer 2):
+      the journalled `before` bytes and the bytes a forced undo `overwrote`, the user's own
+      note, which undo restores byte for byte (docs/security.md T09). Every finding is logged
+      (`horae.store`, names only) and kept in the `secret_flags` table, in the same
+      transaction as the row that held it; `save_run` turns a run's findings (and those in
+      the record itself) into `secret_in_output` violations, then deletes them, so a record
+      saved by another `Store` or process still gets them; `abandon_run` deletes them (no
+      record); when the violations would pass `MAX_ITEMS`, the rest is aggregated into one
+      violation;
+    - **D. trusted inputs are refused (answer 4).** The engine fails the run at plan time,
       before any call, `params_invalid` naming the secret only, when a template variable
       (`horae run --var`) or a rendered parameter holds the value (or a known encoding) of a
-      resolved secret; the variable is redacted in the record's `context`. A skill prompt
-      holding one is refused by `ModelBackends.prepare` (`params_invalid`, before rendering,
-      reserving or sending; with #27's loader the check moves to plan time);
+      resolved secret, in a string, an object key or as a number's whole value; the variable
+      is redacted in the record's `context`. A skill's prompt or output schema holding one is
+      refused by `ModelBackends.prepare` (`params_invalid`, before rendering, reserving or
+      sending). That check is **not** at plan time yet: #27's skill loader is not on `main`,
+      so the engine does not have the prompt before the run; the steps before the `llm` step
+      have run when it refuses. With the loader the check moves to `_plan`.
       `params_invalid` releases a ledger reservation;
-    - **E. the LLM layer.** `ModelBackends.send` redacts what a provider backend returns: an
-      `LlmError`'s message and stderr (raised again as a new error, no `__cause__` /
-      `__context__`), the output, intents and schema errors (logged by name). The engine also
-      redacts an `LlmError` message from any `LlmBackend` before recording it. The pipeline
-      digest and the cache key are computed on the real values (they are hashes);
-    - **F. CLI output.** Every command prints through `horae.cli_output.echo`, which redacts
-      the text; `to_json` scrubs the document as data first. So text and `--json` outputs,
-      errors included, never show a resolved value;
-    - **limits**: as decision 35 (short secrets raw and bounded only, unknown encodings not
-      recognised, leftmost match of overlapping secrets); the gate knows only the secrets
-      this process resolved (primed from the instance); a forced key rewrite can merge two
-      keys that redact to the same token.
+    - **E. logs, warnings, uncaught exceptions (provisional).** `horae.secrets.logs.install()`
+      (the CLI entry point, `Runner.run`, an opening `PluginHost`; idempotent) wraps the log
+      record factory: **every** record of every logger (the root, `asyncio`, `urllib3`,
+      `py.warnings`, `uvicorn`, `openai`, `mcp`... not a list of prefixes any more) is
+      redacted when it is created (message formatted and redacted with the registry and every
+      open host, `args` dropped, `exc_info` and `stack_info` replaced by the exception's type
+      name), whatever handler sees it. It also calls `logging.captureWarnings(True)` and sets
+      `sys.excepthook` and `threading.excepthook` to hooks that redact the report they print.
+      The HTTP loggers are pinned to `WARNING`. The LLM layer: `ModelBackends.send` redacts
+      what a provider backend returns (an `LlmError`'s message and stderr, raised again as a
+      new error with no `__cause__` / `__context__`; the output, intents and schema errors;
+      logged by name); the engine redacts an `LlmError` message from any `LlmBackend` before
+      recording it. The pipeline digest and the cache key are computed on the real values
+      (they are hashes);
+    - **F. deleted bytes (provisional).** Every writable store connection (the main one and
+      the heartbeat's) sets `PRAGMA secure_delete = FAST`, so a deleted or replaced row is
+      zeroed where SQLite rewrites its page anyway. A database written before #53 can hold
+      unredacted values in rows and free pages: docs/operations/retention-and-backups.md
+      documents a one-off `VACUUM`;
+    - **G. key collisions (provisional).** When redacting two keys of one JSON object gives
+      the same text, the later one is renamed `[REDACTED:NAME]#2` (`#3`...) and a violation
+      says so: nothing is lost silently;
+    - **H. short secrets (maintainer decision on #106; supersedes decision 35 D).** A
+      declared secret shorter than 8 bytes of UTF-8 (`MIN_SECRET_BYTES`) is **refused when it
+      is resolved**: `SecretError` "... is too short for reliable redaction (min 8 bytes)",
+      never echoing the value. `horae doctor` reports it as an error; a plugin that declares
+      it fails with `secret_missing`, a model alias with its backend's secret error (the run
+      needing it is refused); priming skips it with a warning naming it (`horae.secrets`).
+      The redactor has no short-secret case any more (`Redactor` raises `ValueError` if it is
+      handed one), and the host no longer warns about one;
+    - **I. CLI output.** Every command prints through `horae.cli_output.echo`, which redacts
+      the text; `to_json` scrubs the document as data first (numbers too, so the JSON stays
+      valid). `horae.apply.render.safe` redacts **before** it escapes control and invisible
+      characters, and text is redacted before it is cut (an HTTP body at 200 characters, a
+      run's error at 4096), so neither a secret holding such a character nor a secret cut in
+      half slips through. An identifier holding a secret is printed redacted (B keeps it in
+      the store, not on the terminal);
+    - **limits**: unknown encodings are not recognised and only the leftmost match of two
+      overlapping secrets is replaced (decision 35); the gate knows only the secrets this
+      process resolved (primed from the instance); an 8-byte secret still matches inside
+      unrelated text that contains it (the reason identifiers are flagged, not rewritten);
+      a secret in an identifier is in the store (flagged), but not in the logs nor the CLI.
