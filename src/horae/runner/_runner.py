@@ -23,8 +23,19 @@
    finished step is persisted (`on_step` → `Store.record_step`), and a heartbeat
    (`Store.heartbeat`) is written every `heartbeat_s` seconds. Heartbeats are for
    observability (`horae runs`); the lock, not the heartbeat, decides whether a run is alive.
-5. **Persist** the record (`Store.save_run`), call `on_record(record)` if given, and release
-   the lock. The status is the engine's: `ok`, `noop`, `degraded` or `failed`.
+5. **Apply** (#22, provisional): when the run is not a dry run, finished `ok`, `noop` or
+   `degraded` within its timeout, and `Ports.sinks` is set, its routed intents are planned
+   (`horae.apply.plan_changes`, with the notifications already sent) and applied
+   (`horae.apply.apply_changes`: journal first, then the sink, then mark applied) while the
+   run's row is still `running`. The record gets its `changes`; if a change cannot be
+   applied the run becomes `failed` (the changes before it stay applied and journalled, the
+   rest are not applied). Without `Ports.sinks` nothing is applied (the intents are only
+   recorded, as before #22). The apply is not under the run timeout (each sink call is bounded
+   by the plugin host's per-call timeout, #24); a crash or cancellation during it abandons the
+   run, and its journal still lets `horae undo` revert what was written.
+6. **Persist** the record (`Store.save_run`), call `on_record(record)` if given, and release
+   the lock. The status is the engine's (`ok`, `noop`, `degraded` or `failed`), or `failed`
+   when the apply failed.
 
 **Timeouts.** The run timeout (`horae.yaml` `runs.timeout_s`, default 900 s) bounds the whole
 run: past it the engine's task is cancelled and given `stop_grace_s` (5 s) to stop. If it stops,
@@ -58,7 +69,7 @@ heartbeat, step write or the final save notices: the run is stopped and `RunLost
 loop's monotonic clock. Since liveness is the lock's, a wall-clock step only shifts recorded
 times (and may reorder run ids started across the step); it cannot make a live run look dead.
 
-**Not here.** Applying intents (#21/#22), the CLI `horae run` and its SIGTERM handling (#26).
+**Not here.** The CLI `horae run` and its SIGTERM handling (#26).
 The ports are injected (`Ports`), so tests use `horae.engine.testing`, and the plugin host
 (#24) plugs in unchanged.
 """
@@ -71,6 +82,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
+from horae.apply import SinkRegistry, apply_changes, plan_changes
 from horae.config import Instance
 from horae.contracts import (
     ActStep,
@@ -199,6 +211,8 @@ class Ports:
     plugins: PluginRegistry
     tools: ToolCaller
     llm: LlmBackend | None = None
+    sinks: SinkRegistry | None = None
+    """The sinks and notifiers that apply a run's intents (#22); `None` applies nothing."""
 
 
 @dataclass
@@ -457,6 +471,21 @@ class Runner:
         if on_record is not None:
             on_record(record)
 
+    async def _apply(self, record: RunRecord) -> RunRecord:
+        """Plan and apply the record's intents (see the module docstring, step 5)."""
+        sinks = self.ports.sinks
+        if sinks is None or record.dry_run or record.status not in {"ok", "noop", "degraded"}:
+            return record
+        if not record.intents:
+            return record
+
+        def notified(key: str) -> bool:
+            return self.store.get_notification(key) is not None
+
+        planned = await plan_changes(record, sinks, notified=notified)
+        result = await apply_changes(record, planned, sinks, self.store, clock=self.clock)
+        return result.record
+
     async def _drive(
         self,
         pipeline: Pipeline,
@@ -550,6 +579,8 @@ class Runner:
             record = self._stopped_record(pipeline, run_id, started_at, context, dry_run, message)
         if timed_out:
             record = _timed_out(record, timeout)
+        elif not cancelled:
+            record = await self._apply(record)
         self._save(state, record, on_record)
         if timed_out:
             raise RunTimedOut(run_id, timeout, record)

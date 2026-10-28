@@ -5,10 +5,13 @@
 implements it over MCP), `horae.apply.notes` the core's note conventions, `horae.apply.plan`
 the dry-run diff (`plan_changes`, which only ever calls `read`), `horae.apply.render` its
 text and JSON forms, `horae.apply.local` a built-in read-only sink over a local vault and
-`horae.apply.testing` an in-memory reference sink.
+`horae.apply.testing` an in-memory reference sink. `horae.apply.apply` journals and applies
+a planned run (#22), `horae.apply.undo` reverts one, and `LocalFileSink` (provisional, until
+#24) writes notes to a local vault.
 """
 
-from horae.apply.local import LocalSink
+from horae.apply.apply import ApplyFailure, ApplyRefused, ApplyResult, apply_changes
+from horae.apply.local import LocalFileSink, LocalSink
 from horae.apply.plan import (
     MAX_DIFF_BYTES,
     ChangeSet,
@@ -32,6 +35,7 @@ from horae.apply.sink import (
     HttpCall,
     Notification,
     Preview,
+    RestorableSink,
     Sink,
     SinkCall,
     SinkError,
@@ -39,23 +43,38 @@ from horae.apply.sink import (
     StaticSinks,
     TaskChange,
 )
+from horae.apply.undo import (
+    NoteUndo,
+    NotUndoable,
+    UndoProblem,
+    UndoRefusal,
+    UndoResult,
+    undo_run,
+)
 
 __all__ = [
     "JSON_SCHEMA_VERSION",
     "MAX_DIFF_BYTES",
     "MAX_NOTE_BYTES",
     "Applied",
+    "ApplyFailure",
+    "ApplyRefused",
+    "ApplyResult",
     "ChangeSet",
     "FileChange",
     "FileDiff",
     "HttpCall",
     "HttpItem",
+    "LocalFileSink",
     "LocalSink",
+    "NotUndoable",
+    "NoteUndo",
     "Notification",
     "NotificationItem",
     "Preview",
     "Problem",
     "Refusal",
+    "RestorableSink",
     "Sink",
     "SinkCall",
     "SinkError",
@@ -63,6 +82,10 @@ __all__ = [
     "StaticSinks",
     "TaskChange",
     "TaskItem",
+    "UndoProblem",
+    "UndoRefusal",
+    "UndoResult",
+    "apply_changes",
     "dedupe_key",
     "describe",
     "entry_params",
@@ -70,5 +93,6 @@ __all__ = [
     "render_text",
     "to_dict",
     "to_json",
+    "undo_run",
     "unified_diff",
 ]

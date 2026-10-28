@@ -538,3 +538,63 @@ loosened later without breaking a valid file.
     not reproduced (messages are not compared), and only the first call of a multi-call
     `transform` step has its input checked (later calls get the previous call's output,
     which is not recorded).
+
+### Provisional decisions (#22, pending maintainer review)
+
+34. **Journal and undo (#22).** No contract changes: the run record already has `changes` and
+    the `undone` status. The rules (`horae.apply.apply`, `horae.apply.undo`, the runner):
+    - **apply in the runner.** `Ports.sinks` (a `SinkRegistry`) is the runner's apply port.
+      After the engine finishes `ok`, `noop` or `degraded` (not a dry run, not timed out or
+      cancelled), the runner plans the run (`plan_changes`, with the notifications already
+      sent) and applies it (`apply_changes`) while its row is still `running`, then saves the
+      record with `changes` (indices into `intents`, with the core's target: note path, task
+      fingerprint, `http.post` URL, or the notifier's tool). Without `Ports.sinks` nothing is
+      applied. The apply is not under `runs.timeout_s` (sink calls are bounded by the host's
+      per-call timeout, #24);
+    - **journal first.** For each planned change in intent order: `journal_append` (with the
+      sink, `applied_by`, and for a note its bytes before and after), then `Sink.apply` (a
+      compare-and-swap on the planned `before_sha256`; the core re-reads the note and
+      recomputes the bytes first), then `journal_mark_applied`. Notes are undoable; task
+      changes, notifications and HTTP calls are journalled with `undoable = 0` (task changes
+      have no recorded before-state yet). A notification whose `dedupe_key` was already sent
+      (`Store.get_notification`) is skipped; once sent, `record_notification` and the mark
+      share one transaction (a crash in between can send it twice, never lose it). An
+      unchanged note is skipped;
+    - **failures.** A plan with problems or a refusal applies nothing (`plan_invalid`,
+      `plan_refused`). Otherwise the first failing change stops the apply: earlier changes
+      stay applied and recorded, later ones are not applied, and the run is saved `failed`
+      with `error` = `<kind>: intent <i> (<sink>) could not be applied: <message>; <n>
+      change(s) applied before it, the rest not applied` (kinds `target_changed`, the sink's
+      `SinkError.kind`, `host_error` for any other exception, whose message is dropped,
+      `apply_mismatch` when the sink reports other bytes than planned, `no_sink`). A crash
+      during the apply abandons the run (decision 31); its journal remains;
+    - **the store** (migration 3) adds `journal.applied_by`, so undo finds the sink even for
+      an abandoned run, which has no record;
+    - **undo restores bytes, not intents.** `RestorableSink` adds `read_target(target)` and
+      `restore(target, content, *, expected_sha256)` (`content=None` removes the note), a
+      compare-and-swap. A synthetic `apply` was rejected: the closed intent set has no
+      "write these bytes" or "delete" intent, and an abandoned run has no `SinkCall` to
+      rebuild. Entries are grouped per (sink, note): one write of the bytes the note had
+      before the run's first change of it (a note the run created is removed), latest note
+      first. Each note is read first: holding its original bytes it is *already restored*
+      (resumability after a crash; also a change journalled but never applied); with the
+      digest of the last applied entry's `after`, or of a later entry still `applied = 0`,
+      it is restored; otherwise it *changed since* and the whole undo is refused before any
+      write, unless `--force`. Once written, the note's entries are marked undone. When every
+      undoable entry is undone, a run with a record is saved `undone`; an abandoned run stays
+      `failed` (the store's constraint), its entries undone. Undoing an undone run is a
+      no-op; a running run or a dry run is refused. Directories created by apply are kept;
+    - **`horae undo <run-id>`** (`--vault`, `--force`, `--json`) holds the pipeline's lock,
+      opens the store read-write (migrating it) and writes with `LocalFileSink`
+      (**provisional** until #24: `LocalSink`'s resolution plus `mkdir` relative to the
+      parent descriptor, a temporary file `O_CREAT | O_EXCL | O_NOFOLLOW` with the note's
+      mode, `fsync`, `os.replace` and a directory `fsync`; the check-then-rename window is not
+      closed against concurrent editors). `LocalSink` stays read-only for `horae diff`. Exit
+      codes follow `horae diff`: `0` undone (or nothing left), `1` configuration, store, lock
+      or sink problem, `2` usage, `3` unknown, running or dry run, `4` refused because a note
+      changed (`--force`), `70` internal. `horae replay` uses other codes (2 unknown run, 3 not
+      comparable); aligning them is left to #26. `--json` prints `{"schema_version": 1, run:
+      {id, pipeline, status, abandoned}, force, complete, marked_undone, refused, notes:
+      [{target, applied_by, intents, action, status, forced, expected_sha256, found_sha256}],
+      not_undoable: [{intent, intent_type, target, applied_by, applied}], problems}`; errors
+      are `{"schema_version": 1, "error": {kind, message}}`.

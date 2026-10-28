@@ -44,7 +44,7 @@ A read or apply that cannot be done raises `SinkError`, with a machine-readable 
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, runtime_checkable
 
 from horae.contracts.intents import Intent
 
@@ -149,6 +149,30 @@ class Sink(Protocol):
     async def apply(self, call: SinkCall, *, expected_before_sha256: str | None) -> Applied:
         """Apply `call` (#22 only, never during a dry run) if the target is still as planned
         (`target_changed` otherwise); raises `SinkError`."""
+        ...
+
+
+@runtime_checkable
+class RestorableSink(Sink, Protocol):
+    """A sink whose note changes `horae undo` can revert (#22, schemas decision 34).
+
+    Undo restores **bytes**, not intents: the closed intent set (ADR 0002) has no "write
+    exactly these bytes" or "delete this note" intent, and a run abandoned mid-apply has no
+    record to rebuild a `SinkCall` from. So undo goes through these two target-keyed methods
+    instead of a synthetic `apply`. Both resolve `target` (a note path) exactly as `read` and
+    `apply` do (no symlink on any component, a single hard link, a regular file)."""
+
+    async def read_target(self, target: str) -> bytes | None:
+        """The current bytes of note `target` (`None`: it does not exist). Side-effect free;
+        raises `SinkError`."""
+        ...
+
+    async def restore(
+        self, target: str, content: bytes | None, *, expected_sha256: str | None
+    ) -> None:
+        """Make note `target` hold exactly `content` (`None`: remove it), a compare-and-swap:
+        if its current bytes do not have SHA-256 `expected_sha256` (`None`: it must not
+        exist), nothing changes and `SinkError("target_changed")` is raised."""
         ...
 
 

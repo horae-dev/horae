@@ -261,6 +261,8 @@ class JournalEntry:
     `after_sha256` before acting on it."""
     undone_at: datetime | None
     created_at: datetime
+    applied_by: str | None = None
+    """The sink that applies the change (`ProposedIntent.applied_by`), when recorded."""
 
 
 @dataclass(frozen=True)
@@ -936,6 +938,7 @@ class Store:
             applied=bool(row[9]),
             undone_at=_opt_dt(row[10]),
             created_at=_dt(row[11]),
+            applied_by=row[12],
         )
 
     def _put_blob(self, data: bytes | None) -> str | None:
@@ -960,13 +963,15 @@ class Store:
         before: bytes | None = None,
         after: bytes | None = None,
         undoable: bool | None = None,
+        applied_by: str | None = None,
         at: datetime,
     ) -> JournalEntry:
         """Record a change of a running run before applying it; `journal_mark_applied` after.
 
         `undoable` defaults to what the intent type allows: `notify.push` and `http.post`
         cannot be undone (and `True` is refused for them); an undoable change needs a `before`
-        or an `after`. Each content is at most `MAX_JOURNAL_BYTES` (`JournalTooLarge`)."""
+        or an `after`. Each content is at most `MAX_JOURNAL_BYTES` (`JournalTooLarge`).
+        `applied_by` names the sink applying it (so undo can find it again)."""
         if intent_type not in INTENT_TYPES:
             raise ValueError(f"unknown intent type {intent_type!r}")
         if undoable is None:
@@ -986,11 +991,11 @@ class Store:
             after_sha = self._put_blob(after)
             (row,) = self._conn.execute(
                 "INSERT INTO journal (run_id, seq, intent, intent_type, target, before_sha256, "
-                "after_sha256, undoable, created_at) VALUES (:run_id, "
+                "after_sha256, undoable, created_at, applied_by) VALUES (:run_id, "
                 "(SELECT coalesce(max(seq) + 1, 0) FROM journal WHERE run_id = :run_id), "
-                ":intent, :intent_type, :target, :before, :after, :undoable, :at) "
+                ":intent, :intent_type, :target, :before, :after, :undoable, :at, :applied_by) "
                 "RETURNING id, run_id, seq, intent, intent_type, target, before_sha256, "
-                "after_sha256, undoable, applied, undone_at, created_at",
+                "after_sha256, undoable, applied, undone_at, created_at, applied_by",
                 {
                     "run_id": run_id,
                     "intent": intent,
@@ -1000,6 +1005,7 @@ class Store:
                     "after": after_sha,
                     "undoable": int(undoable),
                     "at": _ts(at),
+                    "applied_by": applied_by,
                 },
             ).fetchall()
         return self._entry(row)
@@ -1036,7 +1042,8 @@ class Store:
         """A run's journal, in the order the changes were recorded."""
         rows = self._conn.execute(
             "SELECT id, run_id, seq, intent, intent_type, target, before_sha256, after_sha256, "
-            "undoable, applied, undone_at, created_at FROM journal WHERE run_id = ? ORDER BY seq",
+            "undoable, applied, undone_at, created_at, applied_by FROM journal "
+            "WHERE run_id = ? ORDER BY seq",
             (run_id,),
         )
         return [self._entry(row) for row in rows.fetchall()]
