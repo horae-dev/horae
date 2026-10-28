@@ -76,7 +76,7 @@ notification links, one-line titles, size limits); the runtime still checks mean
 
 - §2.1 names intents `create_task`, `append_note`, `notify`; §3.3 lists the closed set above. The
   v1 contract uses the §3.3 names ([schemas decision
-  1](../../schemas/README.md#decisions-provisional-maintainer-to-confirm)).
+  1](../../schemas/README.md#decisions)).
 - `permissions.intents` covers both "may propose" and "may apply" (sinks); whether these should be
   two lists is open (decision 12).
 - Untrusted-content tagging is not part of the v1 run record (decision 21); how the core tracks
@@ -100,5 +100,5 @@ notification links, one-line titles, size limits); the runtime still checks mean
 - [`schemas/intent/v1.json`](../../schemas/intent/v1.json),
   [`schemas/intents/`](../../schemas/intents/),
   [`schemas/run-record/v1.json`](../../schemas/run-record/v1.json)
-- [`schemas/README.md`](../../schemas/README.md#decisions-provisional-maintainer-to-confirm)
+- [`schemas/README.md`](../../schemas/README.md#decisions)
   (decisions 1, 2, 4–7, 12, 21)
