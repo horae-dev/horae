@@ -256,6 +256,19 @@ class PreviousLlm:
     source_run: str | None = None
     """The run that produced the output (a cache entry's producer), recorded in the reuse
     marker of the run that reuses it (`request.source_run`); `None` when unknown."""
+    deid_input_sha256: str | None = None
+    """When the output was produced from a de-identified request (#34): the SHA-256 of what
+    was sent (`llm[].request.deid.input_sha256`). The engine reuses the output only when this
+    run's de-identified input has the same digest (both `None` without de-identification):
+    otherwise the pseudonyms it holds could name other values (another vocabulary, another
+    transform), so it is a miss, and a replay reports the mismatch."""
+
+
+def deid_digest(request: Any) -> str | None:
+    """`request.deid.input_sha256` of a recorded LLM request (#34), else `None`."""
+    deid = request.get("deid") if isinstance(request, dict) else None
+    digest = deid.get("input_sha256") if isinstance(deid, dict) else None
+    return digest if isinstance(digest, str) else None
 
 
 class LlmCache(Protocol):
@@ -396,6 +409,10 @@ class Pseudonyms(Protocol):
 
     def reidentify(self, value: Any) -> tuple[Any, list[str]]:
         """`value` with real values put back, and the pseudonyms left unresolved."""
+        ...
+
+    def growth(self, value: Any) -> int:
+        """How many bytes re-identifying `value` would add (computed without substituting)."""
         ...
 
 

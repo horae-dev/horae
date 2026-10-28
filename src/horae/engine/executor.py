@@ -188,17 +188,22 @@ a backend's cached response costs nothing and counts towards neither the cost no
 
 **De-identification** (#34, schemas decision 47). With a `deid` policy, a skill whose input
 view declares field classes and a cloud model alias, the order is: input view, then
-pseudonymize (`deid.pseudonymize`, deterministic from the viewed input), then the request
-(`LlmRequest.input` is the pseudonymized input, `classified` and `deidentified` set; the
-backend renders it and refuses one that holds a resolved secret, T10), then validation of the
-output (the backend), then **re-identification** of the accepted output and raw intents, then
-the intents are validated and routed on real values (the action guard of #35 runs after that,
-on real values too). The cache key (`input_hash`) is computed on the real viewed input; the
+pseudonymize (`deid.pseudonymize`, deterministic from the viewed input, run in a worker thread
+within the step's `timeout_s`), then the request (`LlmRequest.input` is the pseudonymized
+input, `classified` and `deidentified` set; the backend renders it and refuses one that holds
+a declared or resolved secret, T10), then validation of the output (the backend), then the
+attempt is recorded (`llm[]`) and its usage spent, then **re-identification** of the accepted
+output and raw intents (refused with `output_too_large` before substituting when the result
+would pass `MAX_REIDENTIFIED_BYTES`; the call and its cost stay recorded), then the intents
+are validated and routed on real values (the action guard of #35 runs after that, on real
+values too). The cache key (`input_hash`) is computed on the real viewed input; the
 recorded `LlmCall.input_hash`, `response` and `intents` are what the provider saw and
 returned (pseudonymized), `request.deid` the summary (version, digest, counts) and the
 pseudonyms left `unresolved` (unknown or mangled: left as they are, no repair); the step's
 output and the routed intents carry real values. A cache hit or a replayed `previous` holds
-the pseudonymized output and is re-identified the same way. A policy that cannot
+the pseudonymized output and is re-identified the same way, but only when its
+`deid_input_sha256` equals this run's de-identified input digest (`None` on both sides
+without de-identification): otherwise it is a miss. A policy that cannot
 de-identify (`DeidUnavailable`, e.g. an unreadable vocabulary) degrades the step
 (`deid_unavailable`) before anything is sent. A request refused for a secret
 (`secret_in_request`) also records a `secret_in_request` violation naming the secrets.
@@ -1244,11 +1249,29 @@ def _deid_record(
     return recorded
 
 
+MAX_REIDENTIFIED_BYTES = 256 * 1024
+"""Largest re-identified LLM output and intents together (compact UTF-8 JSON): the skill
+output bound (`horae.skills.MAX_OUTPUT_BYTES`, restated: the engine does not import skills).
+Checked before substituting (`Pseudonyms.growth`), so a model repeating a pseudonym cannot
+make the engine build a huge output (#34 finding 1)."""
+
+
+def _encoded_size(value: Any) -> int:
+    return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
 def _reidentified(pseudo: Pseudonyms | None, output: Any, raw: Any) -> tuple[Any, Any, Any]:
     """`(output, raw intents, deid record)` with real values put back (#34); unchanged, and
-    no record, without pseudonyms."""
+    no record, without pseudonyms. `_DataError` (`output_too_large`) when the result would
+    be larger than `MAX_REIDENTIFIED_BYTES` (computed before substituting)."""
     if pseudo is None:
         return output, raw, None
+    size = _encoded_size(output) + _encoded_size(raw) + pseudo.growth(output) + pseudo.growth(raw)
+    if size > MAX_REIDENTIFIED_BYTES:
+        raise _DataError(
+            "output_too_large",
+            f"the re-identified LLM output would be larger than {MAX_REIDENTIFIED_BYTES} bytes",
+        )
     real_output, in_output = pseudo.reidentify(output)
     real_raw, in_intents = pseudo.reidentify(raw)
     return (
@@ -1256,6 +1279,12 @@ def _reidentified(pseudo: Pseudonyms | None, output: Any, raw: Any) -> tuple[Any
         _json_copy(real_raw, "re-identified LLM intents"),
         _deid_record(pseudo, in_output, in_intents),
     )
+
+
+def _deid_digest(pseudo: Pseudonyms) -> str | None:
+    """The SHA-256 of a de-identified input (`summary()["input_sha256"]`)."""
+    digest = pseudo.summary().get("input_sha256")
+    return digest if isinstance(digest, str) else None
 
 
 def _view_options(skill: LoadedSkill | None) -> dict[str, Any]:
@@ -1296,6 +1325,9 @@ async def _reuse(
         except Exception:  # a broken cache is a miss, never a failed run
             previous = None
     if not isinstance(previous, PreviousLlm) or previous.input_hash != key:
+        return None
+    # Pseudonyms name values only under the mapping that made them (#34 finding 7).
+    if previous.deid_input_sha256 != (None if pseudo is None else _deid_digest(pseudo)):
         return None
     try:
         output = _json_copy(previous.output, "previous LLM output")
@@ -1387,12 +1419,20 @@ async def _llm_step(run: _Run, step: _Planned) -> _Outcome:
     def degraded(kind: str, message: str) -> _Outcome:
         return _Outcome("degraded", StepError(kind=kind, message=_cap(message)), stop=True)
 
+    # The step's deadline covers de-identification too (#34 finding 9): it runs in a worker
+    # thread, so a slow one times the step out instead of blocking the event loop.
+    timeout = spec.timeout_s or DEFAULT_LLM_TIMEOUT_S
+    deadline = run.monotonic() + timeout
     options = _view_options(skill)
     classified = _classified(options)
     pseudo: Pseudonyms | None = None
     if classified and run.deid is not None:
+        policy = run.deid
         try:
-            pseudo = run.deid.pseudonymize(spec.model, options, viewed)
+            async with asyncio.timeout(timeout):
+                pseudo = await asyncio.to_thread(policy.pseudonymize, spec.model, options, viewed)
+        except TimeoutError:
+            return degraded("timeout", f"de-identifying took longer than {timeout} s")
         except DeidUnavailable as error:
             return degraded("deid_unavailable", f"{spec.skill}: {safe_excerpt(str(error), 200)}")
         except Exception as error:  # a policy bug must not crash the run, nor send in clear
@@ -1407,9 +1447,6 @@ async def _llm_step(run: _Run, step: _Planned) -> _Outcome:
         return reused
     prompt = None if skill is None else skill.prompt
     output_schema = None if skill is None else skill.output_schema
-
-    timeout = spec.timeout_s or DEFAULT_LLM_TIMEOUT_S
-    deadline = run.monotonic() + timeout
     spent_usd, spent_tokens = 0.0, 0
     repair: tuple[str, ...] = ()
     for attempt in range(1, MAX_LLM_ATTEMPTS + 1):
@@ -1479,14 +1516,10 @@ async def _llm_step(run: _Run, step: _Planned) -> _Outcome:
             usage = _ZERO if response.cached is True else response.usage
             # Capped like the record's messages; the repair retry is sent these same errors.
             errors = tuple(_cap(str(error)) for error in response.schema_errors)[:MAX_ITEMS]
-            # Validated, then re-identified (#34): the record keeps what the provider saw.
-            real_output, real_raw = output, raw
-            if pseudo is not None:
-                deid_record = _deid_record(pseudo, accepted=not errors)
-                if not errors:
-                    real_output, real_raw, deid_record = _reidentified(pseudo, output, raw)
-                if isinstance(recorded, dict):
-                    recorded["deid"] = deid_record
+            # The record keeps what the provider saw (#34); re-identification comes after
+            # the call is recorded and its usage spent (finding 8).
+            if pseudo is not None and isinstance(recorded, dict):
+                recorded["deid"] = _deid_record(pseudo, accepted=False)
             llm_call = LlmCall(
                 step=step.index,
                 skill=spec.skill,
@@ -1517,6 +1550,14 @@ async def _llm_step(run: _Run, step: _Planned) -> _Outcome:
         if spent_usd > spec.budget.usd or spent_tokens > spec.budget.tokens_out:
             return degraded("budget_exceeded", "the LLM step spent more than its budget")
         if not errors:
+            # Validated, then re-identified (#34): a failure here keeps the call and its cost.
+            try:
+                real_output, real_raw, deid_record = _reidentified(pseudo, output, raw)
+            except _DataError as error:
+                return degraded(error.kind, error.message)
+            if deid_record is not None and isinstance(recorded, dict):
+                request_record = {**recorded, "deid": deid_record}
+                run.llm_calls[-1] = llm_call.model_copy(update={"request": request_record})
             source = f"skill:{spec.skill}"
             proposer = _proposer(plugin, skill)
             accepted, rejected = run.propose(

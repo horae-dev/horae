@@ -452,8 +452,9 @@ class DeidentificationConfig(Contract):
     vocabulary: SecretFileName | None = None
     """A file in `secrets.dir` (never in the instance repository: it holds personal data)
     listing known terms, one `class: term` per line (`person`, `email`, `phone` or `place`;
-    `#` starts a comment), replaced by pseudonyms wherever they appear in a `free_text`
-    field. Read like a secret file (a regular file of at most 64 KiB, UTF-8)."""
+    `#` starts a comment), replaced by pseudonyms wherever they appear in a string or key
+    of the input a skill with field classes is sent (a cloud alias). Read like a secret
+    file (a regular file of at most 64 KiB, UTF-8)."""
 
 
 class InstanceConfig(Contract):

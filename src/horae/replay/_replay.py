@@ -410,6 +410,7 @@ async def replay_async(
     tools = RecordedToolCaller(record, chosen, record.context)
     has_llm = any(isinstance(step, LlmStep) for step in chosen.steps)
     llm = RecordedLlm(record) if has_llm else None
+    previous = recorded_previous(record)
     replayed = await execute(
         chosen,
         run_id=record.id,
@@ -420,7 +421,7 @@ async def replay_async(
         llm=llm,
         skills=skills,
         dry_run=record.dry_run,
-        previous=recorded_previous(record),
+        previous=previous,
         models=used_models,
         lock_digest=record.lock_digest,
         config_digest=record.config_digest,
@@ -429,6 +430,18 @@ async def replay_async(
         deid=deid,
     )
     mismatches = (*tools.mismatches, *(llm.mismatches if llm else ()))
+    if (
+        previous is not None
+        and previous.deid_input_sha256 is not None
+        and not any(_is_reuse(call) for call in replayed.llm)
+    ):
+        # The recorded run reused a de-identified output; its pseudonyms name values only
+        # under the mapping that made it (#34 finding 7).
+        mismatches = (
+            *mismatches,
+            "the reused LLM output was de-identified from another input: the de-identified "
+            "input differs (vocabulary changed, or de-identification not applied the same way)",
+        )
     intents_diff = diff_intents(record, replayed)
     changed_skills = skill_changes(record, replayed)
     summary = (*diff_summary(record, replayed), *changed_skills)

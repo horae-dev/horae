@@ -2007,30 +2007,53 @@ loosened later without breaking a valid file.
       Errors name the line, never the term. `horae doctor` reports an unusable vocabulary
       as an error;
     - **(C) the transforms** (`horae.llm.deid.pseudonymize`, a pure function of the viewed
-      input, the classes and the vocabulary): every scalar leaf of a `person`, `email`,
-      `phone` or `place` field becomes `[PERSON_1]`, `[EMAIL_1]`, `[PHONE_1]`, `[PLACE_1]`;
-      in a `free_text` string, the vocabulary terms **and the values of the classed fields of
-      this input** (so "Lunch with Bob" is covered when Bob is an attendee) are matched as
-      whole words (`(?<!\w)` / `(?!\w)`, Unicode, case-insensitive, NFC-normalized, longest
-      first) and replaced by their pseudonym; an `amount` becomes a bucket label (`<0`,
-      `50-200`, `>=1000`; default bounds 0, 10, 100, 1000, 10000; `[AMOUNT]` for a value
-      that is not a finite number), not reversible. Unclassed fields and object keys are
-      sent as they are (the input view stays the primary control);
+      input, the classes and the vocabulary): every scalar leaf **and every object key**
+      under a `person`, `email`, `phone` or `place` field becomes `[PERSON_1]`, `[EMAIL_1]`,
+      `[PHONE_1]`, `[PLACE_1]` (a value over `MAX_VALUE_CHARS`, 1 KiB, is withheld as
+      `[PERSON]`, not reversible); an `amount` becomes a bucket label (`<0`, `50-200`,
+      `>=1000`; default bounds 0, 10, 100, 1000, 10000; `[AMOUNT]` for a value that is not a
+      finite number), not reversible. **Every other string of the viewed input and every
+      object key** (`free_text` fields and unclassed ones alike: provisional B below) is
+      scanned for the known values: the vocabulary terms, the values of this input's
+      token-class fields (so "Lunch with Bob" is covered when Bob is an attendee) and each
+      name part of a `person` value or term (at least 3 letters, mapped to the whole name's
+      pseudonym: provisional C), replaced by their pseudonym; a phone's last 9 digits with
+      any `[\s.\-()]` separators and up to 4 digits of prefix; an amount's renderings
+      (provisional D), replaced by its bucket label. **Matching**: the string is NFKC-
+      normalized and stripped of format characters (zero-width, bidi controls, soft
+      hyphen), cut into tokens (letter runs `[^\W\d_]+`, digit runs, white-space runs, other
+      single characters), and compared token by token with the known values (letters
+      case-folded on both sides, `STRAUSS` = `Strauß`; any white-space run, NBSP and
+      ideographic space included, equals any other): a known value matches whole letter
+      runs only (`Alice` in `alice_smith`, `user_alice`, `alice123`; not in `Malice`),
+      leftmost then longest. A trie over the tokens, at most `MAX_TERM_TOKENS` (48) deep:
+      linear in the text whatever the number of terms (600 KB and 4096 terms well under a
+      second). A string in which nothing is found is sent byte-identical. Text of the input
+      shaped like a pseudonym (`[PERSON_1]`, any case, fullwidth brackets after NFKC) is
+      first **neutralized** to `(PERSON_1)` (counted `neutralized`), so the model can never
+      be handed a pseudonym that re-identification would turn into a real value. Two keys
+      of one object that are the same once pseudonymized fail closed (`deid_unavailable`).
+      A classed path under another classed path is refused (`DeidError`, a defence in depth:
+      the skill contract already refuses overlapping view paths);
     - **(D) stable per run, no key** (maintainer answer 3). Pseudonyms are numbered per
-      class in order of first occurrence: the classed leaves in canonical order (sorted
-      keys, array order), then the free-text matches; the same value (NFC, case-folded)
-      keeps its pseudonym. The same input always gives byte-identical requests, so a replay
-      or a cache hit recomputes the same mapping. Cross-run stability (keyed HMAC) is a
-      later option;
+      class in order of first occurrence: the classed leaves and keys in canonical order
+      (sorted keys, array order), then the matches in scanned strings; the same value
+      (the same tokens) keeps its pseudonym. The same input always gives byte-identical
+      requests, so a replay or a cache hit recomputes the same mapping. Cross-run stability
+      (keyed HMAC) is a later option. `DEID_VERSION` is 2 (the matching of the privacy
+      review);
     - **(E) where it runs and what is stored.** The engine applies it (`execute(deid=...)`,
       the `horae.engine.ports.Deidentifier` port, `horae.llm.deid.Deidentifier` built by the
       runner and by `horae replay` from `horae.yaml`), for a skill with classes and a cloud
       alias (on by default, no opt-out in v1: answer 7), because the engine is the one
       place that sees the three paths (a call, a cache hit, a replay). Order: input view →
-      pseudonymize → `LlmRequest` (`input` pseudonymized, `classified`, `deidentified` = the
+      pseudonymize (in a worker thread, within the step's `timeout_s`) → `LlmRequest` (`input` pseudonymized, `classified`, `deidentified` = the
       summary) → `ModelBackends` renders (appends `DEID_NOTE`: copy placeholders verbatim)
-      → T10 check → send → schema validation → **re-identify** the accepted output and raw
-      intents → the permission check, the action guard (decision 46) and routing, all on the
+      → T10 check → send → schema validation → the attempt is recorded in `llm[]` and its
+      usage spent → **re-identify** the accepted output and raw intents (the growth is
+      summed first, `Pseudonyms.growth`: past `MAX_REIDENTIFIED_BYTES`, 256 KiB, the step
+      degrades with `output_too_large` and nothing is substituted; the call and its cost
+      stay recorded) → the permission check, the action guard (decision 46) and routing, all on the
       **re-identified** intents and against the **real** viewed input (`guard_for(viewed)`):
       a URL or note link present in the real input matches, and no pseudonym reaches the
       guard's link and tag rules (they are put back first; an unresolved one is left as the
@@ -2039,8 +2062,18 @@ loosened later without breaking a valid file.
       was sent, `llm[].request.deid` `{version, input_sha256, counts, unresolved}` (a digest
       of what was sent, never one of the mapping or of a value, which could be guessed);
       the step output and the routed intents carry real values. The LLM cache stores the
-      pseudonymized output (from `llm[]`), re-identified on a hit; the usage ledger holds
-      no data. As a backstop, `ModelBackends.prepare` refuses a `classified` request to a
+      pseudonymized output (from `llm[]`) and the digest of what was sent
+      (`deid_input_sha256`), re-identified on a hit; the usage ledger holds no data. A
+      reused output (`PreviousLlm`: a cache hit, or a replay's recorded reuse, whose
+      `request.deid.input_sha256` is kept) is reused only when its `deid_input_sha256`
+      equals this run's de-identified digest (`None` on both sides without
+      de-identification): otherwise a miss, and a replay reports a mismatch ("the
+      de-identified input differs (vocabulary changed…)"). Both checks of `ModelBackends`
+      (`deid_required` and T10) live in `ModelBackends` only: an engine given another
+      `LlmBackend` (a test double, the replay tape) has neither, so the runner always wires
+      `ModelBackends`. **For #29 (`claude-cli`, PR #105)**: the subprocess' argv and stdin
+      must be derived only from the decoded frozen body (`RenderedRequest.body()`), never
+      from the `Completion` or the request, so the bytes checked are the bytes sent. As a backstop, `ModelBackends.prepare` refuses a `classified` request to a
       cloud alias that was not de-identified (`deid_required`, an engine given no policy);
       a policy that cannot de-identify (unreadable vocabulary) degrades the step
       (`deid_unavailable`) before anything is sent. Both are not billed;
@@ -2054,17 +2087,54 @@ loosened later without breaking a valid file.
     - **(G) unresolved pseudonyms are left and noted** (answer 4): a pseudonym the input
       never issued, or a mangled one (`Person 1`, `PERSON1`, `[person_1]`), stays as the
       model wrote it and is listed in `llm[].request.deid.unresolved` (at most 16, 40
-      characters each); no repair retry. A string that is exactly one pseudonym gets the
-      original JSON value back (a phone number stays a number);
+      characters each); no repair retry. Re-identification puts back the original value's
+      **text** (`_text(value)`): a string stays a string, also when it is exactly one
+      pseudonym of a number (a phone given as a number comes back as `"33612345678"`), so
+      the validated output keeps its types (finding 5);
     - **(H) no secret in a request (T10, the #14 addition).** `ModelBackends.send` scans the
       exact frozen body (`RenderedRequest.body()`) with the process registry
-      (`horae.secrets.redact.current()`): the raw bytes and the decoded JSON (strings, object
-      keys, whole numbers), every encoding of decision 43. For **every** backend, local ones
+      (`horae.secrets.redact.current()`), primed once with **every secret the instance
+      declares** (`ModelBackends.secret_names` = `Instance.redaction_names()`, the #53 set:
+      `secrets.refs`, the lockfile's plugin secrets, the aliases' `secret`), not only those
+      this process resolved: the raw bytes and the decoded JSON (strings, object keys,
+      whole numbers), every encoding of decision 43. For **every** backend, local ones
       too (a secret in a request is never legitimate, and a local endpoint may log it).
       A match raises `secret_in_request` naming the secrets (never a value; the log
       line gives only their count) before the provider backend is called: nothing is sent, the usage ledger
       releases the reservation (`NOT_BILLED`, decision 41), the step is `degraded` and the
       engine records a `secret_in_request` **violation** (run record v1, a compatible
       addition to `violations[].kind`: answer 6);
+    - **(I) after the privacy review (provisional, pending maintainer review).** The
+      maintainer's answers on PR #98 stand (1: explicit `local:`, never inferred from
+      `base_url`; 2: classes in the input view plus a vocabulary in `secrets.dir`; 3: per
+      run; 4: leave and note; 5: render then send; 6: a `secret_in_request` violation;
+      7: on by default). Provisional answers to the review's open questions:
+      - **A**: `local` stays explicit and is never inferred; `horae doctor` **warns** when
+        an `ollama` alias leaves `local` unset and its `base_url` host is neither loopback,
+        private, single-label nor a local name (`.localhost`, `.local`, `.lan`,
+        `.internal`, `.home.arpa`), or its model tag ends with `-cloud`;
+      - **B**: once a skill declares any class, the known-value matcher runs over every
+        string of the viewed input (not only `free_text` fields) and every object key;
+      - **C**: each name part (at least 3 letters) of a `person` value or term is a term
+        mapped to the same pseudonym as the whole name (privacy over meaning: `[PERSON_1]`
+        for "Bob" is put back as "Bob Martin");
+      - **D**: an amount's renderings (`1234.56`, `1234,56`, `1,234.56`, `1.234,56`,
+        `1 234,56`, `1'234.56`, the whole part `1234`; at least 3 digits, not all zeros) in
+        a string become its bucket label (not reversible, not a pseudonym; counted in
+        `amount`); object keys under a token-class field become pseudonyms (and are put
+        back by re-identification);
+      - **E**: bucket bounds written by the skill are accepted as they are (skills are
+        trusted code, reviewed with their plugin): a skill could choose narrow buckets
+        that reveal an amount, as it could simply not classify the field;
+      - **F**: the T10 check scans every secret the instance declares (the primed #53
+        registry), not only the ones this process resolved (see H);
+      - **G**: `input_hash` (the engine's cache key, decision 47 E) stays an unsalted
+        SHA-256 of the real viewed input: it is stored locally only (run record, cache),
+        never sent, and a salt would break replay and the cache across processes; a
+        dictionary attack on it needs the store, which holds the real outputs anyway;
+    - **limits**: matching misses nicknames, initials, typos and transliterations, and
+      over-matches a known value that is also a common word; a value of more than 48
+      tokens is not looked for in text; values in unclassed fields that equal no known value
+      are sent as they are (the input view stays the primary control);
     - **follow-ups**: per-instance pseudonyms by keyed HMAC; NER-assisted detection in
       `free_text`; de-identification of data sent to plugins.

@@ -32,6 +32,7 @@ from horae.llm import UNVALIDATED, Completion, CompletionResult, ModelBackends
 from horae.llm.base import secrets_in
 from horae.llm.deid import (
     DEID_NOTE,
+    DEID_VERSION,
     Deidentifier,
     DeidError,
     Vocabulary,
@@ -171,16 +172,24 @@ def test_a_repeated_value_keeps_its_pseudonym() -> None:
         "phones": ["[PHONE_1]", "[PHONE_2]"],
     }
     back, notes = result.reidentify(["[PHONE_2]", "[PERSON_1] and [PERSON_2]"])
-    assert back == [600000000, "Ann and Bea"]  # a whole pseudonym keeps its JSON type
+    assert back == ["600000000", "Ann and Bea"]  # put back as text: a string stays a string
     assert notes == []
 
 
 def test_objects_nulls_and_empty_strings_under_a_class() -> None:
     data = {"who": {"name": "Ann", "age": 7, "nick": "", "x": None, "ok": True}}
     result = pseudonymize(data, {"who": {"class": "person"}})
-    assert result.data == {
-        "who": {"age": "[PERSON_1]", "name": "[PERSON_2]", "nick": "", "ok": True, "x": None}
+    assert result.data == {  # keys under a token class are pseudonyms too (decision 47 D)
+        "who": {
+            "[PERSON_1]": "[PERSON_2]",
+            "[PERSON_3]": "[PERSON_4]",
+            "[PERSON_5]": "",
+            "[PERSON_6]": True,
+            "[PERSON_7]": None,
+        }
     }
+    back, _ = result.reidentify(result.data)
+    assert back == {"who": {"age": "7", "name": "Ann", "nick": "", "ok": True, "x": None}}
 
 
 @pytest.mark.parametrize(
@@ -243,7 +252,8 @@ def test_classed_values_are_replaced_in_free_text_too() -> None:
     data = {"who": ["Bob Martin"], "note": "Lunch with bob martin, not Bob"}
     options = {"who[]": {"class": "person"}, "note": {"class": "free_text"}}
     result = pseudonymize(data, options)
-    assert result.data == {"note": "Lunch with [PERSON_1], not Bob", "who": ["[PERSON_1]"]}
+    # A name part maps to the whole name (decision 47 C: privacy over meaning).
+    assert result.data == {"note": "Lunch with [PERSON_1], not [PERSON_1]", "who": ["[PERSON_1]"]}
 
 
 def test_free_text_without_terms_is_sent_as_it_is() -> None:
@@ -252,10 +262,16 @@ def test_free_text_without_terms_is_sent_as_it_is() -> None:
     assert pseudonymize(data, options).data == data
 
 
-def test_unclassed_fields_and_keys_are_left_alone() -> None:
-    data = {"Alice": "Alice", "note": "Alice"}
+def test_unclassed_fields_and_keys_are_scanned_too() -> None:
+    data = {"Alice": "Alice", "note": "Alice", "n": 3, "date": "2026-10-27"}
     result = pseudonymize(data, {"note": {"class": "free_text"}}, _vocabulary())
-    assert result.data == {"Alice": "Alice", "note": "[PERSON_1]"}
+    assert result.data == {
+        "[PERSON_1]": "[PERSON_1]",
+        "date": "2026-10-27",
+        "n": 3,
+        "note": "[PERSON_1]",
+    }
+    assert result.reidentify(result.data)[0] == data | {"n": 3}
 
 
 def test_reidentification_of_output_and_intents() -> None:
@@ -360,7 +376,10 @@ def test_an_unusable_vocabulary_fails_closed(tmp_path: Path, setup: Any, needle:
     policy = load_deidentifier({"default": ModelAlias.model_validate(CLOUD)}, resolver, "vocab.txt")
     with pytest.raises(DeidError):
         policy.pseudonymize("default", OPTIONS, DATA)
-    assert policy.cache_settings("default") == {"version": 1, "vocabulary": "unavailable"}
+    assert policy.cache_settings("default") == {
+        "version": DEID_VERSION,
+        "vocabulary": "unavailable",
+    }
 
 
 @pytest.mark.parametrize("name", ["", "../vocab", "a/b", ".hidden", "a\\b"])
@@ -406,7 +425,7 @@ def test_the_policy_skips_a_skill_without_classes_and_treats_unknown_aliases_as_
     assert policy.pseudonymize("default", OPTIONS, DATA) is None
     assert policy.pseudonymize("other", {"a": {"note": "x"}}, DATA) is None
     assert policy.pseudonymize("other", OPTIONS, DATA) is not None
-    assert policy.cache_settings("other") == {"version": 1, "vocabulary": None}
+    assert policy.cache_settings("other") == {"version": DEID_VERSION, "vocabulary": None}
     assert policy.cache_settings(None) is None
 
 
@@ -674,6 +693,7 @@ def test_a_reused_output_is_re_identified(pack: Path, tmp_path: Path) -> None:
         skill_version=first.llm[0].skill_version,
         model=first.llm[0].model,
         backend=first.llm[0].backend,
+        deid_input_sha256=first.llm[0].request["deid"]["input_sha256"],
     )
     second = _run(llm, pack, deid=_policy(), previous=previous)
     assert len(provider.sent) == 1  # no call
@@ -696,7 +716,7 @@ def test_a_de_identified_run_replays_identically(pack: Path, tmp_path: Path) -> 
     )
     changed = replay(record, _pipeline(), plugins=plugins, skills=skills, deid=other)
     assert changed.outcome == "error"
-    assert any("the input differs" in m for m in changed.mismatches)
+    assert any("the de-identified input differs" in m for m in changed.mismatches)
     without = replay(record, _pipeline(), plugins=plugins, skills=skills)
     assert without.outcome == "error"
 

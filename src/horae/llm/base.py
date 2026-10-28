@@ -69,13 +69,20 @@ alias that is not local, but that was not de-identified, is refused with `deid_r
 before anything is rendered (an engine given no `Deidentifier`).
 
 **No secret leaves in a request** (T10, #34). `send` scans the exact frozen body
-(`RenderedRequest.body()`) for every secret the process resolved, in all its encodings (the
-redaction registry, `horae.secrets.redact.current()`: the raw bytes, and the decoded JSON
-strings, keys and numbers), whatever the backend: one found refuses the attempt with
-`secret_in_request` (naming the secrets, never their values; the log gives their count)
-before the provider backend is
-called, so nothing is sent and nothing is billed (the usage ledger releases its reservation,
-decision 41); the engine records a `secret_in_request` violation and degrades the step.
+(`RenderedRequest.body()`) for every secret the instance declares (`secret_names`, primed
+into the redaction registry before the first check) and every other one the process
+resolved, in all its encodings (the registry, `horae.secrets.redact.current()`: the raw
+bytes, and the decoded JSON strings, keys and numbers), whatever the backend: one found
+refuses the attempt with `secret_in_request` (naming the secrets, never their values; the
+log gives their count) before the provider backend is called, so nothing is sent and
+nothing is billed (the usage ledger releases its reservation, decision 41); the engine
+records a `secret_in_request` violation and degrades the step.
+
+Both checks live here, in `ModelBackends` (decision 47 E, H): an engine given another
+`LlmBackend` (a test double, a replay tape) has neither. A provider backend must derive
+everything it sends, a subprocess' argv and stdin included (`claude-cli`, #29), from the
+decoded frozen body alone (`RenderedRequest.body()`), never from the `Completion` or the
+request, so the bytes checked are the bytes sent.
 
 **Retries.** None here: the engine owns the single repair retry (`attempt` 2). Provider
 backends disable their SDK's own retries.
@@ -146,6 +153,7 @@ from horae.engine.ports import (
 from horae.llm.deid import DEID_NOTE
 from horae.secrets import SecretResolver
 from horae.secrets.redact import current as current_redactor
+from horae.secrets.redact import prime as prime_redaction
 
 _log = logging.getLogger("horae.llm")
 
@@ -549,7 +557,12 @@ class ModelBackends:
     validate: Validator | Unvalidated = field(default_factory=production_validator)
     """The output validator: `horae.llm.validate.validate_output` unless another one, or the
     explicit `UNVALIDATED`, is given (decisions 38 G and 44 D)."""
+    secret_names: tuple[str, ...] = ()
+    """Every secret the instance declares (`Instance.redaction_names`): resolved for
+    redaction once, before the first request is checked, so the T10 check of `send` scans for
+    all of them, not only those this process happened to resolve (decision 47 H)."""
     _backends: dict[str, ProviderBackend] = field(default_factory=dict, init=False, repr=False)
+    _primed: bool = field(default=False, init=False, repr=False)
 
     def _backend(self, alias: str, spec: ModelAlias) -> ProviderBackend:
         backend = self._backends.get(alias)
@@ -686,6 +699,9 @@ class ModelBackends:
             unchanged = False
         if not unchanged:
             raise LlmError("invalid_request", "the payload was changed after it was rendered")
+        if not self._primed:
+            self._primed = True
+            prime_redaction(self.secrets, self.secret_names)
         held = secrets_in(body)
         if held:
             names = ", ".join(sorted(held))

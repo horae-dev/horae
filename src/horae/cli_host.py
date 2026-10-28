@@ -11,10 +11,12 @@ before #25, or by the built-in `LocalFileSink`): it reads or writes that local d
 with the built-in sinks.
 """
 
+import ipaddress
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from horae.apply import SinkRegistry
 from horae.cli_output import EXIT_PROBLEMS, CommandFailed, plural
@@ -24,6 +26,7 @@ from horae.contracts.pipeline import LlmStep
 from horae.contracts.plugin import StdioRuntime
 from horae.engine import UnknownPlugin
 from horae.llm.backends import FACTORIES
+from horae.llm.backends._shared import lan_address
 from horae.llm.deid import vocabulary_problem
 from horae.llm.validate import worker_problem
 from horae.plugins.host import HostRegistry, PluginCallError, RegistryError
@@ -142,6 +145,30 @@ def _is_cloud(spec: ModelAlias) -> bool:
     return not spec.is_local
 
 
+LOCAL_NAME_SUFFIXES = (".localhost", ".local", ".lan", ".internal", ".home.arpa")
+"""Host name suffixes `horae doctor` takes for the host or the LAN (decision 47 A)."""
+
+
+def _ollama_cloud_hint(spec: ModelAlias) -> str | None:
+    """Why an `ollama` alias with `local` unset looks like a hosted or cloud model (decision
+    47 A: a warning only; `local` is never inferred): a `-cloud` model tag, or a `base_url`
+    host that is neither loopback/private nor a single-label or local name."""
+    if spec.model.endswith("-cloud"):
+        return f"names a cloud model ({spec.model!r} ends with -cloud)"
+    host = (urlsplit(spec.base_url).hostname or "") if spec.base_url else ""
+    if not host:
+        return None
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        if "." not in host or host == "localhost" or host.endswith(LOCAL_NAME_SUFFIXES):
+            return None
+        return f"points at host {host!r}, which is not a loopback, private or local name"
+    if lan_address(host):
+        return None
+    return f"points at {host!r}, which is not a loopback or private address"
+
+
 def _deid_problems(instance: Instance) -> list[Problem]:
     """An error when `deidentification.vocabulary` names a file that cannot be read or
     parsed (de-identification would then fail closed at run time; the message never shows
@@ -195,6 +222,19 @@ def _backend_problems(instance: Instance) -> list[Problem]:
                     f"models.{alias}.price: model alias {alias!r} (backend {spec.backend!r}) "
                     "has no price: its calls are recorded at usd 0 and the step's usd budget "
                     "does not bound them (only tokens_out does)",
+                    severity="warning",
+                )
+            )
+        hint = _ollama_cloud_hint(spec) if spec.backend == "ollama" else None
+        if hint is not None and spec.local is None:
+            problems.append(
+                Problem(
+                    CONFIG_FILE,
+                    None,
+                    None,
+                    f"models.{alias}.local: ollama alias {alias!r} {hint}, yet it is treated "
+                    "as local, so a skill's classed fields are sent to it in clear; set "
+                    "`local: false` if it is hosted or a cloud model (`local: true` if not)",
                     severity="warning",
                 )
             )

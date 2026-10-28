@@ -55,7 +55,7 @@ from horae.contracts import RunRecord, Usage
 from horae.contracts.instance import CacheConfig, ModelAlias
 from horae.engine import PreviousLlm
 from horae.engine.canonical import sha256_hex
-from horae.engine.ports import LlmBackendName, LlmError
+from horae.engine.ports import LlmBackendName, LlmError, deid_digest
 from horae.llm.backends._shared import LLM_KEY_VERSION
 from horae.llm.base import Validator, production_validator
 from horae.llm.deid import Deidentifier
@@ -137,6 +137,9 @@ def accepted_entry(record: RunRecord) -> AcceptedEntry | None:
         "input_hash": key,
         "run_id": record.id,
     }
+    digest = deid_digest(call.request)
+    if digest is not None:  # what was sent, never a value (#34 finding 7)
+        response["deid_input_sha256"] = digest
     return AcceptedEntry(key, call.model_alias, call.skill, response, usage)
 
 
@@ -148,6 +151,7 @@ class _Parsed:
     model: str
     skill_version: str
     source_run: str | None
+    deid_input_sha256: str | None = None
 
 
 def _is_backend(value: Any) -> TypeGuard[LlmBackendName]:
@@ -168,7 +172,9 @@ def _parse(response: Any) -> _Parsed | None:
         return None
     run_id = response.get("run_id")
     source_run = run_id if isinstance(run_id, str) else None
-    return _Parsed(response["output"], intents, backend, model, version, source_run)
+    digest = response.get("deid_input_sha256")
+    deid = digest if isinstance(digest, str) else None
+    return _Parsed(response["output"], intents, backend, model, version, source_run, deid)
 
 
 class StoreLlmCache:
@@ -274,6 +280,7 @@ class StoreLlmCache:
             model=model,
             backend=backend,
             source_run=parsed.source_run,
+            deid_input_sha256=parsed.deid_input_sha256,
         )
 
     def remember(self, record: RunRecord) -> bool:

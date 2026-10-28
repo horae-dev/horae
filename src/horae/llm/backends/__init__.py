@@ -39,15 +39,18 @@ def model_backends(
     *,
     prompts: PromptSource | None = None,
     validate: Validator | Unvalidated | None = None,
+    secret_names: tuple[str, ...] = (),
 ) -> ModelBackends:
     """A `ModelBackends` with the built-in `FACTORIES` and, unless another is given, the
-    production validator `horae.llm.validate.validate_output` (decisions 38 G and 44)."""
+    production validator `horae.llm.validate.validate_output` (decisions 38 G and 44).
+    `secret_names`: every secret the instance declares, for the T10 request check."""
     return ModelBackends(
         models=models,
         secrets=secrets,
         factories=FACTORIES,
         prompts=prompts or RequestPrompts(),
         validate=validate_output if validate is None else validate,
+        secret_names=tuple(secret_names),
     )
 
 
