@@ -35,10 +35,14 @@
    applied, and nothing is rolled back: `horae undo` is the remedy). Without `Ports.sinks`
    nothing is applied (the intents are only recorded, as before #22). The apply is not under
    the run timeout; each sink call is bounded by `plugin_defaults.call_timeout_s` (kind
-   `timeout`). A crash or cancellation during it abandons the run, and its journal still lets
-   `horae undo` revert what was written. A run whose caller cancels it after its steps
-   finished but before the apply is saved `failed` ("cancelled before apply"), nothing
-   applied.
+   `timeout`). **The apply is shielded from cancellation** (schemas decision 37): once it
+   has started planning, a cancellation (a signal under `horae run`) is remembered, the
+   apply finishes, the record is saved (with its real status: the changes were applied) and
+   only then is `asyncio.CancelledError` raised. A cancellation while it waits for the apply
+   lock stops the wait: the run is saved `failed` ("cancelled before apply"), nothing
+   applied; so is a run whose caller cancels it after its steps finished but before the
+   apply. A crash during the apply abandons the run (error `run crashed during apply
+   (<type>)`), and its journal still lets `horae undo` revert what was written.
 6. **Persist** the record (`Store.save_run`), call `on_record(record)` if given, and release
    the lock. The status is the engine's (`ok`, `noop`, `degraded` or `failed`), or `failed`
    when the apply failed.
@@ -76,7 +80,8 @@ loop's monotonic clock. Since liveness is the lock's, a wall-clock step only shi
 times (and may reorder run ids started across the step); it cannot make a live run look dead.
 
 **The CLI.** `horae run` (`horae.cli_run`, #26) cancels the run on SIGINT and SIGTERM, as
-above, and exits 130 / 143.
+above, and exits 130 / 143; `on_begin(run_id)` tells it the run's id as soon as the row
+exists, so it can name the run whatever happens next.
 The ports are injected (`Ports`), so tests use `horae.engine.testing`, and the plugin host
 (#24) plugs in unchanged.
 """
@@ -233,6 +238,10 @@ class _State:
     """The heartbeat found the row no longer running."""
     settled: bool = False
     """The row is final (saved or abandoned): a crash must not abandon it."""
+    applying: bool = False
+    """The apply phase has started (a crash then abandons the run "during apply")."""
+    stop_requested: bool = False
+    """The caller cancelled the run during the (shielded) apply phase."""
 
 
 def _step_kind(step: object) -> StepKind:
@@ -377,11 +386,13 @@ class Runner:
         dry_run: bool = False,
         vars: Mapping[str, str] | None = None,
         on_record: Callable[[RunRecord], object] | None = None,
+        on_begin: Callable[[str], object] | None = None,
     ) -> RunRecord:
         """Run pipeline `name` once and return its saved record (see the module docstring).
 
-        `vars` are extra template variables. `on_record(record)` is called with every record
-        that is saved, also when `run` then raises (cancellation, timeout); it should not
+        `vars` are extra template variables. `on_begin(run_id)` is called once the run's row
+        exists (before its first step). `on_record(record)` is called with every record
+        that is saved, also when `run` then raises (cancellation, timeout); neither should
         raise. Raises `UnknownPipeline`, `PipelineLocked` (nothing written), `RunTimedOut`
         (with the saved record, or `None` if the run was abandoned), `asyncio.CancelledError`
         (the caller cancelled; the partial record is saved and passed to `on_record`),
@@ -401,23 +412,31 @@ class Runner:
             context = make_context(started_at, zone, vars)
             state = _State(self._begin(name, started_at, dry_run))
             try:
+                if on_begin is not None:
+                    on_begin(state.run_id)
                 previous = self.store.last_accepted_llm(name)
                 return await self._drive(
                     pipeline, state, started_at, context, dry_run, previous, on_record
                 )
             except BaseException as exc:
                 if not state.settled:
-                    self._abandon_crashed(state.run_id, exc)
+                    self._abandon_crashed(state, exc)
                 raise
         finally:
             lock.release()
 
-    def _abandon_crashed(self, run_id: str, exc: BaseException) -> None:
+    def _abandon_crashed(self, state: _State, exc: BaseException) -> None:
         # Only the exception's type: its message may hold data from a plugin or the store.
+        run_id = state.run_id
+        during = " during apply" if state.applying else ""
+        if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt)):
+            error = f"cancelled: the run was interrupted{during} before its record was saved"
+        else:
+            error = f"run crashed{during} ({type(exc).__name__})"
+        if state.applying:
+            error += f"; run `horae undo {run_id}` to revert what was written"
         try:
-            self.store.abandon_run(
-                run_id, at=self.clock(), error=f"run crashed ({type(exc).__name__})"
-            )
+            self.store.abandon_run(run_id, at=self.clock(), error=error)
         except RunNotRunning:
             pass  # already final
         except Exception as failure:
@@ -510,14 +529,33 @@ class Runner:
             and bool(record.intents)
         )
 
-    async def _apply_lock(self) -> PipelineLock | None:
+    async def _apply_lock(self, state: _State) -> PipelineLock | None:
+        """The apply lock, or `None` after `APPLY_LOCK_WAIT_S` or once a stop is requested."""
         loop = asyncio.get_running_loop()
         deadline = loop.time() + APPLY_LOCK_WAIT_S
         while True:
+            if state.stop_requested:
+                return None
             lock = try_acquire_apply_lock(self.instance.state_dir)
             if lock is not None or loop.time() >= deadline:
                 return lock
             await asyncio.sleep(_APPLY_LOCK_POLL_S)
+
+    async def _shielded_apply(self, state: _State, record: RunRecord) -> tuple[RunRecord, bool]:
+        """`_apply` in its own task, shielded from the caller's cancellation: a cancellation
+        is remembered (`state.stop_requested`) and the apply finishes. Returns the record
+        and whether the caller cancelled meanwhile."""
+        applying = asyncio.create_task(self._apply(state, record))
+        cancelled = False
+        while True:
+            try:
+                return await asyncio.shield(applying), cancelled
+            except asyncio.CancelledError:
+                if applying.done():
+                    # The apply finished (or was itself cancelled: `result` re-raises).
+                    return applying.result(), True
+                cancelled = True
+                state.stop_requested = True
 
     async def _apply(self, state: _State, record: RunRecord) -> RunRecord:
         """Plan and apply the record's intents (see the module docstring, step 5)."""
@@ -530,7 +568,10 @@ class Runner:
 
         beating = asyncio.create_task(self._heartbeat(state, None))
         try:
-            lock = await self._apply_lock()
+            lock = await self._apply_lock(state)
+            if lock is None and state.stop_requested:
+                message = "cancelled before apply: the run was cancelled after its steps finished"
+                return _failed(record, f"{message}; nothing was applied")
             if lock is None:
                 return _failed(
                     record,
@@ -539,6 +580,7 @@ class Runner:
                     "applied",
                 )
             with lock:
+                state.applying = True
                 timeout_s = self.instance.config.plugin_defaults.call_timeout_s
                 planned = await plan_changes(
                     record, sinks, notified=notified, call_timeout_s=timeout_s
@@ -653,7 +695,7 @@ class Runner:
         if timed_out:
             record = _timed_out(record, timeout)
         elif not cancelled:
-            record = await self._apply(state, record)
+            record, cancelled = await self._shielded_apply(state, record)
         elif self._applies(record):
             message = "cancelled before apply: the run was cancelled after its steps finished"
             record = _failed(record, f"{message}; nothing was applied")

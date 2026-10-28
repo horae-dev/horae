@@ -888,15 +888,21 @@ loosened later without breaking a valid file.
       pipeline is running, `pipeline_locked`; the apply lock is held, `apply_locked`: undo
       at once, a run after `APPLY_LOCK_WAIT_S`); `70` internal error (`EX_SOFTWARE`, only
       the exception's type is printed); `130` / `143` `horae run` interrupted by SIGINT /
-      SIGTERM (128 + the signal). Changes from decisions 32 to 34: `horae replay` of an
+      SIGTERM (128 + the signal; a `KeyboardInterrupt` reaching any other command is `130`,
+      kind `interrupted`). Changes from decisions 32 to 34: `horae replay` of an
       unknown run (or with no store) is `3`, not `2`; `horae undo` refused by a lock is
       `5`, not `1`. Decisions 27 and 31 (E) are unchanged;
     - **`--json` on every command**: exactly one JSON document on stdout, ASCII, strict
       (`horae.apply.render.dumps`), `schema_version: 1`. An error is
       `{"schema_version": 1, "error": {"kind", "message"}}`, usage errors included (kind
       `usage`; `JsonUsageCommand` recognises `--json` among a command's arguments, before
-      any `--`); `horae replay` keeps its report with every key and outcome `error`, and
-      `horae doctor` its report. Without `--json`, results go to stdout and errors to
+      any `--`; `JsonUsageGroup` does the same for the `horae` group's own errors, `horae
+      --json` and `horae nope --json`); `horae replay` keeps its report with every key and
+      outcome `error`, its `error` being the same `{kind, message}` object (`null` when
+      there is none; kind `not_comparable` for a replay that cannot compare), and `horae
+      doctor` its report (`instance` is the resolved absolute path). An `OSError` is
+      `store_error` when it names the store's files, else `io_error` (the file it names and
+      its `strerror`, never the exception's text). Without `--json`, results go to stdout and errors to
       stderr as one line, `horae <command>: <message>`, with untrusted text escaped
       (`safe`: Unicode Cc, Cf, Zl and Zp except tab). No colour unless asked
       (`horae diff --color`). Common error kinds: `config_invalid`, `plugins_invalid`,
@@ -912,8 +918,18 @@ loosened later without breaking a valid file.
       `.gitignore` for those three. **It refuses** (exit 3, `target_not_empty` or
       `target_invalid`) a target that is not a new or empty directory (a file, a symbolic
       link, anything inside it): no `--force`, nothing is ever overwritten (files are
-      opened `x`). `--json` prints `{schema_version, instance, vault, pipelines, plugins,
-      files}`. Afterwards `horae doctor` passes and `horae run daily-fixture` writes
+      opened `x`). **It is atomic**: the lock is validated first (a path it cannot hold, a
+      backslash for instance, is `target_invalid`, exit 1, nothing written); the instance is
+      built in a temporary directory, then a new target is one `rename` of a hidden
+      sibling (`.horae-init-*`), and an existing empty target (opened `O_NOFOLLOW`) gets
+      the entries of a hidden directory built inside it renamed up into it (the directory
+      itself is kept, so a shell inside it stays there, and its parent need not be
+      writable); on any failure the temporary directory, the entries moved and the parents
+      `init` created are removed. `--json` prints `{schema_version, instance, vault,
+      pipelines, plugins, files}`. **Instances are not relocatable in v1** (provisional):
+      `horae.lock` holds the vault's absolute path and the installed manifests the absolute
+      path of the interpreter; `init` says so, and `horae doctor` reports a copied or moved
+      instance (below); Afterwards `horae doctor` passes and `horae run daily-fixture` writes
       `vault/Daily/<date>.assistant.md`;
     - **`horae run <pipeline> [--dry-run] [--var KEY=VALUE]... [--json]`**: loads the
       instance (`config_invalid`), checks the pipeline (`unknown_pipeline`, 3) and the
@@ -921,23 +937,41 @@ loosened later without breaking a valid file.
       `plugins_invalid`, 1, before any process starts or any file is written), then
       `open_ports` and `Runner.run` (lock, recovery, execute, apply through `McpSinks`,
       whose identities the core prepares, decision 36). `--var` names match `VarName` and
-      may not be a built-in variable (`now`, `timezone`, `date`; usage, 2). A dry run
-      records its run and prints the change set it would apply (`plan_changes`, rendered
-      like `horae diff`; with problems, exit 4). The run's status gives the code: `ok`,
+      may not be a built-in variable (`now`, `timezone`, `date`; usage, 2); at most
+      `MAX_ITEMS - 1` of them (the context holds `date` too; usage, 2), and a malformed one
+      echoes only its name part (before `=`, truncated to 64 characters), never its value.
+      A dry run records its run and prints the change set it would apply (`plan_changes`,
+      rendered like `horae diff`, without a second header line; with problems, exit 4;
+      when a sink plugin could not start, `plugin_unavailable`, `spawn_failed`,
+      `startup_timeout` or `handshake_failed`, exit 1, kind `plugin_unavailable`: a
+      problem, not a difference). The run's status gives the code: `ok`,
       `noop`, `degraded` 0; `failed` 1 (`run_failed`; `apply_locked` 5); `RunTimedOut` 1
       (`timeout`), `RunLost` 1 (`run_lost`), `PipelineLocked` 5. `--json` prints
-      `{schema_version, run: {id, pipeline, status, dry_run, started_at, finished_at,
-      intents, changes: [{intent, target}], cost, violations, error_kinds, error}, plan,
-      error}` (`run` is `null` when no record was saved, `plan` without `--dry-run`);
+      `{schema_version, run_id, run: {id, pipeline, status, dry_run, started_at,
+      finished_at, intents, changes: [{intent, target}], cost, violations, error_kinds,
+      error}, plan, error}` (`run_id` as soon as the run's row exists, from
+      `Runner.run(on_begin=)`, also when no record was saved; `run` is `null` when none
+      was, `plan` without `--dry-run`);
       `error_kinds` are the failed steps' kinds (also appended to the text error). **No LLM
       backend in M1**: a pipeline with an `llm` step fails with `llm_unavailable` (exit 1);
       M2 wires the backends into `open_ports(llm=...)`. **Signals** (follow-up of decision
       31 F): SIGINT and SIGTERM handlers (`loop.add_signal_handler`, removed afterwards)
-      cancel the run's task; the runner saves the partial record (`failed`, kind
-      `cancelled`), which is printed, and the command exits 130 / 143. A second signal is
-      the same cancellation; the runner's grace period bounds the stop. Secrets: the run's
-      error and messages come from the record and the host, which redact them; internal
-      errors print the exception type only;
+      cancel the run's task and the command exits 130 / 143, naming the run. **During the
+      engine phase** the runner saves the partial record (`failed`, kind `cancelled`),
+      which is printed. **The apply phase is shielded** (provisional): once it has started
+      planning, a cancellation is remembered, the apply finishes (each sink call bounded by
+      `call_timeout_s`), the record is saved with its real status (its changes were
+      applied: `ok`, say) and only then is the run reported interrupted; a cancellation
+      while it waits for the apply lock stops the wait (`failed`, "cancelled before
+      apply", nothing applied). If the run is nonetheless abandoned during the apply (a
+      crash), its error says "run crashed during apply (<type>); run `horae undo <id>` to
+      revert what was written", the command prints "abandoned during apply; run `horae
+      undo <id>`" and `--json` has the id; a cancellation that abandons a run says
+      `cancelled: ...`, never `run crashed (CancelledError)`. **A second signal while the
+      run stops is ignored**: the runner's grace period (`STOP_GRACE_S`) still bounds the
+      stop, after which the run is abandoned as before. Secrets: the run's error and
+      messages come from the record and the host, which redact them; internal errors print
+      the exception type only;
     - **sinks for `horae diff` and `horae undo`**: through the plugin host (`open_ports`,
       `McpSinks`) when the instance has a `plugins/` directory, so a run applied by
       `file-sink` is planned and undone by `file-sink` (decision 36's identity). `--vault`
@@ -948,4 +982,14 @@ loosened later without breaking a valid file.
       vault (`vault_unset`), as before. `horae diff` through the host starts the plugins,
       which only read (`<ns>.read`); the store is still opened read-only;
     - **where plugins are installed**: `<instance>/plugins/<name>/plugin.yaml`
-      (`horae.cli_host.PLUGINS_DIR`), until M4's `horae plugin add` (#44) decides otherwise.
+      (`horae.cli_host.PLUGINS_DIR`), until M4's `horae plugin add` (#44) decides otherwise;
+    - **`horae doctor`** checks, beyond the configuration (`check_instance`,
+      `horae.cli_host.instance_problems`): every `paths.read` / `paths.write` entry of
+      `horae.lock` exists; an instance with its own `vault/` that the lock does not write
+      to is a problem (a copied instance still writing to the original's vault); with a
+      `plugins/` directory, the plugins match the lock (`check_plugins`) and each stdio
+      command (its pinned interpreter) exists and is executable (`resolve_command`). Each
+      is a problem (exit 1) naming `horae.lock` or the plugin's manifest;
+    - **follow-ups** (out of scope here): enforcing the manifests' `horae` version range
+      against `horae.__version__`; whether a second identical run should be `noop` rather
+      than `ok`.

@@ -47,11 +47,14 @@ uv run horae run daily-fixture -i /tmp/walking-skeleton
 To use this directory instead, **copy it first** (the end-to-end tests read these files, and
 `state/` and `plugins/` must not be created inside the checkout), set `file-sink`'s
 `paths.write` in the copy's `horae.lock` to your vault, and install the plugins:
-`python -c 'from pathlib import Path; from horae.plugins.builtin import install;
-install(Path("/tmp/copy/plugins"))'`. `horae diff`, `horae undo` and `horae run` then go
+`uv run python -c 'from pathlib import Path; from horae.plugins.builtin import install;
+install(Path("/tmp/copy/plugins"))'` (from the checkout, so the interpreter pinned in the
+manifests has Horae). `horae diff`, `horae undo` and `horae run` then go
 through those plugins; `horae diff --vault` / `horae undo --vault` use the built-in local
 sinks instead (whose identity differs from `file-sink`'s, so undo refuses, `sink_mismatch`, a
 run applied through the plugin).
 
 `state/` and `plugins/` are created next to the files of your copy; they are not part of the
-example.
+example. The copy is not relocatable either (absolute paths in `horae.lock` and in the
+installed manifests): `horae doctor` reports a lock path that does not exist and a plugin
+command that is not executable.

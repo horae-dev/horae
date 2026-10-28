@@ -16,22 +16,26 @@
   lock);
 - `70` `EXIT_INTERNAL`: internal error (`EX_SOFTWARE`); only the exception's type is printed;
 - `130` / `143` `EXIT_SIGINT` / `EXIT_SIGTERM`: `horae run` was interrupted (128 + the
-  signal); its partial record is saved `failed`, kind `cancelled`.
+  signal): before its apply, its partial record is saved `failed`, kind `cancelled`; during
+  its apply, the apply finishes and the record is saved first. A `KeyboardInterrupt` that
+  reaches any command (outside `horae run`'s handlers) is `130` too, kind `interrupted`.
 
 **Output.** Text goes to stdout, errors to stderr as `horae <command>: <message>`, every
 untrusted character escaped (`safe`: control, bidi, zero-width and separator characters).
 No colour unless asked (`horae diff --color`). With `--json` every command prints exactly
 one JSON document on stdout, `schema_version: 1`, ASCII only, strict (no `NaN`), errors
 included: `{"schema_version": 1, "error": {"kind", "message"}}` (usage errors too, kind
-`usage`). Nothing printed is ever a secret value: an internal error shows its exception
-type only, never its message, traceback or locals.
+`usage`, also those of the `horae` group itself: `horae --json`, `horae nope --json`).
+Nothing printed is ever a secret value: an internal error shows its exception type only,
+never its message, traceback or locals.
 """
 
 from collections.abc import Callable
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn
 
 import typer
-from typer.core import TyperCommand
+from typer.core import TyperCommand, TyperGroup
 
 from horae.apply.render import dumps, safe
 
@@ -74,6 +78,17 @@ class CommandFailed(Exception):
         self.code, self.kind, self.message = code, kind, message
 
 
+def io_failed(exc: OSError, where: Path | str, store: Path | None = None) -> CommandFailed:
+    """`CommandFailed` for an `OSError`: `store_error` when it names the store's files
+    (`store` and its `-wal`, `-shm`, lock files), else `io_error`; the file it names (or
+    `where`) and its `strerror`, never the exception's full text."""
+    named = exc.filename if isinstance(exc.filename, (str, Path)) else None
+    reason = exc.strerror or type(exc).__name__
+    if named is not None and store is not None and str(named).startswith(str(store)):
+        return CommandFailed(EXIT_PROBLEMS, "store_error", f"{named}: {reason}")
+    return CommandFailed(EXIT_PROBLEMS, "io_error", f"{named or where}: {reason}")
+
+
 def plural(count: int, word: str, plurals: str | None = None) -> str:
     return f"{count} {word if count == 1 else plurals or word + 's'}"
 
@@ -112,6 +127,10 @@ def run_command(command: str, json_output: bool, body: Callable[[], int]) -> NoR
     except CommandFailed as failed:
         report_error(command, failed.kind, failed.message, json_output)
         code = failed.code
+    except KeyboardInterrupt:
+        # Ctrl-C outside `horae run`'s own signal handling (or before it is installed).
+        report_error(command, "interrupted", "interrupted by SIGINT", json_output)
+        code = EXIT_SIGINT
     except Exception as exc:
         message = internal_message(exc)
         del exc
@@ -129,6 +148,18 @@ def _wants_json(args: list[str]) -> bool:
     return False
 
 
+def _json_usage_error(error: Exception, wants_json: bool) -> None:
+    """Under `--json`, a usage error (Typer's vendored, private `UsageError`: exit code 2 and
+    `format_message`) becomes a JSON error document and `typer.Exit(2)`; else it is
+    re-raised by the caller."""
+    format_message = getattr(error, "format_message", None)
+    if not wants_json or getattr(error, "exit_code", None) != EXIT_USAGE:
+        return
+    message = format_message() if callable(format_message) else "usage error"
+    echo_json(error_document("usage", str(message)))
+    raise typer.Exit(EXIT_USAGE) from None
+
+
 class JsonUsageCommand(TyperCommand):
     """A command whose usage errors (exit 2) are a JSON error object on stdout when `--json`
     is among its arguments, like every other error."""
@@ -144,13 +175,36 @@ class JsonUsageCommand(TyperCommand):
         try:
             return super().make_context(info_name, args, parent, **extra)
         except Exception as error:
-            # Typer's (vendored, private) `UsageError`: exit code 2 and `format_message`.
-            format_message = getattr(error, "format_message", None)
-            if not wants_json or getattr(error, "exit_code", None) != EXIT_USAGE:
-                raise
-            message = format_message() if callable(format_message) else "usage error"
-            echo_json(error_document("usage", str(message)))
-            raise typer.Exit(EXIT_USAGE) from None
+            _json_usage_error(error, wants_json)
+            raise
+
+
+class JsonUsageGroup(TyperGroup):
+    """The `horae` group: its own usage errors (`horae --json`, `horae nope --json`, an
+    unknown option before the command) are a JSON error object too when `--json` is among
+    the arguments (before any `--`)."""
+
+    def make_context(
+        self,
+        info_name: str | None,
+        args: list[str],
+        parent: "Context | None" = None,
+        **extra: Any,
+    ) -> "Context":
+        wants_json = _wants_json(list(args))
+        try:
+            return super().make_context(info_name, args, parent, **extra)
+        except Exception as error:
+            _json_usage_error(error, wants_json)
+            raise
+
+    def resolve_command(self, ctx: "Context", args: list[str]) -> Any:
+        wants_json = _wants_json(list(args))
+        try:
+            return super().resolve_command(ctx, args)
+        except Exception as error:
+            _json_usage_error(error, wants_json)
+            raise
 
 
 __all__ = [
@@ -167,9 +221,11 @@ __all__ = [
     "SCHEMA_VERSION",
     "CommandFailed",
     "JsonUsageCommand",
+    "JsonUsageGroup",
     "echo_json",
     "error_document",
     "internal_message",
+    "io_failed",
     "plural",
     "report_error",
     "run_command",

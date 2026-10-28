@@ -50,15 +50,20 @@ def _today() -> str:
     return datetime.datetime.now(datetime.UTC).date().isoformat()
 
 
+def _same_day(day: str) -> None:
+    """Skip when the date changed since `day`: the run wrote another day's note."""
+    if _today() != day:  # pragma: no cover - the test ran across midnight UTC
+        pytest.skip("the date changed during the test")
+
+
 def test_init_doctor_run_runs_diff_replay_undo(tmp_path: Path) -> None:
     root = tmp_path / "instance"
-    day = _today()
-    note = f"Daily/{day}.assistant.md"
-
     code, created = _cli("init", str(root))
     assert code == 0, created
     root = Path(created["instance"])
     vault = Path(created["vault"])
+    day = _today()
+    note = f"Daily/{day}.assistant.md"
     (vault / "Daily").mkdir()
     (vault / note).write_bytes(ORIGINAL)
     original = _contents(vault)
@@ -79,6 +84,7 @@ def test_init_doctor_run_runs_diff_replay_undo(tmp_path: Path) -> None:
         code, dry = _cli("run", "daily-fixture", "-i", str(root), "--dry-run")
     assert seen == [], f"the dry run tried to write: {seen}"
     assert code == 0, dry
+    _same_day(day)  # before any assertion on today's note
     assert dry["error"] is None
     assert dry["run"]["dry_run"] is True
     (planned,) = dry["plan"]["files"]
@@ -94,6 +100,7 @@ def test_init_doctor_run_runs_diff_replay_undo(tmp_path: Path) -> None:
     # The run writes the note through file-sink.
     code, run = _cli("run", "daily-fixture", "-i", str(root))
     assert code == 0, run
+    _same_day(day)
     assert run["run"]["status"] == "ok"
     assert run["run"]["changes"] == [{"intent": 0, "target": note}]
     assert (vault / note).read_bytes() == ORIGINAL + b"\r\n" + BLOCK
@@ -126,8 +133,7 @@ def test_init_doctor_run_runs_diff_replay_undo(tmp_path: Path) -> None:
     assert undone["complete"] is True
     (restored,) = undone["notes"]
     assert restored["sink_identity"].startswith("mcp:file-sink:local:")
-    if _today() != day:  # pragma: no cover - the test ran across midnight UTC
-        pytest.skip("the date changed during the test")
+    _same_day(day)
     assert _contents(vault) == original
     code, listed = _cli("runs", "-i", str(root), "--status", "undone")
     assert [r["id"] for r in listed["runs"]] == [run_id]

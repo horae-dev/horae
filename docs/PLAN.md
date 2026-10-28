@@ -262,7 +262,7 @@ Each milestone has a **"done when"** you can check. Time assumes evenings and we
 - [ ] Pipeline loader and engine (`collect → transform → act`), the run record, SQLite store, journal, `--dry-run` diff, `undo`.
 - [ ] Plugin host: start an MCP stdio subprocess with only its declared secrets, call tools, check intents against declarations.
 - [ ] Built-in plugins for tests: `fixture-source` and `file-sink`.
-- [ ] **Done when:** a fixture pipeline writes a note, `--dry-run` shows the diff and writes nothing, `undo` restores it, and a replay gives the same output.
+- [x] **Done when:** a fixture pipeline writes a note, `--dry-run` shows the diff and writes nothing, `undo` restores it, and a replay gives the same output.
 
 ### M2 — The LLM step (4–5 days)
 - [ ] Skills format: prompt, input view and output schema, versioned.

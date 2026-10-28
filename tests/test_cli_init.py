@@ -14,7 +14,7 @@ from horae import cli_init
 from horae.cli import EXIT_OK, EXIT_PROBLEMS, EXIT_REFUSED, app
 from horae.config import check_instance, load_instance
 from horae.contracts import Lockfile
-from horae.plugins.builtin import BUILTIN, InstallError
+from horae.plugins.builtin import BUILTIN, InstallError, install
 from horae.plugins.host import HostRegistry
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "walking-skeleton"
@@ -75,12 +75,19 @@ def test_init_files_are_the_examples(tmp_path: Path) -> None:
 def test_init_in_the_current_directory_text_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    before = os.stat(tmp_path)
     monkeypatch.chdir(tmp_path)
     code, out = _init()
     assert code == EXIT_OK, out
     assert out.splitlines()[0] == f"created a Horae instance in {tmp_path.resolve()}"
     assert f"horae run daily-fixture --dry-run -i {tmp_path.resolve()}" in out
+    assert "not relocatable" in out
     assert (tmp_path / "horae.yaml").is_file()
+    # The existing empty directory is filled in place (a shell inside it stays there).
+    after = os.stat(tmp_path)
+    assert (after.st_ino, after.st_dev) == (before.st_ino, before.st_dev)
+    assert not [p for p in tmp_path.iterdir() if p.name.startswith(".horae-init-")]
+    assert check_instance(tmp_path).ok
 
 
 def test_init_refuses_a_non_empty_directory(tmp_path: Path) -> None:
@@ -116,6 +123,8 @@ def test_init_refuses_a_file_or_a_symbolic_link(tmp_path: Path) -> None:
 def test_init_reports_write_and_install_failures(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    if os.geteuid() == 0:  # pragma: no cover - root ignores the mode
+        pytest.skip("permissions are not enforced for root")
     locked = tmp_path / "locked"
     locked.mkdir()
     locked.chmod(0o500)
@@ -133,3 +142,59 @@ def test_init_reports_write_and_install_failures(
     code, out = _init(str(tmp_path / "other"))
     assert code == EXIT_PROBLEMS
     assert "horae init: no interpreter" in out
+
+
+def _leftovers(directory: Path) -> list[str]:
+    return sorted(p.name for p in directory.iterdir())
+
+
+def test_a_path_the_lock_cannot_hold_writes_nothing(tmp_path: Path) -> None:
+    target = tmp_path / "new" / "back\\slash"
+    code, out = _init(str(target), "--json")
+    assert code == EXIT_PROBLEMS == 1
+    error = json.loads(out)["error"]
+    assert error["kind"] == "target_invalid"
+    assert "nothing was written" in error["message"]
+    assert _leftovers(tmp_path) == []
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_an_install_failure_mid_way_leaves_nothing_behind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, existing: bool
+) -> None:
+    real = install
+
+    def half(directory: Path, *, python: str | None = None) -> dict[str, Path]:
+        real(directory, python=python)  # the plugins are written, then it fails
+        raise InstallError("no interpreter")
+
+    monkeypatch.setattr(cli_init, "install", half)
+    target = tmp_path / "new" / "instance"
+    if existing:
+        target.mkdir(parents=True)
+    code, out = _init(str(target), "--json")
+    assert code == EXIT_PROBLEMS
+    assert json.loads(out)["error"]["kind"] == "install_failed"
+    if existing:
+        assert _leftovers(target) == []  # still the empty directory it was
+    else:
+        assert _leftovers(tmp_path) == []  # nor `new/`, which init created
+
+
+def test_a_target_created_meanwhile_is_not_overwritten(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "instance"
+    real = install
+
+    def racing(directory: Path, *, python: str | None = None) -> dict[str, Path]:
+        target.mkdir()
+        (target / "mine.md").write_text("mine", encoding="utf-8")
+        return real(directory, python=python)
+
+    monkeypatch.setattr(cli_init, "install", racing)
+    code, out = _init(str(target), "--json")
+    assert code == EXIT_REFUSED
+    assert json.loads(out)["error"]["kind"] == "target_not_empty"
+    assert _leftovers(target) == ["mine.md"]
+    assert _leftovers(tmp_path) == ["instance"]

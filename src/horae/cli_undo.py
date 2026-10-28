@@ -42,6 +42,7 @@ from horae.cli_output import (
     EXIT_REFUSED,
     CommandFailed,
     echo_json,
+    io_failed,
     plural,
     run_command,
 )
@@ -129,8 +130,10 @@ def _undo(instance: Path, run_id: str, vault: Path | None, force: bool) -> UndoR
                     return asyncio.run(restore())
     except UnknownRun:
         raise CommandFailed(EXIT_UNKNOWN_RUN, "unknown_run", f"unknown run {run_id!r}") from None
-    except (StoreError, OSError) as exc:
+    except StoreError as exc:
         raise CommandFailed(EXIT_PROBLEMS, "store_error", f"{path}: {exc}") from None
+    except OSError as exc:
+        raise io_failed(exc, state_dir, store=path) from None
 
 
 def _report(instance: Path, run_id: str, vault: Path | None, force: bool, json: bool) -> int:

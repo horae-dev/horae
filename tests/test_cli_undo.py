@@ -134,7 +134,7 @@ def test_undo_store_and_internal_errors(
             pytest.skip("permissions are not enforced")
         result = _undo(RUN_ID, "-i", str(applied), "--json")
         assert result.exit_code == cli_undo.EXIT_PROBLEMS
-        assert json.loads(result.stdout)["error"]["kind"] == "store_error"
+        assert json.loads(result.stdout)["error"]["kind"] == "store_error", result.stdout
     finally:
         os.chmod(db, 0o600)
 

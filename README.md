@@ -43,7 +43,7 @@ instance's own `vault/`, through the two built-in plugins. No LLM, no secret, no
 
 ```sh
 uv run horae init ~/horae-demo            # horae.yaml, a pipeline, horae.lock, vault/, plugins/
-uv run horae doctor -i ~/horae-demo       # checks the configuration: "OK: 1 pipeline, 2 plugins"
+uv run horae doctor -i ~/horae-demo       # "OK: 1 pipeline, 2 plugins, 0 model aliases"
 uv run horae run daily-fixture -i ~/horae-demo --dry-run   # the diff; nothing written
 uv run horae run daily-fixture -i ~/horae-demo             # writes vault/Daily/<today>.assistant.md
 uv run horae runs -i ~/horae-demo                          # runs, newest first
@@ -56,7 +56,15 @@ uv run horae undo <run-id> -i ~/horae-demo     # restores every note the run cha
 for scripting (one JSON document on stdout, `schema_version: 1`, errors too) and prints no
 colour unless asked. `horae run` has no LLM backend in M1: a pipeline with an `llm` step
 fails with `llm_unavailable` (M2 adds the backends). SIGINT or SIGTERM stops a run
-cooperatively and saves its partial record.
+cooperatively and names it: before the apply its partial record is saved `failed`; once the
+apply has started it finishes (each sink call is bounded by its timeout) and the record is
+saved before the run is reported interrupted (a second signal is ignored).
+
+An instance is **not relocatable** in v1: `horae.lock` holds the vault's absolute path and
+`plugins/` the absolute path of the interpreter that installed them. After copying or moving
+one, `horae doctor` reports the paths that no longer match (a lock path that does not exist,
+an own `vault/` the lock does not write to, a plugin command that is not executable); fix
+the lock, or run `horae init` in the new place.
 
 **Exit codes**, the same for every command ([decision 37](schemas/README.md)):
 

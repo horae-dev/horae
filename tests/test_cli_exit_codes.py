@@ -75,6 +75,27 @@ def test_usage_errors_are_json_under_json(command: str) -> None:
     assert runner.invoke(app, [command, "--bogus", "--", "--json"]).stdout == ""
 
 
+@pytest.mark.parametrize(
+    ("args", "message"),
+    [
+        (["nope", "--json"], "No such command 'nope'."),
+        (["--json"], "No such option: --json"),
+        (["--bogus", "run", "--json"], "No such option: --bogus"),
+    ],
+)
+def test_top_level_usage_errors_are_json_under_json(args: list[str], message: str) -> None:
+    result = runner.invoke(app, args)
+    assert result.exit_code == cli.EXIT_USAGE
+    document = json.loads(result.stdout)
+    assert sorted(document) == ["error", "schema_version"]
+    assert document["schema_version"] == 1
+    assert document["error"]["kind"] == "usage"
+    assert document["error"]["message"].startswith(message)
+    text = runner.invoke(app, [arg for arg in args if arg != "--json"] or ["--bogus"])
+    assert text.exit_code == cli.EXIT_USAGE
+    assert text.stdout == ""
+
+
 @pytest.mark.parametrize("command", ["run", "diff", "undo", "replay"])
 def test_a_missing_argument_is_a_json_usage_error(command: str) -> None:
     result = runner.invoke(app, [command, "--json"])

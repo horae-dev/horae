@@ -4,9 +4,11 @@
 import json
 import logging
 import re
+import shutil
 from pathlib import Path
 
 import pytest
+import yaml
 from typer.testing import CliRunner
 
 from horae import cli
@@ -168,3 +170,86 @@ def test_internal_error_with_a_resolved_secret_prints_no_value(
 def test_tracebacks_never_show_local_variables() -> None:
     # Rich tracebacks with locals would print resolved secret values on a crash.
     assert app.pretty_exceptions_show_locals is False
+
+
+def _created(tmp_path: Path, name: str = "instance") -> Path:
+    result = runner.invoke(app, ["init", str(tmp_path / name), "--json"])
+    assert result.exit_code == 0, result.output
+    return Path(json.loads(result.stdout)["instance"])
+
+
+def _report(root: Path) -> tuple[int, dict[str, object]]:
+    result = runner.invoke(app, ["doctor", "-i", str(root), "--json"])
+    report: dict[str, object] = json.loads(result.stdout)
+    return result.exit_code, report
+
+
+def _messages(report: dict[str, object]) -> list[str]:
+    problems = report["problems"]
+    assert isinstance(problems, list)
+    return [f"{p['file']}: {p['message']}" for p in problems]
+
+
+def test_doctor_json_instance_is_the_resolved_absolute_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _created(tmp_path)
+    monkeypatch.chdir(root)
+    code, report = _report(Path())
+    assert code == 0, report
+    assert report["instance"] == str(root.resolve())
+
+
+def test_doctor_reports_a_copied_instance(tmp_path: Path) -> None:
+    """`cp -R`: the copy's lock still writes to the original's vault."""
+    original = _created(tmp_path)
+    copy = tmp_path / "copy"
+    shutil.copytree(original, copy, symlinks=True)
+    code, report = _report(copy)
+    assert code == cli.EXIT_PROBLEMS
+    (message,) = _messages(report)
+    assert message.startswith("horae.lock: the instance has its own vault/")
+    assert f"horae.lock writes to {original / 'vault'}" in message
+    assert "not relocatable" in message
+    assert _report(original)[0] == 0
+
+
+def test_doctor_reports_a_moved_instance(tmp_path: Path) -> None:
+    """`mv`: the lock's vault no longer exists."""
+    original = _created(tmp_path)
+    moved = tmp_path / "moved"
+    original.rename(moved)
+    code, report = _report(moved)
+    assert code == cli.EXIT_PROBLEMS
+    messages = _messages(report)
+    assert (
+        f"horae.lock: plugins.file-sink.permissions.paths.write: {original / 'vault'} does not "
+        "exist"
+    ) in messages[0]
+    assert any("has its own vault/" in m for m in messages)
+    text = runner.invoke(app, ["doctor", "-i", str(moved)])
+    assert text.exit_code == cli.EXIT_PROBLEMS
+    assert text.output.splitlines()[-1] == "2 problems found"
+
+
+def test_doctor_reports_a_broken_plugin_interpreter(tmp_path: Path) -> None:
+    root = _created(tmp_path)
+    manifest = root / "plugins" / "file-sink" / "plugin.yaml"
+    data = yaml.safe_load(manifest.read_text(encoding="utf-8"))
+    data["runtime"]["command"][0] = str(tmp_path / "gone" / "python")
+    manifest.write_text(yaml.safe_dump(data), encoding="utf-8")
+    code, report = _report(root)
+    assert code == cli.EXIT_PROBLEMS
+    (message,) = _messages(report)
+    assert message.startswith("plugins/file-sink/plugin.yaml: runtime.command: ")
+    assert "not found or not executable" in message
+
+
+def test_doctor_reports_plugins_that_do_not_match_the_lock(tmp_path: Path) -> None:
+    root = _created(tmp_path)
+    (root / "plugins" / "fixture-source" / "plugin.yaml").unlink()
+    code, report = _report(root)
+    assert code == cli.EXIT_PROBLEMS
+    (message,) = _messages(report)
+    assert message.startswith("plugins/: ")
+    assert "horae init" in message

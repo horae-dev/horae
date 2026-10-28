@@ -20,7 +20,7 @@ from pydantic import ValidationError
 from horae import __version__
 from horae.apply import LocalSink, SinkRegistry, StaticSinks, plan_changes, to_json
 from horae.apply.render import render_text
-from horae.cli_host import host_sinks, load, uses_host
+from horae.cli_host import host_sinks, instance_problems, load, uses_host
 from horae.cli_output import (
     EXIT_DIFFERENT,
     EXIT_INTERNAL,
@@ -34,11 +34,14 @@ from horae.cli_output import (
     SCHEMA_VERSION,
     CommandFailed,
     JsonUsageCommand,
+    JsonUsageGroup,
     echo_json,
     internal_message,
+    io_failed,
     plural,
     report_error,
     run_command,
+    safe,
 )
 from horae.config import (
     CONFIG_FILE,
@@ -69,6 +72,8 @@ app = typer.Typer(
     epilog=EXIT_CODES_HELP,
     no_args_is_help=True,
     add_completion=False,
+    # `horae --json` and `horae nope --json`: JSON usage errors too.
+    cls=JsonUsageGroup,
     # Never print local variables in tracebacks: they may hold secret values.
     pretty_exceptions_show_locals=False,
 )
@@ -115,18 +120,22 @@ REPORT_SCHEMA_VERSION = SCHEMA_VERSION
 
 def _report(instance: Path, json_output: bool) -> int:
     result = check_instance(instance)
+    problems = list(result.problems)
+    if result.instance is not None:
+        problems.extend(instance_problems(result.instance))
+    ok = not problems
     if json_output:
         report = {
             "schema_version": REPORT_SCHEMA_VERSION,
-            "ok": result.ok,
-            "instance": str(instance),
-            "problems": [problem.to_dict() for problem in result.problems],
+            "ok": ok,
+            "instance": str(instance.resolve()),
+            "problems": [problem.to_dict() for problem in problems],
         }
         echo_json(report)
     else:
-        for problem in result.problems:
-            typer.echo(str(problem))
-        if result.ok and result.instance is not None:
+        for problem in problems:
+            typer.echo(safe(str(problem)))
+        if ok and result.instance is not None:
             loaded = result.instance
             typer.echo(
                 f"OK: {_plural(len(loaded.pipelines), 'pipeline')}, "
@@ -134,8 +143,8 @@ def _report(instance: Path, json_output: bool) -> int:
                 f"{_plural(len(loaded.config.models), 'model alias', 'model aliases')}"
             )
         else:
-            typer.echo(_plural(len(result.problems), "problem") + " found")
-    return EXIT_OK if result.ok else EXIT_PROBLEMS
+            typer.echo(_plural(len(problems), "problem") + " found")
+    return EXIT_OK if ok else EXIT_PROBLEMS
 
 
 InstanceDir = Annotated[
@@ -156,7 +165,12 @@ def doctor(
     instance: InstanceDir = Path(),
     json_output: Annotated[bool, typer.Option("--json", help="Print the report as JSON.")] = False,
 ) -> None:
-    """Check the instance configuration, pipelines, lockfile and secrets.
+    """Check the instance configuration, pipelines, lockfile, secrets and installed plugins.
+
+    Also checks that every path of horae.lock exists, that the instance's own vault/ is the
+    one horae.lock writes to (instances are not relocatable in v1: a copied or moved
+    instance is reported), and, with a plugins/ directory, that the plugins are installed
+    as horae.lock pins them and their commands (interpreters) are executable.
 
     Exit codes: 0 no problem, 1 problems found, 2 usage error, 70 internal error.
     Secret values are never printed. With --json: {schema_version, ok, instance, problems};
@@ -286,8 +300,10 @@ def _list_runs(
                     status=None if status is None else status.value,
                     limit=limit,
                 )
-    except (StoreError, OSError) as exc:
+    except StoreError as exc:
         raise CommandFailed(EXIT_PROBLEMS, "store_error", f"{path}: {exc}") from None
+    except OSError as exc:
+        raise io_failed(exc, path, store=path) from None
     # A `running` row whose pipeline lock is free has no live process: the next run of the
     # pipeline will abandon it. Checked without waiting and without creating anything.
     stale = [
@@ -380,8 +396,10 @@ def _diff(instance: Path, run_id: str, vault: Path | None, json_output: bool, co
                     )
 
             changes = asyncio.run(plan())
-    except (StoreError, OSError) as exc:
+    except StoreError as exc:
         raise CommandFailed(EXIT_PROBLEMS, "store_error", f"{path}: {exc}") from None
+    except OSError as exc:
+        raise io_failed(exc, path, store=path) from None
     if json_output:
         typer.echo(to_json(changes))
     else:
@@ -443,8 +461,10 @@ def _replay(instance: Path, store: Path | None, run_id: str, against_current: bo
             "not_comparable",
             f"run {run_id!r}: its record is not a valid v1 run record",
         ) from None
-    except (StoreError, OSError) as exc:
+    except StoreError as exc:
         raise CommandFailed(EXIT_PROBLEMS, "store_error", f"{path}: {exc}") from None
+    except OSError as exc:
+        raise io_failed(exc, path, store=path) from None
     if record is None:
         raise CommandFailed(
             EXIT_REFUSED, "unknown_run", f"unknown run {run_id!r} (or still running, or abandoned)"
@@ -478,6 +498,14 @@ def _replay(instance: Path, store: Path | None, run_id: str, against_current: bo
 _REPLAY_CODES = {"identical": EXIT_OK, "different": EXIT_DIFFERENT, "error": EXIT_REFUSED}
 
 
+def _replay_json(result: ReplayResult, kind: str) -> dict[str, Any]:
+    """The replay report with `error` as every command's `{kind, message}` (or `null`)."""
+    report = result.to_dict()
+    error = report.get("error")
+    report["error"] = None if error is None else {"kind": kind, "message": error}
+    return report
+
+
 def _replay_report(
     instance: Path, store: Path | None, run_id: str, against_current: bool, json_output: bool
 ) -> int:
@@ -494,10 +522,10 @@ def _replay_report(
             against_current=against_current,
             error=failed.message,
         )
-        echo_json(result.to_dict())
+        echo_json(_replay_json(result, failed.kind))
         return failed.code
     if json_output:
-        echo_json(result.to_dict())
+        echo_json(_replay_json(result, "not_comparable"))
     else:
         typer.echo(result.render())
     return _REPLAY_CODES[result.outcome]
@@ -534,7 +562,8 @@ def replay_command(
     3 unknown run (or no store) or not comparable (pipeline, horae.lock or horae.yaml changed
     without --against-current, unresolved plugin, a call the record cannot answer, a record
     that is not replayable); 4 different; 70 internal error. With --json the report has every
-    key, also on errors (outcome `error`)."""
+    key, also on errors (outcome `error`, and `error` is {kind, message} like every
+    command's; `null` otherwise)."""
     run_command(
         "replay",
         json_output,
