@@ -1,0 +1,11 @@
+{
+  "status": 500,
+  "body": {
+    "error": {
+      "message": "Synthetic: internal error",
+      "type": "server_error",
+      "param": null,
+      "code": null
+    }
+  }
+}

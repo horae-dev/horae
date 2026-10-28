@@ -1,0 +1,11 @@
+{
+  "status": 429,
+  "body": {
+    "error": {
+      "message": "Synthetic: rate limit exceeded",
+      "type": "rate_limit_error",
+      "param": null,
+      "code": "rate_limit_exceeded"
+    }
+  }
+}

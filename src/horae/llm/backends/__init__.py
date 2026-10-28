@@ -1,18 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 """The built-in provider backends, by name (`models.<alias>.backend` in `horae.yaml`).
 
-Only `anthropic` (#28) is implemented; `claude-cli` (#29), `openai-compatible` and `ollama`
-(#30) add their factory to `FACTORIES` when they land. `horae doctor` reports a model alias
+`anthropic` (#28), `openai-compatible` and `ollama` (#30) are implemented; `claude-cli` (#29)
+adds its factory to `FACTORIES` when it lands. `horae doctor` reports a model alias
 used by a pipeline whose backend is not in `FACTORIES`."""
 
 from collections.abc import Mapping
 
 from horae.contracts.instance import ModelAlias
 from horae.llm.backends.anthropic import AnthropicBackend, anthropic_backend
+from horae.llm.backends.ollama import OllamaBackend, ollama_backend
+from horae.llm.backends.openai_compatible import (
+    OpenAICompatibleBackend,
+    openai_compatible_backend,
+)
 from horae.llm.base import BackendFactory, ModelBackends, PromptSource, RequestPrompts, Validator
 from horae.secrets import SecretResolver
 
-FACTORIES: Mapping[str, BackendFactory] = {"anthropic": anthropic_backend}
+FACTORIES: Mapping[str, BackendFactory] = {
+    "anthropic": anthropic_backend,
+    "openai-compatible": openai_compatible_backend,
+    "ollama": ollama_backend,
+}
 """The available backends."""
 
 
@@ -33,4 +42,10 @@ def model_backends(
     )
 
 
-__all__ = ["FACTORIES", "AnthropicBackend", "model_backends"]
+__all__ = [
+    "FACTORIES",
+    "AnthropicBackend",
+    "OllamaBackend",
+    "OpenAICompatibleBackend",
+    "model_backends",
+]

@@ -138,8 +138,9 @@ def test_a_rejected_output_is_charged(inst: Instance, store: Store, text: str) -
     assert record.status == "degraded"
     assert record.steps[1].error is not None
     assert record.steps[1].error.kind == "output_invalid"
-    assert (record.cost.tokens_in, record.cost.tokens_out) == (1200, 45)
-    assert record.cost.usd == pytest.approx((1200 * 3 + 45 * 15) / 1e6)
+    out = max(45, min(-(-len(text.encode()) // 4), 2000))  # floored by the output's size
+    assert (record.cost.tokens_in, record.cost.tokens_out) == (1200, out)
+    assert record.cost.usd == pytest.approx((1200 * 3 + out * 15) / 1e6)
 
 
 def test_uses_llm(inst: Instance, tmp_path: Path) -> None:
@@ -341,3 +342,58 @@ def test_doctor_warnings_do_not_hide_errors(tmp_path: Path) -> None:
     assert severities == ["error", "warning"]
     text = runner.invoke(app, ["doctor", "-i", str(root)])
     assert "1 problem found" in text.stdout
+
+
+# --- openai-compatible and ollama (#30, decision 40) ----------------------------------------
+
+OLLAMA = {"backend": "ollama", "model": "llama3", "base_url": "http://ollama:11434"}
+OPENAI = {
+    "backend": "openai-compatible",
+    "model": "mistral-small",
+    "base_url": "https://llm-gateway.internal.test/v1",
+}
+
+
+def test_doctor_accepts_an_unpriced_ollama_alias(tmp_path: Path) -> None:
+    root = _write(tmp_path / "instance", {"default": OLLAMA}, [LLM_STEP])
+    code, report = _doctor(root)
+    assert (code, report["problems"]) == (0, [])  # local: no price warning
+
+
+def test_doctor_warns_about_an_unpriced_openai_compatible_alias(tmp_path: Path) -> None:
+    root = _write(tmp_path / "instance", {"default": OPENAI}, [LLM_STEP])
+    code, report = _doctor(root)
+    assert code == 0
+    [warning] = report["problems"]
+    assert warning["severity"] == "warning"
+    assert "backend 'openai-compatible'" in warning["message"]
+
+
+def test_doctor_reports_a_missing_openai_compatible_secret(tmp_path: Path) -> None:
+    spec = {**OPENAI, "secret": "LLM_API_KEY", "price": ANTHROPIC["price"]}
+    root = _write(tmp_path / "instance", {"default": spec}, [LLM_STEP])
+    code, report = _doctor(root)
+    assert code == 1
+    assert any("LLM_API_KEY" in p["message"] for p in report["problems"])
+
+
+def test_doctor_warns_about_a_key_sent_over_http(tmp_path: Path) -> None:
+    spec = {**OLLAMA, "secret": "ANTHROPIC_API_KEY"}  # a secret file `_write` creates
+    root = _write(tmp_path / "instance", {"default": spec}, [LLM_STEP])
+    code, report = _doctor(root)
+    assert code == 0  # a warning does not fail the check
+    [warning] = report["problems"]
+    assert warning["severity"] == "warning"
+    assert warning["message"].startswith("models.default.secret: model alias 'default'")
+    assert "in clear text over http://" in warning["message"]
+    assert DECLARED_VALUE not in json.dumps(report)
+
+
+def test_doctor_does_not_warn_about_a_key_over_https_or_no_key_over_http(
+    tmp_path: Path,
+) -> None:
+    https = {**OPENAI, "secret": "ANTHROPIC_API_KEY", "price": ANTHROPIC["price"]}
+    for name, spec in (("https", https), ("keyless", OLLAMA)):
+        root = _write(tmp_path / name, {"default": spec}, [LLM_STEP])
+        code, report = _doctor(root)
+        assert (code, report["problems"]) == (0, [])

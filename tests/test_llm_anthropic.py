@@ -31,6 +31,7 @@ from horae.llm import (
     max_tokens,
 )
 from horae.llm.backends import FACTORIES, AnthropicBackend, model_backends
+from horae.llm.backends._shared import BoundedTransport
 from horae.llm.backends.anthropic import (
     ANTHROPIC_VERSION,
     PLACEHOLDER_KEY,
@@ -719,7 +720,7 @@ def test_a_backend_without_a_factory_is_unavailable(secrets: SecretResolver) -> 
 
 
 def test_the_builtin_factories() -> None:
-    assert set(FACTORIES) == {"anthropic"}
+    assert set(FACTORIES) == {"anthropic", "openai-compatible", "ollama"}
 
 
 def test_request_prompts_need_the_skill_fields(secrets: SecretResolver) -> None:
@@ -821,11 +822,12 @@ def test_ambient_custom_headers_cannot_override_a_sent_header(
         "accept": "application/json",
         "content-type": "application/json",
         "content-length": str(len(sent.content)),
+        "accept-encoding": "identity",
         "anthropic-version": ANTHROPIC_VERSION,
         "user-agent": USER_AGENT,
         "x-api-key": DECLARED_VALUE,
     }
-    assert value not in str(sent.headers.raw)
+    assert value not in str(sent.headers.raw) or value == "identity"
 
 
 def test_the_host_header_keeps_the_alias_port(secrets: SecretResolver) -> None:
@@ -863,7 +865,9 @@ def test_the_client_ignores_ambient_proxies_netrc_and_ca_files(
         assert client.trust_env is False
         assert client.follow_redirects is False
         assert client._mounts == {}  # no proxy mount, from the environment or otherwise
-        transport = client._transport
+        bounded = client._transport
+        assert isinstance(bounded, BoundedTransport)  # every response is bounded
+        transport = bounded.inner
         assert isinstance(transport, httpx2.AsyncHTTPTransport)
         pool = transport._pool
         assert type(pool).__name__ == "AsyncConnectionPool"  # not a proxy pool
@@ -918,8 +922,10 @@ def test_unacceptable_json_is_output_invalid_and_charged(
     assert error.kind == "output_invalid"
     assert "not one JSON value" in error.message
     assert error.usage is not None
-    assert (error.usage.tokens_in, error.usage.tokens_out) == (1200, 45)
-    assert error.usage.usd == pytest.approx((1200 * 3 + 45 * 15) / 1e6)
+    # the reported 45 output tokens, floored by the output's size (at most max_tokens)
+    out = max(45, min(-(-len(text.encode()) // 4), 2000))
+    assert (error.usage.tokens_in, error.usage.tokens_out) == (1200, out)
+    assert error.usage.usd == pytest.approx((1200 * 3 + out * 15) / 1e6)
 
 
 # --- intents (decision 38 D) --------------------------------------------------------------
@@ -1098,3 +1104,15 @@ def test_send_of_an_unknown_alias_is_refused(secrets: SecretResolver) -> None:
         asyncio.run(other.send(rendered))
     assert info.value.kind == "invalid_request"
     assert recorder.requests == []
+
+
+def test_a_response_without_a_content_list_is_output_invalid(secrets: SecretResolver) -> None:
+    def answer(request: httpx2.Request) -> httpx2.Response:
+        _, body = fixture("success")
+        body["content"] = {"type": "text", "text": "{}"}
+        return httpx2.Response(200, json=body)
+
+    error = fails(backends(secrets, Recorder(answer)))
+    assert error.kind == "output_invalid"
+    assert "no content" in error.message
+    assert error.usage is not None

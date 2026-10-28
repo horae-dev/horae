@@ -47,6 +47,20 @@ BACKENDS_NEEDING_HTTPS: tuple[LlmBackend, ...] = ("anthropic",)
 """Cloud backends whose `base_url`, when given, must be `https://` (the API key and the data
 must not cross the network in clear; schemas decision 38 C)."""
 
+StructuredOutput = Literal["json_schema", "json_object", "none"]
+"""How an `openai-compatible` alias constrains the output (schemas decision 40):
+`json_schema` (the default) sends `response_format: {type: json_schema, ...}`, `json_object`
+sends `{type: json_object}` for a server without JSON Schema support, `none` sends no
+`response_format`; with the last two the schema is given in the system prompt."""
+
+BACKENDS_WITH_STRUCTURED_OUTPUT: tuple[LlmBackend, ...] = ("openai-compatible",)
+"""Backends whose alias may set `structured_output` and `max_tokens_field`."""
+
+MaxTokensField = Literal["max_tokens", "max_completion_tokens"]
+"""The request field an `openai-compatible` alias puts its output limit in (schemas decision
+40): `max_tokens` (the default, what most servers take) or `max_completion_tokens` (what
+OpenAI's reasoning models require, where it also bounds the hidden reasoning tokens)."""
+
 MAX_OUTPUT_TOKENS = 1_000_000
 """Largest `models.<alias>.max_output_tokens` accepted (a typo guard)."""
 
@@ -90,6 +104,8 @@ BACKEND_URL_PATTERN = (
 )
 _BACKEND_HOST = re.compile(r"^(https?)://(\[[^\]]*\]|[^/?:]+)")
 _ULA = ipaddress.IPv6Network("fc00::/7")
+_PORT_PREFIX = re.compile(r"^:[0-9]+")
+_ENCODED_SEPARATOR = re.compile(r"%(2f|2e|5c)", re.IGNORECASE)
 
 
 def _check_backend_url(url: str) -> str:
@@ -111,6 +127,11 @@ def _check_backend_url(url: str) -> str:
     for label in host.split("."):
         if label.startswith("xn--") and not _valid_a_label(label):
             raise ValueError("an `xn--` label is not a valid IDNA A-label")
+    path = _PORT_PREFIX.sub("", url[match.end() :]).split("?", 1)[0]
+    if _ENCODED_SEPARATOR.search(path):
+        raise ValueError("the path has an encoded `/`, `.` or `\\` (%2F, %2E, %5C)")
+    if any(segment in (".", "..") for segment in path.split("/")):
+        raise ValueError("the path has a `.` or `..` segment")
     return url
 
 
@@ -124,7 +145,9 @@ BackendUrl = Annotated[
 literal; `http://` only to a loopback address (`localhost`, `127.0.0.0/8`, `[::1]`), a
 private address (`10/8`, `172.16/12`, `192.168/16`, IPv6 ULA `fc00::/7`) or a single-label
 host such as a Compose service name (`ollama`). Optional port; no user info, fragment,
-backslash, whitespace or control characters (schemas README, decision 24)."""
+backslash, whitespace or control characters, and a path with no `.` / `..` segment and no
+encoded `/`, `.` or `\\` (`%2F`, `%2E`, `%5C`, which a server may decode into a traversal
+past the guard's path check; schemas README, decisions 24 and 40)."""
 
 
 MAX_PRICE_PER_MTOK = 10000.0
@@ -176,6 +199,22 @@ class ModelAlias(Contract):
                 {
                     "if": {
                         "required": ["backend"],
+                        "properties": {
+                            "backend": {"not": {"enum": list(BACKENDS_WITH_STRUCTURED_OUTPUT)}}
+                        },
+                    },
+                    "then": {
+                        "not": {
+                            "anyOf": [
+                                {"required": ["structured_output"]},
+                                {"required": ["max_tokens_field"]},
+                            ]
+                        }
+                    },
+                },
+                {
+                    "if": {
+                        "required": ["backend"],
                         "properties": {"backend": {"enum": list(BACKENDS_NEEDING_HTTPS)}},
                     },
                     "then": {
@@ -191,10 +230,15 @@ class ModelAlias(Contract):
     model: Token
     """The concrete model name for that backend."""
     base_url: BackendUrl | None = None
-    """Endpoint; required for `openai-compatible` and `ollama`. See `BackendUrl`."""
+    """Endpoint; required for `openai-compatible` and `ollama`. See `BackendUrl`. For
+    `openai-compatible` it is the API root **with** its version prefix, as the OpenAI SDKs
+    take it (`https://api.mistral.ai/v1`, `https://openrouter.ai/api/v1`,
+    `http://vllm:8000/v1`): requests go to `<base_url>/chat/completions`. For `ollama` it is
+    the server root (`http://ollama:11434`): requests go to `<base_url>/api/chat`."""
     secret: SecretName | None = None
     """The secret holding the backend's API key or token, e.g. `ANTHROPIC_API_KEY`; required
-    for `anthropic`."""
+    for `anthropic`, optional for `openai-compatible` and `ollama` (sent as `Authorization:
+    Bearer`; a local server usually needs none)."""
     price: ModelPrice | None = None
     """What the model costs, for `Usage.usd` and the step's `usd` budget. Without it a call
     is recorded with `usd: 0` and `priced: false`, and only `tokens_out` bounds the step
@@ -202,6 +246,13 @@ class ModelAlias(Contract):
     max_output_tokens: Annotated[StrictInt, Field(ge=1, le=MAX_OUTPUT_TOKENS)] | None = None
     """A cap on `max_tokens` for every call of this alias, below the step's `tokens_out`
     (e.g. the model's own output limit)."""
+    structured_output: StructuredOutput | None = None
+    """`openai-compatible` only: how the output is constrained (`json_schema` when unset, or
+    `json_object` / `none` for a server that lacks JSON Schema support). See
+    `StructuredOutput`."""
+    max_tokens_field: MaxTokensField | None = None
+    """`openai-compatible` only: the request field of the output limit (`max_tokens` when
+    unset, or `max_completion_tokens`). See `MaxTokensField`."""
 
     @model_validator(mode="after")
     def _backend_requirements(self) -> Self:
@@ -215,6 +266,10 @@ class ModelAlias(Contract):
             and not self.base_url.startswith("https://")
         ):
             raise ValueError(f"backend {self.backend!r} requires an `https://` `base_url`")
+        if self.backend not in BACKENDS_WITH_STRUCTURED_OUTPUT:
+            for name in ("structured_output", "max_tokens_field"):
+                if getattr(self, name) is not None:
+                    raise ValueError(f"backend {self.backend!r} takes no `{name}`")
         return self
 
 
