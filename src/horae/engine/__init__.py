@@ -22,6 +22,8 @@ from horae.engine.executor import (
     planned_calls,
 )
 from horae.engine.ports import (
+    Deidentifier,
+    DeidUnavailable,
     EngineCallError,
     LlmBackend,
     LlmCache,
@@ -31,6 +33,7 @@ from horae.engine.ports import (
     LoadedSkill,
     PluginRegistry,
     PreviousLlm,
+    Pseudonyms,
     ReleasingToolCaller,
     ResolvedPlugin,
     SkillSource,
@@ -50,6 +53,8 @@ __all__ = [
     "MAX_OUTPUT_BYTES",
     "MAX_PARALLEL_CALLS",
     "TARGET_FIELDS",
+    "DeidUnavailable",
+    "Deidentifier",
     "EngineCallError",
     "LlmBackend",
     "LlmCache",
@@ -60,6 +65,7 @@ __all__ = [
     "PlannedCall",
     "PluginRegistry",
     "PreviousLlm",
+    "Pseudonyms",
     "ReleasingToolCaller",
     "ResolvedPlugin",
     "RunCancelled",

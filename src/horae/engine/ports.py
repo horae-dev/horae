@@ -198,6 +198,13 @@ class LlmRequest:
     """The loaded skill's version."""
     skill_digest: str | None = None
     """SHA-256 of the skill's content (`LoadedSkill.digest`)."""
+    classified: bool = False
+    """The skill's input view declares field classes (#34): a cloud backend must then be
+    given a de-identified request (`deidentified`), and refuses one that is not
+    (`deid_required`)."""
+    deidentified: Mapping[str, Any] | None = None
+    """When `input` is the pseudonymized viewed input (#34): the `Pseudonymized.summary`
+    (version, digest of what is sent, counts; never a value). `None`: not de-identified."""
 
 
 @dataclass(frozen=True)
@@ -322,6 +329,11 @@ class LoadedSkill(Protocol):
         """The input view paths (`SkillManifest.input_view`), sorted."""
         ...
 
+    @property
+    def view_options(self) -> Mapping[str, Mapping[str, Any]]:
+        """The non-empty options of the input view paths, by path (field classes, #34)."""
+        ...
+
     def view(self, data: Any) -> Any:
         """The step input restricted to the skill's input view (plain JSON, deterministic)."""
         ...
@@ -335,6 +347,40 @@ class SkillSource(Protocol):
 
     def load_skill(self, skill: str, plugin: ResolvedPlugin) -> LoadedSkill:
         """The validated skill `skill` of `plugin`; raises `SkillUnavailable`."""
+        ...
+
+
+class DeidUnavailable(Exception):
+    """De-identification cannot be done (`horae.llm.deid.DeidError`): the step degrades
+    (`deid_unavailable`) and nothing is sent. The message holds no personal data."""
+
+
+class Pseudonyms(Protocol):
+    """One viewed input, pseudonymized (`horae.llm.deid.Pseudonymized`), with its mapping in
+    memory only."""
+
+    @property
+    def data(self) -> Any:
+        """What the model is sent instead of the viewed input."""
+        ...
+
+    def summary(self) -> dict[str, Any]:
+        """What the run record keeps (`llm[].request.deid`): never a value."""
+        ...
+
+    def reidentify(self, value: Any) -> tuple[Any, list[str]]:
+        """`value` with real values put back, and the pseudonyms left unresolved."""
+        ...
+
+
+class Deidentifier(Protocol):
+    """The instance's de-identification policy (`horae.llm.deid.Deidentifier`, #34)."""
+
+    def pseudonymize(
+        self, model_alias: str, view_options: Mapping[str, Mapping[str, Any]], data: Any
+    ) -> Pseudonyms | None:
+        """`data` pseudonymized for `model_alias`, or `None` (a local alias, no field class).
+        Raises `DeidUnavailable`."""
         ...
 
 

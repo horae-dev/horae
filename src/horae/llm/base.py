@@ -60,6 +60,22 @@ never a trusted parameter): by the engine's `_plan`, which loads the skill throu
 backstop, before anything is rendered, reserved or sent (an engine given no `SkillSource`,
 a `PromptSource` other than the skill loader).
 
+**De-identification** (#34, schemas decision 47). The engine pseudonymizes the viewed input
+of a skill that declares field classes before a cloud alias (`horae.llm.deid`) and marks the
+request (`LlmRequest.deidentified`); `prepare` then appends `DEID_NOTE` to the skill's prompt
+(copy placeholders verbatim) and the request summary records `deid` (version, digest of what
+is sent, counts). As a backstop, a request whose skill declares classes (`classified`) to an
+alias that is not local, but that was not de-identified, is refused with `deid_required`
+before anything is rendered (an engine given no `Deidentifier`).
+
+**No secret leaves in a request** (T10, #34). `send` scans the exact frozen body
+(`RenderedRequest.body()`) for every secret the process resolved, in all its encodings (the
+redaction registry, `horae.secrets.redact.current()`: the raw bytes, and the decoded JSON
+strings, keys and numbers), whatever the backend: one found refuses the attempt with
+`secret_in_request` (naming the secrets, never their values) before the provider backend is
+called, so nothing is sent and nothing is billed (the usage ledger releases its reservation,
+decision 41); the engine records a `secret_in_request` violation and degrades the step.
+
 **Retries.** None here: the engine owns the single repair retry (`attempt` 2). Provider
 backends disable their SDK's own retries.
 
@@ -126,6 +142,7 @@ from horae.engine.ports import (
     LlmResponse,
     attach_usage,
 )
+from horae.llm.deid import DEID_NOTE
 from horae.secrets import SecretResolver
 from horae.secrets.redact import current as current_redactor
 
@@ -491,6 +508,29 @@ class PreparedRequest:
     skill_version: str
     input_bound: int
     may_write_cache: bool = False
+    deid: Mapping[str, Any] | None = None
+    """`LlmRequest.deidentified` (recorded as `summary.deid`)."""
+
+
+SECRET_IN_REQUEST = "secret_in_request"  # noqa: S105 - an error kind
+"""The `LlmError` kind of a request refused because its body holds a resolved secret (T10)."""
+DEID_REQUIRED = "deid_required"
+"""The `LlmError` kind of a classified request to a cloud alias that was not de-identified."""
+
+
+def secrets_in(body: bytes) -> set[str]:
+    """The names of the resolved secrets (process registry) whose value, or an encoding of
+    it, is in `body`: matched on the raw bytes and on the decoded JSON (strings, object keys,
+    whole numbers), so a JSON escape cannot hide one."""
+    redactor = current_redactor()
+    if not redactor:
+        return set()
+    found = set(redactor.counts(body))
+    try:
+        decoded = json.loads(body)
+    except ValueError:  # pragma: no cover - a frozen body is canonical JSON
+        return found
+    return found | redactor.find(decoded)
 
 
 @dataclass
@@ -531,6 +571,12 @@ class ModelBackends:
         spec = self.models.get(request.model)
         if spec is None:
             raise LlmError("invalid_request", f"unknown model alias {request.model!r}")
+        if request.classified and request.deidentified is None and not spec.is_local:
+            raise LlmError(
+                DEID_REQUIRED,
+                f"skill {request.skill} declares field classes but its input was not "
+                f"de-identified for cloud model alias {request.model!r}: nothing was sent",
+            )
         prompt = self.prompts.prompt(request)
         held = current_redactor().find([prompt.system, dict(prompt.output_schema)])
         if held:
@@ -544,9 +590,12 @@ class ModelBackends:
         largest = request.budget.tokens_out
         if spec.max_output_tokens is not None:
             largest = min(largest, spec.max_output_tokens)
+        system = prompt.system
+        if request.deidentified is not None:
+            system = f"{system.rstrip()}\n\n{DEID_NOTE}"
         probe = Completion(
             model=spec.model,
-            system=prompt.system,
+            system=system,
             input=prompt.input,
             output_schema=prompt.output_schema,
             max_tokens=max(1, largest),
@@ -561,6 +610,7 @@ class ModelBackends:
             skill_version=prompt.skill_version,
             input_bound=input_bound(backend.render(probe)),
             may_write_cache=getattr(backend, "may_write_cache", False) is True,
+            deid=None if request.deidentified is None else dict(request.deidentified),
         )
 
     def output_limit(self, request: LlmRequest, prepared: "PreparedRequest") -> int:
@@ -590,6 +640,9 @@ class ModelBackends:
         completion = replace(prepared.probe, max_tokens=limit)
         backend = prepared.backend
         payload = backend.render(completion)
+        recorded = summary(completion, backend.name, canonical_json(payload))
+        if prepared.deid is not None:
+            recorded["deid"] = dict(prepared.deid)
         return RenderedRequest(
             alias=prepared.alias,
             backend=backend.name,
@@ -598,7 +651,7 @@ class ModelBackends:
             output_schema=prepared.probe.output_schema,
             payload=payload,
             timeout_s=prepared.probe.timeout_s,
-            summary=summary(completion, backend.name, canonical_json(payload)),
+            summary=recorded,
             input_bound=prepared.input_bound,
             max_tokens=limit,
             may_write_cache=prepared.may_write_cache,
@@ -632,6 +685,17 @@ class ModelBackends:
             unchanged = False
         if not unchanged:
             raise LlmError("invalid_request", "the payload was changed after it was rendered")
+        held = secrets_in(body)
+        if held:
+            names = ", ".join(sorted(held))
+            _log.warning(
+                "secret %s found in a request to model alias %s; refused", names, rendered.alias
+            )
+            raise LlmError(
+                SECRET_IN_REQUEST,
+                f"the request to model alias {rendered.alias!r} holds secret {names}: "
+                "refused before sending",
+            )
         backend = self._backend(rendered.alias, spec)
         started = time.monotonic()
         failure: LlmError | None = None
@@ -735,10 +799,12 @@ def _redacted_response(
 
 
 __all__ = [
+    "DEID_REQUIRED",
     "ERROR_KINDS",
     "INPUT_TOKEN_MARGIN",
     "INTENTS_KEY",
     "MAX_ERROR_CHARS",
+    "SECRET_IN_REQUEST",
     "UNVALIDATED",
     "VALIDATION_MARGIN_S",
     "VALIDATOR_UNAVAILABLE",
@@ -760,6 +826,7 @@ __all__ = [
     "max_tokens",
     "production_validator",
     "redacted_error",
+    "secrets_in",
     "split_intents",
     "summary",
 ]

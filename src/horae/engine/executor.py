@@ -173,6 +173,23 @@ repaired; and of one cancelled by the deadline while its output was being valida
 `horae.engine.ports.attached_usage`);
 a backend's cached response costs nothing and counts towards neither the cost nor the budget.
 
+**De-identification** (#34, schemas decision 47). With a `deid` policy, a skill whose input
+view declares field classes and a cloud model alias, the order is: input view, then
+pseudonymize (`deid.pseudonymize`, deterministic from the viewed input), then the request
+(`LlmRequest.input` is the pseudonymized input, `classified` and `deidentified` set; the
+backend renders it and refuses one that holds a resolved secret, T10), then validation of the
+output (the backend), then **re-identification** of the accepted output and raw intents, then
+the intents are validated and routed on real values (the action guard of #35 runs after that,
+on real values too). The cache key (`input_hash`) is computed on the real viewed input; the
+recorded `LlmCall.input_hash`, `response` and `intents` are what the provider saw and
+returned (pseudonymized), `request.deid` the summary (version, digest, counts) and the
+pseudonyms left `unresolved` (unknown or mangled: left as they are, no repair); the step's
+output and the routed intents carry real values. A cache hit or a replayed `previous` holds
+the pseudonymized output and is re-identified the same way. A policy that cannot
+de-identify (`DeidUnavailable`, e.g. an unreadable vocabulary) degrades the step
+(`deid_unavailable`) before anything is sent. A request refused for a secret
+(`secret_in_request`) also records a `secret_in_request` violation naming the secrets.
+
 **Step policy** (step status, then the effect on the run; the run status is the worst of
 `failed` > `degraded` > `noop` > `ok`):
 
@@ -255,6 +272,8 @@ from horae.contracts.run import (
 from horae.contracts.types import MAX_ITEMS, HttpsUrl, NotePath, Sha256Hex, Token
 from horae.engine.canonical import canonical_json, canonical_pipeline, pipeline_digest, sha256_hex
 from horae.engine.ports import (
+    Deidentifier,
+    DeidUnavailable,
     EngineCallError,
     LlmBackend,
     LlmCache,
@@ -264,6 +283,7 @@ from horae.engine.ports import (
     LoadedSkill,
     PluginRegistry,
     PreviousLlm,
+    Pseudonyms,
     ResolvedPlugin,
     SkillSource,
     SkillUnavailable,
@@ -817,6 +837,7 @@ class _Run:
     models: Mapping[str, str]
     entries: tuple[_Entry, ...]
     monotonic: Callable[[], float]
+    deid: Deidentifier | None = None
     data: Any = None
     inputs: list[InputSnapshot] = field(default_factory=list)
     llm_calls: list[LlmCall] = field(default_factory=list)
@@ -1187,6 +1208,51 @@ def _cache_key(
     return sha256_hex(key)
 
 
+_MAX_DEID_NOTES = 16
+
+
+def _deid_record(
+    pseudo: Pseudonyms, *unresolved: list[str], accepted: bool = True
+) -> dict[str, Any]:
+    """`llm[].request.deid`: the summary (never a value) and, for an accepted output, the
+    pseudonyms that re-identification could not resolve."""
+    recorded = dict(pseudo.summary())
+    if accepted:
+        notes = sorted({str(note) for found in unresolved for note in found})
+        recorded["unresolved"] = notes[:_MAX_DEID_NOTES]
+    return recorded
+
+
+def _reidentified(pseudo: Pseudonyms | None, output: Any, raw: Any) -> tuple[Any, Any, Any]:
+    """`(output, raw intents, deid record)` with real values put back (#34); unchanged, and
+    no record, without pseudonyms."""
+    if pseudo is None:
+        return output, raw, None
+    real_output, in_output = pseudo.reidentify(output)
+    real_raw, in_intents = pseudo.reidentify(raw)
+    return (
+        _json_copy(real_output, "re-identified LLM output"),
+        _json_copy(real_raw, "re-identified LLM intents"),
+        _deid_record(pseudo, in_output, in_intents),
+    )
+
+
+def _view_options(skill: LoadedSkill | None) -> dict[str, Any]:
+    """The skill's input view options (`{}` without a skill, or for a skill without any)."""
+    if skill is None:
+        return {}
+    options = getattr(skill, "view_options", None)
+    return dict(options) if isinstance(options, Mapping) else {}
+
+
+def _classified(options: Mapping[str, Any]) -> bool:
+    """Whether the view options name a field class (#34)."""
+    return any(
+        isinstance(value, Mapping) and isinstance(value.get("class"), str)
+        for value in options.values()
+    )
+
+
 async def _reuse(
     run: _Run,
     step: _Planned,
@@ -1194,6 +1260,8 @@ async def _reuse(
     plugin: ResolvedPlugin,
     key: str,
     viewed: Any,
+    sent: Any,
+    pseudo: Pseudonyms | None,
 ) -> _Outcome | None:
     """An accepted output for `key`, reused; `None` if there is none or it cannot be reused
     (then the LLM is called)."""
@@ -1209,6 +1277,11 @@ async def _reuse(
     try:
         output = _json_copy(previous.output, "previous LLM output")
         raw = _json_copy(_intent_list(previous.intents), "previous LLM intents")
+        # A cached output is the pseudonymized one: the same input gives the same mapping.
+        real_output, real_raw, deid_record = _reidentified(pseudo, output, raw)
+        marker = _reuse_marker(spec, key, previous.source_run)
+        if deid_record is not None:
+            marker["deid"] = deid_record
         call = LlmCall(
             step=step.index,
             skill=spec.skill,
@@ -1219,8 +1292,8 @@ async def _reuse(
             cached=True,
             schema_valid=True,
             model_alias=spec.model,
-            input_hash=sha256_hex(viewed),
-            request=_reuse_marker(spec, key, previous.source_run),
+            input_hash=sha256_hex(sent),
+            request=marker,
             response=output,
             intents=raw,
             usage=_ZERO,
@@ -1230,15 +1303,21 @@ async def _reuse(
     violations = len(run.violations)
     proposer = _proposer(plugin, step.skill)
     accepted, rejected = run.propose(
-        raw, proposer, f"skill:{spec.skill}", step.index, spec.skill, 0, **_shown(step, viewed)
+        real_raw,
+        proposer,
+        f"skill:{spec.skill}",
+        step.index,
+        spec.skill,
+        0,
+        **_shown(step, viewed),
     )
     if rejected is not None:
         # E.g. a target bound to `{{date}}` moved on: a cache miss, not a failure.
         del run.violations[violations:]
         return None
     run.llm_calls.append(call)
-    run.data, run.input_hash, run.reused = output, key, True
-    return _Outcome("ok", output=output, intents=accepted)
+    run.data, run.input_hash, run.reused = real_output, key, True
+    return _Outcome("ok", output=real_output, intents=accepted)
 
 
 def _reuse_marker(spec: LlmSpec, key: str, source_run: str | None) -> dict[str, Any]:
@@ -1274,15 +1353,30 @@ async def _llm_step(run: _Run, step: _Planned) -> _Outcome:
         # Nothing of the input matches the view's shape: no call is made.
         message = f"{spec.skill}: the step input does not have the shape of the input view"
         return _Outcome("degraded", StepError(kind="input_invalid", message=message), stop=True)
+
+    def degraded(kind: str, message: str) -> _Outcome:
+        return _Outcome("degraded", StepError(kind=kind, message=_cap(message)), stop=True)
+
+    options = _view_options(skill)
+    classified = _classified(options)
+    pseudo: Pseudonyms | None = None
+    if classified and run.deid is not None:
+        try:
+            pseudo = run.deid.pseudonymize(spec.model, options, viewed)
+        except DeidUnavailable as error:
+            return degraded("deid_unavailable", f"{spec.skill}: {safe_excerpt(str(error), 200)}")
+        except Exception as error:  # a policy bug must not crash the run, nor send in clear
+            return degraded("host_error", f"unexpected {type(error).__name__} de-identifying")
+    try:
+        sent = viewed if pseudo is None else _json_copy(pseudo.data, "pseudonymized input")
+    except _DataError as error:
+        return degraded(error.kind, error.message)
     key = _cache_key(run, spec, plugin, skill, viewed)
-    reused = await _reuse(run, step, spec, plugin, key, viewed)
+    reused = await _reuse(run, step, spec, plugin, key, viewed, sent, pseudo)
     if reused is not None:
         return reused
     prompt = None if skill is None else skill.prompt
     output_schema = None if skill is None else skill.output_schema
-
-    def degraded(kind: str, message: str) -> _Outcome:
-        return _Outcome("degraded", StepError(kind=kind, message=_cap(message)), stop=True)
 
     timeout = spec.timeout_s or DEFAULT_LLM_TIMEOUT_S
     deadline = run.monotonic() + timeout
@@ -1300,7 +1394,7 @@ async def _llm_step(run: _Run, step: _Planned) -> _Outcome:
         request = LlmRequest(
             spec.skill,
             spec.model,
-            _json_copy(viewed),
+            _json_copy(sent),
             budget,
             remaining,
             attempt,
@@ -1309,6 +1403,8 @@ async def _llm_step(run: _Run, step: _Planned) -> _Outcome:
             output_schema=None if output_schema is None else copy.deepcopy(output_schema),
             skill_version=None if skill is None else skill.version,
             skill_digest=None if skill is None else skill.digest,
+            classified=classified,
+            deidentified=None if pseudo is None else pseudo.summary(),
         )
         try:
             async with asyncio.timeout(remaining):
@@ -1325,6 +1421,10 @@ async def _llm_step(run: _Run, step: _Planned) -> _Outcome:
             if isinstance(usage, Usage):
                 run.spend(usage)
             message = current_redactor().redact_text(error.message)[0]
+            if error.kind == "secret_in_request" and len(run.violations) < MAX_ITEMS:
+                # T10: refused before it was sent; the message names secrets, never values.
+                detail = _cap(f"{spec.skill}: {message}", 500)
+                run.violations.append(Violation(kind="secret_in_request", detail=detail))
             return degraded(_kind(error.kind), safe_excerpt(message, 200))
         except Exception as error:  # a backend bug must not crash the run
             return degraded("host_error", f"unexpected {type(error).__name__}")
@@ -1349,6 +1449,14 @@ async def _llm_step(run: _Run, step: _Planned) -> _Outcome:
             usage = _ZERO if response.cached is True else response.usage
             # Capped like the record's messages; the repair retry is sent these same errors.
             errors = tuple(_cap(str(error)) for error in response.schema_errors)[:MAX_ITEMS]
+            # Validated, then re-identified (#34): the record keeps what the provider saw.
+            real_output, real_raw = output, raw
+            if pseudo is not None:
+                deid_record = _deid_record(pseudo, accepted=not errors)
+                if not errors:
+                    real_output, real_raw, deid_record = _reidentified(pseudo, output, raw)
+                if isinstance(recorded, dict):
+                    recorded["deid"] = deid_record
             llm_call = LlmCall(
                 step=step.index,
                 skill=spec.skill,
@@ -1382,12 +1490,12 @@ async def _llm_step(run: _Run, step: _Planned) -> _Outcome:
             source = f"skill:{spec.skill}"
             proposer = _proposer(plugin, skill)
             accepted, rejected = run.propose(
-                raw, proposer, source, step.index, spec.skill, 0, **_shown(step, viewed)
+                real_raw, proposer, source, step.index, spec.skill, 0, **_shown(step, viewed)
             )
             if rejected is not None:
                 return _Outcome("failed", rejected, stop=True)
-            run.data, run.input_hash = output, key
-            return _Outcome("ok", output=output, intents=accepted)
+            run.data, run.input_hash = real_output, key
+            return _Outcome("ok", output=real_output, intents=accepted)
         repair = errors
     return degraded(
         "schema_invalid", f"the output failed its schema after {MAX_LLM_ATTEMPTS} attempts"
@@ -1422,6 +1530,7 @@ async def execute(
     on_step: StepHook | None = None,
     clock: Callable[[], datetime.datetime] = _utc_now,
     monotonic: Callable[[], float] = time.monotonic,
+    deid: Deidentifier | None = None,
 ) -> RunRecord:
     """Run `pipeline` once and return its record; never raises for a step or port failure.
 
@@ -1444,6 +1553,11 @@ async def execute(
       it is larger than `MAX_PIPELINE_BYTES` or holds a resolved secret's value (#53: a
       literal secret in a pipeline file; its parameters refuse the run at plan time, and the
       definition is not copied into the store).
+    - `deid`: the instance's de-identification policy (`horae.llm.deid.Deidentifier`, #34):
+      with a skill that declares field classes and a cloud model alias, the model is sent
+      the pseudonymized viewed input and the accepted output and intents are re-identified
+      (see **De-identification** in the module docstring). Without it, nothing is
+      pseudonymized (and `ModelBackends` refuses a classified request to a cloud alias).
     - `dry_run` is recorded only: the engine applies nothing either way.
     - `on_step(index, record)` is awaited after each step record is final; its exceptions
       propagate. `clock` gives the wall-clock timestamps, `monotonic` the durations and the
@@ -1486,6 +1600,7 @@ async def execute(
         models=dict(models or {}),
         entries=tuple(entry for p in plan for entry in p.entries),
         monotonic=monotonic,
+        deid=deid,
     )
     used = {c.plugin.manifest.name: c.plugin for p in plan for c in p.calls}
     used.update({e.plugin.manifest.name: e.plugin for e in run.entries})

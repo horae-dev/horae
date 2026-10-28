@@ -19,10 +19,12 @@ from pathlib import Path
 from horae.apply import SinkRegistry
 from horae.cli_output import EXIT_PROBLEMS, CommandFailed, plural
 from horae.config import CONFIG_FILE, Instance, InstanceError, Problem, ProblemsError, load_instance
+from horae.contracts.instance import ModelAlias
 from horae.contracts.pipeline import LlmStep
 from horae.contracts.plugin import StdioRuntime
 from horae.engine import UnknownPlugin
 from horae.llm.backends import FACTORIES
+from horae.llm.deid import vocabulary_problem
 from horae.llm.validate import worker_problem
 from horae.plugins.host import HostRegistry, PluginCallError, RegistryError
 from horae.plugins.host.host import resolve_command
@@ -132,10 +134,25 @@ def _command_problems(registry: HostRegistry) -> list[Problem]:
     return problems
 
 
-CLOUD_BACKENDS = frozenset({"anthropic", "openai-compatible"})
-"""Backends billed per token, whose aliases `horae doctor` expects to have a `price`. `ollama`
-is local (no warning); an `openai-compatible` alias is treated as cloud even when it points
-at a local server (a warning, which does not fail the check; schemas decision 40)."""
+def _is_cloud(spec: ModelAlias) -> bool:
+    """A cloud alias, billed per token, which `horae doctor` expects to have a `price`:
+    `ModelAlias.is_local` false (decision 47 A, which replaces decision 40's backend rule):
+    by default every backend but `ollama`; an alias says `local: true` (an `openai-compatible`
+    server on the LAN) or `local: false` (a hosted `ollama`). Never inferred from `base_url`."""
+    return not spec.is_local
+
+
+def _deid_problems(instance: Instance) -> list[Problem]:
+    """An error when `deidentification.vocabulary` names a file that cannot be read or
+    parsed (de-identification would then fail closed at run time; the message never shows
+    the file's content)."""
+    name = instance.config.deidentification.vocabulary
+    if name is None:
+        return []
+    found = vocabulary_problem(instance.secret_resolver(), name)
+    if isinstance(found, str):
+        return [Problem(CONFIG_FILE, None, None, f"deidentification.vocabulary: {found}")]
+    return []
 
 
 def _backend_problems(instance: Instance) -> list[Problem]:
@@ -169,7 +186,7 @@ def _backend_problems(instance: Instance) -> list[Problem]:
                     f"this version of Horae (available: {available})",
                 )
             )
-        elif spec.backend in CLOUD_BACKENDS and spec.price is None:
+        elif _is_cloud(spec) and spec.price is None:
             problems.append(
                 Problem(
                     CONFIG_FILE,
@@ -292,7 +309,12 @@ def instance_problems(instance: Instance) -> list[Problem]:
     pins them (`check_plugins`), each command (its interpreter) exists and is executable,
     and every skill an `llm` step uses loads (`horae.skills.load_skill`); with an `llm` step,
     the output validator's worker runs (`horae.llm.validate.worker_problem`)."""
-    problems = _path_problems(instance) + _backend_problems(instance) + _budget_problems(instance)
+    problems = (
+        _path_problems(instance)
+        + _backend_problems(instance)
+        + _budget_problems(instance)
+        + _deid_problems(instance)
+    )
     problems.extend(_validator_problems(instance))
     if plugins_dir(instance.root).is_dir():
         try:

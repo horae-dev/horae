@@ -116,7 +116,7 @@
           "additionalProperties": false
         }
       ],
-      "description": "The only fields of the step input the model sees (an allow-list): a list of paths, or a\nmapping `path: {options}` (options unused in v1).",
+      "description": "The only fields of the step input the model sees (an allow-list): a list of paths, or a\nmapping `path: {options}` (`class`: de-identification before a cloud model, #34).",
       "title": "Input View"
     },
     "prompt": {

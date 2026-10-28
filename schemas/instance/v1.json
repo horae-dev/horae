@@ -119,6 +119,29 @@
       "title": "DailyBudget",
       "type": "object"
     },
+    "DeidentificationConfig": {
+      "additionalProperties": false,
+      "description": "De-identification before a cloud model (#34, schemas decision 47).",
+      "properties": {
+        "vocabulary": {
+          "anyOf": [
+            {
+              "maxLength": 255,
+              "pattern": "^[A-Za-z0-9_-][A-Za-z0-9._-]*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "A file in `secrets.dir` (never in the instance repository: it holds personal data)\nlisting known terms, one `class: term` per line (`person`, `email`, `phone` or `place`;\n`#` starts a comment), replaced by pseudonyms wherever they appear in a `free_text`\nfield. Read like a secret file (a regular file of at most 64 KiB, UTF-8).",
+          "title": "Vocabulary"
+        }
+      },
+      "title": "DeidentificationConfig",
+      "type": "object"
+    },
     "EnvSecretRef": {
       "additionalProperties": false,
       "description": "Read the secret from an environment variable.",
@@ -374,6 +397,19 @@
           "default": null,
           "description": "`openai-compatible` only: the request field of the output limit (`max_tokens` when\nunset, or `max_completion_tokens`). See `MaxTokensField`.",
           "title": "Max Tokens Field"
+        },
+        "local": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Whether the model runs on the host or the LAN (`true`) or is a cloud service\n(`false`). Unset: `ollama` is local, every other backend (`anthropic`, `claude-cli`,\n`openai-compatible`) is cloud (`LOCAL_BACKENDS`); never inferred from `base_url`. A cloud\nalias gets de-identified input when the skill declares field classes, and `horae doctor`\nexpects it to have a `price` (#34, schemas decision 47 A).",
+          "title": "Local"
         }
       },
       "required": [
@@ -665,6 +701,10 @@
     "cache": {
       "$ref": "#/$defs/CacheConfig",
       "description": "The LLM cache's expiry policy (#32)."
+    },
+    "deidentification": {
+      "$ref": "#/$defs/DeidentificationConfig",
+      "description": "De-identification of declared fields before a cloud model (#34)."
     }
   },
   "title": "Horae instance configuration (horae.yaml)",

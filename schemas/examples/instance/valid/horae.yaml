@@ -26,6 +26,8 @@ models:
     model: qwen
     base_url: "http://vllm:8000/v1"
     structured_output: json_object
+    # On the LAN: no de-identification, no price expected (#34; never inferred from base_url).
+    local: true
   # http to a single-label host: the `ollama` service of the same Compose project.
   local: { backend: ollama, model: llama3, base_url: "http://ollama:11434" }
 plugin_defaults: { startup_timeout_s: 10, call_timeout_s: 30 }
@@ -45,3 +47,6 @@ budgets:
     daily-brief: { daily: { usd: 0.5 } }
 # The LLM cache: accepted outputs reused on unchanged input for a day (decision 45).
 cache: { ttl_s: 86400, max_entries: 500 }
+# De-identification before a cloud model (#34): known names, one `class: term` per line, in a
+# file of `secrets.dir` (personal data: never in the instance repository).
+deidentification: { vocabulary: deid_vocabulary }

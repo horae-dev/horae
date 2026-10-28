@@ -294,10 +294,18 @@ class Violation(Contract):
     """Access that was blocked or flagged during the run."""
 
     kind: Literal[
-        "egress_blocked", "guard", "undeclared_secret", "undeclared_path", "secret_in_output"
+        "egress_blocked",
+        "guard",
+        "undeclared_secret",
+        "undeclared_path",
+        "secret_in_output",
+        "secret_in_request",
     ]
     """`secret_in_output`: a plugin returned the value (or an encoding) of an instance secret in
-    its output or intents; the plugin host replaced it with `[REDACTED:<NAME>]` (#24)."""
+    its output or intents; the plugin host replaced it with `[REDACTED:<NAME>]` (#24).
+    `secret_in_request`: an LLM request held the value (or an encoding) of a resolved secret;
+    it was refused before it was sent and the step degraded (T10, #34; `detail` names the
+    secrets, never their values)."""
     detail: Message
 
 

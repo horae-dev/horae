@@ -11,8 +11,12 @@ resolved model and the viewed input) says *what was asked*. An entry is **stored
 `price` (backend, model, `base_url`, `structured_output`, `max_output_tokens`,
 `max_tokens_field`, and any later field such as the `claude-cli` command; unset fields
 left out), and `version` is `LLM_KEY_VERSION` (`horae.llm.backends._shared`, bumped when
-Horae's own system preamble or request framing changes). So another backend, endpoint or
-output mode behind the same model name is a miss, while the run record keeps the engine key.
+Horae's own system preamble or request framing changes); for a cloud alias under a
+de-identification policy (#34), `deid` too: the transforms' version and the vocabulary's
+digest (`Deidentifier.cache_settings`, decision 47 F), so another vocabulary is a miss and an
+entry (which holds the pseudonymized output) is only reused with the mapping that made it.
+So another backend, endpoint or output mode behind the same model name is a miss, while
+the run record keeps the engine key.
 An entry's response is `{output, intents, backend, model, skill_version, input_hash,
 run_id, created_at}`: `input_hash` is the engine key (what undo invalidates by), `run_id` the
 run that produced it, `created_at` when.
@@ -54,6 +58,7 @@ from horae.engine.canonical import sha256_hex
 from horae.engine.ports import LlmBackendName, LlmError
 from horae.llm.backends._shared import LLM_KEY_VERSION
 from horae.llm.base import Validator, production_validator
+from horae.llm.deid import Deidentifier
 from horae.skills import INTENTS_PROPERTY
 from horae.store import Store
 
@@ -179,6 +184,7 @@ class StoreLlmCache:
         models: Mapping[str, ModelAlias] | None = None,
         validate: CacheValidator | None = None,
         validation_timeout_s: float = CACHE_VALIDATION_TIMEOUT_S,
+        deid: Deidentifier | None = None,
     ) -> None:
         self.store = store
         self.config = config
@@ -190,6 +196,9 @@ class StoreLlmCache:
         self.validate = validate or default_validator()
         self.validation_timeout_s = validation_timeout_s
         """The longest a re-validation may take (the worker is killed past it: a miss)."""
+        self.deid = deid
+        """The instance's de-identification policy (#34): its settings for a cloud alias join
+        the stored key (decision 47 F)."""
 
     def stored_key(self, input_hash: str, model_alias: str | None) -> str:
         """The key an entry for the engine key `input_hash` is stored under (module docstring);
@@ -200,7 +209,11 @@ class StoreLlmCache:
             if spec is None
             else spec.model_dump(mode="json", exclude={"secret", "price"}, exclude_none=True)
         )
-        return sha256_hex({"input_hash": input_hash, "alias": alias, "version": LLM_KEY_VERSION})
+        key: dict[str, Any] = {"input_hash": input_hash, "alias": alias, "version": LLM_KEY_VERSION}
+        settings = None if self.deid is None else self.deid.cache_settings(model_alias)
+        if settings is not None:
+            key["deid"] = settings
+        return sha256_hex(key)
 
     def _forget(self, stored: str, why: str) -> None:
         _log.warning("LLM cache entry %s; deleted, calling the model", why)
