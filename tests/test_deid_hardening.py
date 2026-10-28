@@ -441,3 +441,100 @@ def test_outer_white_space_and_over_long_terms() -> None:
     assert result.data == {"note": "see [PERSON_1]", "who": "[PERSON_1]"}
     with pytest.raises(DeidError, match="vocabulary line 1: a term has at most 48"):
         Vocabulary.parse(("person: " + "a " * 30).encode())
+
+
+# --- security review of PR #110: the secret check runs before de-identification ------------
+
+OVERLAPPING = "sk-live-bob-martin-1234567"  # synthetic; holds the classed person "Bob Martin"
+
+
+def _plant_secret(tmp_path: Path, name: str, value: str) -> None:
+    folder = tmp_path / name.casefold()
+    folder.mkdir()
+    (folder / name).write_text(value, encoding="utf-8")
+    SecretResolver({}, folder).resolve(name)
+
+
+@pytest.mark.parametrize("where", ["title", "key", "summary"])
+def test_a_secret_overlapping_a_classed_value_is_refused_before_deid(
+    pack: Path, tmp_path: Path, where: str
+) -> None:
+    _plant_secret(tmp_path, "OVERLAPPING_TOKEN", OVERLAPPING)
+    tasks: list[dict[str, Any]] = [{"title": f"Rotate {OVERLAPPING} today"}]
+    events = DATA["events"]
+    if where == "key":
+        tasks = [{"title": "Rotate", "due": {OVERLAPPING: "as a key"}}]
+    elif where == "summary":
+        tasks = []
+        events = [{**DATA["events"][0], "summary": f"Lunch, key {OVERLAPPING}"}]
+    data = {**DATA, "tasks": tasks, "events": events}
+    provider = Provider("anthropic", _answer())
+    record = _run_data(data, _backends(provider, CLOUD, tmp_path), pack, deid=_policy())
+    error = record.steps[2].error
+    assert error is not None
+    assert (record.status, error.kind) == ("degraded", "secret_in_request")
+    assert "OVERLAPPING_TOKEN" in error.message
+    assert provider.sent == []  # nothing rendered or sent
+    assert provider.completions == []
+    assert record.llm == []  # nothing billed
+    assert record.cost.tokens_out == 0
+    [violation] = record.violations
+    assert violation.kind == "secret_in_request"
+    assert "OVERLAPPING_TOKEN" in violation.detail
+    shown = error.model_dump_json() + violation.model_dump_json()
+    for fragment in (OVERLAPPING, "sk-live", "1234567"):
+        assert fragment not in shown
+
+
+def test_the_pseudonymizer_never_rewrites_part_of_a_secret(tmp_path: Path) -> None:
+    _plant_secret(tmp_path, "OVERLAPPING_TOKEN", OVERLAPPING)
+    with_amount = "tok-4321-alpha-bravo-z"  # synthetic; holds the amount 4321
+    _plant_secret(tmp_path, "AMOUNT_TOKEN", with_amount)
+    options: dict[str, dict[str, Any]] = {
+        "who": {"class": "person"},
+        "note": {"class": "free_text"},
+        "paid": {"class": "amount", "buckets": [0, 1000]},
+    }
+    data = {
+        "who": "Bob Martin",
+        "paid": 4321,
+        "note": f"Bob Martin paid 4321 with {OVERLAPPING} and {with_amount}; Bob",
+    }
+    note = pseudonymize(data, options).data["note"]
+    # Matches outside the secrets are still replaced; the secrets stay whole, so the
+    # backend's check of the rendered body still matches them (defence in depth).
+    assert note == f"[PERSON_1] paid >=1000 with {OVERLAPPING} and {with_amount}; [PERSON_1]"
+
+
+def test_a_phone_overlapping_a_secret_is_not_rewritten(tmp_path: Path) -> None:
+    planted = "otp-0612345678-key"  # synthetic; holds the classed phone
+    _plant_secret(tmp_path, "PHONE_TOKEN", planted)
+    options = {"tel": {"class": "phone"}, "note": {"class": "free_text"}}
+    data = {"tel": "06 12 34 56 78", "note": f"call 06.12.34.56.78 or use {planted}"}
+    assert pseudonymize(data, options).data["note"] == f"call [PHONE_1] or use {planted}"
+
+
+def test_without_secrets_the_pre_check_changes_nothing(pack: Path, tmp_path: Path) -> None:
+    redact.forget_all()
+    provider = Provider("anthropic", _answer())
+    record = _run(_backends(provider, CLOUD, tmp_path), pack, deid=_policy())
+    assert record.status == "ok", record.steps[2].error
+    assert len(provider.sent) == 1
+    assert record.violations == []
+
+
+def test_a_failing_pre_check_sends_nothing(
+    pack: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from horae.engine import executor
+
+    def broken(viewed: Any) -> set[str]:
+        raise RuntimeError("port bug")
+
+    monkeypatch.setattr(executor, "_secrets_in_viewed", broken)
+    provider = Provider("anthropic", _answer())
+    record = _run(_backends(provider, CLOUD, tmp_path), pack, deid=_policy())
+    error = record.steps[2].error
+    assert error is not None
+    assert (error.kind, provider.sent) == ("host_error", [])
+    assert "checking for secrets" in error.message

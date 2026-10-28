@@ -206,7 +206,11 @@ the pseudonymized output and is re-identified the same way, but only when its
 without de-identification): otherwise it is a miss. A policy that cannot
 de-identify (`DeidUnavailable`, e.g. an unreadable vocabulary) degrades the step
 (`deid_unavailable`) before anything is sent. A request refused for a secret
-(`secret_in_request`) also records a `secret_in_request` violation naming the secrets.
+(`secret_in_request`) also records a `secret_in_request` violation naming the secrets. The
+real viewed input is checked for a resolved secret **before** it is pseudonymized (decision
+47 J): de-identification could rewrite part of a secret so that the backend's check of the
+rendered request no longer matches it; the step is then degraded the same way, nothing is
+sent and nothing is billed.
 
 **Step policy** (step status, then the effect on the run; the run status is the worst of
 `failed` > `degraded` > `noop` > `ok`):
@@ -1399,6 +1403,16 @@ def _shown(step: _Planned, viewed: Any, source: str) -> dict[str, Any]:
     return guard if step.skill is None else {**guard, "shown": (viewed,)}
 
 
+def _secrets_in_viewed(viewed: Any) -> set[str]:
+    """The names of the resolved secrets (process registry) in the real viewed input: in its
+    canonical JSON bytes (every encoding) and in its strings, object keys and whole numbers,
+    as `horae.llm.base.secrets_in` checks a rendered request (T10)."""
+    redactor = current_redactor()
+    if not redactor:
+        return set()
+    return set(redactor.counts(canonical_json(viewed))) | redactor.find(viewed)
+
+
 async def _llm_step(run: _Run, step: _Planned) -> _Outcome:
     spec, plugin, backend = step.llm, step.skill_plugin, run.llm
     if spec is None or plugin is None or backend is None:  # pragma: no cover (planned)
@@ -1418,6 +1432,26 @@ async def _llm_step(run: _Run, step: _Planned) -> _Outcome:
 
     def degraded(kind: str, message: str) -> _Outcome:
         return _Outcome("degraded", StepError(kind=kind, message=_cap(message)), stop=True)
+
+    # T10 before de-identification (schemas decision 47 J): pseudonymizing can
+    # rewrite part of a secret (a classed value or an amount rendering inside it), so the
+    # backend's check of the rendered request would no longer match the whole value while
+    # the rest of it is sent. The real viewed input is checked first; the backend keeps its
+    # check of the rendered bytes (defence in depth).
+    try:
+        held = _secrets_in_viewed(viewed)
+    except Exception as error:  # a port bug must not crash the run, nor send unchecked
+        return degraded("host_error", f"unexpected {type(error).__name__} checking for secrets")
+    if held:
+        names = ", ".join(sorted(held))
+        message = (
+            f"the request to model alias {spec.model!r} holds secret {names}: "
+            "refused before sending"
+        )
+        if len(run.violations) < MAX_ITEMS:
+            detail = _cap(f"{spec.skill}: {message}", 500)
+            run.violations.append(Violation(kind="secret_in_request", detail=detail))
+        return degraded("secret_in_request", safe_excerpt(message, 200))
 
     # The step's deadline covers de-identification too (#34 finding 9): it runs in a worker
     # thread, so a slow one times the step out instead of blocking the event loop.
