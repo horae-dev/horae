@@ -1,0 +1,45 @@
+{
+  "backend": "anthropic",
+  "model": "claude-fixture-1",
+  "output": {
+    "intents": [
+      {
+        "content": "## Today\n\n- Send the quarterly report (overdue)\n- Water the plants\n- Renew the library card\n\n## Events\n\n- 09:30 Team stand-up\n- 14:00 Dentist\n",
+        "type": "note.create"
+      }
+    ],
+    "ranked": [
+      {
+        "title": "Send the quarterly report",
+        "why": "overdue"
+      },
+      {
+        "title": "Water the plants",
+        "why": "today"
+      },
+      {
+        "title": "Renew the library card",
+        "why": "later"
+      }
+    ],
+    "summary": "One task is overdue, one is due today; two events."
+  },
+  "request": {
+    "input_sha256": "f2d240cd8e4816fbbd47c5f59563dc00833a7d6c7e5a442af1d4fc3fb16e773c",
+    "schema_sha256": "ac6fa6aea53bf3c9796e4e34c62460b13ecb70a8784d25670f377e0bde52062d",
+    "system_sha256": "db338864354ac638905a84278b63ff160ae4c98707055d7136777e4a543598c2"
+  },
+  "schema_version": 2,
+  "skill": "daily-brief/rank-and-word",
+  "skill_digest": "b2b672ce0c2e1a340d0028e143ca634593bdd460d0a700033be254977b569806",
+  "skill_version": "1.0.0",
+  "stop_reason": "end_turn",
+  "usage": {
+    "cache_read_tokens": null,
+    "cache_write_tokens": null,
+    "priced": false,
+    "tokens_in": 612,
+    "tokens_out": 148,
+    "usd": 0.0
+  }
+}

@@ -16,6 +16,7 @@ pids, host names, heartbeats or clocks.
   platform without `fcntl` (Windows), taking a lock raises `LocksUnsupported`.
 """
 
+import hashlib
 import os
 from pathlib import Path
 from types import TracebackType
@@ -40,8 +41,18 @@ class LocksUnsupported(OSError):
     """This platform has no `fcntl.flock` (Windows): Horae runs on POSIX systems only."""
 
 
+EVAL_LOCK_PREFIX = "_eval-"
+"""The lock of a live skill eval's run row (`eval:<skill>`, schemas decision 48 J) is
+`_eval-<sha256 of the row's pipeline, 16 hex>.lock`: a skill name holds `/`, and a pipeline
+name never starts with `_`."""
+
+
 def lock_path(state_dir: Path, pipeline: str) -> Path:
-    """The lock file of `pipeline` (a pipeline name is `a-z 0-9 -`, so it is a safe name)."""
+    """The lock file of `pipeline` (a pipeline name is `a-z 0-9 -`, so it is a safe name; an
+    eval row's `eval:<skill>` is hashed, `EVAL_LOCK_PREFIX`)."""
+    if pipeline.startswith("eval:"):
+        digest = hashlib.sha256(pipeline.encode("utf-8")).hexdigest()[:16]
+        return state_dir / LOCKS_DIR / f"{EVAL_LOCK_PREFIX}{digest}.lock"
     return state_dir / LOCKS_DIR / f"{pipeline}.lock"
 
 

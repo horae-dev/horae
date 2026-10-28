@@ -1,0 +1,77 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Skill evaluation (#36, schemas decision 48): golden cases next to each skill, run offline
+against recorded responses (CI) or live against a backend (on demand, `horae eval --live`).
+
+`horae.evals._cases` reads and writes the files (`evals/<case>.yaml`,
+`evals/recorded/<backend>/<case>.json`); `horae.evals._harness` runs the cases through the
+same render, validation, intent and guard path as the `llm` step of a run."""
+
+from horae.evals._cases import (
+    EVALS_DIR,
+    RECORDED_DIR,
+    CaseScan,
+    EvalError,
+    LoadedCase,
+    case_names,
+    evals_dir,
+    load_case,
+    load_cases,
+    load_recorded,
+    recorded_path,
+    scan_cases,
+    write_recorded,
+)
+from horae.evals._harness import (
+    DEFAULT_BUDGET,
+    DEFAULT_TIMEOUT_S,
+    CaseResult,
+    Check,
+    Complete,
+    LiveEval,
+    Planned,
+    SkillUnderEval,
+    compare,
+    offline_alias,
+    plan_live,
+    pretty,
+    resolve,
+    run_offline,
+    send_live,
+    summary,
+    total,
+    unified,
+)
+
+__all__ = [
+    "DEFAULT_BUDGET",
+    "DEFAULT_TIMEOUT_S",
+    "EVALS_DIR",
+    "RECORDED_DIR",
+    "CaseResult",
+    "CaseScan",
+    "Check",
+    "Complete",
+    "EvalError",
+    "LiveEval",
+    "LoadedCase",
+    "Planned",
+    "SkillUnderEval",
+    "case_names",
+    "compare",
+    "evals_dir",
+    "load_case",
+    "load_cases",
+    "load_recorded",
+    "offline_alias",
+    "plan_live",
+    "pretty",
+    "recorded_path",
+    "resolve",
+    "run_offline",
+    "scan_cases",
+    "send_live",
+    "summary",
+    "total",
+    "unified",
+    "write_recorded",
+]

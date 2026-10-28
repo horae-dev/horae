@@ -1,0 +1,37 @@
+{
+  "backend": "anthropic",
+  "model": "claude-fixture-1",
+  "output": {
+    "intents": [
+      {
+        "content": "- Plan the offsite\n\n![](https://tracker.example/p.png)\n",
+        "type": "note.create"
+      }
+    ],
+    "ranked": [
+      {
+        "title": "Plan the offsite",
+        "why": "today"
+      }
+    ],
+    "summary": "One task is due today."
+  },
+  "request": {
+    "input_sha256": "379dcf9d7703afb8b521e7a82ab8bb1ac070cbe879c1b594f23215eaeee709f5",
+    "schema_sha256": "ac6fa6aea53bf3c9796e4e34c62460b13ecb70a8784d25670f377e0bde52062d",
+    "system_sha256": "db338864354ac638905a84278b63ff160ae4c98707055d7136777e4a543598c2"
+  },
+  "schema_version": 1,
+  "skill": "daily-brief/rank-and-word",
+  "skill_digest": "b2b672ce0c2e1a340d0028e143ca634593bdd460d0a700033be254977b569806",
+  "skill_version": "1.0.0",
+  "stop_reason": "end_turn",
+  "usage": {
+    "cache_read_tokens": null,
+    "cache_write_tokens": null,
+    "priced": false,
+    "tokens_in": 560,
+    "tokens_out": 52,
+    "usd": 0.0
+  }
+}

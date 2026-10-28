@@ -291,6 +291,20 @@ AuthHeader = Callable[[str], tuple[str, str]]
 """The header that carries the key, from its value (e.g. `("x-api-key", key)`)."""
 
 
+REFUSAL_STOP_REASONS = frozenset({"refusal", "content_filter"})
+"""Stop reasons (`CompletionResult.stop_reason`) of a refusal, across the built-in backends
+(`anthropic` `refusal`, `openai-compatible` `content_filter`)."""
+TRUNCATION_STOP_REASONS = frozenset(
+    {"max_tokens", "model_context_window_exceeded", "length", "model_length"}
+)
+"""Stop reasons of a truncated output (`anthropic` `max_tokens` and
+`model_context_window_exceeded`, `openai-compatible` `length` and `model_length`, `ollama`
+`length`). A live backend raises `output_invalid` on any of them; a replayed recording that
+carries one is refused the same way (`horae.evals`, schemas decision 48 D)."""
+UNUSABLE_STOP_REASONS = REFUSAL_STOP_REASONS | TRUNCATION_STOP_REASONS
+"""A refusal or a truncation: the output is not an answer."""
+
+
 def bearer(key: str) -> tuple[str, str]:
     """`Authorization: Bearer <key>`."""
     return ("authorization", f"Bearer {key}")
@@ -782,10 +796,13 @@ __all__ = [
     "MAX_ERROR_BYTES",
     "MAX_RESPONSE_BYTES",
     "MIN_RESPONSE_BYTES",
+    "REFUSAL_STOP_REASONS",
     "RESPONSE_BYTES_PER_TOKEN",
     "RESPONSE_CAP",
     "STATUS_KINDS",
     "SYSTEM_PREAMBLE",
+    "TRUNCATION_STOP_REASONS",
+    "UNUSABLE_STOP_REASONS",
     "USER_AGENT",
     "BoundedTransport",
     "Guard",

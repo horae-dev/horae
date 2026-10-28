@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Command-line entry point for Horae (#26): init, run, runs, diff, undo, replay, doctor,
-usage.
+usage, eval.
 
 Every command shares the exit codes, error reporting and `--json` conventions of
 `horae.cli_output` (schemas decision 37): 0 ok, 1 problems, 2 usage, 3 unknown or refused,
@@ -304,6 +304,7 @@ def _list_runs(
     status: RunStatusFilter | None,
     limit: int,
     json_output: bool,
+    all_runs: bool = False,
 ) -> int:
     config = _config(instance)
     state_dir = instance / config.state_dir
@@ -317,6 +318,8 @@ def _list_runs(
                     pipeline=pipeline,
                     status=None if status is None else status.value,
                     limit=limit,
+                    # Live skill evals (`eval:<skill>`) only with --all or when asked for.
+                    evals=all_runs or pipeline is not None,
                 )
     except StoreError as exc:
         raise CommandFailed(EXIT_PROBLEMS, "store_error", f"{path}: {exc}") from None
@@ -366,15 +369,23 @@ def runs(
         int,
         typer.Option("--limit", "-n", min=0, max=MAX_LIST_RUNS, help="At most this many runs."),
     ] = 20,
+    all_runs: Annotated[
+        bool, typer.Option("--all", help="Also list live skill evals (pipeline eval:<skill>).")
+    ] = False,
     json_output: Annotated[bool, typer.Option("--json", help="Print the runs as JSON.")] = False,
 ) -> None:
     """List runs, newest first, with status, duration and cost.
+
+    The runs of live skill evals (`horae eval --live`, pipeline `eval:<skill>`) are listed only
+    with --all (or --pipeline eval:<skill>).
 
     Exit codes: 0 listed (possibly none), 1 configuration or store problem, 2 usage error,
     70 internal error. With --json: {schema_version, instance, runs}; an error is
     {schema_version, error}."""
     run_command(
-        "runs", json_output, lambda: _list_runs(instance, pipeline, status, limit, json_output)
+        "runs",
+        json_output,
+        lambda: _list_runs(instance, pipeline, status, limit, json_output, all_runs),
     )
 
 
@@ -604,9 +615,10 @@ def replay_command(
     )
 
 
-# `horae init`, `run`, `undo`, `usage` and `cache` live in their own modules; registered here
-# so `horae.cli.app` has every command.
+# `horae init`, `run`, `undo`, `usage`, `eval` and `cache` live in their own modules;
+# registered here so `horae.cli.app` has every command.
 from horae.cli_cache import cache_app as _cache_app  # noqa: E402
+from horae.cli_eval import eval_command as _eval  # noqa: E402
 from horae.cli_init import init as _init  # noqa: E402
 from horae.cli_run import run as _run  # noqa: E402
 from horae.cli_undo import undo as _undo  # noqa: E402
@@ -616,6 +628,7 @@ _command("init")(_init)
 _command("run")(_run)
 _command("undo")(_undo)
 _command("usage")(_usage)
+_command("eval")(_eval)
 app.add_typer(_cache_app, name="cache")
 
 __all__ = [
