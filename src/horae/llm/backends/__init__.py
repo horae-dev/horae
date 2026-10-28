@@ -15,6 +15,7 @@ from horae.llm.backends.openai_compatible import (
     openai_compatible_backend,
 )
 from horae.llm.base import BackendFactory, ModelBackends, PromptSource, RequestPrompts, Validator
+from horae.llm.validate import validate_output
 from horae.secrets import SecretResolver
 
 FACTORIES: Mapping[str, BackendFactory] = {
@@ -32,13 +33,14 @@ def model_backends(
     prompts: PromptSource | None = None,
     validate: Validator | None = None,
 ) -> ModelBackends:
-    """A `ModelBackends` with the built-in `FACTORIES`."""
+    """A `ModelBackends` with the built-in `FACTORIES` and, unless another is given, the
+    production validator `horae.llm.validate.validate_output` (decisions 38 G and 44)."""
     return ModelBackends(
         models=models,
         secrets=secrets,
         factories=FACTORIES,
         prompts=prompts or RequestPrompts(),
-        validate=validate,
+        validate=validate or validate_output,
     )
 
 

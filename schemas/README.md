@@ -1598,3 +1598,65 @@ loosened later without breaking a valid file.
       process resolved (primed from the instance); an 8-byte secret still matches inside
       unrelated text that contains it (the reason identifiers are flagged, not rewritten);
       a secret in an identifier is in the store (flagged), but not in the logs nor the CLI.
+
+### Provisional decisions (#31, pending maintainer review)
+
+44. **Schema-validated output with one repair retry (#31).** (42 is taken by #29.) Contract
+    change: none (`llm[].schema_valid`, `repair` and `schema_errors` exist since decisions 21
+    and 33). Rules of `horae.llm.validate`, `horae.llm._schema_errors` and `ModelBackends`:
+    - **A. the validator is installed in production**: `horae.llm.backends.model_backends`
+      (what `open_ports` builds) passes `validate_output` unless given another validator, so
+      decision 38 G holds for every run. `Validator` may now return an awaitable; a
+      synchronous one (test doubles) runs inline;
+    - **B. what is validated**: the provider's parsed output, **before** the reserved
+      `intents` are split off, against the skill's **full** output schema
+      (`RenderedRequest.output_schema`, the skill file; never the provider's transformed
+      copy, which drops constraints), with `jsonschema`'s `Draft202012Validator`. Formats are
+      annotations (draft 2020-12's default): asserting them would depend on optional
+      packages (`rfc3339-validator`...), so the same output would be valid in one install and
+      not in another. Then the reserved `intents`, when present, must be an array of objects.
+      First, in the parent, the output re-serialised as decision 39 E bounds it (compact,
+      `ensure_ascii=False`, UTF-8) must fit `MAX_OUTPUT_BYTES`; a larger one is the single
+      error `SIZE_ERROR` and never reaches the worker;
+    - **C. a killable worker**: each validation runs in a fresh child process (`sys.executable
+      -I horae/llm/_schema_errors.py`, empty environment, request on stdin, stderr
+      discarded), awaited through asyncio pipes, so the event loop is never blocked. It is
+      killed (and reaped) after `VALIDATION_TIMEOUT_S` (10 s, the interpreter start
+      included), or as soon as the awaiting task is cancelled (the step's single deadline),
+      and it sets `RLIMIT_CPU` on itself as a backstop. Not a thread (it cannot be stopped)
+      nor a process pool (one task cannot be killed without breaking the pool, and a forked
+      pool inherits the parent's resolved secrets, descriptors and threads). The cost is one
+      interpreter start, about 0.5 s with `jsonschema`, at most twice per `llm` step. The
+      worker imports only the standard library and `jsonschema` (nothing of `horae`, no
+      instance state; `-I` keeps the script's folder, `PYTHON*` variables and the user site
+      off its path);
+    - **D. fail closed, fixed messages**: a timeout is `/: timeout: the output could not be
+      validated in time`; a worker that cannot start, exits non-zero or answers anything but
+      a JSON array of at most 16 strings of 1 to 200 characters (64 KiB at most) is `/:
+      validator: the output could not be validated`; an output that is not plain JSON is
+      `/: json: ...`; an unusable schema `/: schema: ...`. Each is an error, never a pass, so
+      such an output drives the repair, then degrades the step;
+    - **E. repair errors carry no data**: each error is `<pointer>: <keyword>: <description>`,
+      where the pointer holds array indexes and property names **the schema declares** only
+      (any other segment is `*`; at most 120 characters, cut on a segment), the keyword is
+      the failing JSON Schema keyword (`false` for a `false` schema, `invalid` for an
+      unlisted one) and the description is Horae's fixed wording, with at most a number or
+      type names taken from the **schema** (trusted, the skill author's). Never an instance
+      value, an excerpt of the output, an undeclared key, or `jsonschema`'s own message
+      (which quotes the value). The errors are de-duplicated, **sorted** (one output, one
+      list: a replay sends the same repair), at most `MAX_ERRORS` = 16 (the last one then
+      says how many more there were) of at most 200 characters each; at most 1000 failures
+      are examined. The provider backends still frame them as data inside `<schema_errors>`
+      (decision 38). The repair attempt sends the same viewed input, prompt and schema plus
+      these errors: nothing new;
+    - **F. an invalid output proposes nothing**: when the validator reports errors,
+      `ModelBackends` drops the output's `intents` whatever their shape (`LlmResponse.intents`
+      is empty, so `LlmCall.intents` of an invalid attempt is `[]`; a non-list `intents` is a
+      schema error, no longer `output_invalid`). The engine (unchanged) routes and keeps
+      nothing from an attempt with schema errors, makes exactly one repair attempt with the
+      remaining step budget (and, through the ledger, the remaining daily allowance;
+      decision 41), and after a second invalid output degrades the step (`schema_invalid`):
+      no intent of the step enters the record, later steps are skipped, the run is
+      `degraded`, which `horae runs` shows (and `--status degraded` lists);
+    - **follow-ups**: a warm worker if the start-up cost matters (#29's CLI backend is
+      slower anyway); a memory ceiling for the worker (#51).

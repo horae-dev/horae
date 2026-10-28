@@ -74,12 +74,18 @@ backends disable their SDK's own retries.
   intents must declare the reserved `intents` array in its output schema (#27,
   `horae.skills.INTENTS_PROPERTY`, the same name as `INTENTS_KEY`). Another `PromptSource`
   can be passed to `ModelBackends` instead.
-- **#31 (repair).** `ModelBackends(validate=...)` turns an output into its schema errors
-  (`LlmResponse.schema_errors`, which drive the repair retry). Without a validator the
-  provider's structured output is the only check and `schema_errors` is empty. **The
-  validator is mandatory before production use** (decision 38 G): structured outputs drop
-  the constraints they do not support (`anthropic.transform_schema` moves them into
-  descriptions), so only the validator enforces the full schema.
+- **#31 (repair, decision 44).** `ModelBackends(validate=...)` turns an output into its
+  repair errors (`LlmResponse.schema_errors`, which drive the repair retry), validated
+  against the skill's **full** output schema (`RenderedRequest.output_schema`, not the
+  provider's transformed copy) before the intents are split off. The validator may be
+  asynchronous: `horae.llm.validate.validate_output`, which `model_backends` installs, runs
+  in a killable child process and never blocks the event loop. An output with errors
+  proposes nothing: its `intents` are dropped (`LlmResponse.intents` is empty, whatever
+  their shape). Without a validator the provider's structured output is the only check and
+  `schema_errors` is empty. **The validator is mandatory before production use** (decision
+  38 G): structured outputs drop the constraints they do not support
+  (`anthropic.transform_schema` moves them into descriptions), so only the validator
+  enforces the full schema.
 - **#33 (budgets).** `worst_case` is what the usage ledger reserves before `send`; the
   runner's `LedgerLlm` (`horae.runner._budget`) calls `prepare` (the prompt, the provider
   backend and the input bound: the `PromptSource` reads happen there, outside the store's
@@ -93,10 +99,11 @@ backends disable their SDK's own retries.
 """
 
 import hashlib
+import inspect
 import json
 import logging
 import math
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
@@ -299,8 +306,11 @@ ERROR_KINDS = (
 BackendFactory = Callable[[str, ModelAlias, SecretResolver], ProviderBackend]
 """Builds the provider backend of one model alias: `(alias, spec, secrets)`."""
 
-Validator = Callable[[Any, Mapping[str, Any]], Sequence[str]]
-"""`validate(output, schema)`: the schema errors of `output` (empty when valid); #31."""
+Validator = Callable[[Any, Mapping[str, Any]], Sequence[str] | Awaitable[Sequence[str]]]
+"""`validate(output, schema)`: the repair errors of `output` against the skill's full output
+schema (empty when valid), or an awaitable of them (#31). `horae.llm.validate.validate_output`
+is the production one (a killable worker); a synchronous validator runs inline, on the event
+loop (test doubles only)."""
 
 
 def cost(
@@ -405,6 +415,13 @@ def split_intents(output: Any, usage: Usage) -> tuple[Any, list[Any]]:
         raise LlmError("output_invalid", f"the output's `{INTENTS_KEY}` is not a list", usage=usage)
     rest = {key: value for key, value in output.items() if key != INTENTS_KEY}
     return rest, intents
+
+
+def _without_intents(output: Any) -> Any:
+    """`output` without its reserved top-level `intents`, whatever their shape."""
+    if not isinstance(output, dict) or INTENTS_KEY not in output:
+        return output
+    return {key: value for key, value in output.items() if key != INTENTS_KEY}
 
 
 @dataclass(frozen=True)
@@ -572,8 +589,17 @@ class ModelBackends:
             raise failure  # outside the handler: no `__context__` leads to the original
         errors: tuple[str, ...] = ()
         if self.validate is not None:
-            errors = tuple(self.validate(result.output, rendered.output_schema))
-        output, intents = split_intents(result.output, result.usage)
+            found = self.validate(result.output, rendered.output_schema)
+            if inspect.isawaitable(found):
+                found = await found
+            errors = tuple(str(error) for error in found)
+        intents: list[Any]
+        if errors:
+            # An invalid output proposes nothing (decision 44): its intents are dropped here,
+            # whatever their shape, and the engine routes nothing from an invalid attempt.
+            output, intents = _without_intents(result.output), []
+        else:
+            output, intents = split_intents(result.output, result.usage)
         output, intents, errors = _redacted_response(output, intents, errors, rendered.alias)
         return LlmResponse(
             output=output,

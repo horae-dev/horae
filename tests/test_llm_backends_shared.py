@@ -735,7 +735,8 @@ def test_intents_are_moved_out_of_the_output(kind: Kind, secrets: SecretResolver
     recorder = kind.recorder(text_answer(kind, json.dumps(output)))
     response = complete(backends(kind, secrets, recorder, validate=validate))
     assert response.output == {"items": ["a"]}
-    assert response.intents == [intent]
+    # An invalid output proposes nothing (decision 44): its intents are dropped.
+    assert response.intents == []
     assert response.schema_errors == ("$.items: synthetic",)
     assert seen == [output]
 
