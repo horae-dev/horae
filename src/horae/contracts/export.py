@@ -27,6 +27,7 @@ from horae.contracts.lockfile import Lockfile
 from horae.contracts.pipeline import Pipeline
 from horae.contracts.plugin import PluginManifest
 from horae.contracts.run import RunRecord
+from horae.contracts.skill import SkillManifest
 
 DIALECT = "https://json-schema.org/draft/2020-12/schema"
 BASE_ID = "https://raw.githubusercontent.com/horae-dev/horae/main/schemas"
@@ -106,6 +107,7 @@ SCHEMAS: tuple[SchemaSpec, ...] = (
     SchemaSpec("lockfile", 1, Lockfile, "Horae lockfile (horae.lock)"),
     SchemaSpec("run-record", 1, RunRecord, "Horae run record"),
     SchemaSpec("instance", 1, InstanceConfig, "Horae instance configuration (horae.yaml)"),
+    SchemaSpec("skill", 1, SkillManifest, "Horae skill (skill.yaml)"),
 )
 
 

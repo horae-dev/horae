@@ -566,6 +566,7 @@ def _run(
     tmp_path: Path,
     provider_kwargs: dict[str, Any] | None = None,
     pipeline: str = "brief-a",
+    cache: bool = True,
     **config: Any,
 ) -> tuple[RunRecord, list[FakeProvider], Instance]:
     root = tmp_path / "instance"
@@ -576,7 +577,7 @@ def _run(
     plugins = Plugins()
     with Store.open(loaded.store_path) as opened:
         runner = Runner(loaded, opened, Ports(plugins, plugins, llm=llm))
-        record = asyncio.run(runner.run(pipeline))
+        record = asyncio.run(runner.run(pipeline, cache=cache))
     return record, made, loaded
 
 
@@ -601,7 +602,8 @@ def test_the_daily_ceiling_stops_the_step_before_any_call(tmp_path: Path) -> Non
     budgets = {"daily": {"tokens_out": 300}}
     first, _, loaded = _run(tmp_path, {"tokens_out": 300}, budgets=budgets)
     assert first.status == "ok"
-    second, made, _ = _run(tmp_path, {"tokens_out": 300}, "brief-b")
+    # The same skill, model and input: a cache hit (#32) unless the lookup is skipped.
+    second, made, _ = _run(tmp_path, {"tokens_out": 300}, "brief-b", cache=False)
     assert second.status == "degraded"
     step = second.steps[1]
     assert (step.status, step.error and step.error.kind) == ("degraded", "budget_exceeded")
@@ -613,7 +615,7 @@ def test_the_daily_ceiling_stops_the_step_before_any_call(tmp_path: Path) -> Non
 
 def test_the_daily_allowance_lowers_max_tokens(tmp_path: Path) -> None:
     _run(tmp_path, {"tokens_out": 1500}, budgets={"daily": {"tokens_out": 1800}})
-    record, made, _ = _run(tmp_path, pipeline="brief-b")
+    record, made, _ = _run(tmp_path, pipeline="brief-b", cache=False)
     assert record.status == "ok"
     assert made[0].sent[0]["max_tokens"] == 300
 

@@ -171,7 +171,25 @@ def cli_main(argv: list[str]) -> None:
     app(argv[2:], prog_name="horae")
 
 
+def brief_main(argv: list[str]) -> int:
+    """`python tests/runner_fixtures.py --brief <instance>`: run `brief` once with a counting
+    fake LLM; print the status and how many LLM calls were made (the cache test)."""
+    from horae.config import load_instance
+    from horae.runner import Ports, Runner
+    from horae.store import Store
+
+    loaded = load_instance(Path(argv[0]))
+    plugins = Plugins()
+    llm = FakeLlm([llm_response({"items": ["Review PR 42"]})])
+    with Store.open(loaded.store_path) as store:
+        record = asyncio.run(Runner(loaded, store, Ports(plugins, plugins, llm)).run("brief"))
+    print(json.dumps({"status": record.status, "llm_calls": len(llm.requests)}))
+    return 0
+
+
 if __name__ == "__main__":
     if sys.argv[1:2] == ["--cli"]:
         cli_main(sys.argv[2:])
+    if sys.argv[1:2] == ["--brief"]:
+        sys.exit(brief_main(sys.argv[2:]))
     sys.exit(child_main(sys.argv[1:]))

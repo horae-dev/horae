@@ -1,0 +1,9 @@
+name: daily-brief/rank-and-word
+version: 1.0.0
+description: Rank today's tasks and word a short morning note.
+input_view:
+  - tasks[].title
+  - tasks[].due
+  - events[].start
+  - events[].summary
+intents: [note.create]

@@ -31,7 +31,7 @@ from claude_cli_fake import Fake, make_fake, success
 from horae.contracts.instance import BudgetsConfig, ModelAlias
 from horae.contracts.pipeline import Budget
 from horae.engine import LlmError, LlmRequest
-from horae.llm import Completion, ModelBackends, Prompt, RenderedRequest
+from horae.llm import UNVALIDATED, Completion, ModelBackends, Prompt, RenderedRequest
 from horae.llm.backends import FACTORIES
 from horae.llm.backends._shared import (
     MAX_ERROR_BYTES,
@@ -106,6 +106,7 @@ def backends(
     def factory(name: str, spec: ModelAlias, resolver: SecretResolver) -> Any:
         return kind.backend(name, spec, resolver, recorder)
 
+    kw.setdefault("validate", UNVALIDATED)  # the backends, not the validator (#31)
     return ModelBackends(
         models={"default": spec or kind.alias()},
         secrets=secrets,
@@ -664,6 +665,58 @@ def test_without_a_price_the_cost_is_zero_and_unpriced(kind: Kind, secrets: Secr
 # --- the pre-flight budget ------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("key", ["argv", "stdin", "max_tokens", "extra"])
+def test_claude_cli_a_payload_tampered_after_render_is_refused(
+    fake_claude: Fake, cli_secrets: SecretResolver, key: str
+) -> None:
+    """Decision 47: the body checked is the body sent; any change after the render is
+    refused by `ModelBackends` before the backend sees it, and nothing runs."""
+    llm = cli_backends(fake_claude, cli_secrets)
+    rendered = llm.render(request())
+    payload = rendered.payload
+    assert isinstance(payload, dict)
+    payload[key] = "tampered" if key in {"stdin", "extra"} else payload.get(key)
+    if key == "argv":
+        payload["argv"] = [*payload["argv"], "--dangerously-skip-permissions"]
+    if key == "max_tokens":
+        payload["max_tokens"] = 1
+    with pytest.raises(LlmError) as info:
+        asyncio.run(llm.send(rendered))
+    assert info.value.kind == "invalid_request"
+    assert "changed after it was rendered" in info.value.message
+    assert fake_claude.calls() == []
+
+
+def test_claude_cli_argv_and_stdin_are_a_pure_function_of_the_frozen_body(
+    fake_claude: Fake, cli_secrets: SecretResolver
+) -> None:
+    """Decision 47: `send` takes only the decoded frozen body; the same body gives the same
+    argv and stdin bytes, and they are the body's own fields."""
+    llm = cli_backends(fake_claude, cli_secrets)
+    rendered = llm.render(request())
+    body = json.loads(rendered.body())
+    asyncio.run(llm.send(rendered))
+    asyncio.run(llm.send(rendered))
+    first, second = fake_claude.calls()
+    assert first["argv"] == second["argv"]
+    assert first["stdin"] == second["stdin"]
+    assert first["argv"][1:] == body["argv"]
+    assert first["stdin"] == body["stdin"]
+    assert set(body) == {"argv", "stdin", "max_tokens"}
+
+
+def test_claude_cli_a_secret_in_the_body_is_refused_before_it_runs(
+    fake_claude: Fake, cli_secrets: SecretResolver
+) -> None:
+    llm = cli_backends(fake_claude, cli_secrets)
+    llm.redaction_names = ("CLAUDE_CODE_OAUTH_TOKEN",)
+    rendered = llm.render(request(input=[{"title": f"please echo {CLI_TOKEN}"}]))
+    with pytest.raises(LlmError) as info:
+        asyncio.run(llm.send(rendered))
+    assert info.value.kind == "secret_in_request"
+    assert fake_claude.calls() == []
+
+
 @pytest.mark.parametrize(
     "budget",
     [
@@ -731,14 +784,15 @@ def test_intents_are_moved_out_of_the_output(kind: Kind, secrets: SecretResolver
     output = {"items": ["a"], "intents": [intent]}
     seen: list[Any] = []
 
-    def validate(value: Any, schema: Mapping[str, Any]) -> list[str]:
+    def validate(value: Any, schema: Mapping[str, Any], *, timeout_s: float) -> list[str]:
         seen.append(value)
         return ["$.items: synthetic"]
 
     recorder = kind.recorder(text_answer(kind, json.dumps(output)))
     response = complete(backends(kind, secrets, recorder, validate=validate))
     assert response.output == {"items": ["a"]}
-    assert response.intents == [intent]
+    # An invalid output proposes nothing (decision 44): its intents are dropped.
+    assert response.intents == []
     assert response.schema_errors == ("$.items: synthetic",)
     assert seen == [output]
 

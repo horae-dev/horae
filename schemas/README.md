@@ -13,6 +13,7 @@ All schemas use JSON Schema **draft 2020-12**. `$id` values below are relative t
 | Lockfile | [`lockfile/v1.json`](lockfile/v1.json) | `lockfile/v1.json` | `horae.lock` (§4) |
 | Run record | [`run-record/v1.json`](run-record/v1.json) | `run-record/v1.json` | one run (§3.1, §2.1.6) |
 | Instance configuration | [`instance/v1.json`](instance/v1.json) | `instance/v1.json` | `horae.yaml` (§3.1, §3.4, §7) |
+| Skill | [`skill/v1.json`](skill/v1.json) | `skill/v1.json` | `skills/<namespace>/<skill>/skill.yaml` of a plugin (§2.1, §3.4) |
 
 ## Source of truth
 
@@ -110,6 +111,8 @@ JSON Schema cannot express these; the models enforce them and the tests pin the 
   `applied_by_call` are all set or all absent (the JSON Schema's `dependentRequired` checks
   presence, the model also rejects an explicit `null` next to a value); `pipeline_definition`
   is a valid pipeline named `pipeline`, at most 64 KiB as compact JSON (decision 33).
+- `skill`: two `input_view` paths may not overlap (one a prefix of the other) or disagree on
+  whether a value is an object or an array (decision 39).
 - `plugin-manifest`: the host of an `mcp-http` `runtime.url` is listed in `permissions.network`;
   no tool in `provides` is a sink operation of the plugin's own sink or notifier namespaces
   (`<ns>.read`, `<ns>.apply`, `<ns>.restore`, `<ns>.parent_exists`, `<ns>.identity`,
@@ -1110,13 +1113,141 @@ loosened later without breaking a valid file.
       37) when an alias is configured. `horae doctor` reports a model alias used by an `llm`
       step whose backend is not available (`models.<alias>.backend`), besides its secret;
     - **integration points (#27)**: the prompt, viewed input, output schema and skill version
-      come from the `LlmRequest` (`RequestPrompts` reads the fields #27 adds with `getattr`,
-      so it works before and after #27). Until then the step stops with `skill_unavailable`
-      before any request; `skill_unavailable` means "no usable prompt for this skill here",
-      and #27's `skill_invalid` (a skill that is present but malformed) is reported before
-      the LLM layer is reached. #27 also changes `open_ports` (`horae.runner._ports`), which
-      this change touches too: the merge keeps both (the skill loader becomes the
-      `PromptSource` of the `ModelBackends` built there).
+      come from the `LlmRequest` (`RequestPrompts` reads the fields #27 added: `prompt`,
+      `output_schema`, `skill_version`). A request without a prompt or schema (an engine
+      given no `SkillSource`) stops with `skill_unavailable` before any request;
+      `skill_unavailable` means "no usable prompt for this skill here", and #27's
+      `skill_invalid` (a skill that is present but malformed) is reported while planning,
+      before the LLM layer is reached. `open_ports` (`horae.runner._ports`) builds both the
+      owned `ModelBackends` and the `DirectorySkills` source (`Ports.skills`, decision 39);
+      the reserved `intents` property is the one #27's schema check requires of a skill
+      that declares intents (`horae.skills.INTENTS_PROPERTY` is `INTENTS_KEY`).
+
+### Provisional decisions (#27, pending maintainer review)
+
+39. **Skill format and loader (#27).** A new contract, `schemas/skill/v1.json`
+    (`horae.contracts.skill.SkillManifest`), the loader `horae.skills`, and one optional
+    run-record field, `llm[].skill_digest` (a compatible addition). Numbered 39 because #28
+    (decision 38) merges first. Choices to verify:
+    - **(A) layout.** A skill `<namespace>/<skill>` is the folder
+      `skills/<namespace>/<skill>/` of the plugin that lists it in `provides.skills`
+      (`HostRegistry.plugin_for_skill`, then the plugin's installed directory). The namespace
+      is a folder level so one plugin can ship skills of two namespaces without a clash. The
+      folder holds `skill.yaml`, the prompt (`prompt.md` by default) and the output schema
+      (`output.schema.json` by default); other files are ignored;
+    - **(B) `skill.yaml` and race-safe reads**: `name` (must equal the skill ref), `version`
+      (semver), `description` (one line), `input_view` (1 to 256 paths), optional `prompt` and
+      `output_schema` file names, optional `intents`. File names are **one path segment**
+      (`^[A-Za-z0-9_][A-Za-z0-9_.-]*$`), so `../`, absolute paths and hidden files cannot be
+      written. The loader opens the plugin root and walks `skills`, the namespace and the
+      skill one component at a time relative to the previous descriptor (`dir_fd`), each
+      `O_DIRECTORY | O_NOFOLLOW`, then opens each file relative to the skill folder with
+      `O_NOFOLLOW | O_NONBLOCK` and checks it with `fstat`: a regular file with exactly one
+      hard link. **Every symbolic link inside the skill tree is refused** (a symlinked skill
+      folder, namespace or `skills` folder too, and a link between two files of the folder),
+      and so is a hard link to a file elsewhere. Swapping a component for a link between a
+      check and the read cannot redirect the read. Sizes: `skill.yaml`, prompt and schema at
+      most 64 KiB each. Every problem, including a non-finite number, a lone surrogate, a
+      `$ref` chain or a recursion too deep, is a `SkillError` (`skill_invalid`);
+    - **(C) input view: dotted paths with `[]`**, not JSON Pointer: `tasks[].title`,
+      `[].data` (a `collect` output is an array at the root), `matrix[][].v`. JSON Pointer
+      names one location (`/tasks/0/title`) and has no "every element", and its `~0`/`~1`
+      escapes are hard to review in YAML. Names are `[A-Za-z_][A-Za-z0-9_-]*`: a key with
+      another character cannot be selected in v1; the bracket-quoted form (`["a.b"]`) is
+      reserved for it. A path selects the whole value it ends on; overlapping or
+      shape-contradicting paths are refused. `input_view` is a list of paths **or a mapping
+      `path: {options}`** (for #34's field classes, `events[].attendees[]: {class: person}`):
+      options are free-form but bounded (at most 16 per path, names like the paths', values
+      booleans, finite numbers, one-line strings or lists of at most 64 of them); `class`,
+      when given, is one of `person`, `email`, `phone`, `place`, `amount`, `free_text`. v1 does
+      not act on options; they join the skill's digest only when present, so a mapping without
+      options has the list form's digest. **Applying** the view (`InputView.apply`) keeps
+      exactly the declared keys that are present, maps `[]` over arrays (keeping order,
+      dropping elements of the wrong shape) and re-encodes the result with `sort_keys`, so
+      object keys are sorted at every depth (inside selected whole values too) and nothing
+      is shared with the input; a value of the wrong shape selects nothing (the root: `null`,
+      see G). Missing fields are not an error: the input is untrusted data;
+    - **(D) prompt: no template syntax in v1.** The prompt is sent verbatim; `{{` and `}}` are
+      refused so a later syntax (e.g. `{{date}}` from the run context, never from the input)
+      is a compatible addition. It must be non-empty UTF-8 without a character of the Unicode
+      categories `Cc`, `Cf`, `Co`, `Cs`, `Cn`, `Zl`, `Zp` (but tab and newline: no CR, so the
+      digest does not depend on line endings), which covers the bidirectional controls,
+      zero-width characters, U+00AD, U+180E, the tag characters U+E0000 to U+E007F and U+2028 /
+      U+2029, nor another invisible character (the variation selectors U+FE00 to U+FE0F and
+      U+E0100 to U+E01EF, the combining grapheme joiner, the Hangul fillers). The input is
+      never interpolated into the prompt: it travels separately, as data (tenet 5);
+    - **(E) output schema: draft 2020-12, self-contained, regex-free and bounded**
+      (`horae.skills.check_output_schema`): the metaschema, an optional `$schema` that must
+      be 2020-12, a root `"type": "object"`, only local `$ref`s (at most 32 chained, no cycle,
+      no `%`: the validator percent-decodes pointers; resolved with `referencing`, as the
+      validator resolves them), every `$defs` / `definitions` entry bounded even when
+      unreferenced, and no `$id`, `$anchor`, `$dynamic*`, `$recursive*` or `$vocabulary`; **no `pattern`,
+      `patternProperties`, `propertyNames` or `"format": "regex"`** (a plugin author's regex
+      is a ReDoS risk; #31 must still validate outputs in a worker it can kill on a timeout);
+      every subschema a value meets has a `type`, `enum`, `const`, `$ref` or combinator; a
+      `string` needs `maxLength`, an `array` `maxItems` (and `items` past its `prefixItems`),
+      an `object` `additionalProperties: false` (as the backends' strict structured-output
+      modes require), an `integer` or `number` a finite lower and upper bound. The **size
+      bound** is in **UTF-8 bytes** of the compact JSON (`separators=(",", ":")`,
+      `ensure_ascii=False`) and is a sound worst case: a string counts `6 * maxLength + 2`
+      (every code point escaped as `\uXXXX`), a number the digits of its larger extreme (an
+      `integer` two more, for `3.0`; a `number` or an extreme of 10^15 or more at least 25, the
+      longest float `repr`), `enum` / `const` their longest serialisation (`1` may be `1.0`);
+      `anyOf` / `oneOf` take the largest branch, `allOf` the smallest **bounded** branch
+      (unconstrained branches are skipped; refused only if none is bounded), and a keyword
+      that does not bound is skipped when another one does. #31 re-serialises the validated
+      output in that form, so the bound holds for what it stores. A property test
+      (`hypothesis`, a new dev dependency) checks it on random bounded schemas. The bound
+      must be at most `MAX_OUTPUT_BYTES` (256 KiB); the file nests at most 64 levels and is
+      strict JSON (no duplicate keys, no `NaN`, no number overflowing to infinity).
+      **Amended by #31 (decision 44 G):** the product of `anyOf` / `oneOf` branch counts
+      along any path of the schema, `$ref`s followed (memoised per `$ref`), is at most
+      `MAX_COMBINATOR_FANOUT` = 1024 (a validator tries every branch, so nested alternatives,
+      through a chain of `$defs` say, make one validation exponential); alternatives side by
+      side (`properties`, `allOf`) do not multiply. This adds
+      **`jsonschema` as a runtime dependency** (it was a dev dependency; #31 needs it to
+      validate outputs);
+    - **(F) intents.** `intents` is a list of types or a mapping `type: max` (1 to 256, #35):
+      at most `max` intents of that type per `llm` step; more is a `guard` violation that
+      degrades the step (decision 46; it was `intent_rejected` before #35); a reused output
+      over the limit is a cache miss. Omitted or empty: the skill
+      proposes none. They must be within the plugin's approved `permissions.intents` (load
+      error otherwise). The engine checks the LLM's intents against the plugin's permissions
+      **narrowed to the skill's**, on fresh and reused outputs alike, and a
+      `task.update_status` fingerprint must appear in the **viewed** input (what the model was
+      shown), not merely in the data collected. **The reserved output property** (#28): the
+      LLM proposes intents in a top-level `intents` property of its output, which the backends
+      extract; a skill that declares intents must declare `properties.intents` as a bounded
+      `"type": "array"` in its output schema, and a skill that declares none may not;
+    - **(G) the engine** (`execute(..., skills=SkillSource)`, `Ports.skills`, built by
+      `open_ports` as `DirectorySkills` over `<instance>/plugins`): the skill is loaded while
+      planning, **before** the backend is checked, so an invalid skill fails the run before
+      any plugin is called (`skill_invalid` on the `llm` step, even without a backend; a port
+      bug is `host_error`), and `horae doctor` loads every skill an `llm` step uses (a
+      `SkillError` is a problem). `LoadedSkill` exposes `name`, `version`, `digest`, `prompt`,
+      `output_schema` (a fresh deep copy on each access: the skill keeps canonical bytes),
+      `intents`, `intent_limits`, `output_bound`, `view_paths` and `view(data)`. `LlmRequest`
+      gains `prompt`, `output_schema` (a fresh copy per attempt), `skill_version` and
+      `skill_digest`, and its `input` is the **viewed** input, so a backend (#28) only sends
+      it. A viewed input of `null` (the input does not have the view's shape) degrades the
+      step **without calling the LLM** (`input_invalid`). `LlmCall.skill_version` is the
+      loaded skill's version (not the backend's), `LlmCall.skill_digest` its digest, and
+      `LlmCall.input_hash` the hash of the viewed input. Without a skill source (fakes, older
+      callers) nothing changes; whether a real backend must refuse a request without a prompt
+      is a question for the maintainer;
+    - **(H) cache key.** With a skill, the key (`RunRecord.input_hash`) is the SHA-256 of
+      `{skill, plugin: {name, version, commit}, model, input: <viewed input>, skill_version,
+      skill_digest}`, where `skill_digest` is the SHA-256 of the canonical JSON of `{name,
+      version, prompt, output_schema, input_view, intents}` (plus `view_options` and
+      `intent_limits` when the manifest has any; not `description`). A new version, an edited
+      prompt, schema, view or intents is a cache miss; a change to an undeclared input field
+      is not (the model would see the same thing). Skills are loaded once per run
+      (`DirectorySkills` caches them), so a run sees one version of the files;
+    - **(I) replay.** `replay(..., skills=)` passes the source to the engine; `horae replay`
+      reads skills from `<instance>/plugins` when it exists (local files only, like
+      `LockRegistry`). A skill edited since the run replays as different, by design; when
+      both records carry `llm[].skill_digest`, the report adds the note "skill <name> changed
+      since the run" and an `llm.<skill>.skill_digest` summary field.
 
 ### Provisional decisions (#30, pending maintainer review)
 
@@ -1572,11 +1703,13 @@ loosened later without breaking a valid file.
       before any call, `params_invalid` naming the secret only, when a template variable
       (`horae run --var`) or a rendered parameter holds the value (or a known encoding) of a
       resolved secret, in a string, an object key or as a number's whole value; the variable
-      is redacted in the record's `context`. A skill's prompt or output schema holding one is
-      refused by `ModelBackends.prepare` (`params_invalid`, before rendering, reserving or
-      sending). That check is **not** at plan time yet: #27's skill loader is not on `main`,
-      so the engine does not have the prompt before the run; the steps before the `llm` step
-      have run when it refuses. With the loader the check moves to `_plan`.
+      is redacted in the record's `context`. A skill's prompt or output schema holding one
+      (in a string, an object key or as a number's whole value) is refused at plan time too:
+      `_plan` loads the skill through the engine's `SkillSource` (#27, decision 39) and fails
+      the run with `params_invalid` (`<skill>: the prompt or output schema holds secret
+      <NAME>`) before any step runs. `ModelBackends.prepare` keeps the same check as a
+      backstop (an engine given no `SkillSource`, a `PromptSource` that reads other files),
+      before rendering, reserving or sending.
       `params_invalid` releases a ledger reservation;
     - **E. logs, warnings, uncaught exceptions (provisional).** `horae.secrets.logs.install()`
       (the CLI entry point, `Runner.run`, an opening `PluginHost`; idempotent) wraps the log
@@ -1620,3 +1753,537 @@ loosened later without breaking a valid file.
       process resolved (primed from the instance); an 8-byte secret still matches inside
       unrelated text that contains it (the reason identifiers are flagged, not rewritten);
       a secret in an identifier is in the store (flagged), but not in the logs nor the CLI.
+
+### Provisional decisions (#31, pending maintainer review)
+
+44. **Schema-validated output with one repair retry (#31).** (42 is taken by #29.) Contract
+    change: none (`llm[].schema_valid`, `repair` and `schema_errors` exist since decisions 21
+    and 33; `validator_unavailable` is a new step error kind, an `ErrorKind` string). Rules of
+    `horae.llm.validate`, `horae.llm._schema_errors` and `ModelBackends`. A security review
+    of the first implementation found 8 issues; **review decisions A to F** below are
+    provisional, for the maintainer to confirm:
+    - **A. the validator is the default** (review decision D): `ModelBackends.validate`
+      defaults to `horae.llm.validate.validate_output` (imported lazily: `horae.llm.validate`
+      imports `horae.skills`, which imports `horae.llm.base`), and so does
+      `horae.llm.backends.model_backends` (what `open_ports` builds), so decision 38 G holds
+      for every `ModelBackends`, not only the one the runner builds. The only opt-out is the
+      explicit sentinel `horae.llm.UNVALIDATED` (test doubles of the backends). A `Validator`
+      is called `validate(output, schema, timeout_s=...)` and may return an awaitable; a
+      synchronous one (test doubles) runs inline;
+    - **B. what is validated**: the provider's parsed output, **before** the reserved
+      `intents` are split off, against the skill's **full** output schema
+      (`RenderedRequest.output_schema`, the skill file; never the provider's transformed
+      copy, which drops constraints: `anthropic.transform_schema` moves `maxLength` into a
+      description, and the validator still reports `/x: maxLength`), with `jsonschema`'s
+      `Draft202012Validator`. Formats are annotations (draft 2020-12's default): asserting
+      them would depend on optional packages (`rfc3339-validator`...), so the same output
+      would be valid in one install and not in another. Then the reserved `intents`, when
+      present, must be an array of objects. First, in the parent, the output re-serialised as
+      decision 39 E bounds it (compact, `ensure_ascii=False`, UTF-8) must fit
+      `MAX_OUTPUT_BYTES`; a larger one is the single repair error `SIZE_ERROR` (the model's
+      fault) and never reaches the worker;
+    - **C. a killable, isolated worker**: each validation runs in a fresh child process,
+      awaited through asyncio pipes, so the event loop is never blocked:
+
+      | | |
+      |---|---|
+      | interpreter | `sys.executable -I -B horae/llm/_schema_errors.py` (isolated: no `PYTHON*` variables, no user site, not the script's folder on `sys.path`; no bytecode written) |
+      | environment | empty (`env={}`) |
+      | descriptors | stdin (the request) and stdout (the answer) pipes, stderr `/dev/null`, nothing else (`close_fds`) |
+      | working directory | `/` |
+      | session | its own (`start_new_session`): no signal of the terminal reaches it |
+      | CPU | `RLIMIT_CPU` of the timeout plus one second, set by the worker on itself |
+      | memory | `RLIMIT_AS` at `MAX_WORKER_MEMORY` (256 MiB; the worker is about 26 MiB once `jsonschema` is imported), `RLIMIT_DATA` where that cannot be set; macOS refuses both, so the ceiling is Linux only there (review decision A). An allocation past it is a `MemoryError`: exit status 3, `WORKER_ERROR` |
+      | timeout | `min(VALIDATION_TIMEOUT_S, the attempt's remaining deadline - VALIDATION_MARGIN_S)` (10 s and 0.5 s; the interpreter start included), then killed and reaped |
+      | cancellation | the awaiting task cancelled (the step's or the run's deadline): killed and reaped |
+      | answer | read with a bound: at most `MAX_WORKER_OUTPUT` + 1 bytes (64 KiB), a longer answer is not read and the worker is killed; it must be a JSON array of at most 16 strings of 1 to 200 characters |
+
+      Not a thread (it cannot be stopped) nor a process pool (one task cannot be killed
+      without breaking the pool, and a forked pool inherits the parent's resolved secrets,
+      descriptors and threads). The cost is one interpreter start, about 0.5 s with
+      `jsonschema`, at most twice per `llm` step. The worker imports only the standard
+      library and `jsonschema` (nothing of `horae`, no instance state). `horae doctor`
+      checks, when a pipeline has an `llm` step, that `sys.executable` and the worker script
+      exist and that a trivial validation, run exactly as above, gives the expected error
+      (`horae.llm.validate.worker_problem`);
+    - **D. fail closed, and no repair for the validator's own failure** (review decision
+      C): a timeout (`/: timeout: the output could not be validated in time`), a worker that
+      cannot start, exits non-zero or answers anything else (`/: validator: the output could
+      not be validated`), an unusable schema (`/: schema: ...`) or an output that is not plain
+      JSON (`/: json: ...`) is never a pass: `validate_output` raises, and `ModelBackends`
+      raises `LlmError("validator_unavailable", <that fixed message>, usage=<the attempt's
+      usage>)` (so does any exception of another validator: `the validator failed
+      (<type>)`). It is not the model's fault, so **no repair** is made: the step degrades at
+      once with kind `validator_unavailable`, its cost charged to the run and settled in the
+      ledger (decision 41). No intent of the attempt is kept, as for any failed attempt;
+    - **E. repair errors carry no data**: each error is `<pointer>: <keyword>: <description>`,
+      where the pointer holds array indexes and property names **the schema declares** only
+      (any other segment is `*`; at most 120 characters, cut on a segment), the keyword is
+      the failing JSON Schema keyword (`false` for a `false` schema, `invalid` for an
+      unlisted one) and the description is Horae's fixed wording, with at most a number or
+      type names taken from the **schema** (trusted, the skill author's). Never an instance
+      value, an excerpt of the output, an undeclared key, or `jsonschema`'s own message
+      (which quotes the value). The errors are de-duplicated, sorted in the **natural order**
+      of their pointers (segment by segment, an index before a name, indexes by value:
+      `/b/2` before `/b/10`; then by keyword and description), at most `MAX_ERRORS` = 16 (the
+      last one then says how many more there were) of at most 200 characters each; at most
+      1000 failures are examined. One output and one schema give one list, so a live run
+      sends the same repair for the same output; a replay serves the **recorded** errors
+      (`horae.replay`), so a later change of this order (or of the wording) changes no
+      replay of a recorded run, but changes what a new run records. The provider backends
+      still frame the errors as data inside `<schema_errors>` (decision 38). The repair
+      attempt sends the same viewed input, prompt and schema plus these errors: nothing new;
+    - **F. an invalid output proposes nothing**: when the validator reports errors,
+      `ModelBackends` drops the output's `intents` whatever their shape (`LlmResponse.intents`
+      is empty, so `LlmCall.intents` of an invalid attempt is `[]`; a non-list `intents` is a
+      schema error, no longer `output_invalid`). The engine (unchanged) routes and keeps
+      nothing from an attempt with schema errors, makes exactly one repair attempt with the
+      remaining step budget (and, through the ledger, the remaining daily allowance;
+      decision 41), and after a second invalid output degrades the step (`schema_invalid`):
+      no intent of the step enters the record, later steps are skipped, the run is
+      `degraded`, which `horae runs` shows (and `--status degraded` lists);
+    - **G. a schema cannot make one validation exponential** (review decision B): the
+      loader caps the product of `anyOf` / `oneOf` branch counts along any path of the
+      output schema, `$ref`s followed (memoised per `$ref`), at `MAX_COMBINATOR_FANOUT` =
+      1024, else `skill_invalid` (decision 39 E, amended). An 18-level `$defs` chain that
+      branches twice per level (2^18 paths) is refused; alternatives side by side (in
+      `properties`, `allOf`) do not multiply. What the cap does not bound (an `anyOf` over a
+      long array keeps every branch's errors for every item) the worker's memory ceiling
+      does;
+    - **H. the deadline and the attempt's cost** (review decision E): the validator is
+      given what is left of the attempt's deadline less `VALIDATION_MARGIN_S`, so it times
+      out (D: `validator_unavailable`, the usage charged) before the engine's own deadline
+      cancels the step. Should the step or the run be cancelled during the validation all
+      the same, the cancellation carries the attempt's usage
+      (`horae.engine.ports.attach_usage` / `attached_usage`): the ledger settles with it
+      (not with the reservation as an estimate) and the engine adds it to the run's cost;
+    - **I. `jsonschema` is pinned to one minor version** (review decision F): `jsonschema
+      >=4.26,<4.27`. Which outputs are valid, and which errors (keyword, path, order) a
+      repair sends, depend on the validator's behaviour, so its version is part of the
+      replay contract: the record holds the errors sent, and a new minor version is an
+      explicit upgrade (with this decision's tests), not a silent change between installs;
+    - **follow-ups**: a warm worker if the start-up cost matters (#29's CLI backend is
+      slower anyway); a memory ceiling on macOS (none of its `setrlimit` limits applies);
+      #51 (sandboxing plugins) may reuse the worker's isolation.
+
+### Provisional decisions (#32, pending maintainer review)
+
+45. **The LLM cache and the $0 path (#32).** Numbering: 44 is #31's (PR #108), opened in
+    parallel. Neither is renumbered: whichever of the two merges second places the #31 section
+    (44) before this one, so the list stays in order. A compatible v1 addition to `horae.yaml` and
+    the rules of `horae.runner._cache`, the engine, `horae undo` and the new `horae cache
+    purge`:
+    - **contract change** (optional): `horae.yaml` `cache: {ttl_s?, max_entries?}`, integers;
+      `ttl_s` 60 to 31622400 (366 days), default 604800 (7 days); `max_entries` 1 to 100000,
+      default 1000. Not part of `config_digest` (decision 33 D3): it changes what is reused,
+      never what a replay computes;
+    - **one source.** The store's `llm_cache` table is the single source of reusable outputs
+      for live runs; the runner no longer reads `Store.last_accepted_llm` (D2, decision 30),
+      which stays for tools and tests. Migration 6 adds the index `llm_cache_created` (on
+      `created_at`, which trimming orders by). A store upgraded from before #32 starts with an
+      empty cache: its first run per input calls the model once;
+    - **two keys (G).** The **engine key** (`RunRecord.input_hash`, unchanged: SHA-256 of the
+      canonical JSON of the skill, the skill plugin's name, version and commit, the resolved
+      model, the viewed input, and with a loaded skill its `skill_version` and
+      `skill_digest`, decision 39) is what the run records and what replay and undo use. The
+      **stored key** (`StoreLlmCache.stored_key`) is SHA-256 of `{input_hash, alias,
+      version}`: `alias` is the step's model alias as `horae.yaml` declares it at the time,
+      without `secret` and `price` and without unset fields (backend, model, `base_url`,
+      `structured_output`, `max_output_tokens`, `max_tokens_field`, and a later field such as
+      the `claude-cli` command), `version` is `LLM_KEY_VERSION`
+      (`horae.llm.backends._shared`, bumped whenever `SYSTEM_PREAMBLE` or the request framing
+      changes; a test pins the preamble's digest to it). So the same model name on another
+      backend or endpoint, or with another output mode, is a miss; a new price is not. The
+      entry's `response` is `{output, intents, backend, model, skill_version, input_hash,
+      run_id, created_at}` (`input_hash` the engine key, `run_id` the producing run); its
+      `tokens_*` and `cost_usd` are what producing it cost (both attempts), for information;
+
+      | | engine key (`input_hash`) | stored key (`llm_cache.key`) |
+      |---|---|---|
+      | skill name, version, digest | yes | via `input_hash` |
+      | skill plugin name, version, commit | yes | via `input_hash` |
+      | resolved model name | yes | via `input_hash`, and in `alias` |
+      | viewed input | yes | via `input_hash` |
+      | alias backend, `base_url`, `structured_output`, `max_output_tokens`, `max_tokens_field`, command | no | yes |
+      | alias `secret`, `price` | no | no |
+      | `LLM_KEY_VERSION` (preamble, framing) | no | yes |
+      | pipeline, act/notify bindings | no | no (re-checked on reuse, C) |
+    - **the engine reads, the runner writes.** `execute(cache=LlmCache)`: the engine awaits
+      `cache.lookup(key, model_alias=..., output_schema=...)` when `previous` does not match
+      the key; a hit is reused exactly as D2 (no backend call, `LlmCall` with `cached=True`,
+      zero usage and the request marker `{skill, model, reused_input_hash, source_run}`,
+      `source_run` the producing run; intents validated and routed again; a reuse whose
+      intents no longer route is a miss; the same step and run statuses: `noop` when nothing
+      is proposed). A hit names the alias' **current** backend and model (equal to the stored
+      ones, since they are in the stored key, unless the alias is no longer declared). No
+      backend call means no ledger row: a cached output is charged zero (decision 41). An
+      exception from `lookup`, or an entry for another key, is a miss. A store error while
+      reading, writing or purging is logged (type only) and never fails the run;
+
+      | rule | when |
+      |---|---|
+      | **write** (`remember`, after the record is saved) | the run is `ok` or `noop` (H: not `degraded`, `failed` or `undone`), not a dry run (D); the `llm` step `ok`; its last call schema-valid with recorded intents; no call of the step a reuse (a hit never extends an entry); no resolved secret in the entry (`cache_put_safe`, decision 43); two processes writing one key: the last write wins |
+      | **read** (`lookup`) | not `--no-cache`; the entry exists, `expires_at` not passed and `created_at` within the current `ttl_s` (A); well-formed (else deleted); the full output (the output with its reserved `intents` put back) passes the skill's full output schema (F, else deleted); its intents still validate and route in this pipeline (C) |
+      | **delete** | expiry and `max_entries` at the start of each non-dry run (first in, first out); invalid on read (F); `horae undo` of a run (B); `horae cache purge` (E) |
+    - **(A) bounded staleness.** An entry is live for `ttl_s` from when it was produced (its
+      `expires_at`, and also `created_at` against the current `ttl_s` at lookup: lowering
+      `ttl_s` applies at once to every entry; raising it applies to entries written from then
+      on). A hit does not extend it: an unchanged input asks the model again at most once per
+      `ttl_s` (PLAN.md §2.2's "no LLM call when inputs unchanged" holds within that window).
+      After expiry a non-deterministic model may answer differently, so an unchanged input may
+      produce new intents and notifications **once per `ttl_s`** (appliers still deduplicate
+      what is identical). At the start of every non-dry run, entries past `ttl_s` or their
+      `expires_at` are deleted, then the oldest beyond `max_entries` (`Store.cache_trim`,
+      first in, first out: a hit does not make an entry recent), best effort;
+    - **(B) undo invalidates.** When `horae undo` marks a run `undone`, every entry for that
+      run's engine key is deleted in the same store transaction (`Store.cache_delete_input`,
+      which matches the `input_hash` the entries record, whatever alias they were stored
+      under), also when the undone run was itself a cache hit: running the same input again
+      asks the model instead of re-applying what was just undone. A partial undo (not every
+      change undone) leaves the entry;
+    - **(C) cross-pipeline and cross-history reuse stays.** Any earlier accepted output is
+      reused, not only the last run's (input A, B, then A again makes two calls), across
+      processes, and across pipelines that run the same skill, model alias and viewed input.
+      This is safe because routing and bindings are re-checked on every reuse: an intent
+      whose explicit target is bound differently in the other pipeline does not route, which
+      is a miss (the model is called);
+    - **(D) dry runs read, never write.** A dry run reuses a live entry (a preview costs
+      nothing on unchanged input) but neither stores its output nor purges: a preview must
+      not change what later real runs do;
+    - **(E) `horae run --no-cache`** (debugging) skips the lookup: the model is called even on
+      unchanged input, and its accepted output still replaces the entry (a fresh answer is a
+      valid answer). `Runner.run(cache=False)` is the same. **`horae cache purge [--all |
+      --older-than DAYS] [--skill NAME] [--json]`** deletes entries on demand (`--skill`
+      alone: all of that skill's): it opens the store writable but never creates it, takes no
+      lock, prints how many entries were deleted and how many remain (`{schema_version,
+      instance, all, older_than_days, skill, deleted, remaining}`); exit codes per decision
+      37: 0 purged (possibly nothing), 1 configuration or store problem, 2 usage error
+      (nothing selected, `--all` with `--older-than`), 70 internal;
+    - **(F) re-validated on read.** A cached output is checked against the skill's full output
+      schema at every lookup, by the validator of the backend path: #31's
+      `horae.llm.validate.validate_output` (`default_validator`; the interim synchronous
+      `check_output` is removed with #31, so no validation runs on the event loop), with its
+      killable worker, CPU and memory ceilings, at most `CACHE_VALIDATION_TIMEOUT_S` (10 s),
+      and the loader's fan-out cap on the schema (decision 44 C, G). An entry that fails, or
+      that cannot be validated (fail closed; `validator_unavailable` on a cache read is a
+      **miss**, never a degraded step: the model is then called), is a miss and is deleted.
+      So an entry written before a validator existed, or tampered with in the store, is
+      never reused unchecked;
+    - **replay stays exact.** Replay never reads the store's cache: a run that reused an entry
+      is replayed with that output as `previous` (`recorded_previous`, decision 33, which
+      keeps `source_run`), so the replay takes the same path; a run that called the model is
+      replayed from its tape;
+    - **follow-ups**: a per-skill `ttl_s`; LRU instead of first in, first out if hit rates
+      show it matters.
+
+### Decisions (#35, design note and maintainer answers on #99)
+
+46. **The action guard on LLM proposals (#35).** Numbering: 44 is #31's (PR #108), 45 #32's.
+    No contract change: the run record's `violations[].kind` already has `guard`, and the
+    step's `error.kind` is the free-form `ErrorKind` `guard_violation`. `horae.engine.guard`
+    runs on every batch of intents the `llm` step proposes (fresh, `previous` or a cache hit),
+    after schema validation and the permission check, **before routing**:
+    - **(1) per-type limits.** A skill's `intents: {type: max}` (decision 39 F) caps the intents
+      of each type per step; more is a guard violation (it was `intent_rejected`). A type the
+      skill does not declare stays `intent_rejected` (a permission breach, the run fails);
+    - **(0) structurally conservative** (security review): rather than chasing each
+      obfuscation, the guard refuses whole classes of text the parsers it guards against could
+      read differently: control and format characters, any non-trivial tag-like token, any
+      link destination with whitespace or a backslash (rules 0a, 0b, 3, 5);
+    - **(0b) Markdown escapes.** A renderer drops `\` before ASCII punctuation, so the text
+      it renders differs from the text as written (`[x](java\script:…)`, `<https\://…>`).
+      Every check also runs on a view with those escapes removed (after each entity-decoding
+      pass), and the text is refused if **any** view fails. A backslash is refused outright
+      inside a link destination, a reference definition and a tag-like token or autolink;
+    - **(0a) no control or format character.** Any Cc character but `\n` (tab and carriage
+      return included), any Cf character (zero-width, joiners, bidi controls, BOM, soft
+      hyphen) and U+2028 / U+2029 refuse the text before any other scan, also when an entity
+      decodes to one (`h&#9;ttps:`). Note text already refused lone CR and U+2028 / U+2029
+      (`content_line_break`); this extends it to all guarded text. A ZWJ emoji sequence is
+      refused too (known cost);
+    - **(2) embeds are always refused**, even when the URL is in the input (they fetch when the
+      note renders, without a click): any `![` (Markdown and reference images, Obsidian
+      `![[…]]` embeds);
+    - **(3) tag-like tokens: an allowlist, exact form.** Every `<` followed by a letter, `/`,
+      `!` or `?` starts a tag-like token, up to its `>`. It is allowed only as exactly
+      `<name>`, `</name>` or `<name/>` with a name of `b i u s em strong code pre br hr p ul ol
+      li blockquote h1`–`h6 kbd sup sub mark del` (no attribute, no `:`, no space), or as an
+      autolink: content up to `>` that `urls` reads as one URL with a `scheme://` or a
+      special scheme, and no whitespace, quote or `=` (the URL then goes through (4)).
+      Everything else is refused: other tags (`img`, `iframe`, `svg`, `a`, `div`, `span`,
+      custom elements…), any attribute (`on*`, `style`, `background`, `poster`, `srcset`,
+      `ping`, `href`, so also `url(` and `@import`), `<name:…>` forms, comments, doctype,
+      processing instructions and an unclosed `<b`. A denylist of embed tags, then an
+      autolink exemption, were rejected in review;
+    - **(4) URLs.** Backslashes are read as `/` first (`https:/\host`, `\\host`). A URL is
+      a run (up to whitespace, `<`, `>` or a control character) starting at `scheme:` followed
+      by `/` (any `[a-z][a-z0-9+.-]*`, whatever precedes it), at a scheme of `http https ftp ws
+      wss obsidian mailto javascript vbscript data file blob` followed by any non-space
+      character (`ftp:host`), at `//` at a token boundary (protocol-relative, not after a
+      scheme character, `:` or `/`), or at `www.` at a word start. A URL with a **refused
+      scheme** (`javascript vbscript data file blob`) is always refused. Every other URL
+      (answer 3) must be an **exact string** extracted the same way from the **viewed** input
+      (string values and object keys of what the model was shown), case-sensitive, after
+      dropping at most 16 trailing punctuation characters (`.,;:!?)]}'"*_~` and backtick) on
+      either side. So a known URL may be copied, but never extended (`…?q=<data>`,
+      `…/<data>`). A `notify.push` `link` must be exactly such a URL **and** fall under the
+      entry's `link_prefix` (decision 30). A per-pipeline `strict_links` (only trusted
+      parameters and `link_prefix`) is a follow-up;
+    - **(5) link destinations.** After `](` (up to the next `)`, or the line end when there
+      is none) and after a line's leading `[label]:` (not a `[^footnote]:`; up to the line
+      end; container prefixes skipped, (H2)), leading spaces skipped: a destination holding
+      **any whitespace or backslash** (so also a title,
+      `[x]( javascript :…)` or a line break) or starting with a refused scheme (also inside
+      `<…>`) is refused; its URLs go through (4). A refused scheme in prose (`data: three
+      items`: colon then a space) is not a link in Markdown and passes;
+    - **fields scanned**: `note.*` `content` and `heading`, `task.create` `title` and
+      `fingerprint`, `notify.push` `title`, `body` and `link`, every string and object key of an
+      `http.post` `body`. Targets bound by routing (`path`, `http.post` `url`) are not text;
+    - **robust parsing, bounded work.** Every check runs on the text as written and on its
+      HTML-entity-decoded forms (up to three passes: `&#x3c;img`, `&amp;lt;img`) and their
+      Markdown-unescaped forms (0b), ASCII
+      case-insensitively. Scans are linear (`find` loops that resume after each match, regular
+      expressions without nested quantifiers, pointers to the next `)`, line end or whitespace
+      reused while ahead); a test scans 1 MiB of hostile text per field, and a seeded fuzz
+      (case flips, decimal and hex entities, Markdown escapes, controls and format characters inserted into
+      embeds, script links and unknown URLs) never passes;
+    - **(answer 4) the whole step degrades.** A violation records one `Violation(kind="guard")`
+      and the step `degraded` with `error.kind` `guard_violation`: none of its intents is
+      routed (also the valid ones), its output is not used, later steps are `skipped`, the
+      run is `degraded`, and no `input_hash` is recorded (so the runner never caches it). The
+      LLM call is recorded with its raw intents (replay and audit);
+    - **(answer 6) content-free detail.** `Violation.detail` (= the step error's message, at
+      most 512 characters) names only closed-set values: the proposer (`skill:<name>`), the
+      intent type and position, the field and the kind of problem, e.g. ``skill:daily-brief/
+      rank proposed note.create #2 with an image or embed in `content` ``, never the URL, its
+      host or the text. The same line is logged at `warning` (`horae.engine`);
+    - **reuse (decision 45).** On a reuse, a guard violation is a **cache miss**: nothing of
+      the entry is recorded (no violation) and the model is called. For a cache hit the engine
+      awaits the cache's `discard(key, model_alias=...)` (a port member, (H4)); `StoreLlmCache.discard`
+      deletes the entry (logged, store errors swallowed), so a poisoned entry is not looked up
+      again. A refused `previous` (replay) is only a miss;
+    - **(answer 5) scope.** LLM proposals only; `collect` and `transform` intents are not
+      guarded in v1 (first-party plugins in the D tier, T04); hostile plugins are #52's;
+    - **fencing** (design note C). The backends already fence the input: it is sent as JSON
+      inside `<input>` tags with every `<` written `<` (`horae.llm.backends._shared.
+      escaped`), and repair errors likewise inside `<schema_errors>`, so data can never close
+      the fence (`tests/test_llm_backends_shared.py`). A per-call nonce adds nothing to that
+      and would make requests non-deterministic, so none is added and `LLM_KEY_VERSION` is
+      unchanged;
+    - **known limits**: obfuscated URLs that are not links in Obsidian (`hxxps://`) pass;
+      zero-width and other format characters are refused (0a); a URL the input brings may be copied (tenet 5 as
+      written); a brief citing a new URL from the model's own knowledge is refused; being
+      conservative, a Windows path (`C:\x`), `a:/b`, `x<b and c` (an unclosed tag-like
+      token), a Markdown link title and a ZWJ emoji not in the input are refused too.
+    - **hardening round (provisional, pending maintainer review).** Conservative: v1
+      protects the **Obsidian rendering surface**, not only CommonMark. In text bound for a
+      note or a notification (every guarded field but `http.post` `body`), on every view:
+      - **(H1a) active code fences.** A fence of three or more backticks or tildes, after any
+        leading spaces (more than CommonMark's three too), blockquote `>` or list prefix,
+        whose info string starts (case-insensitively, after spaces or `{`) with `dataview`,
+        `dataviewjs`, `templater`, `mermaid`, `js`, `javascript`, `html`, `button` or `query`
+        (`ACTIVE_FENCES`): Obsidian or a common plugin runs, queries or draws these instead of
+        showing code. Other fences (`python`, none) pass;
+      - **(H1b) Templater and inline queries.** `<%` and `%>` anywhere (Templater, inline
+        script), `` `= `` and `` `$= `` (Dataview inline queries, their default prefixes);
+      - **(H1c) frontmatter.** In a note intent's `content` (all three `note.*` types), a
+        first non-blank line of three or more `-` (a frontmatter block can set `cssclasses`,
+        aliases and plugin properties). This complements decision 32's note conventions
+        (`content_has_marker`, `content_line_break`); a thematic break later in the text
+        passes;
+      - **(H1d) Mermaid `click`.** `click <id> href`, `click <id> call` or `click <id>` then a
+        quote, at a line's content start or after a `;`, anywhere (also outside a fence,
+        although (H1a) already refuses a `mermaid` fence). A callback without a quote
+        (`click A cb`) is not matched: it needs a Mermaid block, which (H1a) refuses;
+      - **(H1e) wikilinks.** A `[[…]]` (up to `]]` or the line end, alias included) holding
+        `://` or a refused scheme (`javascript:` …) is refused; plain internal wikilinks
+        (`[[Daily/2026-10-27|today]]`) pass. Embeds `![[…]]` stay refused by (2);
+      - **(H1f) `obsidian:` URIs** must be in the input set like any URL (4); a miss is
+        reported as its own kind (`an obsidian URI not in the input`), and the case-sensitive
+        match means `OBSIDIAN://…` is refused unless written so in the input;
+      - **(H2) container prefixes before link definitions.** Before a `[label]:`, any spaces
+        and tabs, blockquote `>` and list markers (`-`, `*`, `+`, `1.`, `1)`, followed by a
+        space, a tab or the line end) are skipped, repeatedly (`> - [r]: javascript:x`). A
+        footnote definition `[^x]:` is not a link definition but gets **no exemption**: its
+        text goes through the URL, embed and tag checks like any other text (an unknown URL
+        in a footnote is refused);
+      - **(H3) entity decoding fails closed.** When a fourth `html.unescape` would still
+        change the text after the three allowed passes, the text is refused (`too many levels
+        of HTML entities`): the guard never checks a text whose rendering it has not seen.
+        Text with four or more nested `&amp;` levels is refused (known cost);
+      - **(H4) `discard` is part of the `LlmCache` port.** `LlmCache.discard(key, *,
+        model_alias)` is now a Protocol member, so mypy rejects a cache without it;
+        `horae.engine.NoDiscardCache` is an abstract base whose `discard` is a documented
+        no-op (a refused hit then stays a miss each lookup, never routed). The engine awaits
+        it directly (exceptions still ignored). A refused `previous` (replay, decision 33;
+        the D2 reuse of decision 30) is not a cache entry: it is only a miss and is left as
+        is;
+      - **(H5) logging and source.** Details and the `warning` line stay content-free. The
+        guard's `source` must be `skill:` followed by the pipeline configuration's `SkillRef`
+        (`<namespace>/<skill>`, pattern-checked, at most 128 characters); anything else is a
+        `ValueError` (a programming error, never input or model text);
+      - **(H6) ADR 0002** keeps its accepted text; what #17 and #35 added after acceptance is
+        a dated amendment at its end;
+      - **bounded work**: the new scans are line loops and `find` loops that resume after each
+        match (wikilinks reuse the next `]]` and line end), plus one regular expression
+        without nested quantifiers (`click`); a test scans 1 MiB per hostile shape.
+
+### Provisional decisions (#34, pending maintainer review)
+
+47. **De-identification before a cloud model, and no secret in a request (#34, design note
+    `docs/design/0034-deidentification.md` and the maintainer's answers on PR #98).**
+    Numbering: 46 is #35's (the action guard). Compatible v1 additions to `horae.yaml` and the run
+    record, and the rules of `horae.llm.deid`, `horae.llm.base`, the engine and the cache:
+    - **(A) local or cloud, explicit.** `models.<alias>.local: true | false` (optional,
+      strict boolean). Unset: `ollama` is local, every other backend (`anthropic`,
+      `claude-cli`, `openai-compatible`) is cloud (`LOCAL_BACKENDS`,
+      `ModelAlias.is_local`); never inferred from `base_url`. `horae doctor`'s price warning
+      now applies to every cloud alias by this rule (replacing decision 40's
+      `CLOUD_BACKENDS`): an `openai-compatible` alias with `local: true` is not warned, an
+      `ollama` alias with `local: false` is. `local` joins the alias' part of the cache's
+      stored key and `config_digest` only when set (an unset `local` is left out of both, so
+      the digests of an instance that does not use it are unchanged and old runs replay
+      without a "horae.yaml changed" error);
+    - **(B) what is declared.** Field classes in the skill's input view (#27, decision 39:
+      `path: {class: person|email|phone|place|amount|free_text}`, `amount` also
+      `buckets: [numbers]`), plus an optional **vocabulary**: `horae.yaml`
+      `deidentification: {vocabulary: <file name>}`, a file of `secrets.dir` (personal data:
+      never in the instance repository) read like a secret file (`SecretResolver.read_file`:
+      one path segment, a regular file of at most 64 KiB, opened once; not registered for
+      redaction). Its format is one `class: term` per line (`person`, `email`, `phone`,
+      `place`; `#` comments; 2 to 200 characters, no control character, at most 4096
+      terms); a plain format, not YAML, so no alias expansion and no parser echoing content.
+      Errors name the line, never the term. `horae doctor` reports an unusable vocabulary
+      as an error;
+    - **(C) the transforms** (`horae.llm.deid.pseudonymize`, a pure function of the viewed
+      input, the classes and the vocabulary): every scalar leaf **and every object key**
+      under a `person`, `email`, `phone` or `place` field becomes `[PERSON_1]`, `[EMAIL_1]`,
+      `[PHONE_1]`, `[PLACE_1]` (a value over `MAX_VALUE_CHARS`, 1 KiB, is withheld as
+      `[PERSON]`, not reversible); an `amount` becomes a bucket label (`<0`, `50-200`,
+      `>=1000`; default bounds 0, 10, 100, 1000, 10000; `[AMOUNT]` for a value that is not a
+      finite number), not reversible. **Every other string of the viewed input and every
+      object key** (`free_text` fields and unclassed ones alike: provisional B below) is
+      scanned for the known values: the vocabulary terms, the values of this input's
+      token-class fields (so "Lunch with Bob" is covered when Bob is an attendee) and each
+      name part of a `person` value or term (at least 3 letters, mapped to the whole name's
+      pseudonym: provisional C), replaced by their pseudonym; a phone's last 9 digits with
+      any `[\s.\-()]` separators and up to 4 digits of prefix; an amount's renderings
+      (provisional D), replaced by its bucket label. **Matching**: the string is NFKC-
+      normalized and stripped of format characters (zero-width, bidi controls, soft
+      hyphen), cut into tokens (letter runs `[^\W\d_]+`, digit runs, white-space runs, other
+      single characters), and compared token by token with the known values (letters
+      case-folded on both sides, `STRAUSS` = `Strauß`; any white-space run, NBSP and
+      ideographic space included, equals any other): a known value matches whole letter
+      runs only (`Alice` in `alice_smith`, `user_alice`, `alice123`; not in `Malice`),
+      leftmost then longest. A trie over the tokens, at most `MAX_TERM_TOKENS` (48) deep:
+      linear in the text whatever the number of terms (600 KB and 4096 terms well under a
+      second). A string in which nothing is found is sent byte-identical. Text of the input
+      shaped like a pseudonym (`[PERSON_1]`, any case, fullwidth brackets after NFKC) is
+      first **neutralized** to `(PERSON_1)` (counted `neutralized`), so the model can never
+      be handed a pseudonym that re-identification would turn into a real value. Two keys
+      of one object that are the same once pseudonymized fail closed (`deid_unavailable`).
+      A classed path under another classed path is refused (`DeidError`, a defence in depth:
+      the skill contract already refuses overlapping view paths);
+    - **(D) stable per run, no key** (maintainer answer 3). Pseudonyms are numbered per
+      class in order of first occurrence: the classed leaves and keys in canonical order
+      (sorted keys, array order), then the matches in scanned strings; the same value
+      (the same tokens) keeps its pseudonym. The same input always gives byte-identical
+      requests, so a replay or a cache hit recomputes the same mapping. Cross-run stability
+      (keyed HMAC) is a later option. `DEID_VERSION` is 2 (the matching of the privacy
+      review);
+    - **(E) where it runs and what is stored.** The engine applies it (`execute(deid=...)`,
+      the `horae.engine.ports.Deidentifier` port, `horae.llm.deid.Deidentifier` built by the
+      runner and by `horae replay` from `horae.yaml`), for a skill with classes and a cloud
+      alias (on by default, no opt-out in v1: answer 7), because the engine is the one
+      place that sees the three paths (a call, a cache hit, a replay). Order: input view →
+      pseudonymize (in a worker thread, within the step's `timeout_s`) → `LlmRequest` (`input` pseudonymized, `classified`, `deidentified` = the
+      summary) → `ModelBackends` renders (appends `DEID_NOTE`: copy placeholders verbatim)
+      → T10 check → send → schema validation → the attempt is recorded in `llm[]` and its
+      usage spent → **re-identify** the accepted output and raw intents (the growth is
+      summed first, `Pseudonyms.growth`: past `MAX_REIDENTIFIED_BYTES`, 256 KiB, the step
+      degrades with `output_too_large` and nothing is substituted; the call and its cost
+      stay recorded) → the permission check, the action guard (decision 46) and routing, all on the
+      **re-identified** intents and against the **real** viewed input (`guard_for(viewed)`):
+      a URL or note link present in the real input matches, and no pseudonym reaches the
+      guard's link and tag rules (they are put back first; an unresolved one is left as the
+      model wrote it and judged as any other text). The mapping lives only in memory: `llm[].response` and `llm[].intents`
+      are what the provider returned (pseudonymized), `llm[].input_hash` the hash of what
+      was sent, `llm[].request.deid` `{version, input_sha256, counts, unresolved}` (a digest
+      of what was sent, never one of the mapping or of a value, which could be guessed);
+      the step output and the routed intents carry real values. The LLM cache stores the
+      pseudonymized output (from `llm[]`) and the digest of what was sent
+      (`deid_input_sha256`), re-identified on a hit; the usage ledger holds no data. A
+      reused output (`PreviousLlm`: a cache hit, or a replay's recorded reuse, whose
+      `request.deid.input_sha256` is kept) is reused only when its `deid_input_sha256`
+      equals this run's de-identified digest (`None` on both sides without
+      de-identification): otherwise a miss, and a replay reports a mismatch ("the
+      de-identified input differs (vocabulary changed…)"). Both checks of `ModelBackends`
+      (`deid_required` and T10) live in `ModelBackends` only: an engine given another
+      `LlmBackend` (a test double, the replay tape) has neither, so the runner always wires
+      `ModelBackends`. **For #29 (`claude-cli`, PR #105)**: the subprocess' argv and stdin
+      must be derived only from the decoded frozen body (`RenderedRequest.body()`), never
+      from the `Completion` or the request, so the bytes checked are the bytes sent. As a backstop, `ModelBackends.prepare` refuses a `classified` request to a
+      cloud alias that was not de-identified (`deid_required`, an engine given no policy);
+      a policy that cannot de-identify (unreadable vocabulary) degrades the step
+      (`deid_unavailable`) before anything is sent. Both are not billed;
+    - **(F) the cache key** (decision 45 G). For a cloud alias, the stored key adds
+      `deid: {version, vocabulary}` (`DEID_VERSION`, the vocabulary file's SHA-256, or
+      `"unavailable"`), so another vocabulary or transform version is a miss and an entry is
+      only re-identified with the mapping that made it; a local alias' key is unchanged.
+      `LLM_KEY_VERSION` is not bumped (the preamble is unchanged; `DEID_NOTE` is part of a
+      de-identified request only, and those keys changed anyway). Entries of cloud aliases
+      written before #34 are therefore a miss once;
+    - **(G) unresolved pseudonyms are left and noted** (answer 4): a pseudonym the input
+      never issued, or a mangled one (`Person 1`, `PERSON1`, `[person_1]`), stays as the
+      model wrote it and is listed in `llm[].request.deid.unresolved` (at most 16, 40
+      characters each); no repair retry. Re-identification puts back the original value's
+      **text** (`_text(value)`): a string stays a string, also when it is exactly one
+      pseudonym of a number (a phone given as a number comes back as `"33612345678"`), so
+      the validated output keeps its types (finding 5);
+    - **(H) no secret in a request (T10, the #14 addition).** `ModelBackends.send` scans the
+      exact frozen body (`RenderedRequest.body()`) with the process registry
+      (`horae.secrets.redact.current()`), primed once with **every secret the instance
+      declares** (`ModelBackends.redaction_names` = `Instance.redaction_names()`, the #53 set:
+      `secrets.refs`, the lockfile's plugin secrets, the aliases' `secret`), not only those
+      this process resolved: the raw bytes and the decoded JSON (strings, object keys,
+      whole numbers), every encoding of decision 43. For **every** backend, local ones
+      too (a secret in a request is never legitimate, and a local endpoint may log it).
+      A match raises `secret_in_request` naming the secrets (never a value; the log
+      line gives only their count) before the provider backend is called: nothing is sent, the usage ledger
+      releases the reservation (`NOT_BILLED`, decision 41), the step is `degraded` and the
+      engine records a `secret_in_request` **violation** (run record v1, a compatible
+      addition to `violations[].kind`: answer 6);
+    - **(I) after the privacy review (provisional, pending maintainer review).** The
+      maintainer's answers on PR #98 stand (1: explicit `local:`, never inferred from
+      `base_url`; 2: classes in the input view plus a vocabulary in `secrets.dir`; 3: per
+      run; 4: leave and note; 5: render then send; 6: a `secret_in_request` violation;
+      7: on by default). Provisional answers to the review's open questions:
+      - **A**: `local` stays explicit and is never inferred; `horae doctor` **warns** when
+        an `ollama` alias leaves `local` unset and its `base_url` host is neither loopback,
+        private, single-label nor a local name (`.localhost`, `.local`, `.lan`,
+        `.internal`, `.home.arpa`), or its model tag ends with `-cloud`;
+      - **B**: once a skill declares any class, the known-value matcher runs over every
+        string of the viewed input (not only `free_text` fields) and every object key;
+      - **C**: each name part (at least 3 letters) of a `person` value or term is a term
+        mapped to the same pseudonym as the whole name (privacy over meaning: `[PERSON_1]`
+        for "Bob" is put back as "Bob Martin");
+      - **D**: an amount's renderings (`1234.56`, `1234,56`, `1,234.56`, `1.234,56`,
+        `1 234,56`, `1'234.56`, the whole part `1234`; at least 3 digits, not all zeros) in
+        a string become its bucket label (not reversible, not a pseudonym; counted in
+        `amount`); object keys under a token-class field become pseudonyms (and are put
+        back by re-identification);
+      - **E**: bucket bounds written by the skill are accepted as they are (skills are
+        trusted code, reviewed with their plugin): a skill could choose narrow buckets
+        that reveal an amount, as it could simply not classify the field;
+      - **F**: the T10 check scans every secret the instance declares (the primed #53
+        registry), not only the ones this process resolved (see H);
+      - **G**: `input_hash` (the engine's cache key, decision 47 E) stays an unsalted
+        SHA-256 of the real viewed input: it is stored locally only (run record, cache),
+        never sent, and a salt would break replay and the cache across processes; a
+        dictionary attack on it needs the store, which holds the real outputs anyway;
+    - **limits**: matching misses nicknames, initials, typos and transliterations, and
+      over-matches a known value that is also a common word; a value of more than 48
+      tokens is not looked for in text; values in unclassed fields that equal no known value
+      are sent as they are (the input view stays the primary control);
+    - **follow-ups**: per-instance pseudonyms by keyed HMAC; NER-assisted detection in
+      `free_text`; de-identification of data sent to plugins.

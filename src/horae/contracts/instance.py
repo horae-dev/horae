@@ -30,6 +30,7 @@ from horae.contracts.types import (
     PluginName,
     SchemaVersion1,
     SecretName,
+    StrictBool,
     StrictFloat,
     Token,
     _valid_a_label,
@@ -47,6 +48,11 @@ BACKENDS_NEEDING_SECRET: tuple[LlmBackend, ...] = ("anthropic",)
 BACKENDS_NEEDING_HTTPS: tuple[LlmBackend, ...] = ("anthropic",)
 """Cloud backends whose `base_url`, when given, must be `https://` (the API key and the data
 must not cross the network in clear; schemas decision 38 C)."""
+
+LOCAL_BACKENDS: tuple[LlmBackend, ...] = ("ollama",)
+"""Backends whose aliases run on the host or the LAN unless the alias says `local: false`;
+every other backend is a cloud backend unless the alias says `local: true` (#34, schemas
+decision 47 A). Never inferred from `base_url`."""
 
 StructuredOutput = Literal["json_schema", "json_object", "none"]
 """How an `openai-compatible` alias constrains the output (schemas decision 40):
@@ -275,6 +281,19 @@ class ModelAlias(Contract):
     max_tokens_field: MaxTokensField | None = None
     """`openai-compatible` only: the request field of the output limit (`max_tokens` when
     unset, or `max_completion_tokens`). See `MaxTokensField`."""
+    local: StrictBool | None = None
+    """Whether the model runs on the host or the LAN (`true`) or is a cloud service
+    (`false`). Unset: `ollama` is local, every other backend (`anthropic`, `claude-cli`,
+    `openai-compatible`) is cloud (`LOCAL_BACKENDS`); never inferred from `base_url`. A cloud
+    alias gets de-identified input when the skill declares field classes, and `horae doctor`
+    expects it to have a `price` (#34, schemas decision 47 A)."""
+
+    @property
+    def is_local(self) -> bool:
+        """`local`, or the backend's default when unset (`LOCAL_BACKENDS`)."""
+        if self.local is not None:
+            return self.local
+        return self.backend in LOCAL_BACKENDS
 
     @model_validator(mode="after")
     def _backend_requirements(self) -> Self:
@@ -371,6 +390,26 @@ class RunsConfig(Contract):
     limits are separate: `plugin_defaults.call_timeout_s` and the LLM step's `timeout_s`."""
 
 
+MIN_CACHE_TTL_S = 60
+MAX_CACHE_TTL_S = 366 * 86400
+DEFAULT_CACHE_TTL_S = 7 * 86400
+MAX_CACHE_ENTRIES = 100_000
+DEFAULT_CACHE_ENTRIES = 1000
+
+
+class CacheConfig(Contract):
+    """The LLM cache: accepted outputs reused on unchanged input, the $0 path (#32)."""
+
+    ttl_s: Annotated[StrictInt, Field(ge=MIN_CACHE_TTL_S, le=MAX_CACHE_TTL_S)] = DEFAULT_CACHE_TTL_S
+    """Seconds an accepted output is reused for (60 to 366 days; default 7 days), counted
+    from when it was produced: a hit does not extend it, so an unchanged input asks the model
+    again at most once per `ttl_s`. Lowering it applies at once (to every entry, at lookup);
+    raising it applies to new entries (an entry keeps the expiry it was written with)."""
+    max_entries: Annotated[StrictInt, Field(ge=1, le=MAX_CACHE_ENTRIES)] = DEFAULT_CACHE_ENTRIES
+    """Most entries kept: at the start of each (non-dry) run, expired entries are deleted, then
+    the oldest beyond this many (first in, first out: a hit does not make an entry recent)."""
+
+
 class SchedulerConfig(Contract):
     """How pipelines with a `trigger` are started."""
 
@@ -430,6 +469,17 @@ class BudgetsConfig(Contract):
     """Per-pipeline ceilings, by pipeline name (both apply: the lower allowance wins)."""
 
 
+class DeidentificationConfig(Contract):
+    """De-identification before a cloud model (#34, schemas decision 47)."""
+
+    vocabulary: SecretFileName | None = None
+    """A file in `secrets.dir` (never in the instance repository: it holds personal data)
+    listing known terms, one `class: term` per line (`person`, `email`, `phone` or `place`;
+    `#` starts a comment), replaced by pseudonyms wherever they appear in a string or key
+    of the input a skill with field classes is sent (a cloud alias). Read like a secret
+    file (a regular file of at most 64 KiB, UTF-8)."""
+
+
 class InstanceConfig(Contract):
     """An instance's `horae.yaml`."""
 
@@ -455,6 +505,10 @@ class InstanceConfig(Contract):
     """Bounds of every pipeline run (the run timeout)."""
     budgets: BudgetsConfig = Field(default_factory=BudgetsConfig)
     """Daily LLM spend ceilings across runs (#33)."""
+    cache: CacheConfig = Field(default_factory=CacheConfig)
+    """The LLM cache's expiry policy (#32)."""
+    deidentification: DeidentificationConfig = Field(default_factory=DeidentificationConfig)
+    """De-identification of declared fields before a cloud model (#34)."""
 
     def plugin_timeouts(self, plugin: str) -> PluginDefaults:
         """The effective timeouts of `plugin`: its own settings, else `plugin_defaults`."""

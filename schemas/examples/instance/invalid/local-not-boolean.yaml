@@ -1,0 +1,3 @@
+# `local` is a strict boolean (#34).
+models:
+  vllm: { backend: openai-compatible, model: qwen, base_url: "http://vllm:8000/v1", local: "yes" }

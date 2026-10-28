@@ -1,0 +1,2 @@
+# The de-identification vocabulary is one file name in `secrets.dir`, not a path (#34).
+deidentification: { vocabulary: ../vocabulary.txt }

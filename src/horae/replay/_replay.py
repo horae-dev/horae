@@ -15,7 +15,13 @@ from horae.contracts.pipeline import LlmStep, Pipeline
 from horae.contracts.run import RunRecord, RunStatus
 from horae.engine.canonical import pipeline_digest
 from horae.engine.executor import execute
-from horae.engine.ports import PluginRegistry, ResolvedPlugin, UnknownPlugin
+from horae.engine.ports import (
+    Deidentifier,
+    PluginRegistry,
+    ResolvedPlugin,
+    SkillSource,
+    UnknownPlugin,
+)
 from horae.replay._lock import pipeline_refs
 from horae.replay._tape import (
     RecordedLlm,
@@ -216,6 +222,22 @@ def diff_summary(recorded: RunRecord, replayed: RunRecord) -> tuple[FieldDiff, .
     )
 
 
+def _skill_digests(record: RunRecord) -> dict[str, str]:
+    """The skill digest of each skill the run's `llm` calls recorded (the last one wins)."""
+    return {call.skill: call.skill_digest for call in record.llm if call.skill_digest is not None}
+
+
+def skill_changes(recorded: RunRecord, replayed: RunRecord) -> tuple[FieldDiff, ...]:
+    """`llm.<skill>.skill_digest` for each skill whose content changed since the run (both
+    records know its digest: a run recorded before #27 has none)."""
+    before, after = _skill_digests(recorded), _skill_digests(replayed)
+    return tuple(
+        FieldDiff(f"llm.{skill}.skill_digest", before[skill], after[skill])
+        for skill in sorted(before)
+        if skill in after and before[skill] != after[skill]
+    )
+
+
 class _Snapshot:
     """The caller's registry, resolved once, up front, for every ref of the pipeline: the
     engine only looks the results up. Nothing that calls a tool is reachable."""
@@ -348,6 +370,8 @@ async def replay_async(
     lock_digest: str | None = None,
     config_digest: str | None = None,
     clock: Callable[[], datetime.datetime] | None = None,
+    skills: SkillSource | None = None,
+    deid: Deidentifier | None = None,
 ) -> ReplayResult:
     """`replay`, as a coroutine."""
     current = None if pipeline is None else pipeline_digest(pipeline)
@@ -386,6 +410,7 @@ async def replay_async(
     tools = RecordedToolCaller(record, chosen, record.context)
     has_llm = any(isinstance(step, LlmStep) for step in chosen.steps)
     llm = RecordedLlm(record) if has_llm else None
+    previous = recorded_previous(record)
     replayed = await execute(
         chosen,
         run_id=record.id,
@@ -394,17 +419,38 @@ async def replay_async(
         plugins=_Snapshot(plugins, chosen),
         tools=tools,
         llm=llm,
+        skills=skills,
         dry_run=record.dry_run,
-        previous=recorded_previous(record),
+        previous=previous,
         models=used_models,
         lock_digest=record.lock_digest,
         config_digest=record.config_digest,
         clock=clock or _frozen(record.started_at),
         monotonic=lambda: 0.0,
+        deid=deid,
     )
     mismatches = (*tools.mismatches, *(llm.mismatches if llm else ()))
+    if (
+        previous is not None
+        and previous.deid_input_sha256 is not None
+        and not any(_is_reuse(call) for call in replayed.llm)
+    ):
+        # The recorded run reused a de-identified output; its pseudonyms name values only
+        # under the mapping that made it (#34 finding 7).
+        mismatches = (
+            *mismatches,
+            "the reused LLM output was de-identified from another input: the de-identified "
+            "input differs (vocabulary changed, or de-identification not applied the same way)",
+        )
     intents_diff = diff_intents(record, replayed)
-    summary = diff_summary(record, replayed)
+    changed_skills = skill_changes(record, replayed)
+    summary = (*diff_summary(record, replayed), *changed_skills)
+    for change in changed_skills:
+        skill = change.field.split(".")[1]
+        notes.append(
+            f"skill {skill} changed since the run (recorded digest {change.recorded[:12]}, "
+            f"current {change.replayed[:12]})"
+        )
     common: dict[str, Any] = {
         "intents_diff": intents_diff,
         "summary": summary,
@@ -429,6 +475,8 @@ def replay(
     lock_digest: str | None = None,
     config_digest: str | None = None,
     clock: Callable[[], datetime.datetime] | None = None,
+    skills: SkillSource | None = None,
+    deid: Deidentifier | None = None,
 ) -> ReplayResult:
     """Re-execute `record` from the record alone, and compare.
 
@@ -446,6 +494,16 @@ def replay(
     - `lock_digest` / `config_digest`: the current instance's (`horae.config.Instance`), to
       compare with the recorded ones; `None` skips the check.
     - `clock` gives the replayed record's timestamps (default: frozen at the run's start).
+    - `skills`: the skill source of the run (#27), for a run whose `llm` step loaded a skill:
+      the input view and the skill's version and digest are part of what is compared (the
+      viewed input's hash and the cache key), so an edited skill replays as different, with
+      a "skill changed" note and an `llm.<skill>.skill_digest` summary field when both runs
+      recorded the skill's digest (`LlmCall.skill_digest`).
+    - `deid`: the instance's de-identification policy (#34, `horae.llm.deid`). A run whose
+      skill declares field classes for a cloud alias recorded what the provider saw: the
+      pseudonymized input (its hash) and output. The replay pseudonymizes the viewed input
+      again (deterministic), so the request matches, and re-identifies the recorded output;
+      without the policy (or with another vocabulary) the input differs: a mismatch.
 
     Not for use inside a running event loop: use `replay_async` there."""
     return asyncio.run(
@@ -458,5 +516,7 @@ def replay(
             lock_digest=lock_digest,
             config_digest=config_digest,
             clock=clock,
+            skills=skills,
+            deid=deid,
         )
     )

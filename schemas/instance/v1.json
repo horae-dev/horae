@@ -37,6 +37,30 @@
       "title": "BudgetsConfig",
       "type": "object"
     },
+    "CacheConfig": {
+      "additionalProperties": false,
+      "description": "The LLM cache: accepted outputs reused on unchanged input, the $0 path (#32).",
+      "properties": {
+        "ttl_s": {
+          "default": 604800,
+          "description": "Seconds an accepted output is reused for (60 to 366 days; default 7 days), counted\nfrom when it was produced: a hit does not extend it, so an unchanged input asks the model\nagain at most once per `ttl_s`. Lowering it applies at once (to every entry, at lookup);\nraising it applies to new entries (an entry keeps the expiry it was written with).",
+          "maximum": 31622400,
+          "minimum": 60,
+          "title": "Ttl S",
+          "type": "integer"
+        },
+        "max_entries": {
+          "default": 1000,
+          "description": "Most entries kept: at the start of each (non-dry) run, expired entries are deleted, then\nthe oldest beyond this many (first in, first out: a hit does not make an entry recent).",
+          "maximum": 100000,
+          "minimum": 1,
+          "title": "Max Entries",
+          "type": "integer"
+        }
+      },
+      "title": "CacheConfig",
+      "type": "object"
+    },
     "DailyBudget": {
       "additionalProperties": false,
       "anyOf": [
@@ -93,6 +117,29 @@
         }
       },
       "title": "DailyBudget",
+      "type": "object"
+    },
+    "DeidentificationConfig": {
+      "additionalProperties": false,
+      "description": "De-identification before a cloud model (#34, schemas decision 47).",
+      "properties": {
+        "vocabulary": {
+          "anyOf": [
+            {
+              "maxLength": 255,
+              "pattern": "^[A-Za-z0-9_-][A-Za-z0-9._-]*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "A file in `secrets.dir` (never in the instance repository: it holds personal data)\nlisting known terms, one `class: term` per line (`person`, `email`, `phone` or `place`;\n`#` starts a comment), replaced by pseudonyms wherever they appear in a string or key\nof the input a skill with field classes is sent (a cloud alias). Read like a secret\nfile (a regular file of at most 64 KiB, UTF-8).",
+          "title": "Vocabulary"
+        }
+      },
+      "title": "DeidentificationConfig",
       "type": "object"
     },
     "EnvSecretRef": {
@@ -388,6 +435,19 @@
           "default": null,
           "description": "`openai-compatible` only: the request field of the output limit (`max_tokens` when\nunset, or `max_completion_tokens`). See `MaxTokensField`.",
           "title": "Max Tokens Field"
+        },
+        "local": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Whether the model runs on the host or the LAN (`true`) or is a cloud service\n(`false`). Unset: `ollama` is local, every other backend (`anthropic`, `claude-cli`,\n`openai-compatible`) is cloud (`LOCAL_BACKENDS`); never inferred from `base_url`. A cloud\nalias gets de-identified input when the skill declares field classes, and `horae doctor`\nexpects it to have a `price` (#34, schemas decision 47 A).",
+          "title": "Local"
         }
       },
       "required": [
@@ -675,6 +735,14 @@
     "budgets": {
       "$ref": "#/$defs/BudgetsConfig",
       "description": "Daily LLM spend ceilings across runs (#33)."
+    },
+    "cache": {
+      "$ref": "#/$defs/CacheConfig",
+      "description": "The LLM cache's expiry policy (#32)."
+    },
+    "deidentification": {
+      "$ref": "#/$defs/DeidentificationConfig",
+      "description": "De-identification of declared fields before a cloud model (#34)."
     }
   },
   "title": "Horae instance configuration (horae.yaml)",

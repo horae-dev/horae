@@ -39,7 +39,8 @@ and every other step `skipped`, when:
   encoding) of a secret this process resolved, in a string, an object key or as a number's
   whole value (`pin: 12345678`) (`params_invalid`, naming the secret only, #53, schemas
   decision 43 D): a secret is never a trusted parameter. The variable's value is redacted in
-  the record's `context`;
+  the record's `context`. The same holds for an `llm` step's skill: a prompt or output
+  schema (loaded through the `SkillSource`) holding a secret is `params_invalid`;
 - an `act` entry has no valid `mode`, or its binding parameters (or a `notify` entry's
   `link_prefix`) are invalid (`params_invalid`, see below);
 - the pipeline has more than `MAX_ITEMS` `collect` calls in all, or uses more than
@@ -96,8 +97,9 @@ entry of a later step, which is recorded in `ProposedIntent.applied_by` (the ent
    `%2f`, `%5c` or `%25` (any case). The link may add its own query and fragment;
 4. a `task.update_status` is routed only if its `task` fingerprint appears, as an exact string
    value, in the data collected so far in the run (`RunRecord.inputs`, and the current
-   `collect` step's earlier sources and own output): a proposer can change the status of a
-   task it was shown, not of one it guessed. `task.create` binds no target: its title is free
+   `collect` step's earlier sources and own output; for an `llm` step with a loaded skill,
+   only its **viewed** input, what the model was shown): a proposer can change the status of
+   a task it was shown, not of one it guessed. `task.create` binds no target: its title is free
    text.
 
 An intent that no entry takes fails the step (`intent_unrouted`), as does one that several
@@ -114,6 +116,18 @@ trusted metadata for the sink, recorded with the entry in the `act` / `notify` s
 task titles, notification titles and bodies and `http.post` bodies are untrusted text from
 the proposer. Appliers (#21/#22) must treat them as data (never as markup to interpret,
 commands, templates or further targets).
+
+**The action guard** (#35, `horae.engine.guard`, schemas decision 46). Every batch the `llm`
+step proposes (fresh or reused) is checked after validation and before routing: at most the
+skill's `intent_limits` of each type, no Markdown image or Obsidian embed, no HTML tag outside
+a small inert allowlist and no HTML attribute, no `javascript:` / `data:` / `file:` /
+protocol-relative link in its text, and every
+URL in its text (and a `notify.push` `link`) an exact string of the viewed input. A refusal
+records a `guard` violation (a content-free detail) and **degrades the whole step**
+(`guard_violation`): nothing it proposed is routed, its output is not used, later steps are
+skipped. On a reuse, a refusal is a cache miss, and a cached entry is deleted (`discard`, when
+the cache has it). Intents of `collect` and `transform` steps are not guarded (first-party
+plugins, #52).
 
 | `mode` | intent types | binding parameter |
 |---|---|---|
@@ -142,16 +156,57 @@ every call, shared with replay.
 **The LLM step.** Its cache key, recorded as `RunRecord.input_hash` once the output is
 accepted, is the SHA-256 of the canonical JSON of `{skill, plugin: {name, version, commit},
 model, input}`, where `model` is the alias's target from `models` when the caller knows it, else
-the alias. When `previous` (the last accepted output, `PreviousLlm`) has the same key, no LLM
-call is made: its output and intents are reused (validated and routed again), recorded as an
-`LlmCall` with `cached=True` and zero usage, and the run continues. If the reused intents no
-longer validate or route (e.g. an explicit target bound to `{{date}}` moved to a new day), it
-is a cache miss: nothing of `previous` is recorded and the LLM is called. Without a usable
-`previous` the LLM is called. A reused run re-proposes the same intents, including
-`notify.push`: appliers must deduplicate notifications (e.g. by `input_hash` and intent).
+the alias. With a `SkillSource` (#27), the skill is loaded while planning (`skill_invalid`
+otherwise), `input` is the step input restricted to the skill's input view (what the model
+sees, also what `LlmRequest.input` and `LlmCall.input_hash` hold), and the key adds
+`skill_version` and `skill_digest` (prompt, output schema, view and intents), so a new version
+or an edited prompt is a cache miss; `LlmCall.skill_version` and `LlmCall.skill_digest` are the
+loaded skill's, and the LLM's intents are checked against the plugin's permissions narrowed to
+the skill's `intents` (`intent_rejected`). A viewed
+input of `null` (the input does not have the view's shape) degrades the step without calling
+the LLM (`input_invalid`). The skill is loaded before the backend is checked, so an invalid
+skill is `skill_invalid` even without a backend.
+When `previous` (an accepted output, `PreviousLlm`, e.g. the one a replayed run reused) has the
+same key, or else the `cache` (`LlmCache`, the store's `llm_cache` table under the runner, #32)
+holds a live entry for the key that still passes the skill's full output schema (the cache
+re-validates it), no LLM call is made: its output and intents are reused (validated and routed
+again), recorded as an `LlmCall` with `cached=True`, zero usage and the request marker
+`{skill, model, reused_input_hash, source_run?}` (`source_run`: the run that produced it),
+and the run continues. If the reused intents no longer validate or route (e.g. an explicit
+target bound to `{{date}}` moved to a new day) or the action guard refuses them, it is a cache
+miss: nothing of the entry is recorded and the LLM is called (a guarded cache entry is also
+deleted). Without a usable entry (or when `cache.lookup` raises: a
+miss) the LLM is called. A hit calls no backend, so no usage is reserved or charged (schemas
+decision 45). A reused run re-proposes the same intents, including `notify.push`: appliers
+must deduplicate notifications (e.g. by `input_hash` and intent).
 `timeout_s` (default `DEFAULT_LLM_TIMEOUT_S`) is one deadline for both attempts. The budget
-counts what every attempt cost, including the `usage` of a failed attempt (`LlmError.usage`);
+counts what every attempt cost, including the `usage` of a failed attempt (`LlmError.usage`,
+also of one whose output could not be validated, `validator_unavailable`, which is not
+repaired; and of one cancelled by the deadline while its output was being validated,
+`horae.engine.ports.attached_usage`);
 a backend's cached response costs nothing and counts towards neither the cost nor the budget.
+
+**De-identification** (#34, schemas decision 47). With a `deid` policy, a skill whose input
+view declares field classes and a cloud model alias, the order is: input view, then
+pseudonymize (`deid.pseudonymize`, deterministic from the viewed input, run in a worker thread
+within the step's `timeout_s`), then the request (`LlmRequest.input` is the pseudonymized
+input, `classified` and `deidentified` set; the backend renders it and refuses one that holds
+a declared or resolved secret, T10), then validation of the output (the backend), then the
+attempt is recorded (`llm[]`) and its usage spent, then **re-identification** of the accepted
+output and raw intents (refused with `output_too_large` before substituting when the result
+would pass `MAX_REIDENTIFIED_BYTES`; the call and its cost stay recorded), then the intents
+are validated and routed on real values (the action guard of #35 runs after that, on real
+values too). The cache key (`input_hash`) is computed on the real viewed input; the
+recorded `LlmCall.input_hash`, `response` and `intents` are what the provider saw and
+returned (pseudonymized), `request.deid` the summary (version, digest, counts) and the
+pseudonyms left `unresolved` (unknown or mangled: left as they are, no repair); the step's
+output and the routed intents carry real values. A cache hit or a replayed `previous` holds
+the pseudonymized output and is re-identified the same way, but only when its
+`deid_input_sha256` equals this run's de-identified input digest (`None` on both sides
+without de-identification): otherwise it is a miss. A policy that cannot
+de-identify (`DeidUnavailable`, e.g. an unreadable vocabulary) degrades the step
+(`deid_unavailable`) before anything is sent. A request refused for a secret
+(`secret_in_request`) also records a `secret_in_request` violation naming the secrets.
 
 **Step policy** (step status, then the effect on the run; the run status is the worst of
 `failed` > `degraded` > `noop` > `ok`):
@@ -162,13 +217,16 @@ a backend's cached response costs nothing and counts towards neither the cost no
 | collect | some sources fail, at least one succeeds | degraded | degraded | run (1) |
 | collect | every source fails | failed | failed | skipped |
 | transform | a transform fails | failed | failed | skipped |
-| llm | backend error, timeout, budget, invalid output, schema x2 | degraded | degraded | skipped |
+| llm | backend or validator error, timeout, budget, schema x2 (3) | degraded | degraded | skipped |
+| llm | the action guard refuses its proposals | degraded | degraded | skipped |
 | llm | unchanged input, previous output reused | ok | ok or noop (2) | run |
 | act | after a degraded `collect` (`partial_input`) | skipped | (degraded) | run |
 | act, notify | otherwise | ok | ok | run |
 
 "Proposer" is any `collect`, `transform` or `llm` step. (1) On the partial data, except that
-every `act` step is skipped. (2) `noop` when the run records no intent at all.
+every `act` step is skipped. (2) `noop` when the run records no intent at all. (3) Also a
+response that is not a valid `LlmResponse` (`output_invalid`); an output the validator could
+not check (`validator_unavailable`) degrades the step at once, without a repair.
 
 Rationale: a write is never made from partial or unvalidated data (a degraded `collect` skips
 every `act` step, whose intents are dropped, while `notify` still runs: telling the user about
@@ -188,6 +246,7 @@ import contextlib
 import copy
 import datetime
 import json
+import logging
 import math
 import time
 from collections.abc import Awaitable, Callable, Mapping
@@ -232,22 +291,33 @@ from horae.contracts.run import (
 )
 from horae.contracts.types import MAX_ITEMS, HttpsUrl, NotePath, Sha256Hex, Token
 from horae.engine.canonical import canonical_json, canonical_pipeline, pipeline_digest, sha256_hex
+from horae.engine.guard import GUARD_ERROR, guard_for
 from horae.engine.ports import (
+    Deidentifier,
+    DeidUnavailable,
     EngineCallError,
     LlmBackend,
+    LlmCache,
     LlmError,
     LlmRequest,
     LlmResponse,
+    LoadedSkill,
     PluginRegistry,
     PreviousLlm,
+    Pseudonyms,
     ResolvedPlugin,
+    SkillSource,
+    SkillUnavailable,
     ToolCaller,
     ToolResult,
     UnknownPlugin,
+    attached_usage,
 )
 from horae.engine.template import TemplateError, render, variables
 from horae.intents import MAX_BODY_DEPTH, IntentRejected, safe_excerpt, validate_intents
 from horae.secrets.redact import current as current_redactor
+
+_log = logging.getLogger("horae.engine")
 
 DEFAULT_LLM_TIMEOUT_S = 120.0
 """Timeout of the LLM step (both attempts) when the pipeline sets no `timeout_s`."""
@@ -497,6 +567,7 @@ class _Planned:
     entries: tuple[_Entry, ...] = ()
     llm: LlmSpec | None = None
     skill_plugin: ResolvedPlugin | None = None
+    skill: LoadedSkill | None = None
 
 
 class _PlanError(Exception):
@@ -618,6 +689,7 @@ def _plan(
     context: RunContext,
     plugins: PluginRegistry,
     has_llm: bool,
+    skills: SkillSource | None = None,
 ) -> tuple[_Planned, ...]:
     planned: list[_Planned] = []
     used: set[str] = set()
@@ -648,8 +720,6 @@ def _plan(
                 fail("plan_too_large", f"the pipeline uses more than {MAX_ITEMS} plugins")
 
         if isinstance(step, LlmStep):
-            if not has_llm:
-                fail("llm_unavailable", "the pipeline has an `llm` step and no LLM backend")
             try:
                 skill_plugin = plugins.plugin_for_skill(step.llm.skill)
             except UnknownPlugin:
@@ -657,7 +727,16 @@ def _plan(
             if step.llm.skill not in skill_plugin.manifest.provides.skills:
                 fail("tool_not_provided", f"{step.llm.skill} is not in the plugin's skills")
             use(skill_plugin)
-            planned.append(_Planned(index, kind, llm=step.llm, skill_plugin=skill_plugin))
+            # The skill is loaded before the backend check: an invalid skill is reported
+            # (`skill_invalid`) even where no backend is configured.
+            skill = None if skills is None else _load_skill(skills, step.llm.skill, skill_plugin)
+            if isinstance(skill, StepError):
+                fail(skill.kind, skill.message)
+            if not has_llm:
+                fail("llm_unavailable", "the pipeline has an `llm` step and no LLM backend")
+            planned.append(
+                _Planned(index, kind, llm=step.llm, skill_plugin=skill_plugin, skill=skill)
+            )
             continue
         calls: list[_Call] = []
         entries: list[_Entry] = []
@@ -697,6 +776,52 @@ def _plan(
     return tuple(planned)
 
 
+def _load_skill(skills: SkillSource, ref: str, plugin: ResolvedPlugin) -> LoadedSkill | StepError:
+    """The skill of the `llm` step, loaded and checked while planning (`skill_invalid`)."""
+    try:
+        skill = skills.load_skill(ref, plugin)
+        name, intents = skill.name, frozenset(skill.intents)
+        limits = dict(skill.intent_limits)
+    except SkillUnavailable as error:
+        return StepError(kind="skill_invalid", message=_cap(str(error) or "skill unavailable"))
+    except Exception as error:  # a port bug must not crash the run
+        return StepError(kind="host_error", message=f"unexpected {type(error).__name__}")
+    if name != ref:
+        return StepError(kind="skill_invalid", message=_cap(f"{ref}: the source loaded {name}"))
+    extra = sorted(intents - set(plugin.manifest.permissions.intents))
+    if extra:
+        message = f"{ref}: intents {', '.join(extra)} are not in the plugin's permissions"
+        return StepError(kind="skill_invalid", message=_cap(message))
+    if not set(limits) <= intents or not all(
+        type(value) is int and value >= 1 for value in limits.values()
+    ):
+        message = f"{ref}: the skill's intent limits do not match its intents"
+        return StepError(kind="skill_invalid", message=_cap(message))
+    # #53 (schemas decision 43 D): a secret in the prompt or output schema refuses the run
+    # here, before any step runs; `ModelBackends.prepare` keeps the same check as a backstop.
+    try:
+        held = current_redactor().find([skill.prompt, dict(skill.output_schema)])
+    except Exception as error:  # a port bug must not crash the run
+        return StepError(kind="host_error", message=f"unexpected {type(error).__name__}")
+    if held:
+        names = ", ".join(sorted(held))
+        message = f"{ref}: the prompt or output schema holds secret {names} (never a parameter)"
+        return StepError(kind="params_invalid", message=_cap(message))
+    return skill
+
+
+def _proposer(plugin: ResolvedPlugin, skill: LoadedSkill | None) -> ResolvedPlugin:
+    """Whose permissions the LLM's intents are checked against: the plugin's, narrowed to
+    the loaded skill's `intents` (an empty list: the skill proposes none)."""
+    if skill is None:
+        return plugin
+    permissions = plugin.manifest.permissions.model_copy(
+        update={"intents": [t for t in plugin.manifest.permissions.intents if t in skill.intents]}
+    )
+    manifest = plugin.manifest.model_copy(update={"permissions": permissions})
+    return ResolvedPlugin(manifest, plugin.commit)
+
+
 # --- execution -------------------------------------------------------------------------------
 
 
@@ -731,9 +856,11 @@ class _Run:
     tools: ToolCaller
     llm: LlmBackend | None
     previous: PreviousLlm | None
+    cache: LlmCache | None
     models: Mapping[str, str]
     entries: tuple[_Entry, ...]
     monotonic: Callable[[], float]
+    deid: Deidentifier | None = None
     data: Any = None
     inputs: list[InputSnapshot] = field(default_factory=list)
     llm_calls: list[LlmCall] = field(default_factory=list)
@@ -794,11 +921,17 @@ class _Run:
         by: str,
         pending: int,
         collected: tuple[Any, ...] = (),
+        shown: tuple[Any, ...] | None = None,
+        guard: Callable[[tuple[Intent, ...]], str | None] | None = None,
     ) -> tuple[list[ProposedIntent], StepError | None]:
         """Validate and route one call's proposals; `pending` intents of this step are kept.
 
         `collected` is input data of the current `collect` step not yet in `self.inputs`
-        (searched, with them, for `task.update_status` fingerprints)."""
+        (searched, with them, for `task.update_status` fingerprints). `shown`, when given, is
+        what the proposer was shown (the LLM step's viewed input): fingerprints are searched
+        there only. `guard` (the LLM step's action guard, `horae.engine.guard`) runs on the
+        validated batch before routing: a detail it returns is recorded as a `guard` violation
+        and returned as a `guard_violation` error (nothing of the batch is routed)."""
         raw = _intent_list(raw)
         entries = [entry for entry in self.entries if entry.step > index]
         unroutable: list[tuple[str, int, str]] = []
@@ -823,6 +956,13 @@ class _Run:
             return [], rejected.step_error()
         if unroutable:  # pragma: no cover (an unfilled target always fails its schema)
             return [], _route_error(source, unroutable)
+        if guard is not None:
+            refused = guard(typed)
+            if refused is not None:
+                _log.warning("action guard: %s", refused)
+                if len(self.violations) < MAX_ITEMS:
+                    self.violations.append(Violation(kind="guard", detail=refused))
+                return [], StepError(kind=GUARD_ERROR, message=_cap(refused))
         kept = len(self.intents) + sum(len(p) for p in self.pending.values()) + pending
         if kept + len(typed) > MAX_RUN_INTENTS:
             message = f"more than {MAX_RUN_INTENTS} intents in the run"
@@ -832,7 +972,11 @@ class _Run:
         for position, intent in enumerate(typed):
             if isinstance(intent, TaskUpdateStatus):
                 if known is None:
-                    known = _strings([snap.data for snap in self.inputs], collected)
+                    known = (
+                        _strings([snap.data for snap in self.inputs], collected)
+                        if shown is None
+                        else _strings(*shown)
+                    )
                 if intent.task not in known:
                     unroutable.append(("intent_unrouted", position, intent.type))
                     continue
@@ -1071,42 +1215,140 @@ async def _apply_step(run: _Run, step: _Planned) -> _Outcome:
     return _Outcome("ok", output=output)
 
 
-def _cache_key(run: _Run, spec: LlmSpec, plugin: ResolvedPlugin) -> str:
-    return sha256_hex(
-        {
-            "skill": spec.skill,
-            "plugin": {
-                "name": plugin.manifest.name,
-                "version": plugin.manifest.version,
-                "commit": plugin.commit,
-            },
-            "model": run.models.get(spec.model, spec.model),
-            "input": run.data,
-        }
+def _cache_key(
+    run: _Run, spec: LlmSpec, plugin: ResolvedPlugin, skill: LoadedSkill | None, viewed: Any
+) -> str:
+    key: dict[str, Any] = {
+        "skill": spec.skill,
+        "plugin": {
+            "name": plugin.manifest.name,
+            "version": plugin.manifest.version,
+            "commit": plugin.commit,
+        },
+        "model": run.models.get(spec.model, spec.model),
+        "input": viewed,
+    }
+    if skill is not None:
+        key["skill_version"] = skill.version
+        key["skill_digest"] = skill.digest
+    return sha256_hex(key)
+
+
+_MAX_DEID_NOTES = 16
+
+
+def _deid_record(
+    pseudo: Pseudonyms, *unresolved: list[str], accepted: bool = True
+) -> dict[str, Any]:
+    """`llm[].request.deid`: the summary (never a value) and, for an accepted output, the
+    pseudonyms that re-identification could not resolve."""
+    recorded = dict(pseudo.summary())
+    if accepted:
+        notes = sorted({str(note) for found in unresolved for note in found})
+        recorded["unresolved"] = notes[:_MAX_DEID_NOTES]
+    return recorded
+
+
+MAX_REIDENTIFIED_BYTES = 256 * 1024
+"""Largest re-identified LLM output and intents together (compact UTF-8 JSON): the skill
+output bound (`horae.skills.MAX_OUTPUT_BYTES`, restated: the engine does not import skills).
+Checked before substituting (`Pseudonyms.growth`), so a model repeating a pseudonym cannot
+make the engine build a huge output (#34 finding 1)."""
+
+
+def _encoded_size(value: Any) -> int:
+    return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+def _reidentified(pseudo: Pseudonyms | None, output: Any, raw: Any) -> tuple[Any, Any, Any]:
+    """`(output, raw intents, deid record)` with real values put back (#34); unchanged, and
+    no record, without pseudonyms. `_DataError` (`output_too_large`) when the result would
+    be larger than `MAX_REIDENTIFIED_BYTES` (computed before substituting)."""
+    if pseudo is None:
+        return output, raw, None
+    size = _encoded_size(output) + _encoded_size(raw) + pseudo.growth(output) + pseudo.growth(raw)
+    if size > MAX_REIDENTIFIED_BYTES:
+        raise _DataError(
+            "output_too_large",
+            f"the re-identified LLM output would be larger than {MAX_REIDENTIFIED_BYTES} bytes",
+        )
+    real_output, in_output = pseudo.reidentify(output)
+    real_raw, in_intents = pseudo.reidentify(raw)
+    return (
+        _json_copy(real_output, "re-identified LLM output"),
+        _json_copy(real_raw, "re-identified LLM intents"),
+        _deid_record(pseudo, in_output, in_intents),
     )
 
 
-def _reuse(
-    run: _Run, step: _Planned, spec: LlmSpec, plugin: ResolvedPlugin, key: str
+def _deid_digest(pseudo: Pseudonyms) -> str | None:
+    """The SHA-256 of a de-identified input (`summary()["input_sha256"]`)."""
+    digest = pseudo.summary().get("input_sha256")
+    return digest if isinstance(digest, str) else None
+
+
+def _view_options(skill: LoadedSkill | None) -> dict[str, Any]:
+    """The skill's input view options (`{}` without a skill, or for a skill without any)."""
+    if skill is None:
+        return {}
+    options = getattr(skill, "view_options", None)
+    return dict(options) if isinstance(options, Mapping) else {}
+
+
+def _classified(options: Mapping[str, Any]) -> bool:
+    """Whether the view options name a field class (#34)."""
+    return any(
+        isinstance(value, Mapping) and isinstance(value.get("class"), str)
+        for value in options.values()
+    )
+
+
+async def _reuse(
+    run: _Run,
+    step: _Planned,
+    spec: LlmSpec,
+    plugin: ResolvedPlugin,
+    key: str,
+    viewed: Any,
+    sent: Any,
+    pseudo: Pseudonyms | None,
 ) -> _Outcome | None:
-    """The previous accepted output, reused; `None` if it cannot be (then the LLM is called)."""
+    """An accepted output for `key`, reused; `None` if there is none or it cannot be reused
+    (then the LLM is called)."""
     previous = run.previous
-    if previous is None or previous.input_hash != key:
+    from_cache = False
+    if (previous is None or previous.input_hash != key) and run.cache is not None:
+        schema = None if step.skill is None else step.skill.output_schema
+        from_cache = True
+        try:
+            previous = await run.cache.lookup(key, model_alias=spec.model, output_schema=schema)
+        except Exception:  # a broken cache is a miss, never a failed run
+            previous = None
+    if not isinstance(previous, PreviousLlm) or previous.input_hash != key:
+        return None
+    # Pseudonyms name values only under the mapping that made them (#34 finding 7).
+    if previous.deid_input_sha256 != (None if pseudo is None else _deid_digest(pseudo)):
         return None
     try:
         output = _json_copy(previous.output, "previous LLM output")
         raw = _json_copy(_intent_list(previous.intents), "previous LLM intents")
+        # A cached output is the pseudonymized one: the same input gives the same mapping.
+        real_output, real_raw, deid_record = _reidentified(pseudo, output, raw)
+        marker = _reuse_marker(spec, key, previous.source_run)
+        if deid_record is not None:
+            marker["deid"] = deid_record
         call = LlmCall(
             step=step.index,
             skill=spec.skill,
-            skill_version=previous.skill_version,
+            skill_version=previous.skill_version if step.skill is None else step.skill.version,
+            skill_digest=None if step.skill is None else step.skill.digest,
             backend=previous.backend,
             model=previous.model,
             cached=True,
             schema_valid=True,
             model_alias=spec.model,
-            input_hash=sha256_hex(run.data),
-            request={"skill": spec.skill, "model": spec.model, "reused_input_hash": key},
+            input_hash=sha256_hex(sent),
+            request=marker,
             response=output,
             intents=raw,
             usage=_ZERO,
@@ -1114,30 +1356,97 @@ def _reuse(
     except (_DataError, ValidationError):
         return None
     violations = len(run.violations)
-    accepted, rejected = run.propose(raw, plugin, f"skill:{spec.skill}", step.index, spec.skill, 0)
+    proposer = _proposer(plugin, step.skill)
+    source = f"skill:{spec.skill}"
+    accepted, rejected = run.propose(
+        real_raw, proposer, source, step.index, spec.skill, 0, **_shown(step, viewed, source)
+    )
     if rejected is not None:
-        # E.g. a target bound to `{{date}}` moved on: a cache miss, not a failure.
+        # E.g. a target bound to `{{date}}` moved on: a cache miss, not a failure. A cached
+        # entry the action guard refuses is also deleted (schemas decision 46).
         del run.violations[violations:]
+        if from_cache and rejected.kind == GUARD_ERROR:
+            await _discard(run.cache, key, spec.model)
         return None
     run.llm_calls.append(call)
-    run.data, run.input_hash, run.reused = output, key, True
-    return _Outcome("ok", output=output, intents=accepted)
+    run.data, run.input_hash, run.reused = real_output, key, True
+    return _Outcome("ok", output=real_output, intents=accepted)
+
+
+def _reuse_marker(spec: LlmSpec, key: str, source_run: str | None) -> dict[str, Any]:
+    """The recorded request of a reuse: no call was made (`reused_input_hash`), and the run
+    that produced the output, when known (`source_run`)."""
+    marker: dict[str, Any] = {"skill": spec.skill, "model": spec.model, "reused_input_hash": key}
+    if source_run is not None:
+        marker["source_run"] = source_run
+    return marker
+
+
+async def _discard(cache: LlmCache | None, key: str, model_alias: str) -> None:
+    """Delete a cached entry (`LlmCache.discard`, part of the port: a cache that cannot delete
+    has a no-op); never raises."""
+    if cache is not None:
+        with contextlib.suppress(Exception):  # a broken cache never fails the run
+            await cache.discard(key, model_alias=model_alias)
+
+
+def _shown(step: _Planned, viewed: Any, source: str) -> dict[str, Any]:
+    """The action guard on what the model was shown (the viewed input), with the skill's
+    per-type intent limits; with a skill, `task.update_status` fingerprints must also come
+    from the viewed input."""
+    limits = None if step.skill is None else step.skill.intent_limits
+    guard = {"guard": guard_for(viewed, source, limits)}
+    return guard if step.skill is None else {**guard, "shown": (viewed,)}
 
 
 async def _llm_step(run: _Run, step: _Planned) -> _Outcome:
     spec, plugin, backend = step.llm, step.skill_plugin, run.llm
     if spec is None or plugin is None or backend is None:  # pragma: no cover (planned)
         raise RuntimeError("an llm step is planned with its spec, plugin and backend")
-    key = _cache_key(run, spec, plugin)
-    reused = _reuse(run, step, spec, plugin, key)
-    if reused is not None:
-        return reused
+    skill = step.skill
+    try:
+        viewed = run.data if skill is None else _json_copy(skill.view(run.data), "viewed input")
+    except _DataError as error:
+        return _Outcome("degraded", StepError(kind=error.kind, message=error.message), stop=True)
+    except Exception as error:  # a skill bug must not crash the run
+        message = f"unexpected {type(error).__name__} applying the input view"
+        return _Outcome("degraded", StepError(kind="host_error", message=message), stop=True)
+    if skill is not None and viewed is None:
+        # Nothing of the input matches the view's shape: no call is made.
+        message = f"{spec.skill}: the step input does not have the shape of the input view"
+        return _Outcome("degraded", StepError(kind="input_invalid", message=message), stop=True)
 
     def degraded(kind: str, message: str) -> _Outcome:
         return _Outcome("degraded", StepError(kind=kind, message=_cap(message)), stop=True)
 
+    # The step's deadline covers de-identification too (#34 finding 9): it runs in a worker
+    # thread, so a slow one times the step out instead of blocking the event loop.
     timeout = spec.timeout_s or DEFAULT_LLM_TIMEOUT_S
     deadline = run.monotonic() + timeout
+    options = _view_options(skill)
+    classified = _classified(options)
+    pseudo: Pseudonyms | None = None
+    if classified and run.deid is not None:
+        policy = run.deid
+        try:
+            async with asyncio.timeout(timeout):
+                pseudo = await asyncio.to_thread(policy.pseudonymize, spec.model, options, viewed)
+        except TimeoutError:
+            return degraded("timeout", f"de-identifying took longer than {timeout} s")
+        except DeidUnavailable as error:
+            return degraded("deid_unavailable", f"{spec.skill}: {safe_excerpt(str(error), 200)}")
+        except Exception as error:  # a policy bug must not crash the run, nor send in clear
+            return degraded("host_error", f"unexpected {type(error).__name__} de-identifying")
+    try:
+        sent = viewed if pseudo is None else _json_copy(pseudo.data, "pseudonymized input")
+    except _DataError as error:
+        return degraded(error.kind, error.message)
+    key = _cache_key(run, spec, plugin, skill, viewed)
+    reused = await _reuse(run, step, spec, plugin, key, viewed, sent, pseudo)
+    if reused is not None:
+        return reused
+    prompt = None if skill is None else skill.prompt
+    output_schema = None if skill is None else skill.output_schema
     spent_usd, spent_tokens = 0.0, 0
     repair: tuple[str, ...] = ()
     for attempt in range(1, MAX_LLM_ATTEMPTS + 1):
@@ -1150,18 +1459,39 @@ async def _llm_step(run: _Run, step: _Planned) -> _Outcome:
             usd=spec.budget.usd - spent_usd, tokens_out=spec.budget.tokens_out - spent_tokens
         )
         request = LlmRequest(
-            spec.skill, spec.model, _json_copy(run.data), budget, remaining, attempt, repair
+            spec.skill,
+            spec.model,
+            _json_copy(sent),
+            budget,
+            remaining,
+            attempt,
+            repair,
+            prompt=prompt,
+            output_schema=None if output_schema is None else copy.deepcopy(output_schema),
+            skill_version=None if skill is None else skill.version,
+            skill_digest=None if skill is None else skill.digest,
+            classified=classified,
+            deidentified=None if pseudo is None else pseudo.summary(),
         )
         try:
             async with asyncio.timeout(remaining):
                 response = await backend.complete(request)
-        except TimeoutError:
+        except TimeoutError as error:
+            # Cancelled while its output was being validated, the attempt was billed: its
+            # usage travels with the cancellation (schemas decision 44 E).
+            billed = attached_usage(error)
+            if billed is not None:
+                run.spend(billed)
             return degraded("timeout", f"the LLM step took longer than {timeout} s")
         except LlmError as error:
             usage = getattr(error, "usage", None)
             if isinstance(usage, Usage):
                 run.spend(usage)
             message = current_redactor().redact_text(error.message)[0]
+            if error.kind == "secret_in_request" and len(run.violations) < MAX_ITEMS:
+                # T10: refused before it was sent; the message names secrets, never values.
+                detail = _cap(f"{spec.skill}: {message}", 500)
+                run.violations.append(Violation(kind="secret_in_request", detail=detail))
             return degraded(_kind(error.kind), safe_excerpt(message, 200))
         except Exception as error:  # a backend bug must not crash the run
             return degraded("host_error", f"unexpected {type(error).__name__}")
@@ -1186,10 +1516,15 @@ async def _llm_step(run: _Run, step: _Planned) -> _Outcome:
             usage = _ZERO if response.cached is True else response.usage
             # Capped like the record's messages; the repair retry is sent these same errors.
             errors = tuple(_cap(str(error)) for error in response.schema_errors)[:MAX_ITEMS]
+            # The record keeps what the provider saw (#34); re-identification comes after
+            # the call is recorded and its usage spent (finding 8).
+            if pseudo is not None and isinstance(recorded, dict):
+                recorded["deid"] = _deid_record(pseudo, accepted=False)
             llm_call = LlmCall(
                 step=step.index,
                 skill=spec.skill,
-                skill_version=response.skill_version,
+                skill_version=response.skill_version if skill is None else skill.version,
+                skill_digest=None if skill is None else skill.digest,
                 backend=response.backend,
                 model=response.model,
                 cached=response.cached,
@@ -1215,12 +1550,32 @@ async def _llm_step(run: _Run, step: _Planned) -> _Outcome:
         if spent_usd > spec.budget.usd or spent_tokens > spec.budget.tokens_out:
             return degraded("budget_exceeded", "the LLM step spent more than its budget")
         if not errors:
+            # Validated, then re-identified (#34): a failure here keeps the call and its cost.
+            try:
+                real_output, real_raw, deid_record = _reidentified(pseudo, output, raw)
+            except _DataError as error:
+                return degraded(error.kind, error.message)
+            if deid_record is not None and isinstance(recorded, dict):
+                request_record = {**recorded, "deid": deid_record}
+                run.llm_calls[-1] = llm_call.model_copy(update={"request": request_record})
             source = f"skill:{spec.skill}"
-            accepted, rejected = run.propose(raw, plugin, source, step.index, spec.skill, 0)
+            proposer = _proposer(plugin, skill)
+            accepted, rejected = run.propose(
+                real_raw,
+                proposer,
+                source,
+                step.index,
+                spec.skill,
+                0,
+                **_shown(step, viewed, source),
+            )
             if rejected is not None:
-                return _Outcome("failed", rejected, stop=True)
-            run.data, run.input_hash = output, key
-            return _Outcome("ok", output=output, intents=accepted)
+                # The guard degrades the whole step (nothing of it is routed); a permission or
+                # routing breach fails the run.
+                status: StepStatus = "degraded" if rejected.kind == GUARD_ERROR else "failed"
+                return _Outcome(status, rejected, stop=True)
+            run.data, run.input_hash = real_output, key
+            return _Outcome("ok", output=real_output, intents=accepted)
         repair = errors
     return degraded(
         "schema_invalid", f"the output failed its schema after {MAX_LLM_ATTEMPTS} attempts"
@@ -1245,14 +1600,17 @@ async def execute(
     plugins: PluginRegistry,
     tools: ToolCaller,
     llm: LlmBackend | None = None,
+    skills: SkillSource | None = None,
     dry_run: bool = False,
     previous: PreviousLlm | None = None,
+    cache: LlmCache | None = None,
     models: Mapping[str, str] | None = None,
     lock_digest: str | None = None,
     config_digest: str | None = None,
     on_step: StepHook | None = None,
     clock: Callable[[], datetime.datetime] = _utc_now,
     monotonic: Callable[[], float] = time.monotonic,
+    deid: Deidentifier | None = None,
 ) -> RunRecord:
     """Run `pipeline` once and return its record; never raises for a step or port failure.
 
@@ -1261,15 +1619,25 @@ async def execute(
     - `started_at`: the run's start, the value given to `Store.begin_run` (the record keeps it).
     - `tools` is called for `collect` and `transform` only; `act` / `notify` entries are
       routed to, never called (ADR 0002).
-    - `previous`: the last accepted LLM output (`Store.last_accepted_llm`), for the
-      unchanged-input path. `models`: model alias to concrete model (`horae.yaml`), part of
-      the LLM cache key.
+    - `skills`: loads the `llm` step's skill while planning (`skill_invalid` when it cannot);
+      its prompt, output schema and version go into each `LlmRequest`, its input view
+      restricts what the model sees, and its version and digest join the cache key. Without
+      it (fakes and older callers) the request carries the whole input and no prompt.
+    - `previous`: an accepted LLM output for the unchanged-input path (replay gives the one
+      the recorded run reused); `cache`: looked up by the step's cache key when `previous`
+      does not match (the runner's `StoreLlmCache`, #32). `models`: model alias to concrete
+      model (`horae.yaml`), part of the LLM cache key.
     - `models` (when given), `lock_digest` and `config_digest` (`horae.config.Instance`) are
       recorded as given, for replays; an invalid value raises `ValueError` before anything
       runs. The canonical pipeline definition is recorded too (`pipeline_definition`), unless
       it is larger than `MAX_PIPELINE_BYTES` or holds a resolved secret's value (#53: a
       literal secret in a pipeline file; its parameters refuse the run at plan time, and the
       definition is not copied into the store).
+    - `deid`: the instance's de-identification policy (`horae.llm.deid.Deidentifier`, #34):
+      with a skill that declares field classes and a cloud model alias, the model is sent
+      the pseudonymized viewed input and the accepted output and intents are re-identified
+      (see **De-identification** in the module docstring). Without it, nothing is
+      pseudonymized (and `ModelBackends` refuses a classified request to a cloud alias).
     - `dry_run` is recorded only: the engine applies nothing either way.
     - `on_step(index, record)` is awaited after each step record is final; its exceptions
       propagate. `clock` gives the wall-clock timestamps, `monotonic` the durations and the
@@ -1295,7 +1663,7 @@ async def execute(
     status: RunStatus = "ok"
     run_error: str | None = None
     try:
-        plan = _plan(pipeline, context, plugins, llm is not None)
+        plan = _plan(pipeline, context, plugins, llm is not None, skills)
     except _PlanError as error:
         plan = ()
         status, run_error = "failed", f"step {error.index}: {error.error.message}"
@@ -1308,9 +1676,11 @@ async def execute(
         tools=tools,
         llm=llm,
         previous=previous,
+        cache=cache,
         models=dict(models or {}),
         entries=tuple(entry for p in plan for entry in p.entries),
         monotonic=monotonic,
+        deid=deid,
     )
     used = {c.plugin.manifest.name: c.plugin for p in plan for c in p.calls}
     used.update({e.plugin.manifest.name: e.plugin for e in run.entries})

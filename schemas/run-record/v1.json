@@ -193,6 +193,20 @@
           "title": "Skill Version",
           "type": "string"
         },
+        "skill_digest": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "SHA-256 of the loaded skill's content (prompt, output schema, input view, intents; part\nof the cache key), set by the engine when it loaded the skill (#27). Replays report a\nskill that changed since the run.",
+          "title": "Skill Digest"
+        },
         "backend": {
           "enum": [
             "claude-cli",
@@ -1114,13 +1128,14 @@
       "description": "Access that was blocked or flagged during the run.",
       "properties": {
         "kind": {
-          "description": "`secret_in_output`: a plugin returned the value (or an encoding) of an instance secret in\nits output or intents; the plugin host replaced it with `[REDACTED:<NAME>]` (#24).",
+          "description": "`secret_in_output`: a plugin returned the value (or an encoding) of an instance secret in\nits output or intents; the plugin host replaced it with `[REDACTED:<NAME>]` (#24).\n`secret_in_request`: an LLM request held the value (or an encoding) of a resolved secret;\nit was refused before it was sent and the step degraded (T10, #34; `detail` names the\nsecrets, never their values).",
           "enum": [
             "egress_blocked",
             "guard",
             "undeclared_secret",
             "undeclared_path",
-            "secret_in_output"
+            "secret_in_output",
+            "secret_in_request"
           ],
           "title": "Kind",
           "type": "string"

@@ -54,30 +54,68 @@ process resolved, the alias' key included once its backend resolved it) before i
 error with no `__cause__` / `__context__`), and the response's output, intents, schema
 errors and request summary. A secret found there is logged (`horae.llm`, names only). A
 skill's prompt or output schema holding a secret (in a string, an object key or as a
-number's whole value) is refused by `prepare` with `params_invalid`, naming the secret only,
-before anything is rendered, reserved or sent (a secret is never a trusted parameter). This
-check runs when the `llm` step prepares its request, **not at plan time**: until #27's skill
-loader gives the engine the prompt before the run starts, the steps before the `llm` step have
-already run when it refuses (the run then fails at that step, nothing is sent to the model);
-with the loader the check moves to the engine's `_plan`, before any step runs.
+number's whole value) is refused with `params_invalid`, naming the secret only (a secret is
+never a trusted parameter): by the engine's `_plan`, which loads the skill through its
+`SkillSource` before any step runs (schemas decision 43 D), and again by `prepare`, as a
+backstop, before anything is rendered, reserved or sent (an engine given no `SkillSource`,
+a `PromptSource` other than the skill loader).
+
+**De-identification** (#34, schemas decision 47). The engine pseudonymizes the viewed input
+of a skill that declares field classes before a cloud alias (`horae.llm.deid`) and marks the
+request (`LlmRequest.deidentified`); `prepare` then appends `DEID_NOTE` to the skill's prompt
+(copy placeholders verbatim) and the request summary records `deid` (version, digest of what
+is sent, counts). As a backstop, a request whose skill declares classes (`classified`) to an
+alias that is not local, but that was not de-identified, is refused with `deid_required`
+before anything is rendered (an engine given no `Deidentifier`).
+
+**No secret leaves in a request** (T10, #34). `send` scans the exact frozen body
+(`RenderedRequest.body()`) for every secret the instance declares (`redaction_names`, primed
+into the redaction registry before the first check) and every other one the process
+resolved, in all its encodings (the registry, `horae.secrets.redact.current()`: the raw
+bytes, and the decoded JSON strings, keys and numbers), whatever the backend: one found
+refuses the attempt with `secret_in_request` (naming the secrets, never their values; the
+log gives their count) before the provider backend is called, so nothing is sent and
+nothing is billed (the usage ledger releases its reservation, decision 41); the engine
+records a `secret_in_request` violation and degrades the step.
+
+Both checks live here, in `ModelBackends` (decision 47 E, H): an engine given another
+`LlmBackend` (a test double, a replay tape) has neither. A provider backend must derive
+everything it sends, a subprocess' argv and stdin included (`claude-cli`, #29), from the
+decoded frozen body alone (`RenderedRequest.body()`), never from the `Completion` or the
+request, so the bytes checked are the bytes sent.
 
 **Retries.** None here: the engine owns the single repair retry (`attempt` 2). Provider
 backends disable their SDK's own retries.
 
 **Integration points.**
 
-- **#27 (skill format).** `RequestPrompts` reads the rendered prompt, the viewed input, the
+- **#27 (skill format).** `RequestPrompts` reads the skill's prompt, the viewed input, the
   output schema and the skill version from the `LlmRequest` (`prompt`, `input`,
-  `output_schema`, `skill_version`) with `getattr`, so it works before and after #27 adds
-  those fields. Until then a request without them fails with kind `skill_unavailable` (the
-  skill cannot be used yet; a skill that is present but malformed is #27's `skill_invalid`).
-  Another `PromptSource` (a skill loader) can be passed to `ModelBackends` instead.
-- **#31 (repair).** `ModelBackends(validate=...)` turns an output into its schema errors
-  (`LlmResponse.schema_errors`, which drive the repair retry). Without a validator the
-  provider's structured output is the only check and `schema_errors` is empty. **The
-  validator is mandatory before production use** (decision 38 G): structured outputs drop
-  the constraints they do not support (`anthropic.transform_schema` moves them into
-  descriptions), so only the validator enforces the full schema.
+  `output_schema`, `skill_version`, set by the engine from the loaded skill). A request
+  without a prompt or schema (an engine given no `SkillSource`) fails with kind
+  `skill_unavailable`: a real backend never sends the whole input without a skill (a skill
+  that is present but malformed fails earlier, `skill_invalid`). A skill that declares
+  intents must declare the reserved `intents` array in its output schema (#27,
+  `horae.skills.INTENTS_PROPERTY`, the same name as `INTENTS_KEY`). Another `PromptSource`
+  can be passed to `ModelBackends` instead.
+- **#31 (repair, decision 44).** `ModelBackends(validate=...)` turns an output into its
+  repair errors (`LlmResponse.schema_errors`, which drive the repair retry), validated
+  against the skill's **full** output schema (`RenderedRequest.output_schema`, not the
+  provider's transformed copy) before the intents are split off. The validator may be
+  asynchronous: `horae.llm.validate.validate_output`, the **default** (imported lazily;
+  `model_backends` installs it too), runs in a killable child process and never blocks the
+  event loop; it is given what is left of the attempt's deadline less
+  `VALIDATION_MARGIN_S`, so it gives up before the engine's deadline cancels the step. An
+  output with errors proposes nothing: its `intents` are dropped (`LlmResponse.intents` is
+  empty, whatever their shape). An output that **could not be validated** (the validator
+  raised: a timeout, a failing worker) is not the model's fault: `send` raises
+  `LlmError(VALIDATOR_UNAVAILABLE)` with the attempt's usage, so no repair is made and the
+  step degrades at once; a cancellation during the validation carries the usage too
+  (`horae.engine.ports.attach_usage`). Only the explicit `UNVALIDATED` (test doubles) skips
+  validation, so that the provider's structured output is the only check. **The validator
+  is mandatory in production** (decision 38 G): structured outputs drop the constraints
+  they do not support (`anthropic.transform_schema` moves them into descriptions), so only
+  the validator enforces the full schema.
 - **#33 (budgets).** `worst_case` is what the usage ledger reserves before `send`; the
   runner's `LedgerLlm` (`horae.runner._budget`) calls `prepare` (the prompt, the provider
   backend and the input bound: the `PromptSource` reads happen there, outside the store's
@@ -90,20 +128,32 @@ backends disable their SDK's own retries.
   and `worst_case`, so that a settled call never costs more than its reservation.
 """
 
+import asyncio
+import enum
 import hashlib
+import inspect
 import json
 import logging
 import math
-from collections.abc import Callable, Mapping, Sequence
+import time
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
 from horae.contracts.instance import ModelAlias, ModelPrice
 from horae.contracts.run import Usage
 from horae.engine.canonical import canonical_json
-from horae.engine.ports import LlmBackendName, LlmError, LlmRequest, LlmResponse
+from horae.engine.ports import (
+    LlmBackendName,
+    LlmError,
+    LlmRequest,
+    LlmResponse,
+    attach_usage,
+)
+from horae.llm.deid import DEID_NOTE
 from horae.secrets import SecretResolver
 from horae.secrets.redact import current as current_redactor
+from horae.secrets.redact import prime as prime_redaction
 
 _log = logging.getLogger("horae.llm")
 
@@ -144,10 +194,8 @@ class RequestPrompts:
     """Reads the prompt from the request itself (the #27 fields of `LlmRequest`)."""
 
     def prompt(self, request: LlmRequest) -> Prompt:
-        system = getattr(request, "prompt", None)
-        schema = getattr(request, "output_schema", None)
-        version = getattr(request, "skill_version", None)
-        if not isinstance(system, str) or not isinstance(schema, Mapping):
+        system, schema, version = request.prompt, request.output_schema, request.skill_version
+        if system is None or schema is None:
             raise LlmError(
                 "skill_unavailable",
                 f"skill {request.skill} has no loaded prompt and output schema",
@@ -156,7 +204,7 @@ class RequestPrompts:
             system=system,
             input=request.input,
             output_schema=schema,
-            skill_version=version if isinstance(version, str) and version else "0",
+            skill_version=version or "0",
         )
 
 
@@ -299,8 +347,47 @@ ERROR_KINDS = (
 BackendFactory = Callable[[str, ModelAlias, SecretResolver], ProviderBackend]
 """Builds the provider backend of one model alias: `(alias, spec, secrets)`."""
 
-Validator = Callable[[Any, Mapping[str, Any]], Sequence[str]]
-"""`validate(output, schema)`: the schema errors of `output` (empty when valid); #31."""
+VALIDATOR_UNAVAILABLE = "validator_unavailable"
+"""The `LlmError` kind of an attempt whose output could not be validated (a validator
+timeout, a failing worker, an unusable schema, an output that is not plain JSON): not the
+model's fault, so no repair is made and the step degrades at once, the attempt's usage
+charged (schemas decision 44 C)."""
+
+VALIDATION_MARGIN_S = 0.5
+"""What a validation leaves of the attempt's deadline, so that it times out (and reports the
+attempt's usage) before the engine's own deadline cancels the step (decision 44 E)."""
+
+
+class Validator(Protocol):
+    """`validate(output, schema, timeout_s=...)`: the repair errors of `output` against the
+    skill's full output schema (empty when valid), or an awaitable of them (#31). It returns
+    within about `timeout_s` and raises `LlmError` (any kind: it is reported as
+    `validator_unavailable`) when it cannot validate. `horae.llm.validate.validate_output` is
+    the production one (a killable worker); a synchronous validator runs inline, on the event
+    loop (test doubles only)."""
+
+    def __call__(
+        self, output: Any, schema: Mapping[str, Any], /, *, timeout_s: float
+    ) -> Sequence[str] | Awaitable[Sequence[str]]: ...
+
+
+class Unvalidated(enum.Enum):
+    """`UNVALIDATED`: the explicit opt-out of output validation (test doubles only)."""
+
+    UNVALIDATED = "unvalidated"
+
+
+UNVALIDATED = Unvalidated.UNVALIDATED
+"""`ModelBackends(validate=UNVALIDATED)`: no validator, the provider's structured output is
+the only check. Never in production (decision 38 G): it must be written out."""
+
+
+def production_validator() -> Validator:
+    """`horae.llm.validate.validate_output`, imported lazily (it imports `horae.skills`,
+    which imports this module): the default of `ModelBackends.validate`."""
+    from horae.llm.validate import validate_output  # lazily: an import cycle
+
+    return validate_output
 
 
 def cost(
@@ -407,6 +494,13 @@ def split_intents(output: Any, usage: Usage) -> tuple[Any, list[Any]]:
     return rest, intents
 
 
+def _without_intents(output: Any) -> Any:
+    """`output` without its reserved top-level `intents`, whatever their shape."""
+    if not isinstance(output, dict) or INTENTS_KEY not in output:
+        return output
+    return {key: value for key, value in output.items() if key != INTENTS_KEY}
+
+
 @dataclass(frozen=True)
 class PreparedRequest:
     """An attempt before its budget is applied (`ModelBackends.prepare`)."""
@@ -423,6 +517,29 @@ class PreparedRequest:
     skill_version: str
     input_bound: int
     may_write_cache: bool = False
+    deid: Mapping[str, Any] | None = None
+    """`LlmRequest.deidentified` (recorded as `summary.deid`)."""
+
+
+SECRET_IN_REQUEST = "secret_in_request"  # noqa: S105 - an error kind
+"""The `LlmError` kind of a request refused because its body holds a resolved secret (T10)."""
+DEID_REQUIRED = "deid_required"
+"""The `LlmError` kind of a classified request to a cloud alias that was not de-identified."""
+
+
+def secrets_in(body: bytes) -> set[str]:
+    """The names of the resolved secrets (process registry) whose value, or an encoding of
+    it, is in `body`: matched on the raw bytes and on the decoded JSON (strings, object keys,
+    whole numbers), so a JSON escape cannot hide one."""
+    redactor = current_redactor()
+    if not redactor:
+        return set()
+    found = set(redactor.counts(body))
+    try:
+        decoded = json.loads(body)
+    except ValueError:  # pragma: no cover - a frozen body is canonical JSON
+        return found
+    return found | redactor.find(decoded)
 
 
 @dataclass
@@ -437,8 +554,15 @@ class ModelBackends:
     secrets: SecretResolver
     factories: Mapping[str, BackendFactory]
     prompts: PromptSource = field(default_factory=RequestPrompts)
-    validate: Validator | None = None
+    validate: Validator | Unvalidated = field(default_factory=production_validator)
+    """The output validator: `horae.llm.validate.validate_output` unless another one, or the
+    explicit `UNVALIDATED`, is given (decisions 38 G and 44 D)."""
+    redaction_names: tuple[str, ...] = ()
+    """Every secret the instance declares (`Instance.redaction_names`): resolved for
+    redaction once, before the first request is checked, so the T10 check of `send` scans for
+    all of them, not only those this process happened to resolve (decision 47 H)."""
     _backends: dict[str, ProviderBackend] = field(default_factory=dict, init=False, repr=False)
+    _primed: bool = field(default=False, init=False, repr=False)
 
     def _backend(self, alias: str, spec: ModelAlias) -> ProviderBackend:
         backend = self._backends.get(alias)
@@ -461,6 +585,12 @@ class ModelBackends:
         spec = self.models.get(request.model)
         if spec is None:
             raise LlmError("invalid_request", f"unknown model alias {request.model!r}")
+        if request.classified and request.deidentified is None and not spec.is_local:
+            raise LlmError(
+                DEID_REQUIRED,
+                f"skill {request.skill} declares field classes but its input was not "
+                f"de-identified for cloud model alias {request.model!r}: nothing was sent",
+            )
         prompt = self.prompts.prompt(request)
         held = current_redactor().find([prompt.system, dict(prompt.output_schema)])
         if held:
@@ -474,9 +604,12 @@ class ModelBackends:
         largest = request.budget.tokens_out
         if spec.max_output_tokens is not None:
             largest = min(largest, spec.max_output_tokens)
+        system = prompt.system
+        if request.deidentified is not None:
+            system = f"{system.rstrip()}\n\n{DEID_NOTE}"
         probe = Completion(
             model=spec.model,
-            system=prompt.system,
+            system=system,
             input=prompt.input,
             output_schema=prompt.output_schema,
             max_tokens=max(1, largest),
@@ -491,6 +624,7 @@ class ModelBackends:
             skill_version=prompt.skill_version,
             input_bound=input_bound(backend.render(probe)),
             may_write_cache=getattr(backend, "may_write_cache", False) is True,
+            deid=None if request.deidentified is None else dict(request.deidentified),
         )
 
     def output_limit(self, request: LlmRequest, prepared: "PreparedRequest") -> int:
@@ -520,6 +654,9 @@ class ModelBackends:
         completion = replace(prepared.probe, max_tokens=limit)
         backend = prepared.backend
         payload = backend.render(completion)
+        recorded = summary(completion, backend.name, canonical_json(payload))
+        if prepared.deid is not None:
+            recorded["deid"] = dict(prepared.deid)
         return RenderedRequest(
             alias=prepared.alias,
             backend=backend.name,
@@ -528,7 +665,7 @@ class ModelBackends:
             output_schema=prepared.probe.output_schema,
             payload=payload,
             timeout_s=prepared.probe.timeout_s,
-            summary=summary(completion, backend.name, canonical_json(payload)),
+            summary=recorded,
             input_bound=prepared.input_bound,
             max_tokens=limit,
             may_write_cache=prepared.may_write_cache,
@@ -562,7 +699,25 @@ class ModelBackends:
             unchanged = False
         if not unchanged:
             raise LlmError("invalid_request", "the payload was changed after it was rendered")
+        if not self._primed:
+            self._primed = True
+            prime_redaction(self.secrets, self.redaction_names)
+        held = secrets_in(body)
+        if held:
+            names = ", ".join(sorted(held))
+            # The names travel in the error (and the run's violation); the log says how many.
+            _log.warning(
+                "%d secret(s) found in a request to model alias %s; refused",
+                len(held),
+                rendered.alias,
+            )
+            raise LlmError(
+                SECRET_IN_REQUEST,
+                f"the request to model alias {rendered.alias!r} holds secret {names}: "
+                "refused before sending",
+            )
         backend = self._backend(rendered.alias, spec)
+        started = time.monotonic()
         failure: LlmError | None = None
         try:
             result = await backend.send(json.loads(body), rendered.timeout_s)
@@ -570,10 +725,29 @@ class ModelBackends:
             failure = redacted_error(error, rendered.alias)
         if failure is not None:
             raise failure  # outside the handler: no `__context__` leads to the original
-        errors: tuple[str, ...] = ()
-        if self.validate is not None:
-            errors = tuple(self.validate(result.output, rendered.output_schema))
-        output, intents = split_intents(result.output, result.usage)
+        left = rendered.timeout_s - (time.monotonic() - started) - VALIDATION_MARGIN_S
+        try:
+            errors = await self._errors(result.output, rendered.output_schema, max(0.0, left))
+        except asyncio.CancelledError as cancelled:
+            # The step's deadline (or the run's) cancelled the validation: the attempt was
+            # billed all the same, so its usage travels with the cancellation (decision 44 E).
+            attach_usage(cancelled, result.usage)
+            raise
+        except LlmError as error:
+            failure = LlmError(VALIDATOR_UNAVAILABLE, error.message, usage=result.usage)
+        except Exception as error:  # a validator bug: fail closed, never a pass
+            message = f"the validator failed ({type(error).__name__})"
+            failure = LlmError(VALIDATOR_UNAVAILABLE, message, usage=result.usage)
+        if failure is not None:
+            # Not the model's fault: no repair, the step degrades now (decision 44 C).
+            raise redacted_error(failure, rendered.alias)
+        intents: list[Any]
+        if errors:
+            # An invalid output proposes nothing (decision 44): its intents are dropped here,
+            # whatever their shape, and the engine routes nothing from an invalid attempt.
+            output, intents = _without_intents(result.output), []
+        else:
+            output, intents = split_intents(result.output, result.usage)
         output, intents, errors = _redacted_response(output, intents, errors, rendered.alias)
         return LlmResponse(
             output=output,
@@ -585,6 +759,17 @@ class ModelBackends:
             request=dict(rendered.summary),
             intents=intents,
         )
+
+    async def _errors(
+        self, output: Any, schema: Mapping[str, Any], timeout_s: float
+    ) -> tuple[str, ...]:
+        """The validator's repair errors of `output` (none `UNVALIDATED`)."""
+        if self.validate is UNVALIDATED:
+            return ()
+        found = self.validate(output, schema, timeout_s=timeout_s)
+        if inspect.isawaitable(found):
+            found = await found
+        return tuple(str(error) for error in found)
 
     async def complete(self, request: LlmRequest) -> LlmResponse:
         """`send(render(request))`: the engine's `LlmBackend.complete`."""
@@ -634,10 +819,15 @@ def _redacted_response(
 
 
 __all__ = [
+    "DEID_REQUIRED",
     "ERROR_KINDS",
     "INPUT_TOKEN_MARGIN",
     "INTENTS_KEY",
     "MAX_ERROR_CHARS",
+    "SECRET_IN_REQUEST",
+    "UNVALIDATED",
+    "VALIDATION_MARGIN_S",
+    "VALIDATOR_UNAVAILABLE",
     "BackendFactory",
     "Completion",
     "CompletionResult",
@@ -648,12 +838,15 @@ __all__ = [
     "ProviderBackend",
     "RenderedRequest",
     "RequestPrompts",
+    "Unvalidated",
     "Validator",
     "cost",
     "input_bound",
     "input_price",
     "max_tokens",
+    "production_validator",
     "redacted_error",
+    "secrets_in",
     "split_intents",
     "summary",
 ]

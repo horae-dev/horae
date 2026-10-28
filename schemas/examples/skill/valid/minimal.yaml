@@ -1,0 +1,4 @@
+name: daily-brief/summarize
+version: 0.1.0-rc.1
+description: Summarize the collected data.
+input_view: ["[].data"]

@@ -21,7 +21,7 @@ from pydantic import ValidationError
 from horae import __version__
 from horae.apply import LocalSink, SinkRegistry, StaticSinks, plan_changes, to_json
 from horae.apply.render import render_text
-from horae.cli_host import host_sinks, instance_problems, load, uses_host
+from horae.cli_host import PLUGINS_DIR, host_sinks, instance_problems, load, uses_host
 from horae.cli_output import (
     EXIT_DIFFERENT,
     EXIT_INTERNAL,
@@ -57,9 +57,11 @@ from horae.config import (
     validate,
 )
 from horae.contracts import InstanceConfig, RunRecord
+from horae.llm.deid import load_deidentifier
 from horae.replay import LockRegistry, ReplayResult, definition_for, replay
 from horae.runner import lock_is_free
 from horae.secrets import logs
+from horae.skills import DirectorySkills
 from horae.store import MAX_LIST_RUNS, RunSummary, Store, StoreError
 
 EXIT_CODES_HELP = (
@@ -178,7 +180,8 @@ def doctor(
     Also checks that every path of horae.lock exists, that the instance's own vault/ is the
     one horae.lock writes to (instances are not relocatable in v1: a copied or moved
     instance is reported), and, with a plugins/ directory, that the plugins are installed
-    as horae.lock pins them and their commands (interpreters) are executable.
+    as horae.lock pins them and their commands (interpreters) are executable. With an llm
+    step, it also checks that the LLM output validator (a child process) runs.
 
     Warnings (e.g. a cloud model alias without a price, whose usd budget is then
     ineffective) are reported but do not fail the check.
@@ -500,6 +503,14 @@ def _replay(instance: Path, store: Path | None, run_id: str, against_current: bo
             ),
         )
     models = {alias: spec.model for alias, spec in loaded.config.models.items()}
+    # Skills are read from the installed plugins (local files only, #27); without them a run
+    # whose `llm` step loaded a skill replays as different (the viewed input and key differ).
+    plugins_dir = instance / PLUGINS_DIR
+    skills = (
+        DirectorySkills({name: plugins_dir / name for name in loaded.lock.plugins})
+        if plugins_dir.is_dir()
+        else None
+    )
     return replay(
         record,
         current,
@@ -508,6 +519,12 @@ def _replay(instance: Path, store: Path | None, run_id: str, against_current: bo
         against_current=against_current,
         lock_digest=loaded.lock_digest(),
         config_digest=loaded.config_digest(),
+        skills=skills,
+        deid=load_deidentifier(
+            loaded.config.models,
+            loaded.secret_resolver(),
+            loaded.config.deidentification.vocabulary,
+        ),
     )
 
 
@@ -587,8 +604,9 @@ def replay_command(
     )
 
 
-# `horae init`, `horae run` and `horae undo` live in their own modules; registered here so
-# `horae.cli.app` has every command.
+# `horae init`, `run`, `undo`, `usage` and `cache` live in their own modules; registered here
+# so `horae.cli.app` has every command.
+from horae.cli_cache import cache_app as _cache_app  # noqa: E402
 from horae.cli_init import init as _init  # noqa: E402
 from horae.cli_run import run as _run  # noqa: E402
 from horae.cli_undo import undo as _undo  # noqa: E402
@@ -598,6 +616,7 @@ _command("init")(_init)
 _command("run")(_run)
 _command("undo")(_undo)
 _command("usage")(_usage)
+app.add_typer(_cache_app, name="cache")
 
 __all__ = [
     "EXIT_DIFFERENT",

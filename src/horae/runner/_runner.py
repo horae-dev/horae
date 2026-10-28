@@ -15,12 +15,12 @@
 3. **Begin.** A sortable run id (`new_run_id`) and `Store.begin_run` (retried once with a fresh
    id on `RunExists`). The store's unique index on running runs stays as a second guard:
    `PipelineBusy` there is reported as `PipelineLocked` too.
-4. **Execute** (`horae.engine.execute`) with the last accepted LLM output
-   (`Store.last_accepted_llm`, read after `begin_run`) for the unchanged-input path, the
-   model alias targets of `horae.yaml`, and the digests of `horae.lock` and of `horae.yaml`'s
-   `models` and `plugins` sections (`Instance.lock_digest`, `Instance.config_digest`), which
-   the record keeps so that `horae replay` can tell what changed since the run. Each
-   finished step is persisted (`on_step` → `Store.record_step`), and a heartbeat
+4. **Execute** (`horae.engine.execute`) with the LLM cache (`StoreLlmCache` over the store's
+   `llm_cache` table, `horae.runner._cache`, #32) for the unchanged-input path (no lookup under
+   `cache=False`, `horae run --no-cache`), the model alias targets of `horae.yaml`, and the digests
+   of `horae.lock` and of `horae.yaml`'s `models` and `plugins` sections (`Instance.lock_digest`,
+   `Instance.config_digest`), which the record keeps so that `horae replay` can tell what changed
+   since the run. Each finished step is persisted (`on_step` → `Store.record_step`), and a heartbeat
    (`Store.heartbeat`) is written every `heartbeat_s` seconds. Heartbeats are for
    observability (`horae runs`); the lock, not the heartbeat, decides whether a run is alive.
    The LLM backend is wrapped in `LedgerLlm` (`horae.runner._budget`, #33): the daily
@@ -46,9 +46,11 @@
    applied; so is a run whose caller cancels it after its steps finished but before the
    apply. A crash during the apply abandons the run (error `run crashed during apply
    (<type>)`), and its journal still lets `horae undo` revert what was written.
-6. **Persist** the record (`Store.save_run`), call `on_record(record)` if given, and release
-   the lock. The status is the engine's (`ok`, `noop`, `degraded` or `failed`), or `failed`
-   when the apply failed.
+6. **Persist** the record (`Store.save_run`), call `on_record(record)` if given, cache the
+   run's accepted LLM output (not for a dry run; also under `cache=False`, which only skips
+   the lookup), and release the lock. Before step 3, a non-dry run purges expired cache
+   entries and the oldest beyond `cache.max_entries` (best effort). The status is the
+   engine's (`ok`, `noop`, `degraded` or `failed`), or `failed` when the apply failed.
 
 **Timeouts.** The run timeout (`horae.yaml` `runs.timeout_s`, default 900 s) bounds the whole
 run: past it the engine's task is cancelled and given `stop_grace_s` (5 s) to stop. If it stops,
@@ -119,14 +121,16 @@ from horae.contracts.run import StepKind
 from horae.engine import (
     LlmBackend,
     PluginRegistry,
-    PreviousLlm,
     RunCancelled,
+    SkillSource,
     ToolCaller,
     execute,
     make_context,
     pipeline_digest,
 )
+from horae.llm.deid import load_deidentifier
 from horae.runner._budget import LedgerLlm
+from horae.runner._cache import StoreLlmCache
 from horae.runner._lock import PipelineLock, try_acquire_apply_lock
 from horae.secrets import logs
 from horae.store import (
@@ -239,6 +243,9 @@ class Ports:
     llm: LlmBackend | None = None
     sinks: SinkRegistry | None = None
     """The sinks and notifiers that apply a run's intents (#22); `None` applies nothing."""
+    skills: SkillSource | None = None
+    """Loads the `llm` step's skill (#27): `horae.skills.DirectorySkills` over the installed
+    plugins; `None` sends the whole input and no prompt (fakes only)."""
 
 
 @dataclass
@@ -397,10 +404,13 @@ class Runner:
         vars: Mapping[str, str] | None = None,
         on_record: Callable[[RunRecord], object] | None = None,
         on_begin: Callable[[str], object] | None = None,
+        cache: bool = True,
     ) -> RunRecord:
         """Run pipeline `name` once and return its saved record (see the module docstring).
 
-        `vars` are extra template variables. `on_begin(run_id)` is called once the run's row
+        `vars` are extra template variables. `cache=False` (`horae run --no-cache`) skips the
+        LLM cache lookup: the model is called even on unchanged input, and the accepted
+        output still replaces the cache entry. `on_begin(run_id)` is called once the run's row
         exists (before its first step). `on_record(record)` is called with every record
         that is saved, also when `run` then raises (cancellation, timeout); neither should
         raise. Raises `UnknownPipeline`, `PipelineLocked` (nothing written), `RunTimedOut`
@@ -416,6 +426,15 @@ class Runner:
         lock = await self._lock(name)
         try:
             self._recover(name)
+            config = self.instance.config
+            deid = load_deidentifier(
+                config.models, self.instance.secret_resolver(), config.deidentification.vocabulary
+            )
+            llm_cache = StoreLlmCache(
+                self.store, config.cache, self.clock, read=cache, models=config.models, deid=deid
+            )
+            if not dry_run:
+                llm_cache.purge()
             started_at = self.clock()
             trigger = pipeline.trigger
             zone = (
@@ -428,9 +447,8 @@ class Runner:
             try:
                 if on_begin is not None:
                     on_begin(state.run_id)
-                previous = self.store.last_accepted_llm(name)
                 return await self._drive(
-                    pipeline, state, started_at, context, dry_run, previous, on_record
+                    pipeline, state, started_at, context, dry_run, llm_cache, on_record
                 )
             except BaseException as exc:
                 if not state.settled:
@@ -639,7 +657,7 @@ class Runner:
         started_at: datetime,
         context: RunContext,
         dry_run: bool,
-        previous: PreviousLlm | None,
+        llm_cache: StoreLlmCache,
         on_record: Callable[[RunRecord], object] | None,
     ) -> RunRecord:
         run_id = state.run_id
@@ -662,13 +680,15 @@ class Runner:
                 plugins=self.ports.plugins,
                 tools=self.ports.tools,
                 llm=llm,
+                skills=self.ports.skills,
                 dry_run=dry_run,
-                previous=previous,
+                cache=llm_cache,
                 models=models,
                 lock_digest=self.instance.lock_digest(),
                 config_digest=self.instance.config_digest(),
                 on_step=on_step,
                 clock=self.clock,
+                deid=llm_cache.deid,
             )
         )
         task.add_done_callback(_retrieve)
@@ -732,6 +752,8 @@ class Runner:
             message = "cancelled before apply: the run was cancelled after its steps finished"
             record = _failed(record, f"{message}; nothing was applied")
         self._save(state, record, on_record)
+        if not dry_run:
+            llm_cache.remember(record)
         if timed_out:
             raise RunTimedOut(run_id, timeout, record)
         if cancelled:

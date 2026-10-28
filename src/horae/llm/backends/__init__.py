@@ -18,7 +18,15 @@ from horae.llm.backends.openai_compatible import (
     OpenAICompatibleBackend,
     openai_compatible_backend,
 )
-from horae.llm.base import BackendFactory, ModelBackends, PromptSource, RequestPrompts, Validator
+from horae.llm.base import (
+    BackendFactory,
+    ModelBackends,
+    PromptSource,
+    RequestPrompts,
+    Unvalidated,
+    Validator,
+)
+from horae.llm.validate import validate_output
 from horae.secrets import SecretResolver
 
 FACTORIES: Mapping[str, BackendFactory] = {
@@ -35,11 +43,15 @@ def model_backends(
     secrets: SecretResolver,
     *,
     prompts: PromptSource | None = None,
-    validate: Validator | None = None,
+    validate: Validator | Unvalidated | None = None,
+    redaction_names: tuple[str, ...] = (),
     work_dir: Path | None = None,
 ) -> ModelBackends:
-    """A `ModelBackends` with the built-in `FACTORIES`; `work_dir` is where `claude-cli`
-    makes its per-call workspaces (`<state_dir>/llm-runs` in a run, schemas decision 42 C)."""
+    """A `ModelBackends` with the built-in `FACTORIES` and, unless another is given, the
+    production validator `horae.llm.validate.validate_output` (decisions 38 G and 44).
+    `redaction_names`: every secret the instance declares, for the T10 request check.
+    `work_dir` is where `claude-cli` makes its per-call workspaces (`<state_dir>/llm-runs` in
+    a run, schemas decision 42 C)."""
     factories: Mapping[str, BackendFactory] = FACTORIES
     if work_dir is not None:
         factories = {**FACTORIES, "claude-cli": partial(claude_cli_backend, work_dir=work_dir)}
@@ -48,7 +60,8 @@ def model_backends(
         secrets=secrets,
         factories=factories,
         prompts=prompts or RequestPrompts(),
-        validate=validate,
+        validate=validate_output if validate is None else validate,
+        redaction_names=tuple(redaction_names),
     )
 
 

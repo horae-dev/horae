@@ -13,7 +13,8 @@ one `horae undo`), everything the runner needs from the installed plugins:
 - `McpSinks`, the `SinkRegistry` that applies routed intents through the plugins' sink
   operations (`horae.plugins.host.sink`).
 
-`LivePorts.ports` is the runner's `Ports(plugins=registry, tools=host, llm=llm, sinks=sinks)`.
+`LivePorts.ports` is the runner's `Ports(plugins=registry, tools=host, llm=llm, sinks=sinks,
+skills=skills)`, the skills read from `<plugins_dir>/<name>/skills/` (`DirectorySkills`, #27).
 `llm` is the caller's backend when given; otherwise, when a pipeline of the instance has an
 `llm` step, a `horae.llm.ModelBackends` over the instance's model aliases
 (`horae.llm.backends.model_backends`, #28), sharing the host's `SecretResolver`. It is lazy:
@@ -44,6 +45,7 @@ from horae.llm.backends.claude_cli import LLM_RUNS_DIR
 from horae.plugins.host import HostRegistry, McpSinks, PluginHost, host_for_instance
 from horae.runner._runner import Ports
 from horae.secrets import SecretResolver
+from horae.skills import DirectorySkills
 
 
 @dataclass(frozen=True)
@@ -70,12 +72,16 @@ async def open_ports(
     owned: ModelBackends | None = None
     if llm is None and uses_llm(instance):
         llm = owned = model_backends(
-            instance.config.models, secrets, work_dir=instance.state_dir / LLM_RUNS_DIR
+            instance.config.models,
+            secrets,
+            redaction_names=instance.redaction_names(),
+            work_dir=instance.state_dir / LLM_RUNS_DIR,
         )
     try:
         async with host_for_instance(instance, registry, secrets=secrets) as host:
             sinks = McpSinks(registry, host)
-            ports = Ports(plugins=registry, tools=host, llm=llm, sinks=sinks)
+            skills = DirectorySkills({p.manifest.name: p.root for p in registry.plugins()})
+            ports = Ports(plugins=registry, tools=host, llm=llm, sinks=sinks, skills=skills)
             yield LivePorts(registry, host, sinks, ports)
     finally:
         if owned is not None:

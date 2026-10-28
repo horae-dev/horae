@@ -8,6 +8,7 @@ import asyncio
 import hashlib
 import json
 import re
+import shutil
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any
@@ -23,7 +24,7 @@ from horae.config import Instance
 from horae.contracts import InstanceConfig, Lockfile, RunRecord
 from horae.contracts.instance import ModelAlias
 from horae.engine import LlmRequest
-from horae.llm import ModelBackends, Prompt
+from horae.llm import UNVALIDATED, ModelBackends, Prompt
 from horae.llm.backends import FACTORIES, AnthropicBackend, claude_cli
 from horae.runner import Ports, Runner, open_ports, uses_llm
 from horae.secrets import SecretResolver
@@ -74,7 +75,7 @@ def _llm(inst: Instance, recorder: Recorder) -> ModelBackends:
         return AnthropicBackend(alias, spec, secrets, transport=recorder.transport)
 
     return ModelBackends(
-        inst.config.models, inst.secret_resolver({}), {"anthropic": factory}, Prompts()
+        inst.config.models, inst.secret_resolver({}), {"anthropic": factory}, Prompts(), UNVALIDATED
     )
 
 
@@ -250,6 +251,19 @@ def _write(root: Path, models: Mapping[str, Any], steps: list[dict[str, Any]]) -
     }
     (root / "plugins" / "pack").mkdir(parents=True)
     (root / "plugins" / "pack" / "plugin.yaml").write_text(yaml.safe_dump(manifest), "utf-8")
+    # Its skill (#27): no intents, so no reserved `intents` output property.
+    skill = root / "plugins" / "pack" / "skills" / "pack" / "brief"
+    skill.mkdir(parents=True)
+    (skill / "skill.yaml").write_text(
+        "name: pack/brief\nversion: 1.2.0\ndescription: Brief.\ninput_view: [items]\n", "utf-8"
+    )
+    (skill / "prompt.md").write_text(SYSTEM + "\n", "utf-8")
+    output = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"summary": {"type": "string", "maxLength": 200}},
+    }
+    (skill / "output.schema.json").write_text(json.dumps(output), "utf-8")
     return root
 
 
@@ -262,8 +276,9 @@ def test_horae_run_reaches_the_model_alias_backend(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """`horae run` goes through the real `open_ports`: the llm step is no longer
-    `llm_unavailable`. Without a skill loader (#27) it stops at `skill_unavailable`, before any
-    request; no network is used either way."""
+    `llm_unavailable`, and its skill is loaded (#27). The pipeline collects nothing, so the
+    viewed input is `null` and the step stops at `input_invalid` before any request; a
+    missing skill is `skill_invalid`. No network is used either way."""
     sent: list[httpx2.Request] = []
 
     def refuse(request: httpx2.Request) -> httpx2.Response:  # pragma: no cover - never sent
@@ -286,7 +301,17 @@ def test_horae_run_reaches_the_model_alias_backend(
     assert record is not None
     error = record.steps[0].error
     assert error is not None
-    assert error.kind == "skill_unavailable"
+    assert error.kind == "input_invalid"
+    assert sent == []
+    shutil.rmtree(root / "plugins" / "pack" / "skills")
+    result = runner.invoke(app, ["run", "brief", "-i", str(root), "--json"])
+    report = json.loads(result.stdout)
+    with Store.open(root / "state" / "horae.db") as store:
+        record = store.get_run(report["run_id"])
+    assert record is not None
+    error = record.steps[0].error
+    assert error is not None
+    assert error.kind == "skill_invalid"
     assert sent == []
 
 

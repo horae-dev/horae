@@ -10,7 +10,7 @@ import hashlib
 import json
 import logging
 import ssl
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -22,6 +22,7 @@ from horae.contracts.instance import ModelAlias
 from horae.contracts.pipeline import Budget
 from horae.engine import LlmError, LlmRequest
 from horae.llm import (
+    UNVALIDATED,
     Completion,
     ModelBackends,
     Prompt,
@@ -40,6 +41,7 @@ from horae.llm.backends.anthropic import (
     SYSTEM_PREAMBLE,
     USER_AGENT,
 )
+from horae.llm.validate import validate_output
 from horae.secrets import SecretResolver
 
 FIXTURES = Path(__file__).parent / "fixtures" / "llm" / "anthropic"
@@ -124,6 +126,7 @@ def backends(
     def factory(name: str, spec: ModelAlias, resolver: SecretResolver) -> AnthropicBackend:
         return AnthropicBackend(name, spec, resolver, transport=recorder.transport)
 
+    kw.setdefault("validate", UNVALIDATED)  # the backend, not the validator (#31)
     return ModelBackends(
         models={"default": spec or alias()},
         secrets=secrets,
@@ -753,7 +756,7 @@ def test_request_prompts_read_the_skill_fields() -> None:
 def test_the_validator_gives_the_schema_errors(secrets: SecretResolver) -> None:
     seen: list[Any] = []
 
-    def validate(output: Any, schema: Mapping[str, Any]) -> list[str]:
+    def validate(output: Any, schema: Mapping[str, Any], *, timeout_s: float) -> list[str]:
         seen.append((output, schema))
         return ["$.summary: too long"]
 
@@ -945,7 +948,7 @@ def test_intents_are_moved_out_of_the_output(secrets: SecretResolver) -> None:
     intent = {"type": "notify.push", "title": "Review PR 42"}
     seen: list[Any] = []
 
-    def validate(output: Any, schema: Mapping[str, Any]) -> list[str]:
+    def validate(output: Any, schema: Mapping[str, Any], *, timeout_s: float) -> list[str]:
         seen.append(output)
         return []
 
@@ -1117,3 +1120,41 @@ def test_a_response_without_a_content_list_is_output_invalid(secrets: SecretReso
     assert error.kind == "output_invalid"
     assert "no content" in error.message
     assert error.usage is not None
+
+
+# --- the validator enforces what structured output drops (#31, decision 44 B) -----------------
+
+
+def _properties(node: Any) -> Iterator[Mapping[str, Any]]:
+    """Every `properties` mapping in `node` (a rendered payload)."""
+    if isinstance(node, dict):
+        if isinstance(node.get("properties"), dict):
+            yield node["properties"]
+        for value in node.values():
+            yield from _properties(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _properties(value)
+
+
+def test_the_validator_enforces_a_constraint_transform_schema_moved(
+    secrets: SecretResolver,
+) -> None:
+    short = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["x"],
+        "properties": {"x": {"type": "string", "maxLength": 3}},
+    }
+    llm = backends(
+        secrets, Recorder(_answer({"x": "0123456789"})), schema=short, validate=validate_output
+    )
+    rendered = llm.render(request())
+    # The real AnthropicBackend.render: `anthropic.transform_schema` moved `maxLength` out
+    # of the schema it sends (into a description), so the provider does not enforce it.
+    (sent,) = [p["x"] for p in _properties(rendered.payload) if "x" in p]
+    assert "maxLength" not in sent
+    assert rendered.output_schema == short  # the validator gets the skill's full schema
+    response = complete(llm)
+    assert response.schema_errors == ("/x: maxLength: the string is longer than 3 characters",)
+    assert "0123456789" not in json.dumps(response.schema_errors)
