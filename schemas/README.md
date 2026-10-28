@@ -12,6 +12,7 @@ All schemas use JSON Schema **draft 2020-12**. `$id` values below are relative t
 | One intent | `intents/<type>/v1.json` | `intents/<type>/v1.json` | `note.create`, `note.append_section`, `note.replace_owned_block`, `task.create`, `task.update_status`, `notify.push`, `http.post` |
 | Lockfile | [`lockfile/v1.json`](lockfile/v1.json) | `lockfile/v1.json` | `horae.lock` (§4) |
 | Run record | [`run-record/v1.json`](run-record/v1.json) | `run-record/v1.json` | one run (§3.1, §2.1.6) |
+| Instance configuration | [`instance/v1.json`](instance/v1.json) | `instance/v1.json` | `horae.yaml` (§3.1, §3.4, §7) |
 
 ## Source of truth
 
@@ -39,7 +40,8 @@ pydantic may change them; the drift test then fails in CI and the fix is to rege
 - A breaking change adds `v<N+1>.json` next to the old file; compatible additions stay in `v<N>`.
   Most rules are deliberately tight: loosening one later is a compatible change.
 - Files that Horae writes itself carry `schema_version` (`horae.lock`, run records). Files that
-  people write (pipelines, `plugin.yaml`) do not, so the PLAN.md examples validate unchanged.
+  people write (pipelines, `plugin.yaml`, `horae.yaml`) do not, so the PLAN.md examples validate
+  unchanged.
 
 ## Rules worth knowing
 
@@ -186,3 +188,15 @@ conservative option, so loosening one later is a compatible change.
     A dry run has no `changes`. Untrusted-content tagging is not part of v1.
 22. **`$id` host.** `raw.githubusercontent.com/horae-dev/horae/main/schemas/…`, which this project
     controls and which serves the files once merged. A custom domain can come later as `v<N+1>`.
+23. **`horae.yaml` (instance v1)**, proposed in #16 and pending maintainer review, is kept minimal; every key is optional. `timezone` (IANA,
+    default `UTC`), `state_dir` (default `state`, relative to the instance directory),
+    `models` (alias → `backend` from the run-record list, `model`, optional `base_url` (https
+    only, as decision 6) and `secret`, the name of the secret holding the API key or token),
+    `plugins` (per installed plugin: optional `startup_timeout_s` and `call_timeout_s`, as
+    proposed in the #24 design note), `secrets` (`dir`, default `/run/secrets`, and `refs`:
+    secret name → `{env: VAR}` or `{file: name}`, a single file name inside `dir`) and
+    `scheduler.mode` (`builtin`, the default, or `external`). It never holds a secret value. A
+    secret without a ref is read from the environment variable of the same name, else from the
+    file of the same name in `dir`.
+    Rules the loader (not the schema) checks: time zones exist, `llm.model` aliases are defined,
+    configured plugins are in `horae.lock`, a pipeline's `name` equals its file name.

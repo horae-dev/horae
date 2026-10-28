@@ -263,6 +263,7 @@ name = "horae"
 source = { editable = "." }
 dependencies = [
     { name = "pydantic" },
+    { name = "pyyaml" },
     { name = "typer" },
 ]
 
@@ -273,7 +274,6 @@ dev = [
     { name = "pre-commit" },
     { name = "pytest" },
     { name = "pytest-cov" },
-    { name = "pyyaml" },
     { name = "regex" },
     { name = "ruff" },
     { name = "types-jsonschema" },
@@ -284,6 +284,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "pydantic", specifier = ">=2.14" },
+    { name = "pyyaml", specifier = ">=6" },
     { name = "typer", specifier = ">=0.27" },
 ]
 
@@ -294,7 +295,6 @@ dev = [
     { name = "pre-commit", specifier = ">=4.7" },
     { name = "pytest", specifier = ">=9.1" },
     { name = "pytest-cov", specifier = ">=7" },
-    { name = "pyyaml", specifier = ">=6" },
     { name = "regex", specifier = ">=2024.11" },
     { name = "ruff", specifier = ">=0.17" },
     { name = "types-jsonschema", specifier = ">=4.23" },

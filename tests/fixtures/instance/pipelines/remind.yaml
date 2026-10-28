@@ -1,0 +1,7 @@
+# A pipeline with no LLM step (pack-reminders, PLAN.md §5).
+name: remind
+trigger: { cron: "*/5 * * * *" }
+steps:
+  - collect: [obsidian.open_tasks]
+  - notify:
+      - ntfy.reminders: {}

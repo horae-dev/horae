@@ -9,3 +9,9 @@
   and Graft is the review service used on this repository.
 
 It is used only by `tests/test_graft_policy.py` to validate `graft.yaml` offline.
+
+## instance/
+
+A synthetic Horae instance (`horae.yaml`, `pipelines/`, `horae.lock`) for the configuration
+loader and `horae doctor` tests. The pipelines and the lockfile are copies of examples in
+`schemas/examples/`. It holds no secret values: tests create them in a temporary directory.

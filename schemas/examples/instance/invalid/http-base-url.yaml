@@ -1,0 +1,2 @@
+models:
+  local: { backend: ollama, model: llama3, base_url: "http://ollama.example.org" }
