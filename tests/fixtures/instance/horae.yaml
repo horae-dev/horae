@@ -1,0 +1,12 @@
+# A synthetic instance used by the configuration loader tests.
+timezone: Europe/Paris
+state_dir: state
+models:
+  default: { backend: anthropic, model: claude-sonnet-4-5, secret: ANTHROPIC_API_KEY }
+  personal: { backend: claude-cli, model: sonnet }
+plugins:
+  github: { call_timeout_s: 20 }
+secrets:
+  dir: secrets
+  refs:
+    ANTHROPIC_API_KEY: { file: anthropic_api_key }

@@ -1,0 +1,2 @@
+# Plugin timeouts are bounded: 1 to 600 seconds.
+plugin_defaults: { call_timeout_s: 601 }
