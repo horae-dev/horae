@@ -1,0 +1,4 @@
+# Unknown keys are refused.
+schema_version: 1
+input: {}
+expect: { guard: pass, outputs: {} }

@@ -172,15 +172,61 @@ def _user_content(completion: Completion) -> list[TextBlockParam]:
     return [{"type": "text", "text": text} for text in user_texts(completion)]
 
 
+_SCHEMA_ONE = ("items", "additionalProperties", "not", "contains", "if", "then", "else")
+_SCHEMA_MAP = ("properties", "$defs", "definitions", "dependentSchemas")
+_SCHEMA_LIST = ("anyOf", "oneOf", "allOf", "prefixItems")
+
+
+def _children(node: Mapping[str, Any], where: str) -> list[tuple[Any, str]]:
+    found: list[tuple[Any, str]] = [(node[k], f"{where}/{k}") for k in _SCHEMA_ONE if k in node]
+    for key in _SCHEMA_MAP:
+        if isinstance(node.get(key), dict):
+            found.extend((v, f"{where}/{key}/{k}") for k, v in node[key].items())
+    for key in _SCHEMA_LIST:
+        if isinstance(node.get(key), list):
+            found.extend((v, f"{where}/{key}/{i}") for i, v in enumerate(node[key]))
+    return found
+
+
+def _transform_fails(node: Any) -> str | None:
+    if not isinstance(node, dict):
+        return None
+    try:
+        anthropic.transform_schema(node)
+    except Exception as error:  # any shape transform_schema cannot handle
+        return f"{type(error).__name__}: {str(error)[:200]}"
+    return None
+
+
+def schema_problem(schema: Mapping[str, Any]) -> str | None:
+    """Why `schema` cannot be used for the Messages API's structured output (`None`: it
+    can): `anthropic.transform_schema`'s error, at the JSON pointer of the deepest subschema
+    it refuses (e.g. `#/properties/why: ValueError: Schema must have a 'type', ...`). For
+    `horae doctor` and the render's own error (schemas decision 39, amended by 48)."""
+    plain = plain_schema(schema)
+    reason = _transform_fails(plain)
+    if reason is None:
+        return None
+    where = "#"
+    pending = _children(plain, where)
+    while pending:
+        node, at = pending.pop(0)
+        deeper = _transform_fails(node)
+        if deeper is not None:
+            where, reason = at, deeper
+            pending = _children(node, at)
+    return f"{where}: {reason}"
+
+
 def _schema(schema: Mapping[str, Any]) -> dict[str, Any]:
-    transformed: dict[str, Any] | None = None
-    with contextlib.suppress(Exception):  # any shape transform_schema cannot handle
-        transformed = anthropic.transform_schema(plain_schema(schema))
-    if transformed is None:
+    try:
+        return anthropic.transform_schema(plain_schema(schema))
+    except Exception as error:  # any shape transform_schema cannot handle
+        detail = schema_problem(schema) or f"{type(error).__name__}: {str(error)[:200]}"
         raise LlmError(
-            "invalid_request", "the skill's output schema cannot be used for structured output"
-        )
-    return transformed
+            "invalid_request",
+            f"the skill's output schema cannot be used for structured output ({detail})",
+        ) from error
 
 
 class AnthropicBackend:
@@ -408,4 +454,5 @@ __all__ = [
     "AnthropicBackend",
     "anthropic_backend",
     "quiet_sdk_loggers",
+    "schema_problem",
 ]

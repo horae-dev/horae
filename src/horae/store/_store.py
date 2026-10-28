@@ -119,6 +119,10 @@ _log = logging.getLogger("horae.store")
 StoreRunStatus = Literal["running", "ok", "noop", "degraded", "failed", "undone"]
 """A run record's status, plus `running` while the run has no record yet."""
 TaskStatus = Literal["todo", "done", "cancelled", "snoozed"]
+EVAL_PIPELINE_PREFIX = "eval:"
+"""The pipeline of a live skill eval's run row (`eval:<skill>`, schemas decision 48 J): a
+pipeline name never holds `:`, so an eval row never collides with a pipeline's; `horae runs`
+hides these rows unless `--all`."""
 
 DEFAULT_BUSY_TIMEOUT_MS = 5000
 HEARTBEAT_BUSY_TIMEOUT_MS = 100
@@ -1028,6 +1032,35 @@ class Store:
             self._conn.execute("DELETE FROM secret_flags WHERE run_id = ?", (run_id,))
 
     @_api
+    def finish_bare_run(
+        self,
+        run_id: str,
+        *,
+        status: Literal["ok", "failed"],
+        at: datetime,
+        cost: Usage,
+        error: str | None = None,
+    ) -> None:
+        """Finish a running run that never gets a run record (a live skill eval, decision
+        48 J): its status, end time and cost; its ledger rows are its own. `RunNotRunning` /
+        `UnknownRun` when it is not running. Its secret flags are dropped like an abandoned
+        run's (there is no record to put them on)."""
+        stamp = _ts(at)
+        text: str | None = None
+        if error is not None:
+            text, _found = self._text(error, f"the error of run {run_id}")
+        with self.transaction():
+            cur = self._conn.execute(
+                "UPDATE runs SET status = ?, finished_at = ?, tokens_in = ?, tokens_out = ?, "
+                "cost_usd = ?, error = ? WHERE id = ? AND status = 'running' AND record IS NULL",
+                (status, stamp, cost.tokens_in, cost.tokens_out, cost.usd, text, run_id),
+            )
+            if cur.rowcount != 1:
+                self._require_running(run_id)
+                raise InvalidRow(f"run {run_id!r} has a record")  # pragma: no cover
+            self._conn.execute("DELETE FROM secret_flags WHERE run_id = ?", (run_id,))
+
+    @_api
     def save_run(self, record: RunRecord) -> None:
         """Insert or replace a run's record (also its step rows).
 
@@ -1166,8 +1199,10 @@ class Store:
         pipeline: str | None = None,
         status: StoreRunStatus | None = None,
         limit: int = 50,
+        evals: bool = True,
     ) -> list[RunSummary]:
-        """Runs, newest first, optionally filtered; `0 <= limit <= MAX_LIST_RUNS`."""
+        """Runs, newest first, optionally filtered; `0 <= limit <= MAX_LIST_RUNS`.
+        `evals=False` leaves out the rows of live skill evals (`EVAL_PIPELINE_PREFIX`)."""
         if type(limit) is not int or not 0 <= limit <= MAX_LIST_RUNS:
             raise ValueError(f"limit must be an int between 0 and {MAX_LIST_RUNS}")
         rows = self._conn.execute(
@@ -1175,8 +1210,9 @@ class Store:
             "tokens_out, cost_usd, pid, host, heartbeat_at, abandoned_at, error FROM runs "
             "WHERE (:pipeline IS NULL OR pipeline = :pipeline) "
             "AND (:status IS NULL OR status = :status) "
+            "AND (:evals = 1 OR substr(pipeline, 1, 5) != 'eval:') "
             "ORDER BY started_at DESC, id DESC LIMIT :limit",
-            {"pipeline": pipeline, "status": status, "limit": limit},
+            {"pipeline": pipeline, "status": status, "limit": limit, "evals": int(evals)},
         ).fetchall()
         return [self._summary(row) for row in rows]
 

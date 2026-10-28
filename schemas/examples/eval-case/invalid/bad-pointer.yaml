@@ -1,0 +1,6 @@
+# A JSON pointer starts with `/` (or is empty).
+schema_version: 1
+input: {}
+expect:
+  assertions:
+    - { pointer: output/summary, exists: true }

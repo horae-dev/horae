@@ -14,7 +14,7 @@ from horae import cli_output
 from horae.cli import app
 
 ROOT = Path(__file__).resolve().parents[1]
-COMMANDS = ("init", "run", "runs", "diff", "undo", "replay", "doctor", "usage")
+COMMANDS = ("init", "run", "runs", "diff", "undo", "replay", "doctor", "usage", "eval")
 TABLE = {0: "ok", 1: "problems", 2: "usage", 3: "unknown or refused", 4: "different"}
 runner = CliRunner()
 

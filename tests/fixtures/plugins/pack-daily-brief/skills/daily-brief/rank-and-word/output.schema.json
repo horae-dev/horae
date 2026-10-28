@@ -40,6 +40,7 @@
           "maxLength": 200
         },
         "why": {
+          "type": "string",
           "enum": [
             "overdue",
             "today",
@@ -57,6 +58,7 @@
       ],
       "properties": {
         "type": {
+          "type": "string",
           "const": "note.create"
         },
         "content": {
