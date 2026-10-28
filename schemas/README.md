@@ -1721,7 +1721,12 @@ loosened later without breaking a valid file.
     - **(0) structurally conservative** (security review): rather than chasing each
       obfuscation, the guard refuses whole classes of text the parsers it guards against could
       read differently: control and format characters, any non-trivial tag-like token, any
-      link destination with whitespace (rules 0a, 3, 5);
+      link destination with whitespace or a backslash (rules 0a, 0b, 3, 5);
+    - **(0b) Markdown escapes.** A renderer drops `\` before ASCII punctuation, so the text
+      it renders differs from the text as written (`[x](java\script:…)`, `<https\://…>`).
+      Every check also runs on a view with those escapes removed (after each entity-decoding
+      pass), and the text is refused if **any** view fails. A backslash is refused outright
+      inside a link destination, a reference definition and a tag-like token or autolink;
     - **(0a) no control or format character.** Any Cc character but `\n` (tab and carriage
       return included), any Cf character (zero-width, joiners, bidi controls, BOM, soft
       hyphen) and U+2028 / U+2029 refuse the text before any other scan, also when an entity
@@ -1758,7 +1763,7 @@ loosened later without breaking a valid file.
       parameters and `link_prefix`) is a follow-up;
     - **(5) link destinations.** After `](` (up to the next `)`, or the line end when there
       is none) and after a line's leading `[label]:` (not a `[^footnote]:`; up to the line
-      end), leading spaces skipped: a destination holding **any whitespace** (so also a title,
+      end), leading spaces skipped: a destination holding **any whitespace or backslash** (so also a title,
       `[x]( javascript :…)` or a line break) or starting with a refused scheme (also inside
       `<…>`) is refused; its URLs go through (4). A refused scheme in prose (`data: three
       items`: colon then a space) is not a link in Markdown and passes;
@@ -1766,11 +1771,12 @@ loosened later without breaking a valid file.
       `fingerprint`, `notify.push` `title`, `body` and `link`, every string and object key of an
       `http.post` `body`. Targets bound by routing (`path`, `http.post` `url`) are not text;
     - **robust parsing, bounded work.** Every check runs on the text as written and on its
-      HTML-entity-decoded forms (up to three passes: `&#x3c;img`, `&amp;lt;img`), ASCII
+      HTML-entity-decoded forms (up to three passes: `&#x3c;img`, `&amp;lt;img`) and their
+      Markdown-unescaped forms (0b), ASCII
       case-insensitively. Scans are linear (`find` loops that resume after each match, regular
       expressions without nested quantifiers, pointers to the next `)`, line end or whitespace
       reused while ahead); a test scans 1 MiB of hostile text per field, and a seeded fuzz
-      (case flips, decimal and hex entities, controls and format characters inserted into
+      (case flips, decimal and hex entities, Markdown escapes, controls and format characters inserted into
       embeds, script links and unknown URLs) never passes;
     - **(answer 4) the whole step degrades.** A violation records one `Violation(kind="guard")`
       and the step `degraded` with `error.kind` `guard_violation`: none of its intents is

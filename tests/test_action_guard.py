@@ -9,6 +9,7 @@ and is deleted)."""
 import asyncio
 import datetime
 import random
+import string
 import time
 from collections.abc import Mapping
 from pathlib import Path
@@ -208,7 +209,6 @@ ALLOWED = [
     f"[the review]({KNOWN})",
     f"[the review](<{KNOWN}>)",
     f"<{KNOWN}>",
-    KNOWN.replace("/", "\\"),  # backslashes read as slashes
     f"<b>Review</b> {KNOWN}",
     f"(see {KNOWN})",
     "The data: three items. A file: none. JavaScript: not today.",
@@ -343,14 +343,16 @@ def _mutate(rng: random.Random, text: str) -> str:
     tokens = list(text)
     for _ in range(rng.randint(1, 6)):
         at = rng.randrange(len(tokens))
-        kind = rng.randrange(3)
+        kind = rng.randrange(4)
         if kind == 0:
             tokens[at] = rng.choice(_MUTATIONS) + tokens[at]
         elif kind == 1 and len(tokens[at]) == 1:
             code = ord(tokens[at])
             tokens[at] = f"&#{code};" if rng.random() < 0.5 else f"&#x{code:x};"
-        elif len(tokens[at]) == 1:
+        elif kind == 2 and len(tokens[at]) == 1:
             tokens[at] = tokens[at].swapcase()
+        elif len(tokens[at]) == 1 and tokens[at] in string.punctuation:
+            tokens[at] = "\\" + tokens[at]  # a Markdown escape
     return "".join(tokens)
 
 
@@ -360,6 +362,27 @@ def test_random_obfuscations_never_pass(seed: int) -> None:
     for _ in range(500):
         text = _mutate(rng, rng.choice(_FORBIDDEN))
         assert text_problem(text, _known(KNOWN)) is not None, repr(text)
+
+
+BACKSLASHES = [
+    "[x](java\\script:alert(1))",
+    "[x](javascript\\:alert(1))",
+    "<https\\://evil.example.net/c>",
+    f"<{KNOWN.replace('://', ':\\/\\/')}>",
+    "[x]: h\\ttps://evil.example.net/c",
+    "[x]: h\tttps://evil.example.net/c",
+    "[x](https:\\/\\/evil.example.net/c)",
+    f"[x]({KNOWN.replace('/', '\\/')})",
+    "\\![x](https://docs.example.org/review/42)",
+    "\\<img src=https://docs.example.org/review/42>",
+    "ftp\\:evil.example.net",
+    "\\/\\/evil.example.net/c",
+]
+
+
+@pytest.mark.parametrize("text", BACKSLASHES)
+def test_backslashes_and_markdown_escapes_never_hide_a_link(text: str) -> None:
+    assert text_problem(text, _known(KNOWN)) is not None
 
 
 def test_url_extraction() -> None:

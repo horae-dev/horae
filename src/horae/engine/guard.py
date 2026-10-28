@@ -25,8 +25,9 @@ cache), after schema validation and before routing:
    else (other tags, attributes, comments, an unclosed `<b`) is refused.
 5. **Link destinations.** After `](` (up to the next `)`, or the line end when there is
    none) and after a line's leading `[label]:` (not a `[^footnote]:`, up to the line end),
-   leading spaces skipped: a destination holding whitespace, or starting with a refused
-   scheme (also inside `<…>`), is refused.
+   leading spaces skipped: a destination holding whitespace or a backslash, or starting with
+   a refused scheme (also inside `<…>`), is refused. A backslash in a tag-like token or an
+   autolink (4) is refused too.
 6. **URLs.** Backslashes are read as `/` first (`https:/\\host`, `\\\\host`). A URL is a run
    (up to whitespace, `<`, `>` or a control character) starting at
    - `scheme:` followed by `/` (any scheme, `[a-z][a-z0-9+.-]*`), or a scheme of
@@ -45,7 +46,9 @@ cache), after schema validation and before routing:
 
 A refused scheme in prose (`data: three items`, colon then a space) is not a link in Markdown
 and passes. Every check runs on the text as written and on its HTML-entity-decoded forms (up
-to three passes: `&#x3c;img`, `&amp;lt;img`), ASCII case-insensitively. All scans are linear:
+to three passes: `&#x3c;img`, `&amp;lt;img`) and on the Markdown-unescaped form of each (a
+backslash before ASCII punctuation dropped, as a renderer does), ASCII case-insensitively; the
+text is refused if any view fails. All scans are linear:
 `find` loops whose next search starts after the previous match, pointers to the next `)`,
 line end or whitespace reused while ahead, and
 regular expressions without nested quantifiers.
@@ -109,7 +112,8 @@ _WORD = frozenset(string.ascii_lowercase + string.digits + "-_.")
 _RUN = re.compile(r"[^\s<>\x00-\x1f\x7f]*")
 _TAG_NAME = re.compile(r"[a-z][a-z0-9-]{0,31}")
 _CONTROL = re.compile("[\\x00-\\x09\\x0b-\\x1f\\x7f-\\x9f\\u2028\\u2029]")
-_WHITESPACE = re.compile(r"\s")
+_WHITESPACE = re.compile(r"[\s\\]")
+_MD_ESCAPE = re.compile(r"\\([!-/:-@\[-`{-~])")
 _TRAILING = frozenset(".,;:!?)]}'\"*_~`")
 _REFUSED_PREFIXES = tuple(f"{scheme}:" for scheme in sorted(REFUSED_SCHEMES))
 _MAX_STRIP = 16
@@ -117,14 +121,18 @@ _DECODE_PASSES = 3
 
 
 def _views(text: str) -> Iterator[str]:
-    """`text`, then its HTML-entity-decoded forms until nothing changes (bounded passes)."""
-    yield text
-    for _ in range(_DECODE_PASSES):
+    """`text` and its HTML-entity-decoded forms until nothing changes (bounded passes), each
+    followed by its Markdown-unescaped form (`\\` + ASCII punctuation read as the
+    punctuation) when that differs: a check refuses the text if any view fails it."""
+    for _ in range(_DECODE_PASSES + 1):
+        yield text
+        unescaped = _MD_ESCAPE.sub(r"\1", text) if "\\" in text else text
+        if unescaped != text:
+            yield unescaped
         decoded = html.unescape(text) if "&" in text else text
         if decoded == text:
             return
         text = decoded
-        yield text
 
 
 def _variants(url: str) -> Iterator[str]:
@@ -246,7 +254,7 @@ def _find(text: str, what: str, start: int) -> int:
 def _destination(text: str, start: int, end: int, space: int) -> str | None:
     """The destination `text[start:end]`, whose first whitespace is at `space`."""
     if space < end:
-        return "whitespace in a link destination"
+        return "whitespace or a backslash in a link destination"
     at = start + 1 if text.startswith("<", start) else start
     if text.startswith(_REFUSED_PREFIXES, at):
         return "a script, data or file link"
@@ -277,6 +285,8 @@ def _tag_problem(low: str) -> str | None:
         if first and (first in _LETTERS or first in "/!?"):
             close = low.find(">", found + 1, stop)
             token = low[found + 1 : stop if close == -1 else close]
+            if "\\" in token:
+                return "a backslash in an HTML tag or autolink"
             name = token[1:] if token.startswith("/") else token
             name = name[:-1] if name.endswith("/") and not token.startswith("/") else name
             if close == -1 or name not in INERT_TAGS:
@@ -334,7 +344,7 @@ def text_problem(text: str, known: Callable[[str], bool]) -> str | None:
     if any(_control_problem(view) for view in views):
         return "a control or format character"
     for view in views:
-        low = view.replace("\\", "/").translate(_LOWER)
+        low = view.translate(_LOWER)  # backslashes kept: refused in destinations and tags
         if "![" in low:
             return "an image or embed"
         problem = _tag_problem(low) or _destination_problem(low)
