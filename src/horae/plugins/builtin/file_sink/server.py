@@ -5,8 +5,8 @@ It implements the sink operations of `horae.plugins.host.sink` for the `file-sin
 entry, and nothing else: it never decides what a note becomes. **The core computes every
 note's bytes** (`horae.apply.notes`, ownership included); this server only reads and writes
 bytes, with the resolution and the atomic compare-and-swap of `horae.apply.local`
-(`LocalFileSink`: no symlink on any component, a single hard link, a regular file, at most
-16 MiB, a temporary file then `os.replace` relative to the directory descriptor, every
+(`LocalFileSink`: no symlink on any component, a single hard link, a regular file, a
+temporary file then `os.replace` relative to the directory descriptor, every
 file-system call in a worker thread). So its safety rules are exactly the built-in sink's.
 
 - **The vault** is the single `paths.write` entry the core passes with every operation: the
@@ -21,6 +21,11 @@ file-system call in a worker thread). So its safety rules are exactly the built-
   where `content: null` removes the note; `file-sink.parent_exists` and `file-sink.identity`
   (`local:<st_dev>:<st_ino>:<real path>` of the vault) are read-only. Only `note.*` intents
   are applied (`not_supported` otherwise).
+- **Size.** A note travels over MCP only up to `MAX_MCP_NOTE_BYTES` (about 5.95 MiB, the
+  host's message cap less base64 and the envelope), below `LocalFileSink`'s 16 MiB:
+  `file-sink.read` of a larger note returns `note_too_large` before encoding it (never an
+  oversized message, which would cost the process), and `content` above it is refused.
+  Each result is sent once, as `structuredContent` with a short text block.
 - A `SinkError` is returned as `{"error": {"kind", "message"}}`: the core maps it to its
   kinds (`target_changed`, `symlink`, `hard_link`, `not_a_file`, `note_too_large`…).
 """
@@ -34,6 +39,7 @@ from pathlib import Path
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
+from mcp_types import CallToolResult, TextContent
 from pydantic import TypeAdapter, ValidationError
 
 from horae.apply.local import LocalFileSink
@@ -129,12 +135,20 @@ def identity_op(paths: dict[str, Any]) -> Result:
 
 
 # The MCP tools (the core passes more arguments to `apply` than this sink needs: accepted).
+# Each returns its result once, as `structuredContent`, with a short text block: never a
+# second copy of a note's base64 (the host caps each message at `MAX_MESSAGE_BYTES`).
+
+
+def _result(data: Result) -> CallToolResult:
+    failure = data.get("error")
+    summary = f"error: {failure['kind']}" if isinstance(failure, dict) else "ok"
+    return CallToolResult(content=[TextContent(text=summary)], structured_content=data)
 
 
 @server.tool(name="file-sink.read")
-async def read(paths: dict[str, Any], path: str) -> Result:
+async def read(paths: dict[str, Any], path: str) -> CallToolResult:
     """The note's bytes (base64), or `null` when it does not exist."""
-    return await read_op(paths, path)
+    return _result(await read_op(paths, path))
 
 
 @server.tool(name="file-sink.apply")
@@ -149,29 +163,29 @@ async def apply(
     index: int | None = None,
     input_hash: str | None = None,
     dedupe_key: str | None = None,
-) -> Result:
+) -> CallToolResult:
     """Write the core's bytes for a note intent (compare-and-swap)."""
-    return await apply_op(paths, intent, content, expected_before_sha256)
+    return _result(await apply_op(paths, intent, content, expected_before_sha256))
 
 
 @server.tool(name="file-sink.restore")
 async def restore(
     paths: dict[str, Any], path: str, content: str | None = None, expected_sha256: str | None = None
-) -> Result:
+) -> CallToolResult:
     """Make the note hold `content` (`null`: remove it), compare-and-swap (`horae undo`)."""
-    return await restore_op(paths, path, content, expected_sha256)
+    return _result(await restore_op(paths, path, content, expected_sha256))
 
 
 @server.tool(name="file-sink.parent_exists")
-async def parent_exists(paths: dict[str, Any], path: str) -> Result:
+async def parent_exists(paths: dict[str, Any], path: str) -> CallToolResult:
     """Whether the note's directory exists."""
-    return await parent_exists_op(paths, path)
+    return _result(await parent_exists_op(paths, path))
 
 
 @server.tool(name="file-sink.identity")
-def identity(paths: dict[str, Any]) -> Result:
+def identity(paths: dict[str, Any]) -> CallToolResult:
     """Where this sink writes: the vault's device, inode and real path."""
-    return identity_op(paths)
+    return _result(identity_op(paths))
 
 
 def main() -> None:  # pragma: no cover (runs in the plugin's subprocess)

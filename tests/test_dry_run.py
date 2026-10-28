@@ -18,8 +18,10 @@ plugin subprocesses (no process can start here; `tests/test_e2e.py` allows the b
 plugins' and compares the vault byte for byte).
 """
 
+import _posixsubprocess
 import _socket
 import asyncio
+import multiprocessing
 import os
 import pty
 import socket
@@ -192,6 +194,15 @@ def test_the_guard_catches_writes(
         with pytest.raises(Forbidden):
             attempt()
     assert len(guard) == len(attempts)
+    # Below Popen: multiprocessing's spawn start method calls `_posixsubprocess.fork_exec`.
+    guard.clear()
+    process = multiprocessing.get_context("spawn").Process(target=print)
+    with pytest.raises(Forbidden):
+        process.start()
+    assert any("fork_exec" in attempt for attempt in guard), guard
+    with pytest.raises(Forbidden):
+        _posixsubprocess.fork_exec()  # type: ignore[call-arg]
+    guard.clear()
     scratch = tmp_path / "scratch"
     (scratch / "ok.txt").write_text("allowed")
     os.chmod(scratch / "ok.txt", 0o600)

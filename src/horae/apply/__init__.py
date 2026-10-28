@@ -44,7 +44,9 @@ from horae.apply.sink import (
     StaticSinks,
     TaskChange,
     error_kind,
+    prepare_sinks,
     sink_identity,
+    take_violations,
 )
 from horae.apply.undo import (
     NoteUndo,
@@ -95,8 +97,10 @@ __all__ = [
     "entry_params",
     "error_kind",
     "plan_changes",
+    "prepare_sinks",
     "render_text",
     "sink_identity",
+    "take_violations",
     "to_dict",
     "to_json",
     "undo_run",

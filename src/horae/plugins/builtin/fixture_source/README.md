@@ -4,7 +4,7 @@ A source that serves **deterministic synthetic data** from a JSON fixture file. 
 tests and examples (PLAN.md M1, #25): the walking skeleton in
 [`examples/walking-skeleton`](../../../../../examples/walking-skeleton/) and
 [`tests/test_e2e.py`](../../../../../tests/test_e2e.py) use it. It needs no network, no
-secret and no path permission.
+secret and, for the packaged fixture, no path permission.
 
 ## Tool
 
@@ -19,6 +19,21 @@ steps:
   - collect:
       - fixture-source.serve: {}                                  # the packaged fixture
       - fixture-source.serve: { file: /srv/fixtures/week.json }   # your own
+```
+
+Your own `file` must be inside a `permissions.paths.read` entry **approved in `horae.lock`**
+(its real path, symbolic links resolved; the core sends the approved paths with every call),
+and a regular file (a FIFO or a device is refused without blocking). The manifest asks for no
+path, so with a lock that grants none, like the walking skeleton's, only the packaged fixture
+can be served:
+
+```yaml
+# horae.lock
+plugins:
+  fixture-source:
+    permissions:
+      paths: { read: [/srv/fixtures] }
+      intents: [note.replace_owned_block]
 ```
 
 A fixture file is an object with two optional keys:

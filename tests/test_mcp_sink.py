@@ -9,14 +9,32 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
-from horae.apply import RestorableSink, SinkCall, SinkError, sink_identity
-from horae.apply.sink import MAX_IDENTITY, MAX_NOTE_BYTES
-from horae.contracts import PluginManifest
+from apply_fixtures import DAILY, START, plugins, run_pipeline
+from horae.apply import (
+    RestorableSink,
+    SinkCall,
+    SinkError,
+    apply_changes,
+    plan_changes,
+    sink_identity,
+    undo_run,
+)
+from horae.apply.sink import MAX_IDENTITY
+from horae.contracts import PluginManifest, Violation
 from horae.contracts.intents import NoteCreate, NoteReplaceOwnedBlock, NotifyPush
+from horae.contracts.plugin import Provides
 from horae.engine.ports import ToolResult
-from horae.plugins.host import HostRegistry, McpSink, McpSinks, PluginCallError
-from horae.plugins.host.sink import MAX_SINK_MESSAGE, clean_message, decode, encode
+from horae.plugins.host import HostRegistry, McpSink, McpSinks, PluginCallError, RegistryError
+from horae.plugins.host.sink import (
+    MAX_MCP_NOTE_BYTES,
+    MAX_SINK_MESSAGE,
+    clean_message,
+    decode,
+    encode,
+)
+from horae.store import Store
 from plugin_fixtures import host, lock_for, probe_manifest
 
 Reply = Callable[[str, dict[str, Any]], Any]
@@ -125,7 +143,7 @@ def test_read_refuses_other_intents_and_maps_errors() -> None:
         ({"content": 3}, "output_invalid"),
         ({"content": "!!not base64!!"}, "output_invalid"),
         ({"content": "é"}, "output_invalid"),
-        ({"content": "A" * (4 * (MAX_NOTE_BYTES // 3 + 1) + 4)}, "note_too_large"),
+        ({"content": "A" * (4 * (MAX_MCP_NOTE_BYTES // 3 + 1) + 4)}, "note_too_large"),
         (PluginCallError("timeout", "notes.read: took too long"), "timeout"),
     ],
 )
@@ -230,7 +248,7 @@ def test_a_long_identity_is_hashed_and_prepare_covers_every_sink() -> None:
     long = "local:1:2:/" + "v" * MAX_IDENTITY
     scripted = ScriptedHost(identity=lambda _t, _a: {"identity": long})
     sinks = McpSinks(_registry(sinks=["notes.write"], notifiers=["notes.push"]), scripted)
-    asyncio.run(sinks.prepare())
+    asyncio.run(sinks.prepare(sinks.tools()))
     sink = sinks.mcp_sink_for("notes.write")
     assert sink is not None
     identity = sink_identity(sink)
@@ -244,29 +262,239 @@ def test_base64_and_messages() -> None:
     assert decode(encode(b"\x00\xff")) == b"\x00\xff"
     assert decode(None) is None
     with pytest.raises(SinkError) as caught:
-        encode(b"x" * (MAX_NOTE_BYTES + 1))
+        encode(b"x" * (MAX_MCP_NOTE_BYTES + 1))
     assert caught.value.kind == "note_too_large"
-    assert clean_message("a‮b\tc\n") == "ab c"
+    assert clean_message("a\u202eb\tc\n") == "ab c"
     assert clean_message(None) == "the sink reported an error"
     assert clean_message("\x00") == "the sink reported an error"
     assert len(clean_message("x" * 2000)) == MAX_SINK_MESSAGE
 
 
-def test_call_operation_reaches_unprovided_tools_only_through_the_host(tmp_path: Path) -> None:
-    """The host calls a listed tool that is not in `provides` with `call_operation` only."""
+def test_call_operation_reaches_sink_operations_only(tmp_path: Path) -> None:
+    """`call_operation` calls `<ns>.<operation>` of a sink namespace of the plugin, nothing else
+    (not a provided tool, not another unprovided one); every call carries the locked paths."""
+    manifest = probe_manifest(
+        provides={"sources": ["probe.echo"], "sinks": ["probe.write"]},
+        permissions={"secrets": ["PROBE_TOKEN"], "paths": {"read": ["/srv/data"]}},
+    )
 
     async def go() -> None:
-        async with host(tmp_path, probe_manifest(provides={"sources": ["probe.env"]})) as live:
-            result = await live.call_operation("probe", "probe.echo", {"value": 1})
-            assert result.data["value"] == 1
+        async with host(tmp_path, manifest) as live:
+            result = await live.call_operation("probe", "probe.identity", {"paths": "arg"})
+            assert result.data["identity"] == "probe"
+            assert result.data["paths"] == "arg"
+            assert result.data["meta_paths"] == {"read": ["/srv/data"], "write": []}
+            echoed = await live.call("probe.echo", {"value": 1}, None)
+            assert echoed.data["value"] == 1
+            for plugin, tool in [
+                ("probe", "probe.echo"),  # provided: a step's tool, never an operation
+                ("probe", "probe.text"),  # listed, unprovided, not an operation name
+                ("probe", "other.identity"),  # not one of its sink namespaces
+                ("probe", "probe"),
+                ("nobody", "nobody.read"),
+            ]:
+                with pytest.raises(PluginCallError) as caught:
+                    await live.call_operation(plugin, tool, {})
+                assert caught.value.kind == "tool_missing", tool
             with pytest.raises(PluginCallError) as caught:
-                await live.call("probe.echo", {"value": 1}, None)
-            assert caught.value.kind == "tool_missing"
-            with pytest.raises(PluginCallError) as caught:
-                await live.call_operation("nobody", "nobody.read", {})
-            assert caught.value.kind == "tool_missing"
-            with pytest.raises(PluginCallError) as caught:
-                await live.call_operation("probe", "probe.unlisted", {})
+                await live.call_operation("probe", "probe.read", {})  # not in tools/list
             assert caught.value.kind == "tool_missing"
 
     asyncio.run(go())
+
+
+def test_sink_operation_names_are_reserved() -> None:
+    clash = _manifest(sinks=["notes.write"], sources=["notes.read"])
+    with pytest.raises(ValidationError, match="sink operation"):
+        PluginManifest.model_validate(clash)
+    notifier = _manifest(notifiers=["notes.push"], transforms=["notes.identity"])
+    with pytest.raises(ValidationError, match="sink operation"):
+        PluginManifest.model_validate(notifier)
+    PluginManifest.model_validate(_manifest(sinks=["notes.write"], sources=["x.read"]))
+    # Across plugins: another plugin may not provide `notes.read` either.
+    other = {**_manifest(sources=["notes.read"]), "name": "other"}
+    with pytest.raises(RegistryError, match="sink operation"):
+        HostRegistry(
+            lock_for(_manifest(), other),
+            {
+                "notes": PluginManifest.model_validate(_manifest()),
+                "other": PluginManifest.model_validate(other),
+            },
+        )
+    # A manifest built without validation is refused by the registry too.
+    unchecked = PluginManifest.model_validate(_manifest()).model_copy(
+        update={"provides": Provides(sinks=["notes.write"], sources=["notes.apply"])}
+    )
+    with pytest.raises(RegistryError, match="sink operation"):
+        HostRegistry(lock_for(_manifest()), {"notes": unchecked})
+
+
+def test_transient_identity_failures_are_retried_once() -> None:
+    answers: list[Any] = [
+        PluginCallError("timeout", "notes.identity: took too long"),
+        PluginCallError("plugin_crashed", "gone"),
+        {"identity": "local:1:2:/vault"},
+    ]
+    scripted = ScriptedHost(identity=lambda _t, _a: answers.pop(0))
+    sink = _sink(scripted)
+    asyncio.run(sink.prepare())
+    with pytest.raises(SinkError) as caught:
+        sink_identity(sink)
+    assert caught.value.kind == "timeout"  # the last failure, not cached yet
+    asyncio.run(sink.prepare())  # retried once
+    with pytest.raises(SinkError) as caught:
+        sink_identity(sink)
+    assert caught.value.kind == "plugin_crashed"
+    asyncio.run(sink.prepare())  # cached now: not asked again
+    assert [tool for _, tool, _ in scripted.calls] == ["notes.identity"] * 2
+    with pytest.raises(SinkError):
+        sink_identity(sink)
+    later: list[Any] = [PluginCallError("timeout", "slow"), {"identity": "local:1:2:/vault"}]
+    recovered = _sink(ScriptedHost(identity=lambda _t, _a: later.pop(0)))
+    asyncio.run(recovered.prepare())
+    asyncio.run(recovered.prepare())
+    assert sink_identity(recovered) == "mcp:notes:local:1:2:/vault"
+
+
+# --- apply_changes and undo_run through McpSinks ---------------------------------------------
+
+
+def _apply_registry() -> HostRegistry:
+    """The sinks of `apply_fixtures.PIPELINE` as plugins of the host."""
+    manifests = [
+        {
+            "name": "vault",
+            "version": "0.1.0",
+            "horae": ">=0",
+            "provides": {"sinks": ["vault.write_note", "vault.tasks"]},
+            "permissions": {"intents": ["note.replace_owned_block", "task.create"]},
+        },
+        {
+            "name": "ntfy",
+            "version": "0.1.0",
+            "horae": ">=0",
+            "provides": {"notifiers": ["ntfy.push"]},
+            "permissions": {"intents": ["notify.push"]},
+        },
+    ]
+    models = {str(data["name"]): PluginManifest.model_validate(data) for data in manifests}
+    return HostRegistry(lock_for(*manifests), models)
+
+
+def test_apply_changes_prepares_the_runs_sinks_and_records_violations(tmp_path: Path) -> None:
+    """task.create and notify.push through McpSinks: nothing reads their target first, so the
+    core prepares the identities (`prepare_sinks`) before journalling."""
+    leaked = Violation(kind="secret_in_output", detail="vault.apply returned secret TOKEN")
+    applied: list[dict[str, Any]] = []
+
+    def apply(_t: str, a: dict[str, Any]) -> Any:
+        applied.append(a)
+        return {"target": "done"}
+
+    class Leaky(ScriptedHost):
+        async def call_operation(
+            self,
+            plugin: str,
+            tool: str,
+            arguments: dict[str, Any],
+            *,
+            timeout_s: float | None = None,
+        ) -> ToolResult:
+            result = await super().call_operation(plugin, tool, arguments)
+            if tool.endswith(".apply"):
+                return ToolResult(data=result.data, violations=(leaked,))
+            return result
+
+    scripted = Leaky(apply=apply)
+    sinks = McpSinks(_apply_registry(), scripted)
+    intents = [
+        {"type": "task.create", "title": "Water the plants", "fingerprint": "fp-1"},
+        {"type": "notify.push", "title": "Brief", "body": "hi"},
+    ]
+    run = asyncio.run(run_pipeline(dry_run=False, fixture=plugins(intents)))
+    with Store.open(tmp_path / "horae.db") as store:
+        store.begin_run(run.id, run.pipeline, run.started_at)
+
+        async def go() -> Any:
+            planned = await plan_changes(run, sinks)
+            return await apply_changes(run, planned, sinks, store, clock=lambda: START)
+
+        result = asyncio.run(go())
+        assert result.failure is None, result.failure
+        journal = store.journal(run.id)
+    assert [change.intent for change in result.applied] == [0, 1]
+    assert [entry.sink_identity for entry in journal] == [
+        "mcp:vault:local:1:2:/vault",
+        "mcp:ntfy:local:1:2:/vault",
+    ]
+    tools = [tool for _, tool, _ in scripted.calls]
+    assert tools[:2] == ["ntfy.identity", "vault.identity"]  # the run's sinks, first, once
+    assert tools.count("vault.identity") == tools.count("ntfy.identity") == 1
+    assert [a["intent"]["type"] for a in applied] == ["task.create", "notify.push"]
+    assert result.record.violations == [leaked]  # deduplicated, kept on the run
+    assert sinks.take_violations() == ()
+
+
+def test_sink_violations_outside_a_run_are_logged_by_name(caplog: pytest.LogCaptureFixture) -> None:
+    leaked = Violation(kind="secret_in_output", detail="notes.read returned secret TOKEN")
+
+    class Leaky(ScriptedHost):
+        async def call_operation(
+            self,
+            plugin: str,
+            tool: str,
+            arguments: dict[str, Any],
+            *,
+            timeout_s: float | None = None,
+        ) -> ToolResult:
+            result = await super().call_operation(plugin, tool, arguments)
+            return ToolResult(data=result.data, violations=(leaked,))
+
+    sinks = McpSinks(_registry(), Leaky(read=lambda _t, _a: {"content": None}))
+    sink = sinks.mcp_sink_for("notes.write")
+    assert sink is not None
+    with caplog.at_level("WARNING", logger="horae.plugins.host.sink"):
+        asyncio.run(sink.read_target(NOTE))
+    assert "returned secret TOKEN" in caplog.text
+    assert sinks.take_violations() == (leaked,)
+
+
+def test_undo_prepares_its_sinks_itself(tmp_path: Path) -> None:
+    """`undo_run` through McpSinks with no manual `prepare`."""
+    state: dict[str, bytes | None] = {"note": None}
+
+    def read(_t: str, _a: dict[str, Any]) -> Any:
+        note = state["note"]
+        return {"content": None if note is None else _b64(note)}
+
+    def apply(_t: str, a: dict[str, Any]) -> Any:
+        written = base64.b64decode(a["content"])
+        state["note"] = written
+        return {"target": NOTE, "after_sha256": hashlib.sha256(written).hexdigest()}
+
+    def restore(_t: str, a: dict[str, Any]) -> Any:
+        state["note"] = None if a["content"] is None else base64.b64decode(a["content"])
+        return {}
+
+    scripted = ScriptedHost(
+        read=read, apply=apply, restore=restore, parent_exists=lambda _t, _a: {"exists": True}
+    )
+    intents = [{"type": "note.replace_owned_block", "path": DAILY, "block": "b", "content": "x"}]
+    run = asyncio.run(run_pipeline(dry_run=False, fixture=plugins(intents)))
+    with Store.open(tmp_path / "horae.db") as store:
+        store.begin_run(run.id, run.pipeline, run.started_at)
+        sinks = McpSinks(_apply_registry(), scripted)
+
+        async def go() -> Any:
+            planned = await plan_changes(run, sinks)
+            return await apply_changes(run, planned, sinks, store, clock=lambda: START)
+
+        result = asyncio.run(go())
+        assert result.failure is None, result.failure
+        store.save_run(result.record)
+        assert state["note"] is not None
+        fresh = McpSinks(_apply_registry(), scripted)  # as `horae undo` would build it
+        undone = asyncio.run(undo_run(store, run.id, fresh, clock=lambda: START))
+    assert undone.refused is None, undone.refused
+    assert undone.complete
+    assert state["note"] is None

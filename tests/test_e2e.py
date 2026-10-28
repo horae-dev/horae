@@ -13,8 +13,9 @@ allows only Horae's own state (the store, the locks, the host's per-run director
 two plugin processes; their own writes are below the guard, so the vault is also compared
 byte for byte. No network: the plugins are local processes and touch only the vault.
 
-The module must stay well under 60 seconds in CI (`pytest --durations` reports it): each
-step starts at most two plugin processes.
+The module must stay under 60 seconds in CI (#25 acceptance criterion): a module fixture
+measures it and fails the module's last test past `MAX_MODULE_S`. Each step starts at most two
+plugin processes.
 """
 
 import asyncio
@@ -22,6 +23,8 @@ import datetime
 import os
 import shutil
 import sys
+import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +52,18 @@ BLOCK = (
     b"- [ ] Read chapter 3 (fx-2)\r\n"
     b"<!-- horae:end fixture -->\r\n"
 )
+
+
+MAX_MODULE_S = 60.0
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _module_under_a_minute() -> Iterator[None]:
+    """Fail (at the module's teardown) when the module took `MAX_MODULE_S` or more."""
+    start = time.monotonic()
+    yield
+    elapsed = time.monotonic() - start
+    assert elapsed < MAX_MODULE_S, f"the end-to-end module took {elapsed:.1f} s"
 
 
 def _clock() -> datetime.datetime:
@@ -102,7 +117,6 @@ async def _run(instance: Instance, *, dry_run: bool) -> tuple[RunRecord, Any]:
 async def _undo(instance: Instance, run_id: str, sinks_for: Any = None) -> Any:
     async with open_ports(instance, instance.root / "plugins") as live:
         sinks = live.sinks if sinks_for is None else sinks_for(live)
-        await sinks.prepare()
         with Store.open(instance.store_path) as store:
             return await undo_run(store, run_id, sinks, clock=_clock, call_timeout_s=30)
 

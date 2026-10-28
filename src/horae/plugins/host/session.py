@@ -18,6 +18,10 @@ lists in `provides`; the server must list that exact name in `tools/list`.
 `transform` (the previous step's data) travels in the request's `_meta["dev.horae/input"]`
 (absent for sources), so it can never shadow a parameter. Intents a tool proposes travel in
 the result's `_meta["dev.horae/intents"]` (PR #85 answer 5), a key plain MCP servers never set.
+Every request also carries the plugin's path permissions **as approved in `horae.lock`** in
+`_meta["dev.horae/paths"]` (`{"read": [...], "write": [...]}`, #25): trusted configuration
+from the core (v1 has no per-plugin configuration in `horae.yaml`), e.g. which files
+`fixture-source` may serve. A plugin must never take paths from its arguments' untrusted data.
 """
 
 import json
@@ -40,6 +44,8 @@ INPUT_META = "dev.horae/input"
 """Request `_meta` key of a transform's input data."""
 INTENTS_META = "dev.horae/intents"
 """Result `_meta` key of the intents a tool proposes."""
+PATHS_META = "dev.horae/paths"
+"""Request `_meta` key of the plugin's locked path permissions."""
 MAX_TOOLS = 1024
 """Most tools (over all `tools/list` pages) a plugin may list."""
 _MAX_PAGES = 64
@@ -159,13 +165,22 @@ class PluginProcess:
         self.capture.feed(line.encode("utf-8", errors="replace"))
 
     async def call(
-        self, name: str, arguments: dict[str, Any], input: Any, timeout_s: float
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        input: Any,
+        timeout_s: float,
+        *,
+        paths: dict[str, list[str]] | None = None,
     ) -> mcp_types.CallToolResult:
         """Call tool `name`; `CallFailed` (process unusable) or `PluginCallError` (it is fine)."""
         session = self.session
         if session is None:
             raise CallFailed("plugin_crashed", "the process is not running")
-        meta: Any = None if input is None else {INPUT_META: input}
+        meta: Any = {} if input is None else {INPUT_META: input}
+        if paths is not None:
+            meta[PATHS_META] = paths
+        meta = meta or None
         crashed: MCPError | None = None
         result: mcp_types.CallToolResult | None = None
         with anyio.move_on_after(timeout_s) as scope:
@@ -232,4 +247,4 @@ async def _list_tools(session: ClientSession) -> frozenset[str]:
 
 Factory = Callable[[Spawn, StderrCapture], PluginProcess]
 
-__all__ = ["INPUT_META", "INTENTS_META", "CallFailed", "PluginProcess", "Spawn"]
+__all__ = ["INPUT_META", "INTENTS_META", "PATHS_META", "CallFailed", "PluginProcess", "Spawn"]

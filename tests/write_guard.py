@@ -12,10 +12,17 @@ so a test can fail at teardown even when code swallows the exception.
   allows the built-in plugins' subprocesses, whose own writes are below this guard: it
   compares the vault byte for byte instead (`tree`).
 
+Processes: besides `subprocess.Popen`, `os.system`, `os.posix_spawn*`, `os.fork*`, `os.exec*`
+and `pty.fork`, the guard replaces `_posixsubprocess.fork_exec` (and `subprocess._fork_exec`,
+the same function imported by `subprocess`), which `multiprocessing` (`spawn` and
+`forkserver`, through `multiprocessing.util.spawnv_passfds`) and `Popen` itself use: it is
+allowed only inside an allowed `Popen`.
+
 Out of scope: writes made below Python (`ctypes`, C extensions calling libc directly) and the
 writes of an allowed subprocess.
 """
 
+import _posixsubprocess
 import _socket
 import builtins
 import io
@@ -159,6 +166,14 @@ def arm(
         finally:
             spawning.pop()
 
+    real_fork_exec = _posixsubprocess.fork_exec
+
+    def guarded_fork_exec(*args: Any, **kwargs: Any) -> Any:
+        """Only through an allowed `Popen` (which checked its argv)."""
+        if not spawning:
+            forbid(f"_posixsubprocess.fork_exec({args[0] if args else ()!r})")
+        return real_fork_exec(*args, **kwargs)
+
     def guarded_rmtree(path: Any, ignore_errors: bool = False, **kwargs: Any) -> None:
         """`shutil.rmtree` inside an allowed path, by path (the real one works relative to
         directory descriptors, which the guard never allows)."""
@@ -222,4 +237,7 @@ def arm(
     ):
         monkeypatch.setattr(socket, name, never(f"socket.{name}"))
     monkeypatch.setattr(subprocess, "Popen", guarded_popen)
+    monkeypatch.setattr(_posixsubprocess, "fork_exec", guarded_fork_exec)
+    if hasattr(subprocess, "_fork_exec"):
+        monkeypatch.setattr(subprocess, "_fork_exec", guarded_fork_exec)
     return seen

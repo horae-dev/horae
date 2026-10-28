@@ -26,6 +26,12 @@ before saving the record: `Store.journal_append` refuses a run that is no longer
 passes `horae.yaml` `plugin_defaults.call_timeout_s`): past it the call is cancelled and the
 apply stops with kind `timeout`; the change stays "maybe applied" (`applied = 0`).
 
+**Sinks first.** Before the first change, the registry's optional `prepare` is awaited with
+the tools of the run's changes (`horae.apply.sink.prepare_sinks`): a plugin sink fetches its
+identity over MCP, and `sink_identity` is synchronous. After the apply, the registry's
+violations (`take_violations`, e.g. a plugin sink that returned a secret) are added to the
+record's `violations` (at most 256 in all).
+
 A notification whose `dedupe_key` was already sent (by any run) is skipped: not journalled,
 not applied, listed in `ApplyResult.duplicates`. An unchanged note is skipped too.
 
@@ -63,9 +69,12 @@ from horae.apply.sink import (
     SinkError,
     SinkRegistry,
     error_kind,
+    prepare_sinks,
     sink_identity,
+    take_violations,
 )
-from horae.contracts.run import AppliedChange, RunRecord
+from horae.contracts.run import AppliedChange, RunRecord, Violation
+from horae.contracts.types import MAX_ITEMS
 from horae.store import Store
 
 _MAX_ERROR = 4096
@@ -107,10 +116,16 @@ def _sha(data: bytes | None) -> str | None:
 
 
 def _with_changes(
-    record: RunRecord, applied: list[AppliedChange], failure: ApplyFailure | None
+    record: RunRecord,
+    applied: list[AppliedChange],
+    failure: ApplyFailure | None,
+    violations: tuple[Violation, ...] = (),
 ) -> RunRecord:
     data = record.model_dump(mode="json")
     data["changes"] = [change.model_dump(mode="json") for change in applied]
+    if violations:
+        kept = [*record.violations, *violations][:MAX_ITEMS]
+        data["violations"] = [violation.model_dump(mode="json") for violation in kept]
     if failure is not None:
         where = f"intent {failure.intent}"
         if failure.applied_by is not None:
@@ -186,6 +201,8 @@ async def apply_changes(
         )
         failure = ApplyFailure(first.intent, first.applied_by, "plan_invalid", message)
     else:
+        # Before any identity is read (`sink_identity` is synchronous): the run's sinks only.
+        await prepare_sinks(sinks, (item.applied_by for item in _items(changeset)))
         try:
             await _apply_all(
                 record,
@@ -198,8 +215,9 @@ async def apply_changes(
             )
         except _Stop as stop:
             failure = stop.failure
+    violations = take_violations(sinks)
     return ApplyResult(
-        _with_changes(record, applied, failure),
+        _with_changes(record, applied, failure, violations),
         tuple(applied),
         tuple(duplicates),
         tuple(unchanged),

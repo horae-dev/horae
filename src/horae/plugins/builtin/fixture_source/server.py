@@ -2,8 +2,13 @@
 """The `fixture-source` stdio MCP server: deterministic synthetic data (#25).
 
 One source, `fixture-source.serve`, with one optional parameter, `file`: the absolute path of a
-JSON fixture file (default: the packaged `data.json`). The file is an object with two
-optional keys:
+JSON fixture file (default: the packaged `data.json`). A `file` must be inside one of the
+plugin's `paths.read` entries **as approved in `horae.lock`** (its real path, symbolic links
+resolved; the core sends the approved paths with every call, `_meta["dev.horae/paths"]`), and
+be a regular file: opened with `O_NONBLOCK` (a FIFO never blocks the call) and checked with
+`fstat` (`S_ISREG`). The manifest asks for no path, so a lock that grants none (the walking
+skeleton's) can only serve the packaged fixture. The file is an object with two optional
+keys:
 
 - `data` (an object, default `{}`): returned as the tool's `structuredContent`;
 - `intents` (a list, default `[]`): proposed as they are, through
@@ -20,32 +25,69 @@ malformed file is a tool error (`isError`, the host's `tool_error`).
 import json
 import logging
 import os
+import stat
 import sys
 import warnings
 from pathlib import Path
 from typing import Any
 
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp_types import CallToolResult, TextContent
 
 DEFAULT_FIXTURE = Path(__file__).resolve().parent / "data.json"
 MAX_FIXTURE_BYTES = 1024 * 1024
 INTENTS_META = "dev.horae/intents"
+PATHS_META = "dev.horae/paths"
 
 server = MCPServer("fixture-source")
 
 
-def load(file: str | None = None) -> tuple[dict[str, Any], list[Any]]:
-    """The fixture's `data` and `intents` (see the module docstring); `ToolError` otherwise."""
-    if file is not None and not os.path.isabs(file):
+def _allowed(file: str, paths: Any) -> str:
+    """The real path of `file` if it is inside one of `paths["read"]`; `ToolError` otherwise."""
+    if not os.path.isabs(file):
         raise ToolError("file must be an absolute path")
-    path = DEFAULT_FIXTURE if file is None else Path(file)
+    read = paths.get("read") if isinstance(paths, dict) else None
+    if not isinstance(read, list):
+        read = []
+    roots = [root for root in read if isinstance(root, str) and os.path.isabs(root)]
+    real = os.path.realpath(file)
+    for root in roots:
+        top = os.path.realpath(root)
+        if os.path.commonpath([top, real]) == top:
+            return real
+    raise ToolError("file is not inside a paths.read entry approved in horae.lock")
+
+
+def _read(path: str) -> bytes:
+    flags = os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW
     try:
-        with path.open("rb") as handle:
-            raw = handle.read(MAX_FIXTURE_BYTES + 1)
+        fd = os.open(path, flags)
     except OSError as error:
         raise ToolError(f"the fixture cannot be read ({error.strerror})") from None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ToolError("the fixture is not a regular file")
+        chunks: list[bytes] = []
+        size = 0
+        while size <= MAX_FIXTURE_BYTES:
+            chunk = os.read(fd, MAX_FIXTURE_BYTES + 1 - size)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+        return b"".join(chunks)
+    except OSError as error:
+        raise ToolError(f"the fixture cannot be read ({error.strerror})") from None
+    finally:
+        os.close(fd)
+
+
+def load(file: str | None = None, paths: Any = None) -> tuple[dict[str, Any], list[Any]]:
+    """The fixture's `data` and `intents` (see the module docstring); `ToolError` otherwise.
+    `paths` are the locked path permissions (`{"read": [...], ...}`)."""
+    path = str(DEFAULT_FIXTURE) if file is None else _allowed(file, paths)
+    raw = _read(path)
     if len(raw) > MAX_FIXTURE_BYTES:
         raise ToolError(f"the fixture is larger than {MAX_FIXTURE_BYTES} bytes")
     try:
@@ -62,9 +104,10 @@ def load(file: str | None = None) -> tuple[dict[str, Any], list[Any]]:
 
 
 @server.tool(name="fixture-source.serve")
-def serve(file: str | None = None) -> CallToolResult:
+def serve(ctx: Context, file: str | None = None) -> CallToolResult:
     """Serve the fixture's `data` and propose its `intents`."""
-    data, intents = load(file)
+    meta = ctx.request_context.meta or {}
+    data, intents = load(file, meta.get(PATHS_META))
     return CallToolResult(
         content=[TextContent(text=json.dumps(data, sort_keys=True))],
         structured_content=data,

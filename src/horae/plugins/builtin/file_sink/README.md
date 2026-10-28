@@ -49,9 +49,15 @@ calls (they are not in `provides`, so no pipeline step can):
 
 Reads and writes reuse the built-in `LocalFileSink` (`horae.apply.local`), so the safety rules
 are the same: note paths only (no `..`, no hidden segment), no symbolic link on any component,
-a single hard link, a regular file, at most 16 MiB, a temporary file `fsync`ed then renamed
-over the note relative to its directory descriptor, the note's mode kept. Errors come back as
+a single hard link, a regular file, a temporary file `fsync`ed then renamed over the note
+relative to its directory descriptor, the note's mode kept. Errors come back as
 `{"error": {"kind", "message"}}` (`symlink`, `hard_link`, `not_a_file`, `target_changed`…).
+
+**Size.** A note goes over MCP base64-encoded, in one JSON-RPC message, and the host caps a
+plugin's message at 8 MiB: so a note is at most `MAX_MCP_NOTE_BYTES` (6,242,304 bytes, about
+5.95 MiB) either way, less than the built-in local sink's 16 MiB. Reading a larger note
+returns `note_too_large` (the plugin keeps running), and the core refuses to send larger
+content.
 
 ## Running it
 

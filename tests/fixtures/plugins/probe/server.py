@@ -126,6 +126,14 @@ def echo(ctx: Context, value: Any = None, reveal: str | None = None) -> dict[str
     return {"value": value, "input": meta.get("dev.horae/input"), "revealed": revealed}
 
 
+@server.tool(name="probe.identity")
+def identity(ctx: Context, paths: Any = None) -> dict[str, Any]:
+    """A sink operation (`PluginHost.call_operation`, #25): the `paths` argument and the
+    locked paths the host sent in `_meta["dev.horae/paths"]`."""
+    meta = ctx.request_context.meta or {}
+    return {"identity": "probe", "paths": paths, "meta_paths": meta.get("dev.horae/paths")}
+
+
 @server.tool(name="probe.text", structured_output=False)
 def text(body: str, note: str | None = None) -> str:
     """A plain text result (no structured content); `note` is written to stderr first."""

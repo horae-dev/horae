@@ -8,6 +8,11 @@ created is removed. Tasks, notifications and HTTP calls cannot be undone: they a
 `UndoResult.not_undoable` (task undo is left to the tasks story; notifications stay sent, and
 their dedupe keys are kept, so an undo never causes a notification to be sent again).
 
+**Sinks first.** The registry's optional `prepare` is awaited with the tools of the journal's
+undoable entries (`horae.apply.sink.prepare_sinks`) before any identity is read: a plugin
+sink fetches its identity over MCP. A violation a plugin sink meets here (e.g.
+`secret_in_output`) is only logged: there is no run record to add it to.
+
 **Refused before anything is read** when the run is running (`run_running`), a dry run
 (`dry_run`), has no undoable change at all (`nothing_to_undo`; its status is left as it is),
 or when a sink now resolves to another place than the one that applied a change
@@ -58,6 +63,7 @@ from horae.apply.sink import (
     SinkError,
     SinkRegistry,
     error_kind,
+    prepare_sinks,
     sink_identity,
 )
 from horae.store import JournalEntry, Store, UnknownRun
@@ -304,7 +310,10 @@ async def undo_run(
         message = "the run changed no note: nothing to undo (its status is left as it is)"
         return replace(base, refused=UndoRefusal("nothing_to_undo", message))
 
-    # Phase 0: every note still to undo must resolve to the place that changed it.
+    # Phase 0: every note still to undo must resolve to the place that changed it. A plugin
+    # sink fetches its identity first (`sink_identity` is synchronous).
+    tools = (entry.applied_by for entry in entries if entry.undoable and entry.applied_by)
+    await prepare_sinks(sinks, tools)
     groups = _groups(entries, sinks)
     notes: list[NoteUndo] = []
     for group in groups:

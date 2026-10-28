@@ -5,8 +5,10 @@ An `act` entry (`file-sink.write_note: {...}`) names a tool that a plugin lists 
 `provides.sinks` (or `provides.notifiers`). The core never calls that tool: it applies the
 intents routed to the entry through the plugin's **sink operations**, tools named by
 convention after the entry tool's namespace `<ns>` and listed in the plugin's `tools/list`,
-**not** in `provides` (so no pipeline step can call them: the engine only calls provided
-tools, and only the core calls these, through `PluginHost.call_operation`):
+**not** in `provides` (the manifest contract reserves `<ns>.<operation>` for every
+`SINK_OPERATIONS` entry and sink or notifier namespace, and `HostRegistry` refuses any plugin
+providing one; so no pipeline step can call them: the engine only calls provided tools, and
+only the core calls these, through `PluginHost.call_operation`, which accepts nothing else):
 
 - `<ns>.read` (`path`): `{"content": <base64> | null}`;
 - `<ns>.apply` (`tool`, `params`, `intent`, `run_id`, `index`, `input_hash`, `dedupe_key`,
@@ -29,41 +31,63 @@ markers, line endings: the core's conventions, so the sink cannot write anything
 diff did not show) and sends them as `content`: the plugin's `<ns>.apply` only writes those
 bytes, atomically, if the note still has SHA-256 `expected_before_sha256` (`null`: must not
 exist), else `target_changed`. It reports the SHA-256 of what it wrote; another digest is
-`apply_mismatch` (the change stays "maybe applied" in the journal, and undo compares the note
-with its digests). For other intents (`task.*`, `notify.push`, `http.post`) `content` and
-`expected_before_sha256` are `null` and the plugin applies the intent itself (the routing,
-target and parameters are the core's; titles and bodies are untrusted text, data only).
+`apply_mismatch`: the change stays "maybe applied" in the journal, **without** the bytes the
+sink wrote (`actual_after`: only their digest came back), so `horae undo` takes the note for
+"changed since" and needs `--force` to restore it. For other intents (`task.*`,
+`notify.push`, `http.post`) `content` and `expected_before_sha256` are `null` and the plugin
+applies the intent itself (the routing, target and parameters are the core's; titles and
+bodies are untrusted text, data only).
+
+**Double read** (accepted). `horae.apply.apply_changes` reads the note (`Sink.read`) to check
+it against the plan, and `McpSink.apply` reads it again to compute the bytes it sends: two
+`<ns>.read` calls per note change. The second read is what the compare-and-swap is built on
+(the adapter never trusts bytes it did not read itself), and notes are small; merging them
+would couple the adapter to the apply phase.
 
 **Trusted configuration.** v1 has no per-plugin configuration in `horae.yaml`, so every
 operation also receives `paths`, the plugin's path permissions **as approved in
-`horae.lock`** (`{"read": [...], "write": [...]}`): `file-sink` writes to its single
-`paths.write` entry, the vault. The plugin trusts the core, never a proposer, for it.
+`horae.lock`** (`{"read": [...], "write": [...]}`; every tool call also carries them in
+`_meta["dev.horae/paths"]`): `file-sink` writes to its single `paths.write` entry, the
+vault. The plugin trusts the core, never a proposer, for it. (M4's `horae plugin add` must
+write that entry into the lock; a per-plugin configuration in `horae.yaml` is a later
+decision.)
 
-**Bytes** travel base64-encoded (standard alphabet, validated), at most `MAX_NOTE_BYTES`
-(16 MiB) decoded each way (`note_too_large`); a malformed result is `output_invalid`. In
-practice the host's JSON-RPC message cap (`MAX_MESSAGE_BYTES`, 8 MiB per message from the
-plugin) bounds what `read` can return to about 6 MiB of note: a larger read fails
-`output_too_large` (and costs the plugin its process, like any oversized message).
+**Bytes** travel base64-encoded (standard alphabet, validated), at most `MAX_MCP_NOTE_BYTES`
+decoded each way (`note_too_large`), derived from the host's JSON-RPC message cap
+(`MAX_MESSAGE_BYTES`, 8 MiB per message from the plugin): base64 is 4/3 of the bytes, and
+`MESSAGE_MARGIN` is left for the envelope. A sink must send the note once per message (in
+`structuredContent`, with a short text block, not a copy of the payload). Both sides check the
+cap **before encoding**: `McpSink.apply` and `restore` refuse larger content before calling,
+and `file-sink.read` returns `note_too_large` for a larger note instead of an oversized
+message (which would cost the plugin its process, `output_too_large`). A malformed result is
+`output_invalid`.
 
 **Calls** go through `PluginHost.call_operation`: the plugin's process, its one restart, the
 per-call timeout (`plugins.<name>.call_timeout_s`, else `plugin_defaults.call_timeout_s`,
 `timeout`), redaction of secrets in everything the plugin returns. A host failure becomes
 `SinkError(<host kind>)` with the host's (redacted) message. A `secret_in_output` violation
-in a sink operation is dropped (the data was redacted already, and there is no step to
-record it on).
+in a sink operation is logged (the secret's name only, never its value) and kept by
+`McpSinks`; `horae.apply.apply_changes` adds the ones collected during a run to the run's
+`violations` (`McpSinks.take_violations`), while those of other calls (`horae undo`, a dry
+run's diff outside the runner) are only logged.
 
 **Identity** (`horae.apply.sink_identity`) is `mcp:<plugin>:<what <ns>.identity returns>`
 (hashed when longer than `MAX_IDENTITY`): where the sink says it writes (`file-sink`: the
 vault's `local:<st_dev>:<st_ino>:<real path>`, like `LocalFileSink`), so `horae undo` refuses
-a run applied to another vault (`sink_mismatch`). It is fetched on the sink's first
-operation and cached; `sink_identity` is synchronous, so a caller that needs it before any
-operation (undo) awaits `McpSinks.prepare()` first. Until then reading it raises
-`SinkError("identity_unknown")`; a failed fetch raises that failure's kind.
+a run applied to another vault (`sink_mismatch`). `sink_identity` is synchronous, so the core
+**always** awaits the registry's `prepare(tools)` for the tools it is about to use before it
+reads an identity (`horae.apply.prepare_sinks`: `apply_changes` for the run's `applied_by`
+tools, `undo_run` for the journal's); each operation also prepares its sink first. Until
+then reading it raises `SinkError("identity_unknown")`. A definitive failure
+(`DEFINITIVE_IDENTITY_FAILURES`: the plugin's answer is wrong or its configuration is) is
+cached; any other one (a timeout, a crash: host kinds) is retried once, on the next
+`prepare`, then cached; reading the identity meanwhile raises the last failure's kind.
 """
 
 import base64
 import binascii
 import hashlib
+import logging
 import unicodedata
 from collections.abc import Iterable
 from typing import Any, Protocol
@@ -71,21 +95,32 @@ from typing import Any, Protocol
 from horae.apply.notes import NoteIntent, note_after
 from horae.apply.sink import (
     MAX_IDENTITY,
-    MAX_NOTE_BYTES,
     Applied,
     Sink,
     SinkCall,
     SinkError,
     error_kind,
 )
+from horae.contracts.plugin import SINK_OPERATIONS
+from horae.contracts.run import Violation
+from horae.contracts.types import MAX_ITEMS
 from horae.engine.ports import ToolCallError, ToolResult, UnknownPlugin
 from horae.plugins.host.host import HostRegistry, InstalledPlugin
+from horae.plugins.host.transport import MAX_MESSAGE_BYTES
 
 MAX_SINK_MESSAGE = 500
 """The longest error message kept from a sink operation."""
-_MAX_B64 = 4 * -(-MAX_NOTE_BYTES // 3)
-OPERATIONS = ("read", "apply", "restore", "parent_exists", "identity")
+MESSAGE_MARGIN = 64 * 1024
+"""Bytes of a message left for the JSON-RPC envelope around a note's base64."""
+MAX_MCP_NOTE_BYTES = (MAX_MESSAGE_BYTES - MESSAGE_MARGIN) // 4 * 3
+"""The largest note sent over MCP either way (6,242,304 bytes: about 5.95 MiB)."""
+_MAX_B64 = 4 * -(-MAX_MCP_NOTE_BYTES // 3)
+OPERATIONS = SINK_OPERATIONS
 """The sink operations, called `<ns>.<operation>`."""
+DEFINITIVE_IDENTITY_FAILURES = frozenset({"identity_invalid", "vault_unset", "config_invalid"})
+"""Identity failures cached at once (any other kind is retried once)."""
+_IDENTITY_ATTEMPTS = 2
+_log = logging.getLogger("horae.plugins.host.sink")
 
 
 class OperationCaller(Protocol):
@@ -105,27 +140,33 @@ def _sha(data: bytes | None) -> str | None:
     return None if data is None else hashlib.sha256(data).hexdigest()
 
 
+def _too_large() -> SinkError:
+    return SinkError(
+        "note_too_large", f"the note is larger than {MAX_MCP_NOTE_BYTES} bytes (the MCP cap)"
+    )
+
+
 def encode(data: bytes) -> str:
-    """`data` as standard base64 (refusing more than `MAX_NOTE_BYTES`)."""
-    if len(data) > MAX_NOTE_BYTES:
-        raise SinkError("note_too_large", f"the note is larger than {MAX_NOTE_BYTES} bytes")
+    """`data` as standard base64 (refusing more than `MAX_MCP_NOTE_BYTES`, before encoding)."""
+    if len(data) > MAX_MCP_NOTE_BYTES:
+        raise _too_large()
     return base64.b64encode(data).decode("ascii")
 
 
 def decode(value: object, what: str = "content") -> bytes | None:
-    """Base64 `value` (`None` stays `None`), at most `MAX_NOTE_BYTES` decoded."""
+    """Base64 `value` (`None` stays `None`), at most `MAX_MCP_NOTE_BYTES` decoded."""
     if value is None:
         return None
     if not isinstance(value, str):
         raise SinkError("output_invalid", f"the sink's {what} is not a base64 string")
     if len(value) > _MAX_B64:
-        raise SinkError("note_too_large", f"the note is larger than {MAX_NOTE_BYTES} bytes")
+        raise _too_large()
     try:
         data = base64.b64decode(value.encode("ascii"), validate=True)
     except (UnicodeEncodeError, binascii.Error, ValueError):
         raise SinkError("output_invalid", f"the sink's {what} is not valid base64") from None
-    if len(data) > MAX_NOTE_BYTES:  # pragma: no cover (bounded by _MAX_B64)
-        raise SinkError("note_too_large", f"the note is larger than {MAX_NOTE_BYTES} bytes")
+    if len(data) > MAX_MCP_NOTE_BYTES:  # pragma: no cover (bounded by _MAX_B64)
+        raise _too_large()
     return data
 
 
@@ -147,16 +188,44 @@ def _namespace(tool: str) -> str:
     return tool.split(".", 1)[0]
 
 
+class _Violations:
+    """`secret_in_output` violations of sink operations, logged and kept (deduplicated, at most
+    `MAX_ITEMS`) until `take`."""
+
+    def __init__(self) -> None:
+        self._kept: list[Violation] = []
+
+    def add(self, tool: str, violations: Iterable[Violation]) -> None:
+        for violation in violations:
+            # The detail names the secrets (the host redacted their values), never a value.
+            _log.warning("sink operation %s: %s", tool, violation.detail)
+            if violation not in self._kept and len(self._kept) < MAX_ITEMS:
+                self._kept.append(violation)
+
+    def take(self) -> tuple[Violation, ...]:
+        kept, self._kept = tuple(self._kept), []
+        return kept
+
+
 class McpSink:
     """One sink namespace of one plugin, as a `RestorableSink` (see the module docstring)."""
 
-    def __init__(self, host: OperationCaller, installed: InstalledPlugin, namespace: str) -> None:
+    def __init__(
+        self,
+        host: OperationCaller,
+        installed: InstalledPlugin,
+        namespace: str,
+        violations: _Violations | None = None,
+    ) -> None:
         self._host = host
         self._installed = installed
         self.plugin = installed.manifest.name
         self.namespace = namespace
+        self._violations = violations if violations is not None else _Violations()
         self._identity: str | None = None
         self._identity_error: SinkError | None = None
+        self._identity_final = False
+        self._identity_attempts = 0
 
     # --- calls -----------------------------------------------------------------------------
 
@@ -178,6 +247,7 @@ class McpSink:
             )
         except ToolCallError as error:
             raise SinkError(error_kind(error.kind), clean_message(error.message)) from None
+        self._violations.add(tool, result.violations)
         data = result.data
         if not isinstance(data, dict):
             raise SinkError("output_invalid", f"{tool} did not return an object")
@@ -191,9 +261,11 @@ class McpSink:
     # --- identity --------------------------------------------------------------------------
 
     async def prepare(self) -> None:
-        """Fetch and cache the identity (once; a failure is cached too). Never raises."""
-        if self._identity is not None or self._identity_error is not None:
+        """Fetch and cache the identity (see the module docstring for what is retried).
+        Never raises: a failure is raised when the identity is read."""
+        if self._identity is not None or self._identity_final:
             return
+        self._identity_attempts += 1
         try:
             data = await self._raw("identity", {})
             value = data.get("identity")
@@ -203,9 +275,13 @@ class McpSink:
             if len(identity) > MAX_IDENTITY:
                 digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
                 identity = f"mcp:{self.plugin}:sha256:{digest}"
-            self._identity = identity
+            self._identity, self._identity_error = identity, None
         except SinkError as error:
             self._identity_error = error
+            self._identity_final = (
+                error.kind in DEFINITIVE_IDENTITY_FAILURES
+                or self._identity_attempts >= _IDENTITY_ATTEMPTS
+            )
 
     @property
     def identity(self) -> str:
@@ -253,7 +329,7 @@ class McpSink:
             raise SinkError("target_changed", f"{intent.path} changed since it was planned")
         after = note_after(intent, before)
         arguments["expected_before_sha256"] = expected_before_sha256
-        arguments["content"] = encode(after)
+        arguments["content"] = encode(after)  # note_too_large before any call
         data = await self._op("apply", arguments)
         if data.get("after_sha256") != _sha(after):
             message = f"the sink reports other bytes in {intent.path} than the core planned"
@@ -270,7 +346,7 @@ class McpSink:
     async def restore(
         self, target: str, content: bytes | None, *, expected_sha256: str | None
     ) -> None:
-        payload = None if content is None else encode(content)
+        payload = None if content is None else encode(content)  # note_too_large before any call
         arguments = {"path": target, "content": payload, "expected_sha256": expected_sha256}
         await self._op("restore", arguments)
 
@@ -284,6 +360,7 @@ class McpSinks:
         self._registry = registry
         self._host = host
         self._sinks: dict[tuple[str, str], McpSink] = {}
+        self._violations = _Violations()
 
     def sink_for(self, tool: str) -> Sink | None:
         return self.mcp_sink_for(tool)
@@ -301,7 +378,7 @@ class McpSinks:
         key = (installed.manifest.name, _namespace(tool))
         sink = self._sinks.get(key)
         if sink is None:
-            sink = self._sinks[key] = McpSink(self._host, installed, key[1])
+            sink = self._sinks[key] = McpSink(self._host, installed, key[1], self._violations)
         return sink
 
     def tools(self) -> tuple[str, ...]:
@@ -314,18 +391,26 @@ class McpSinks:
             )
         )
 
-    async def prepare(self, tools: Iterable[str] | None = None) -> None:
-        """Fetch the identity of the sinks serving `tools` (default: every sink), for callers
-        that read `sink_identity` before any operation (`horae undo`). Never raises: a failure
-        is raised when the identity is read."""
-        for tool in sorted(set(self.tools() if tools is None else tools)):
+    async def prepare(self, tools: Iterable[str]) -> None:
+        """Fetch the identity of the sinks serving `tools` (the core passes the tools it is
+        about to use: `horae.apply.prepare_sinks`), so `sink_identity` can be read. Never
+        raises: a failure is raised when the identity is read."""
+        for tool in sorted(set(tools)):
             sink = self.mcp_sink_for(tool)
             if sink is not None:
                 await sink.prepare()
 
+    def take_violations(self) -> tuple[Violation, ...]:
+        """The `secret_in_output` violations of the sink operations since the last call
+        (each was logged when it happened)."""
+        return self._violations.take()
+
 
 __all__ = [
+    "DEFINITIVE_IDENTITY_FAILURES",
+    "MAX_MCP_NOTE_BYTES",
     "MAX_SINK_MESSAGE",
+    "MESSAGE_MARGIN",
     "OPERATIONS",
     "McpSink",
     "McpSinks",
