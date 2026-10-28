@@ -1,0 +1,3 @@
+# ollama and openai-compatible have no default endpoint.
+models:
+  local: { backend: ollama, model: llama3 }

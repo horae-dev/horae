@@ -1,0 +1,364 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/horae-dev/horae/main/schemas/instance/v1.json",
+  "$defs": {
+    "EnvSecretRef": {
+      "additionalProperties": false,
+      "description": "Read the secret from an environment variable.",
+      "properties": {
+        "env": {
+          "maxLength": 128,
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
+          "title": "Env",
+          "type": "string"
+        }
+      },
+      "required": [
+        "env"
+      ],
+      "title": "EnvSecretRef",
+      "type": "object"
+    },
+    "FileSecretRef": {
+      "additionalProperties": false,
+      "description": "Read the secret from a file in the secrets directory (Docker or Compose secrets).",
+      "properties": {
+        "file": {
+          "maxLength": 255,
+          "pattern": "^[A-Za-z0-9_-][A-Za-z0-9._-]*$",
+          "title": "File",
+          "type": "string"
+        }
+      },
+      "required": [
+        "file"
+      ],
+      "title": "FileSecretRef",
+      "type": "object"
+    },
+    "ModelAlias": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "backend": {
+                "enum": [
+                  "openai-compatible",
+                  "ollama"
+                ]
+              }
+            },
+            "required": [
+              "backend"
+            ]
+          },
+          "then": {
+            "properties": {
+              "base_url": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "base_url"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "backend": {
+                "enum": [
+                  "anthropic"
+                ]
+              }
+            },
+            "required": [
+              "backend"
+            ]
+          },
+          "then": {
+            "properties": {
+              "secret": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "secret"
+            ]
+          }
+        }
+      ],
+      "description": "What a model alias resolves to.",
+      "properties": {
+        "backend": {
+          "description": "The backend adapter.",
+          "enum": [
+            "claude-cli",
+            "anthropic",
+            "openai-compatible",
+            "ollama"
+          ],
+          "title": "Backend",
+          "type": "string"
+        },
+        "model": {
+          "description": "The concrete model name for that backend.",
+          "maxLength": 128,
+          "pattern": "^[^\\x00-\\x20\\x7f]+$",
+          "title": "Model",
+          "type": "string"
+        },
+        "base_url": {
+          "anyOf": [
+            {
+              "maxLength": 2048,
+              "pattern": "^(https://(([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)*[a-z]([a-z0-9-]{0,61}[a-z0-9])?|(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])(\\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3}|\\[[0-9a-f:.]{2,45}\\])|http://([a-z]([a-z0-9-]{0,61}[a-z0-9])?|127(\\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3}|10(\\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3}|172\\.(1[6-9]|2[0-9]|3[01])(\\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){2}|192\\.168(\\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){2}|\\[::1\\]|\\[f[cd][0-9a-f]{2}:[0-9a-f:.]{0,40}\\]))(:(6553[0-5]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|[1-5][0-9]{4}|[1-9][0-9]{0,3}))?([/?][^\\x00-\\x20\\x7f\\\\#]*)?$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Endpoint; required for `openai-compatible` and `ollama`. See `BackendUrl`.",
+          "title": "Base Url"
+        },
+        "secret": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "not": {
+                "pattern": "^(HORAE(_|$)|LD_|DYLD_|PYTHON|PATH$|HOME$)"
+              },
+              "pattern": "^[A-Z][A-Z0-9_]*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The secret holding the backend's API key or token, e.g. `ANTHROPIC_API_KEY`; required\nfor `anthropic`.",
+          "title": "Secret"
+        }
+      },
+      "required": [
+        "backend",
+        "model"
+      ],
+      "title": "ModelAlias",
+      "type": "object"
+    },
+    "PluginDefaults": {
+      "additionalProperties": false,
+      "description": "Timeouts for every plugin without its own setting (the #24 plugin host reads them).",
+      "properties": {
+        "startup_timeout_s": {
+          "default": 10.0,
+          "description": "Seconds a plugin may take to start and answer the MCP handshake.",
+          "maximum": 600.0,
+          "minimum": 1.0,
+          "title": "Startup Timeout S",
+          "type": "number"
+        },
+        "call_timeout_s": {
+          "default": 30.0,
+          "description": "Seconds one tool call may take.",
+          "maximum": 600.0,
+          "minimum": 1.0,
+          "title": "Call Timeout S",
+          "type": "number"
+        }
+      },
+      "title": "PluginDefaults",
+      "type": "object"
+    },
+    "PluginSettings": {
+      "additionalProperties": false,
+      "description": "Instance settings for one installed plugin (it must be in `horae.lock`).",
+      "properties": {
+        "startup_timeout_s": {
+          "anyOf": [
+            {
+              "maximum": 600.0,
+              "minimum": 1.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Seconds the plugin may take to start. When omitted, `plugin_defaults` applies.",
+          "title": "Startup Timeout S"
+        },
+        "call_timeout_s": {
+          "anyOf": [
+            {
+              "maximum": 600.0,
+              "minimum": 1.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Seconds one tool call may take. When omitted, `plugin_defaults` applies.",
+          "title": "Call Timeout S"
+        }
+      },
+      "title": "PluginSettings",
+      "type": "object"
+    },
+    "RunsConfig": {
+      "additionalProperties": false,
+      "description": "Bounds of one pipeline run (#19).",
+      "properties": {
+        "timeout_s": {
+          "default": 900.0,
+          "description": "Seconds a whole run may take. Past it the run is cancelled: the current step is\n`failed` with kind `timeout`, later steps are `skipped` and the run is `failed`. Per-call\nlimits are separate: `plugin_defaults.call_timeout_s` and the LLM step's `timeout_s`.",
+          "maximum": 86400.0,
+          "minimum": 1.0,
+          "title": "Timeout S",
+          "type": "number"
+        }
+      },
+      "title": "RunsConfig",
+      "type": "object"
+    },
+    "SchedulerConfig": {
+      "additionalProperties": false,
+      "description": "How pipelines with a `trigger` are started.",
+      "properties": {
+        "mode": {
+          "default": "builtin",
+          "description": "`builtin`: Horae's own cron. `external`: triggers are ignored and an external scheduler\n(Coolify, systemd, cron) calls `horae run <pipeline>`.",
+          "enum": [
+            "builtin",
+            "external"
+          ],
+          "title": "Mode",
+          "type": "string"
+        }
+      },
+      "title": "SchedulerConfig",
+      "type": "object"
+    },
+    "SecretsConfig": {
+      "additionalProperties": false,
+      "description": "Where secret values are read from.",
+      "properties": {
+        "dir": {
+          "default": "/run/secrets",
+          "description": "Directory of secret files.",
+          "maxLength": 1024,
+          "pattern": "^[^\\x00-\\x1f\\x7f]+$",
+          "title": "Dir",
+          "type": "string"
+        },
+        "refs": {
+          "description": "Explicit sources, by secret name. A secret without one is read from the file of the\nsame name in `dir` only: environment variables are read only through an explicit\n`{env: VAR}` reference.",
+          "maxProperties": 256,
+          "patternProperties": {
+            "^[A-Z][A-Z0-9_]*$": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/EnvSecretRef"
+                },
+                {
+                  "$ref": "#/$defs/FileSecretRef"
+                }
+              ]
+            }
+          },
+          "propertyNames": {
+            "maxLength": 128,
+            "not": {
+              "pattern": "^(HORAE(_|$)|LD_|DYLD_|PYTHON|PATH$|HOME$)"
+            }
+          },
+          "title": "Refs",
+          "type": "object",
+          "additionalProperties": false
+        }
+      },
+      "title": "SecretsConfig",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "An instance's `horae.yaml`.",
+  "properties": {
+    "schema_version": {
+      "const": 1,
+      "default": 1,
+      "description": "Optional. Lets a later `horae.yaml` v2 be told apart from v1.",
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "timezone": {
+      "default": "UTC",
+      "description": "Default IANA time zone for triggers and run contexts.",
+      "maxLength": 128,
+      "pattern": "^[A-Za-z][A-Za-z0-9_+-]{0,63}(/[A-Za-z0-9_+-]{1,64}){0,3}$",
+      "title": "Timezone",
+      "type": "string"
+    },
+    "state_dir": {
+      "default": "state",
+      "description": "The state directory (SQLite store, run records).",
+      "maxLength": 1024,
+      "pattern": "^[^\\x00-\\x1f\\x7f]+$",
+      "title": "State Dir",
+      "type": "string"
+    },
+    "models": {
+      "description": "Model aliases, by name.",
+      "maxProperties": 256,
+      "patternProperties": {
+        "^[a-z][a-z0-9._-]*$": {
+          "$ref": "#/$defs/ModelAlias"
+        }
+      },
+      "propertyNames": {
+        "maxLength": 64
+      },
+      "title": "Models",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "plugin_defaults": {
+      "$ref": "#/$defs/PluginDefaults",
+      "description": "Timeouts for every plugin, unless `plugins.<name>` overrides them."
+    },
+    "plugins": {
+      "description": "Per-plugin settings, by plugin name.",
+      "maxProperties": 256,
+      "patternProperties": {
+        "^[a-z][a-z0-9-]*$": {
+          "$ref": "#/$defs/PluginSettings"
+        }
+      },
+      "propertyNames": {
+        "maxLength": 64
+      },
+      "title": "Plugins",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "secrets": {
+      "$ref": "#/$defs/SecretsConfig"
+    },
+    "scheduler": {
+      "$ref": "#/$defs/SchedulerConfig"
+    },
+    "runs": {
+      "$ref": "#/$defs/RunsConfig",
+      "description": "Bounds of every pipeline run (the run timeout)."
+    }
+  },
+  "title": "Horae instance configuration (horae.yaml)",
+  "type": "object"
+}
