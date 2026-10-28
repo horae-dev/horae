@@ -20,6 +20,7 @@ lists in `provides`; the server must list that exact name in `tools/list`.
 the result's `_meta["dev.horae/intents"]` (PR #85 answer 5), a key plain MCP servers never set.
 """
 
+import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -150,8 +151,11 @@ class PluginProcess:
         return default
 
     async def _log(self, params: mcp_types.LoggingMessageNotificationParams) -> None:
-        source = f" {params.logger}" if params.logger else ""
-        line = f"[log {params.level}{source}] {params.data}\n"
+        # JSON (not `str()`/`repr()`), so a value is written in one of the forms the redactor
+        # knows (its JSON escaping): `repr` would write a control character as `\x01`.
+        source = f" {json.dumps(params.logger, ensure_ascii=False)}" if params.logger else ""
+        data = params.data if isinstance(params.data, str) else _json(params.data)
+        line = f"[log {params.level}{source}] {data}\n"
         self.capture.feed(line.encode("utf-8", errors="replace"))
 
     async def call(
@@ -202,6 +206,13 @@ class PluginProcess:
         self._stop.set()
         with anyio.move_on_after(_STOP_WAIT_S), anyio.CancelScope(shield=True):
             await self.stopped.wait()
+
+
+def _json(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, default=str)
+    except (ValueError, RecursionError):  # pragma: no cover (the data came from JSON)
+        return "<unprintable log data>"
 
 
 async def _list_tools(session: ClientSession) -> frozenset[str]:

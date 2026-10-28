@@ -13,11 +13,19 @@ copied from `os.environ`, and Horae never puts a resolved secret into its own en
 | `LANG` | `C.UTF-8` |
 | `TZ` | the instance time zone (`horae.yaml` `timezone`) |
 
-**Deny list** (schemas decisions 8 and 28): a declared secret may not be one of the base keys or
-a variable that changes how a runtime behaves: `HORAE_*`, `LD_*`, `DYLD_*`, `PYTHON*`, `LC_*`,
-`GIT_*`, `SSL_CERT_*`, `*_PROXY`, `NODE_OPTIONS`, `NODE_PATH`, `BASH_ENV`, `ENV`, `PERL5OPT`,
-`RUBYOPT`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `IFS` (compared case-insensitively). Such a
-plugin is refused at spawn with `env_unsafe`; a value with a NUL character too.
+**Deny list** (schemas decisions 8, 28 and 35): a declared secret may not be one of the base
+keys or a variable that changes how a runtime, its loader, its TLS stack or its package manager
+behaves (compared case-insensitively):
+
+- prefixes `HORAE_*`, `LD_*`, `DYLD_*`, `PYTHON*`, `LC_*`, `GIT_*`, `SSL_CERT_*`, `OPENSSL_*`,
+  `MALLOC_*`, `UV_*`, `PIP_*`, `NPM_CONFIG_*`, and the suffix `*_PROXY`;
+- `NODE_OPTIONS`, `NODE_PATH`, `NODE_EXTRA_CA_CERTS`, `NODE_TLS_REJECT_UNAUTHORIZED`,
+  `BASH_ENV`, `ENV`, `SHELLOPTS`, `PS4`, `IFS`, `PERL5OPT`, `PERL5LIB`, `PERLLIB`, `RUBYOPT`,
+  `RUBYLIB`, `JAVA_TOOL_OPTIONS`, `JDK_JAVA_OPTIONS`, `CLASSPATH`, `GODEBUG`,
+  `GLIBC_TUNABLES`, `LOCPATH`, `GCONV_PATH`, `TZDIR`, `LANGUAGE`, `SSLKEYLOGFILE`,
+  `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `VIRTUAL_ENV`.
+
+Such a plugin is refused at spawn with `env_unsafe`; a value with a NUL character too.
 """
 
 from collections.abc import Mapping
@@ -33,15 +41,46 @@ BASE_KEYS = frozenset({"PATH", "HOME", "TMPDIR", "LANG", "TZ"})
 _DENIED = BASE_KEYS | {
     "NODE_OPTIONS",
     "NODE_PATH",
+    "NODE_EXTRA_CA_CERTS",
+    "NODE_TLS_REJECT_UNAUTHORIZED",
     "BASH_ENV",
     "ENV",
+    "SHELLOPTS",
+    "PS4",
+    "IFS",
     "PERL5OPT",
+    "PERL5LIB",
+    "PERLLIB",
     "RUBYOPT",
+    "RUBYLIB",
+    "JAVA_TOOL_OPTIONS",
+    "JDK_JAVA_OPTIONS",
+    "CLASSPATH",
+    "GODEBUG",
+    "GLIBC_TUNABLES",
+    "LOCPATH",
+    "GCONV_PATH",
+    "TZDIR",
+    "LANGUAGE",
+    "SSLKEYLOGFILE",
     "REQUESTS_CA_BUNDLE",
     "CURL_CA_BUNDLE",
-    "IFS",
+    "VIRTUAL_ENV",
 }
-_DENIED_PREFIXES = ("HORAE_", "LD_", "DYLD_", "PYTHON", "LC_", "GIT_", "SSL_CERT_")
+_DENIED_PREFIXES = (
+    "HORAE_",
+    "LD_",
+    "DYLD_",
+    "PYTHON",
+    "LC_",
+    "GIT_",
+    "SSL_CERT_",
+    "OPENSSL_",
+    "MALLOC_",
+    "UV_",
+    "PIP_",
+    "NPM_CONFIG_",
+)
 _DENIED_SUFFIXES = ("_PROXY",)
 
 

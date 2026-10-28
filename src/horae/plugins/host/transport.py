@@ -9,6 +9,8 @@ file object. Here the process is spawned with:
   element the caller resolved to an absolute path;
 - **exactly** the given environment, and the given (empty) working directory;
 - `start_new_session=True`, so the plugin and everything it starts form one process group;
+- `umask=0o077`, so the files it creates (in its `HOME`, `TMPDIR` or anywhere else) are
+  readable by the user only, whatever Horae's own umask is (decision 35 E);
 - stdin, stdout and stderr as pipes: stdout carries the JSON-RPC messages, at most
   `MAX_MESSAGE_BYTES` (8 MiB) each (`output_too_large` otherwise), stderr is drained into a
   `StderrCapture` as it arrives.
@@ -22,6 +24,13 @@ once (the caller then kills the process).
 or a crash) skips the stdin step. Once the leader is gone, the group gets a final `SIGKILL`,
 so nothing the plugin started outlives it. Every wait is bounded and runs shielded from
 cancellation, so a cancelled run cannot leak a process.
+
+**Limits of group termination** (the "declared" tier, until M5 puts each plugin in its own
+container): a descendant that calls `setsid()` or `setpgid()` leaves the group and is not
+signalled, so a hostile plugin can leave a process behind. And the final `killpg` targets the
+group by number after the leader was reaped: if every member is gone and the system reuses
+that number for a new group in between (a PID-reuse race, very unlikely in that window), the
+signal could reach an unrelated process group of the same user.
 """
 
 import os
@@ -131,6 +140,7 @@ async def open_stdio(
             cwd=cwd,
             env=env,
             start_new_session=True,
+            umask=0o077,
         )
     except (OSError, ValueError) as error:
         reason = error.strerror if isinstance(error, OSError) and error.strerror else "invalid"

@@ -18,6 +18,10 @@ replay) does not depend on timing. Every source of the step is called and record
 an earlier one's proposals then fail the step. `transform` calls run one at a time (each is
 fed the previous output), and steps run one after the other.
 
+**Releasing plugins.** When `tools` has a `release` method (`ReleasingToolCaller`), each
+plugin is released right after the last step of the plan that calls it (or as soon as the run
+stops early), so its process does not outlive its use (schemas decision 35 A).
+
 **Who proposes, who applies (ADR 0002).** `collect` sources, `transform` tools and the `llm`
 step **propose** intents. `act` and `notify` entries are never called here: each entry
 (`<sink>.<tool>: {params}`) names the sink or notifier that will **apply** the intents routed
@@ -175,6 +179,7 @@ each step record is final, in order, so a caller can also persist steps as they 
 """
 
 import asyncio
+import contextlib
 import copy
 import datetime
 import json
@@ -1331,6 +1336,21 @@ async def execute(
             error=_cap(error) if error else None,
         )
 
+    last_use: dict[str, int] = {}
+    for p in plan:
+        for c in p.calls:
+            last_use[c.plugin.manifest.name] = p.index
+    release = getattr(tools, "release", None)
+
+    async def release_after(index: int, stopping: bool) -> None:
+        if not callable(release):
+            return
+        for name in sorted(last_use):
+            if stopping or last_use[name] == index:
+                del last_use[name]
+                with contextlib.suppress(Exception):  # a port problem never fails the run
+                    await release(name)
+
     in_step = False
     try:
         if on_step is not None:
@@ -1368,6 +1388,7 @@ async def execute(
                 if outcome.error is not None and run_error is None and outcome.status != "ok":
                     run_error = f"step {step.index} ({step.kind}): {outcome.error.message}"
                 stopped = outcome.stop or outcome.status == "failed"
+                await release_after(step.index, stopped)
             records.append(step_record)
             if on_step is not None:
                 await on_step(step.index, step_record)

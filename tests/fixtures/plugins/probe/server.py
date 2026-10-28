@@ -11,6 +11,7 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 import time
 import warnings
 from pathlib import Path
@@ -44,7 +45,10 @@ def env() -> dict[str, Any]:
     host, its digest is not), the working directory and the process group."""
     environ = _initial_environ()
     digests = {key: hashlib.sha256(value.encode()).hexdigest() for key, value in environ.items()}
+    umask = os.umask(0)
+    os.umask(umask)
     return {
+        "umask": umask,
         "env": environ,
         "sha256": digests,
         "cwd": os.getcwd(),
@@ -70,10 +74,7 @@ def crash(code: int = 3) -> dict[str, Any]:
     os._exit(code)
 
 
-@server.tool(name="probe.stderr")
-def stderr(parts: list[dict[str, Any]]) -> dict[str, Any]:
-    """Write each `{"text": str, "times": int}` (or `{"env": NAME}`: that variable's value)
-    part to stderr, in order."""
+def _write(parts: list[dict[str, Any]], exit_code: int | None) -> int:
     written = 0
     for part in parts:
         if "env" in part:
@@ -83,7 +84,27 @@ def stderr(parts: list[dict[str, Any]]) -> dict[str, Any]:
         sys.stderr.buffer.write(data)
         written += len(data)
     sys.stderr.flush()
-    return {"written": written}
+    if exit_code is not None:
+        os._exit(exit_code)
+    return written
+
+
+@server.tool(name="probe.stderr")
+def stderr(
+    parts: list[dict[str, Any]], delay_s: float = 0, exit_code: int | None = None
+) -> dict[str, Any]:
+    """Write each `{"text": str, "times": int}` (or `{"env": NAME}`: that variable's value)
+    part to stderr, in order; then exit with `exit_code` if given. With `delay_s`, return at
+    once and do it `delay_s` seconds later (after the call)."""
+    if delay_s > 0:
+
+        def later() -> None:
+            time.sleep(delay_s)
+            _write(parts, exit_code)
+
+        threading.Thread(target=later, daemon=True).start()
+        return {"written": 0}
+    return {"written": _write(parts, exit_code)}
 
 
 @server.tool(name="probe.intents")
@@ -106,8 +127,11 @@ def echo(ctx: Context, value: Any = None, reveal: str | None = None) -> dict[str
 
 
 @server.tool(name="probe.text", structured_output=False)
-def text(body: str) -> str:
-    """A plain text result (no structured content)."""
+def text(body: str, note: str | None = None) -> str:
+    """A plain text result (no structured content); `note` is written to stderr first."""
+    if note is not None:
+        sys.stderr.write(note)
+        sys.stderr.flush()
     return body
 
 

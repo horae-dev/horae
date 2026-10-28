@@ -9,6 +9,7 @@
   shutdown;
 - `horae.plugins.host.session`: one process, its MCP session and tool calls;
 - `horae.plugins.host.capture` and `horae.plugins.host.redact`: stderr capture and redaction;
+- `horae.plugins.host.logs`: redaction of the MCP SDK's own log records;
 - `horae.plugins.host.errors`: the error kinds.
 
 **Not enforced until M5** (ADR 0003, "declared" tier). A plugin runs as the same user as Horae:
@@ -17,7 +18,10 @@ working directory are hygiene, not isolation), use unbounded CPU and memory, and
 `/proc/<horae-pid>/environ`, i.e. every secret Horae itself got through **its own**
 environment. Horae never adds a resolved secret to its own environment (each child's is built
 explicitly), so secrets read from files (`/run/secrets/<NAME>`, the default, schemas decision
-25) are not exposed that way; `{env: VAR}` references are. Prefer secret files. The proper fix
+25) are not exposed that way; `{env: VAR}` references are. Prefer secret files. Likewise a
+plugin can read the environment, hence the declared secrets, of another plugin running at the
+same time (accepted for first-party plugins; each plugin is stopped after its last planned
+call to narrow it, schemas decision 35 A). The proper fix
 (one container per plugin, M5 #50/#51) is tracked there. `undeclared_secret`,
 `undeclared_path` and `egress_blocked` (network) are not detected in v1. The MCP-backed `Sink`
 (apply port) is a follow-up: sinks and notifiers are not called through this host yet.

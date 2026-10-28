@@ -134,6 +134,17 @@ class ToolCaller(Protocol):
         ...
 
 
+class ReleasingToolCaller(ToolCaller, Protocol):
+    """A `ToolCaller` that can stop a plugin the run will not call again (optional).
+
+    When `tools` has a `release` method, the engine awaits `release(plugin)` (the plugin's
+    manifest name) right after the last step of the plan that calls one of its tools, or when
+    the run stops early, so a plugin's process is not alive during later steps that do not use
+    it (schemas decision 35 A). `release` must not raise; if it does, the error is ignored."""
+
+    async def release(self, plugin: str) -> None: ...
+
+
 @dataclass(frozen=True)
 class LlmRequest:
     """One attempt of the bounded LLM step."""

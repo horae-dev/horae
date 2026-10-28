@@ -2,7 +2,10 @@
 """The plugin host's pure parts: environment, redaction, stderr capture, registry, commands."""
 
 import base64
+import binascii
 import itertools
+import json
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -18,7 +21,7 @@ from horae.plugins.host import HostRegistry, PluginCallError, RegistryError, hos
 from horae.plugins.host.capture import StderrCapture
 from horae.plugins.host.env import BASE_KEYS, BASE_PATH, build_env, unsafe_name
 from horae.plugins.host.host import resolve_command
-from horae.plugins.host.redact import Redactor, token
+from horae.plugins.host.redact import MIN_PARTIAL_BYTES, Redactor, SecretInKey, token
 from horae.plugins.host.transport import exit_status
 from horae.secrets import Secret
 from plugin_fixtures import PROBE, lock_for, probe_manifest, registry
@@ -51,6 +54,31 @@ from plugin_fixtures import PROBE, lock_for, probe_manifest, registry
         "RUBYOPT",
         "REQUESTS_CA_BUNDLE",
         "CURL_CA_BUNDLE",
+        "GLIBC_TUNABLES",
+        "JAVA_TOOL_OPTIONS",
+        "JDK_JAVA_OPTIONS",
+        "CLASSPATH",
+        "PERL5LIB",
+        "PERLLIB",
+        "RUBYLIB",
+        "SSLKEYLOGFILE",
+        "OPENSSL_CONF",
+        "OPENSSL_MODULES",
+        "NODE_EXTRA_CA_CERTS",
+        "NODE_TLS_REJECT_UNAUTHORIZED",
+        "LOCPATH",
+        "GCONV_PATH",
+        "TZDIR",
+        "LANGUAGE",
+        "SHELLOPTS",
+        "PS4",
+        "GODEBUG",
+        "MALLOC_CONF",
+        "MALLOC_ARENA_MAX",
+        "UV_INDEX_URL",
+        "PIP_INDEX_URL",
+        "npm_config_registry",
+        "VIRTUAL_ENV",
         "A=B",
         "",
     ],
@@ -118,20 +146,63 @@ def test_every_encoding_of_a_secret_is_redacted() -> None:
 
 
 def test_the_longest_secret_wins_and_data_is_walked() -> None:
-    redactor = Redactor([Secret("SHORT", "abc"), Secret("LONG", "xxabcxx")])
-    assert redactor.redact_text("xxabcxx abc")[0] == "[REDACTED:LONG] [REDACTED:SHORT]"
-    deep: Any = "abc"
+    redactor = Redactor([Secret("INNER", "abcdefgh12"), Secret("OUTER", "xxabcdefgh12xx")])
+    text = "xxabcdefgh12xx abcdefgh12"
+    assert redactor.redact_text(text)[0] == "[REDACTED:OUTER] [REDACTED:INNER]"
+    deep: Any = "abcdefgh12"
     for _ in range(500):  # deeper than any recursion limit would like
         deep = [deep]
-    data, found = redactor.redact_data({"abc": deep, "n": 1, "ok": [True, None, 2.5]})
-    assert found == {"SHORT"}
-    assert data["[REDACTED:SHORT]"] is not None
+    data, found = redactor.redact_data({"key": deep, "n": 1, "ok": [True, None, 2.5]})
+    assert found == {"INNER"}
     assert data["n"] == 1
     assert data["ok"] == [True, None, 2.5]
-    inner = data["[REDACTED:SHORT]"]
+    inner = data["key"]
     for _ in range(500):
         inner = inner[0]
-    assert inner == "[REDACTED:SHORT]"
+    assert inner == "[REDACTED:INNER]"
+
+
+def test_misaligned_base64_hex_basic_auth_and_json_are_redacted() -> None:
+    sample = "hunter2-is-long-enough"
+    redactor = Redactor([Secret("S", sample)])
+    raw = sample.encode()
+    for before, after in itertools.product(range(6), range(4)):
+        for encode in (base64.b64encode, base64.urlsafe_b64encode):
+            stream = encode(os.urandom(before) + raw + os.urandom(after)).decode()
+            text, found = redactor.redact_text(stream)
+            assert found == {"S"}, (before, after, stream)
+            # Only characters that also depend on the neighbouring bytes stay (at most 2 a side).
+            assert len(text.replace(token("S"), "")) <= len(stream) - len(raw) * 4 // 3 + 4
+    basic = "Authorization: Basic " + base64.b64encode(b"user:" + raw).decode()
+    assert token("S") in redactor.redact_text(basic)[0]
+    for form in (binascii.hexlify(raw).decode(), binascii.hexlify(raw).decode().upper()):
+        assert redactor.redact_text(f"hex={form};")[0] == f"hex={token('S')};"
+    embedded = json.dumps({"auth": {"token": sample, "note": f"Bearer {sample}"}})
+    assert sample not in redactor.redact_text(embedded)[0]
+    assert redactor.redact_bytes(embedded.encode()).count(token("S").encode()) == 2
+
+
+def test_short_secrets_match_whole_values_only() -> None:
+    short = "pin42"
+    assert len(short) < MIN_PARTIAL_BYTES
+    redactor = Redactor([Secret("PIN", short), Secret("NUM", "12345678901")])
+    assert redactor.redact_text(f"spin42 {short}") == (f"spin42 {short}", set())
+    assert redactor.redact_bytes(short.encode()) == short.encode()
+    assert redactor.redact_text(short) == (token("PIN"), {"PIN"})
+    value = {"a": short, "b": f"x{short}", "n": 12345678901, "f": 1.5, "t": True}
+    data, found = redactor.redact_data(value)
+    assert data == {"a": token("PIN"), "b": f"x{short}", "n": token("NUM"), "f": 1.5, "t": True}
+    assert found == {"PIN", "NUM"}
+
+
+def test_object_keys_are_never_rewritten() -> None:
+    redactor = Redactor([Secret("PIN", "pin42"), Secret("LONG", "a-long-secret-value")])
+    for key in ("pin42", "has a-long-secret-value inside"):
+        with pytest.raises(SecretInKey) as info:
+            redactor.redact_data({"ok": [{key: 1}]})
+        assert "pin42" not in str(info.value)
+        assert "a-long-secret-value" not in str(info.value)
+    assert redactor.redact_data({"xpin42": 1}) == ({"xpin42": 1}, set())
 
 
 def test_an_empty_redactor_changes_nothing() -> None:
@@ -176,9 +247,9 @@ def test_a_secret_at_any_offset_around_the_cuts_never_leaks() -> None:
 
 
 def test_a_short_stream_is_redacted_whole_and_windows_restart() -> None:
-    redactor = Redactor([Secret("S", "SECRET")])
+    redactor = Redactor([Secret("S", "SECRET-VALUE")])
     capture = StderrCapture(redactor.max_len - 1, head=8, tail=8)
-    capture.feed(b"abc SECRET def")
+    capture.feed(b"abc SECRET-VALUE def")
     assert capture.take(redactor) == "abc [REDACTED:S] def"
     assert capture.take(redactor) is None
     capture.feed(b"\xff\xfe broken utf-8")
@@ -252,12 +323,33 @@ def test_from_directory_reads_each_locked_plugin(tmp_path: Path) -> None:
     assert installed.manifest.provides.sources[0] == "probe.env"
 
 
+def test_relative_commands_stay_inside_the_plugin(tmp_path: Path) -> None:
+    root = tmp_path / "plugin"
+    (root / "bin").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.write_text("#!/bin/sh\n", encoding="utf-8")
+    outside.chmod(0o755)
+    (root / "bin" / "link").symlink_to(outside)
+    for command in ("../outside", "bin/../../outside", "bin/link"):
+        with pytest.raises(PluginCallError) as info:
+            resolve_command([command], root)
+        assert info.value.kind == "spawn_failed"
+        assert "outside the plugin" in info.value.message
+    inside = root / "bin" / "run"
+    inside.write_text("#!/bin/sh\n", encoding="utf-8")
+    inside.chmod(0o755)
+    relative = Path(os.path.relpath(root, Path.cwd()))
+    resolved = resolve_command(["bin/../bin/run"], relative)
+    assert resolved == [str(inside.resolve())]
+    assert os.path.isabs(resolved[0])
+
+
 def test_resolve_command(tmp_path: Path) -> None:
     script = tmp_path / "bin" / "run"
     script.parent.mkdir()
     script.write_text("#!/bin/sh\n", encoding="utf-8")
     script.chmod(0o755)
-    assert resolve_command(["bin/run", "x"], tmp_path) == [str(script), "x"]
+    assert resolve_command(["bin/run", "x"], tmp_path) == [str(script.resolve()), "x"]
     assert resolve_command([sys.executable], None) == [sys.executable]
     env = shutil.which("env", path=BASE_PATH)
     assert env is not None

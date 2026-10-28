@@ -20,7 +20,7 @@ its message.
 | `plugin_unavailable` | the plugin failed earlier in the run and has used its one restart |
 | `protocol_error` | a JSON-RPC error response, or a message that is not JSON-RPC |
 | `output_too_large` | one stdout message was over `MAX_MESSAGE_BYTES`; the process was killed |
-| `output_invalid` | no structured content nor single JSON text block, or malformed intents |
+| `output_invalid` | no structured content nor one JSON text block, bad intents, a secret as key |
 | `tool_error` | the tool reported an error (`isError: true`) |
 | `host_error` | a bug in the host |
 """

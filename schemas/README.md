@@ -664,7 +664,7 @@ loosened later without breaking a valid file.
       When omitted, `plugins.<name>.call_timeout_s`, then `plugin_defaults.call_timeout_s`
       apply. The engine passes it to `ToolCaller.call(..., timeout_s=)`;
     - **`secret_in_output` violation (answer 4).** The maintainer's answer "add the secrets
-      from the output" is read as: a secret value (or its base64, percent or JSON encoding)
+      from the output" is read as: a secret value (or its base64, hex, percent or JSON encoding)
       found in a tool's output or intents is **redacted** (`[REDACTED:<NAME>]`) and recorded
       as a `secret_in_output` violation; the step does not fail. Redaction covers every
       secret the instance resolved (`SecretResolver.resolved()`), in stderr, error messages,
@@ -695,3 +695,51 @@ loosened later without breaking a valid file.
       environment, and secret files (decision 25, the default) are recommended over
       `{env: VAR}` references, whose values a same-user plugin can read on Linux. The proper
       fix is the M5 container isolation (#50, #51).
+
+    Security review of the implementation (provisional, pending maintainer review):
+    - **A. Sibling plugins.** Plugins run as the same user, so while two run at once one can
+      read the other's environment, hence its declared secrets (`/proc/<pid>/environ` on
+      Linux, `ps eww` on some systems). Accepted as a pre-M5 risk, mitigated by the
+      first-party-only rule of the "declared" tier, and narrowed: the engine releases each
+      plugin right after the last step of the plan that calls it (or as soon as the run stops
+      early), through an optional `release(plugin)` method of the `ToolCaller`
+      (`ReleasingToolCaller`); `PluginHost.release` stops its process, so a plugin is not
+      alive during later steps that do not use it. A released plugin called again starts
+      afresh without using its one restart; a failing `release` is ignored;
+    - **B. Complete redaction from the first call.** When the host opens it resolves every
+      secret declared by every locked plugin and every `secrets.refs` entry (one that cannot
+      be resolved is skipped; the plugin needing it fails with `secret_missing` later), so
+      redaction does not depend on which plugin started first (`SecretResolver.referenced()`
+      lists the refs);
+    - **C. More encodings.** For secrets of at least 8 bytes the redactor also matches the
+      lower- and upper-case hex, and misaligned base64 (both alphabets) of the value embedded
+      in a longer stream at byte offsets 1 and 2 (an HTTP Basic `user:<secret>` header): only
+      the characters that depend on the value alone, `ceil(8k/6)` to `floor((8k + 8n)/6)` for
+      offset `k` and `n` bytes, so up to 4 bits of the value can stay visible on each side;
+    - **D. Short secrets and keys.** Encoded and partial forms are used only for secrets of at
+      least 8 bytes; a shorter secret is matched only as a whole value (a JSON string or
+      number that is exactly it, or a whole message), never inside text or stderr. Object keys
+      are never rewritten: a key holding a secret fails the call with `output_invalid` and
+      nothing is stored. When the matches of two secrets overlap, only the leftmost one is
+      replaced (documented limit). A JSON number whose `json.dumps` is a secret becomes the
+      token string; the SDK's own log records (`mcp.*`, `client`, `server`) are scrubbed when
+      created: message redacted, arguments, traceback and stack dropped;
+    - **E. umask.** Every plugin process starts with umask `0o077`;
+    - **F. Stderr window.** The per-call stderr window keeps its quiet-window heuristic
+      (stderr and stdout are separate pipes, so nothing orders them); tests wait for a
+      sentinel line instead of relying on timing. What a process wrote before it died between
+      two calls goes with the next call; what it wrote after its last call is kept, redacted,
+      in `PluginHost.leftover_stderr`;
+    - **G. `runtime.command` pinning.** The lock pins version, commit and permissions, not the
+      manifest's `runtime.command` or the plugin's files; pinning them is M4 (#44, #46). A
+      relative command must resolve (symlinks included) inside the plugin's directory, and is
+      passed as an absolute path;
+    - the deny list (decision 28) also covers `GLIBC_TUNABLES`, `JAVA_TOOL_OPTIONS`,
+      `JDK_JAVA_OPTIONS`, `CLASSPATH`, `PERL5LIB`, `PERLLIB`, `RUBYLIB`, `SSLKEYLOGFILE`,
+      `OPENSSL_*`, `NODE_EXTRA_CA_CERTS`, `NODE_TLS_REJECT_UNAUTHORIZED`, `LOCPATH`,
+      `GCONV_PATH`, `TZDIR`, `LANGUAGE`, `SHELLOPTS`, `PS4`, `GODEBUG`, `MALLOC_*`, `UV_*`,
+      `PIP_*`, `NPM_CONFIG_*` and `VIRTUAL_ENV`;
+    - calls to one plugin are serialised, so N calls to it in one step can take N times the
+      call timeout; the run timeout (#19) bounds the whole. Group termination cannot reach a
+      descendant that left the group (`setsid`/`setpgid`), and the final `killpg` after the
+      leader is reaped has a (very unlikely) PID-reuse race; both are M5's (#50, #51).

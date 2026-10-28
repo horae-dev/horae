@@ -33,7 +33,10 @@ RAW_TOOLS = [
     "raw.junk",
     "raw.big",
     "raw.rpc_error",
-    "raw.sampling",
+    "raw.ask",
+    "raw.init",
+    "raw.progress",
+    "raw.log",
     "raw.bad_result",
     "raw.bad_intents",
     "raw.two_blocks",
@@ -45,13 +48,13 @@ RAW_TOOLS = [
 """The tools of `tests/fixtures/plugins/raw/raw_server.py`, plus one it does not list."""
 
 
-def raw_manifest(mode: str = "normal") -> dict[str, Any]:
+def raw_manifest(mode: str = "normal", **permissions: Any) -> dict[str, Any]:
     return {
         "name": "raw",
         "version": "0.1.0",
         "horae": ">=0",
-        "provides": {"sources": RAW_TOOLS},
-        "permissions": {},
+        "provides": {"sources": RAW_TOOLS, "transforms": ["raw.ok"]},
+        "permissions": permissions,
         "runtime": {"protocol": "mcp-stdio", "command": [sys.executable, str(RAW_SERVER), mode]},
     }
 

@@ -12,13 +12,19 @@ providing the same ref is an error. Resolution reads only the documents given (#
 run's `ToolCaller`:
 
 - **one process per plugin per run**, started lazily on the first call to one of its tools,
-  reused for every later call, and stopped when the host exits (no daemons, nothing carried
-  between runs). Calls to one plugin are serialised (one in flight per process, so its stderr
-  belongs to one call); calls to different plugins run concurrently (the engine's parallel
-  `collect`);
+  reused for every later call, and stopped after its **last planned call** (the engine calls
+  `release(plugin)` after the last step that uses it, decision 35 A) or when the host exits
+  (no daemons, nothing carried between runs). Calls to one plugin are serialised (one in
+  flight per process, so its stderr belongs to one call); calls to different plugins run
+  concurrently (the engine's parallel `collect`). Serialisation means N calls to one plugin
+  in one step can take up to N times the call timeout; the run timeout (#19) bounds the
+  whole;
+- **opening** resolves every secret it knows of: those declared by every locked plugin and
+  every `secrets.refs` entry (a secret that cannot be resolved is skipped here; it fails the
+  plugin that needs it later). The redactor is then complete from the first call, whatever
+  order plugins start in (decision 35 B);
 - **startup**: the declared secrets are resolved (`secret_missing`) and checked against the
-  deny list (`env_unsafe`), `argv[0]` is resolved to an absolute path (a bare name with
-  `shutil.which` on the child's `PATH`, a relative path against the plugin's directory), the
+  deny list (`env_unsafe`), `argv[0]` is resolved to an absolute path (`resolve_command`), the
   process is spawned (`horae.plugins.host.transport`) with the environment of
   `horae.plugins.host.env` and an empty working directory, and the MCP handshake and
   `tools/list` must finish within the plugin's `startup_timeout_s` (`startup_timeout`);
@@ -33,19 +39,32 @@ run's `ToolCaller`:
 - **results**: `isError: true` is `tool_error`; the data is `structuredContent`, else a single
   text block that parses as JSON (PR #85 answer 9), else `output_invalid`; intents come from
   `_meta["dev.horae/intents"]` (a list) and are validated by the engine;
+- **runtime.command is not pinned** against the lock in v1: the lock pins the plugin's
+  version, commit and permissions, and the installed manifest's command is used as it is.
+  Pinning it (and the plugin's files) is M4's install and verify work (#44, #46);
 - **redaction** (PR #85 answer 4): every secret the instance resolved
   (`SecretResolver.resolved()`) and its encodings is replaced with `[REDACTED:<NAME>]` in
   stderr, error messages, tool output and intents. A secret found in the output or intents
   does not fail the call: it is redacted and recorded as a `secret_in_output` violation
   (`ToolResult.violations`). This is how the maintainer's answer "add the secrets from the
-  output" is read: redact them, flag them, keep going.
+  output" is read: redact them, flag them, keep going. An object key holding a secret is
+  never rewritten: the call fails with `output_invalid` and nothing is stored. The SDK's own
+  log records are redacted too (`horae.plugins.host.logs`).
 
 **Stderr** is captured per call (`horae.plugins.host.capture`): what the plugin wrote since
 the previous call ended, until the pipe has been quiet for `STDERR_QUIET_S` after the result
-(at most `STDERR_SETTLE_S`), or until the process is gone after a failure.
+(at most `STDERR_SETTLE_S`: a heuristic, stderr and stdout are separate pipes), or until the
+process is gone after a failure. What a process wrote before it died between two calls goes
+with the next call (its result or error); what it wrote after its last call is kept in
+`PluginHost.leftover_stderr` (redacted) when it is released or the host exits.
 
 Nothing here puts a secret into Horae's own environment: each child's mapping is built
-explicitly and handed to the spawn call only.
+explicitly and handed to the spawn call only. **Sibling plugins** (accepted risk until M5,
+decision 35 A): every plugin runs as the same user, so while two plugins run at the same time
+one can read the other's environment, hence its declared secrets (`/proc/<pid>/environ` on
+Linux, `ps eww` on some systems). This is accepted for first-party plugins only (the
+"declared" tier) and narrowed by stopping each plugin after its last planned call, so a plugin
+is not alive during later steps that do not use it.
 """
 
 import json
@@ -69,10 +88,11 @@ from horae.contracts.lockfile import Lockfile
 from horae.contracts.plugin import Permissions, PluginManifest, StdioRuntime
 from horae.contracts.run import Violation
 from horae.engine.ports import ResolvedPlugin, ToolResult, UnknownPlugin
+from horae.plugins.host import logs
 from horae.plugins.host.capture import StderrCapture
 from horae.plugins.host.env import BASE_PATH, build_env, check_names
 from horae.plugins.host.errors import HostErrorKind, PluginCallError
-from horae.plugins.host.redact import MAX_EXPANSION, Redactor
+from horae.plugins.host.redact import MAX_EXPANSION, Redactor, SecretInKey
 from horae.plugins.host.session import INTENTS_META, CallFailed, PluginProcess, Spawn
 from horae.secrets import MAX_SECRET_BYTES, Secret, SecretError, SecretResolver
 
@@ -170,6 +190,10 @@ class HostRegistry:
             roots[name] = root
         return cls(lock, manifests, roots)
 
+    def plugins(self) -> tuple[InstalledPlugin, ...]:
+        """Every installed plugin, by name."""
+        return tuple(self._plugins.values())
+
     def installed(self, name: str) -> InstalledPlugin:
         try:
             return self._plugins[name]
@@ -193,17 +217,36 @@ class HostRegistry:
 
 
 def resolve_command(command: list[str], root: Path | None) -> list[str]:
-    """`command` with `argv[0]` as an absolute path (see the module docstring)."""
+    """`command` with `argv[0]` as an absolute path.
+
+    - an absolute path is kept as written (resolving its symlinks would change `argv[0]`,
+      which interpreters such as a virtual environment's `python` use to find their
+      environment);
+    - a relative path (with a `/`) is resolved against the plugin's directory with
+      `Path.resolve()`, and its real path must stay inside the real plugin directory (no
+      `../`, no symlink out of it);
+    - a bare name is looked up with `shutil.which` on the child's `PATH` (absolute entries).
+
+    `spawn_failed` if it is not found, not an executable file, or escapes the plugin."""
     first = command[0]
+    path: str | None
     if os.path.isabs(first):
-        path: str | None = first
+        path = first
     elif "/" in first:
-        path = str(root / first) if root is not None else None
+        path = None
+        if root is not None:
+            real_root = root.resolve()
+            real = (real_root / first).resolve()
+            if not real.is_relative_to(real_root):
+                raise PluginCallError(
+                    "spawn_failed", f"command {first!r} is outside the plugin's directory"
+                )
+            path = str(real)
     else:
         path = shutil.which(first, path=BASE_PATH)
     if path is None or not os.path.isfile(path) or not os.access(path, os.X_OK):
         raise PluginCallError("spawn_failed", f"command {first!r} not found or not executable")
-    return [path, *command[1:]]
+    return [os.path.abspath(path), *command[1:]]
 
 
 @dataclass
@@ -214,8 +257,12 @@ class _Entry:
     lock: anyio.Lock = field(default_factory=anyio.Lock)
     process: PluginProcess | None = None
     starts: int = 0
+    failures: int = 0
+    """Processes lost to a timeout, crash or protocol failure (one restart allowed)."""
     dead: str | None = None
     """Why the plugin is unavailable for the rest of the run."""
+    pending_stderr: str | None = None
+    """What a process wrote before it died between two calls (goes with the next call)."""
 
 
 def _text(result: mcp_types.CallToolResult) -> str:
@@ -243,15 +290,34 @@ class PluginHost:
         self._group: anyio.abc.TaskGroup | None = None
         self._run_dir: Path | None = None
         self._redactor: tuple[tuple[Secret, ...], Redactor] | None = None
+        self.leftover_stderr: dict[str, str] = {}
+        """Per plugin, the (redacted) stderr written after its last call, kept when it was
+        released or the host exited."""
 
     # --- lifecycle -------------------------------------------------------------------------
 
     async def __aenter__(self) -> Self:
         self._work_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self._resolve_known_secrets()
         self._run_dir = Path(tempfile.mkdtemp(prefix="run-", dir=self._work_root))
+        logs.register(self)
         self._group = anyio.create_task_group()
         await self._group.__aenter__()
         return self
+
+    def _resolve_known_secrets(self) -> None:
+        """Resolve every declared and referenced secret, for redaction (decision 35 B)."""
+        names = {
+            name
+            for plugin in self.registry.plugins()
+            for name in plugin.manifest.permissions.secrets
+        }
+        names.update(self.secrets.referenced())
+        for name in sorted(names):
+            try:
+                self.secrets.resolve(name)
+            except SecretError:
+                continue  # the plugin that needs it fails with `secret_missing`
 
     async def __aexit__(
         self,
@@ -266,13 +332,40 @@ class PluginHost:
                     for entry in self._entries.values():
                         if entry.process is not None:
                             stopping.start_soon(entry.process.stop)
+                for entry in self._entries.values():
+                    self._keep_leftover(entry)
             if group is not None:
                 group.cancel_scope.cancel()
                 await group.__aexit__(None, None, None)
         finally:
+            logs.unregister(self)
             if self._run_dir is not None:
                 shutil.rmtree(self._run_dir, ignore_errors=True)
         return None
+
+    async def release(self, plugin: str) -> None:
+        """Stop `plugin`'s process: the run will not call it again (decision 35 A). A later
+        call would start it again (without using its one restart). Never raises."""
+        entry = self._entries.get(plugin)
+        if entry is None:
+            return
+        async with entry.lock:
+            process, entry.process = entry.process, None
+            if process is not None:
+                await process.stop()
+            self._keep_leftover(entry, process)
+
+    def _keep_leftover(self, entry: _Entry, process: PluginProcess | None = None) -> None:
+        """Keep what `entry`'s process wrote after its last call in `leftover_stderr`."""
+        process = process or entry.process
+        parts = [entry.pending_stderr]
+        entry.pending_stderr = None
+        if process is not None:
+            parts.append(process.capture.take(self.redactor()))
+        text = "".join(part for part in parts if part)
+        if text:
+            name = entry.installed.manifest.name
+            self.leftover_stderr[name] = self.leftover_stderr.get(name, "") + text
 
     # --- redaction -------------------------------------------------------------------------
 
@@ -315,36 +408,63 @@ class PluginHost:
         name = installed.manifest.name
         entry = self._entries.setdefault(name, _Entry(installed))
         async with entry.lock:
-            process = await self._ready(entry)
-            if ref not in process.tools:
-                raise PluginCallError("tool_missing", f"{name} does not list {ref} in tools/list")
-            timeout = timeout_s or self._timeouts(name).call_timeout_s
             try:
-                result = await process.call(ref, params, input, timeout)
-            except CallFailed as failed:
-                await process.stop(forced=True)
-                self._lost(entry)
-                stderr = process.capture.take(self.redactor())
-                raise PluginCallError(
-                    failed.kind, f"{ref}: {failed.message}", stderr=stderr
-                ) from None
+                outcome = await self._call_locked(entry, ref, params, input, timeout_s)
             except PluginCallError as error:
-                stderr = await self._stderr(process)
-                kind: HostErrorKind = error.host_kind
-                raise PluginCallError(kind, f"{ref}: {error.message}", stderr=stderr) from None
+                pending = self._pending(entry, error.stderr)
+                raise PluginCallError(error.host_kind, error.message, stderr=pending) from None
+            pending = self._pending(entry, outcome.stderr)
+            if pending is outcome.stderr:
+                return outcome
+            return ToolResult(
+                data=outcome.data,
+                intents=outcome.intents,
+                stderr=pending,
+                violations=outcome.violations,
+            )
+
+    def _pending(self, entry: _Entry, stderr: str | None) -> str | None:
+        """`stderr` after what an earlier process wrote before it died, if anything."""
+        pending, entry.pending_stderr = entry.pending_stderr, None
+        if pending is None:
+            return stderr
+        return f"--- previous process ---\n{pending}" + (stderr or "")
+
+    async def _call_locked(
+        self, entry: _Entry, ref: str, params: dict[str, Any], input: Any, timeout_s: float | None
+    ) -> ToolResult:
+        name = entry.installed.manifest.name
+        process = await self._ready(entry)
+        if ref not in process.tools:
+            raise PluginCallError("tool_missing", f"{name} does not list {ref} in tools/list")
+        timeout = timeout_s or self._timeouts(name).call_timeout_s
+        try:
+            result = await process.call(ref, params, input, timeout)
+        except CallFailed as failed:
+            await process.stop(forced=True)
+            self._lost(entry)
+            stderr = process.capture.take(self.redactor())
+            raise PluginCallError(failed.kind, f"{ref}: {failed.message}", stderr=stderr) from None
+        except PluginCallError as error:
             stderr = await self._stderr(process)
-            return self._result(ref, result, stderr)
+            kind: HostErrorKind = error.host_kind
+            raise PluginCallError(kind, f"{ref}: {error.message}", stderr=stderr) from None
+        stderr = await self._stderr(process)
+        return self._result(ref, result, stderr)
 
     def _lost(self, entry: _Entry) -> None:
         """The process failed: it may be started once more in this run."""
         entry.process = None
-        if entry.starts >= 2:
+        entry.failures += 1
+        if entry.failures >= 2:
             entry.dead = "it failed twice in this run (one restart allowed)"
 
     async def _ready(self, entry: _Entry) -> PluginProcess:
         name = entry.installed.manifest.name
         if entry.process is not None and not entry.process.alive:
-            await entry.process.stop(forced=True)  # it died between two calls
+            dead = entry.process  # it died between two calls: keep what it wrote
+            await dead.stop(forced=True)
+            entry.pending_stderr = dead.capture.take(self.redactor())
             self._lost(entry)
         if entry.dead is not None:
             raise PluginCallError(
@@ -419,16 +539,19 @@ class PluginHost:
         elif len(result.content) == 1 and result.content[0].type == "text":
             try:
                 data = json.loads(result.content[0].text)
-            except ValueError:
-                raise invalid("the text result is not JSON") from None
+            except (ValueError, RecursionError):
+                raise invalid("the text result is not JSON (or nested too deeply)") from None
         else:
             raise invalid("no structured content and not a single JSON text block")
         intents = (result.meta or {}).get(INTENTS_META, [])
         if not isinstance(intents, list):
             raise invalid(f"_meta[{INTENTS_META!r}] is not a list")
         redactor = self.redactor()
-        data, in_data = redactor.redact_data(data)
-        intents, in_intents = redactor.redact_data(intents)
+        try:
+            data, in_data = redactor.redact_data(data)
+            intents, in_intents = redactor.redact_data(intents)
+        except SecretInKey as error:
+            raise invalid(f"an object key holds secret {error.name} (nothing stored)") from None
         violations: tuple[Violation, ...] = ()
         found = in_data | in_intents
         if found:
