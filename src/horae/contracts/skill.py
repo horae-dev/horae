@@ -27,7 +27,9 @@ The bracket-quoted form (`["a.b"]`) is reserved for keys with other characters.
 `input_view` is either a list of paths or a mapping `path: {options}` (#34 declares field
 classes there: `events[].attendees[]: {class: person}`). Options are free-form but bounded (at
 most 16 per path, scalar values or short lists); `class`, when given, is one of
-`FIELD_CLASSES`. v1 does not act on options; they join the skill's digest when present.
+`FIELD_CLASSES`: before a cloud model, the fields of a class are de-identified
+(`horae.llm.deid`, #34; `amount` also takes `buckets: [...]`). Options join the skill's digest
+when present.
 
 **Intents.** `intents` is either a list of intent types or a mapping `type: max` (#35): the
 skill may propose at most `max` intents of that type per step (the engine enforces it,
@@ -70,7 +72,7 @@ SkillFile = Annotated[
 """A file of the skill folder: one path segment (no `/`, `\\`, `..` or leading dot)."""
 
 FIELD_CLASSES = ("person", "email", "phone", "place", "amount", "free_text")
-"""The field classes an input view option `class` may name (#34; unused in v1)."""
+"""The field classes an input view option `class` may name (#34, `horae.llm.deid`)."""
 
 OptionName = Annotated[
     str, Strict(), StringConstraints(pattern=r"^[A-Za-z_][A-Za-z0-9_-]*$", max_length=64)
@@ -128,7 +130,7 @@ class SkillManifest(Contract):
         | Annotated[dict[ViewPath, ViewOptions | None], Field(min_length=1, max_length=MAX_ITEMS)]
     )
     """The only fields of the step input the model sees (an allow-list): a list of paths, or a
-    mapping `path: {options}` (options unused in v1)."""
+    mapping `path: {options}` (`class`: de-identification before a cloud model, #34)."""
     prompt: SkillFile = PROMPT_FILE
     """The prompt file, in the skill folder."""
     output_schema: SkillFile = OUTPUT_SCHEMA_FILE

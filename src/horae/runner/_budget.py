@@ -63,10 +63,13 @@ NOT_BILLED = frozenset(
         "auth_failed",
         "rate_limited",
         "overloaded",
+        "secret_in_request",
+        "deid_required",
     }
 )
 """`LlmError` kinds that mean the provider did not process the request (or no request was
-made): a reservation is released, not charged, when such an error reports no usage."""
+made): a reservation is released, not charged, when such an error reports no usage.
+`secret_in_request` and `deid_required` (#34) are refusals before anything is sent."""
 
 MIN_OUTPUT_TOKENS = 256
 """The least output a daily ceiling must leave an attempt (decision 41 A): when the capped

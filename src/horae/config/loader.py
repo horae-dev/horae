@@ -96,8 +96,12 @@ class Instance:
         """`RunRecord.config_digest`: SHA-256 of the canonical JSON of the `models` and `plugins`
         sections of `horae.yaml` as validated (defaults filled in), what a run's LLM cache key
         and plugins depend on. Other settings (time zone, state directory, timeouts) are not
-        part of it."""
+        part of it. An unset `models.<alias>.local` (#34) is left out, so that the digest of
+        an instance that does not use it is the one recorded before it existed."""
         data = self.config.model_dump(mode="json", include={"models", "plugins"})
+        for alias in data["models"].values():
+            if alias.get("local") is None:
+                alias.pop("local", None)
         return sha256_hex(data)
 
     @property

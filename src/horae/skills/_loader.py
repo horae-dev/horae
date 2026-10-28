@@ -119,6 +119,11 @@ class Skill:
         return self.input_view.paths
 
     @property
+    def view_options(self) -> Mapping[str, Mapping[str, Any]]:
+        """The non-empty options of the input view paths (field classes, #34)."""
+        return self.manifest.view_options
+
+    @property
     def output_schema(self) -> dict[str, Any]:
         """A fresh deep copy of the output schema: mutating it changes nothing here."""
         result: dict[str, Any] = json.loads(self.schema_json)

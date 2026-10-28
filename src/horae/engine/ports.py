@@ -199,6 +199,13 @@ class LlmRequest:
     """The loaded skill's version."""
     skill_digest: str | None = None
     """SHA-256 of the skill's content (`LoadedSkill.digest`)."""
+    classified: bool = False
+    """The skill's input view declares field classes (#34): a cloud backend must then be
+    given a de-identified request (`deidentified`), and refuses one that is not
+    (`deid_required`)."""
+    deidentified: Mapping[str, Any] | None = None
+    """When `input` is the pseudonymized viewed input (#34): the `Pseudonymized.summary`
+    (version, digest of what is sent, counts; never a value). `None`: not de-identified."""
 
 
 @dataclass(frozen=True)
@@ -249,6 +256,19 @@ class PreviousLlm:
     source_run: str | None = None
     """The run that produced the output (a cache entry's producer), recorded in the reuse
     marker of the run that reuses it (`request.source_run`); `None` when unknown."""
+    deid_input_sha256: str | None = None
+    """When the output was produced from a de-identified request (#34): the SHA-256 of what
+    was sent (`llm[].request.deid.input_sha256`). The engine reuses the output only when this
+    run's de-identified input has the same digest (both `None` without de-identification):
+    otherwise the pseudonyms it holds could name other values (another vocabulary, another
+    transform), so it is a miss, and a replay reports the mismatch."""
+
+
+def deid_digest(request: Any) -> str | None:
+    """`request.deid.input_sha256` of a recorded LLM request (#34), else `None`."""
+    deid = request.get("deid") if isinstance(request, dict) else None
+    digest = deid.get("input_sha256") if isinstance(deid, dict) else None
+    return digest if isinstance(digest, str) else None
 
 
 class LlmCache(Protocol):
@@ -348,6 +368,11 @@ class LoadedSkill(Protocol):
         """The input view paths (`SkillManifest.input_view`), sorted."""
         ...
 
+    @property
+    def view_options(self) -> Mapping[str, Mapping[str, Any]]:
+        """The non-empty options of the input view paths, by path (field classes, #34)."""
+        ...
+
     def view(self, data: Any) -> Any:
         """The step input restricted to the skill's input view (plain JSON, deterministic)."""
         ...
@@ -361,6 +386,44 @@ class SkillSource(Protocol):
 
     def load_skill(self, skill: str, plugin: ResolvedPlugin) -> LoadedSkill:
         """The validated skill `skill` of `plugin`; raises `SkillUnavailable`."""
+        ...
+
+
+class DeidUnavailable(Exception):
+    """De-identification cannot be done (`horae.llm.deid.DeidError`): the step degrades
+    (`deid_unavailable`) and nothing is sent. The message holds no personal data."""
+
+
+class Pseudonyms(Protocol):
+    """One viewed input, pseudonymized (`horae.llm.deid.Pseudonymized`), with its mapping in
+    memory only."""
+
+    @property
+    def data(self) -> Any:
+        """What the model is sent instead of the viewed input."""
+        ...
+
+    def summary(self) -> dict[str, Any]:
+        """What the run record keeps (`llm[].request.deid`): never a value."""
+        ...
+
+    def reidentify(self, value: Any) -> tuple[Any, list[str]]:
+        """`value` with real values put back, and the pseudonyms left unresolved."""
+        ...
+
+    def growth(self, value: Any) -> int:
+        """How many bytes re-identifying `value` would add (computed without substituting)."""
+        ...
+
+
+class Deidentifier(Protocol):
+    """The instance's de-identification policy (`horae.llm.deid.Deidentifier`, #34)."""
+
+    def pseudonymize(
+        self, model_alias: str, view_options: Mapping[str, Mapping[str, Any]], data: Any
+    ) -> Pseudonyms | None:
+        """`data` pseudonymized for `model_alias`, or `None` (a local alias, no field class).
+        Raises `DeidUnavailable`."""
         ...
 
 
