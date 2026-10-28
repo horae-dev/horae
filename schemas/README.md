@@ -2094,7 +2094,7 @@ loosened later without breaking a valid file.
     - **(H) no secret in a request (T10, the #14 addition).** `ModelBackends.send` scans the
       exact frozen body (`RenderedRequest.body()`) with the process registry
       (`horae.secrets.redact.current()`), primed once with **every secret the instance
-      declares** (`ModelBackends.secret_names` = `Instance.redaction_names()`, the #53 set:
+      declares** (`ModelBackends.redaction_names` = `Instance.redaction_names()`, the #53 set:
       `secrets.refs`, the lockfile's plugin secrets, the aliases' `secret`), not only those
       this process resolved: the raw bytes and the decoded JSON (strings, object keys,
       whole numbers), every encoding of decision 43. For **every** backend, local ones

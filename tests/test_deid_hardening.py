@@ -382,7 +382,7 @@ def test_a_declared_secret_never_resolved_is_still_refused(pack: Path, tmp_path:
         SecretResolver({}, folder),
         {"anthropic": lambda alias, spec, secrets: provider},
         validate=UNVALIDATED,
-        secret_names=("PLANTED_TOKEN",),
+        redaction_names=("PLANTED_TOKEN",),
     )
     data = {**DATA, "tasks": [{"title": f"Pay {PLANTED}"}]}
     record = _run_data(data, llm, pack, deid=_policy())

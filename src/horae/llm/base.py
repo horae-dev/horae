@@ -69,7 +69,7 @@ alias that is not local, but that was not de-identified, is refused with `deid_r
 before anything is rendered (an engine given no `Deidentifier`).
 
 **No secret leaves in a request** (T10, #34). `send` scans the exact frozen body
-(`RenderedRequest.body()`) for every secret the instance declares (`secret_names`, primed
+(`RenderedRequest.body()`) for every secret the instance declares (`redaction_names`, primed
 into the redaction registry before the first check) and every other one the process
 resolved, in all its encodings (the registry, `horae.secrets.redact.current()`: the raw
 bytes, and the decoded JSON strings, keys and numbers), whatever the backend: one found
@@ -557,7 +557,7 @@ class ModelBackends:
     validate: Validator | Unvalidated = field(default_factory=production_validator)
     """The output validator: `horae.llm.validate.validate_output` unless another one, or the
     explicit `UNVALIDATED`, is given (decisions 38 G and 44 D)."""
-    secret_names: tuple[str, ...] = ()
+    redaction_names: tuple[str, ...] = ()
     """Every secret the instance declares (`Instance.redaction_names`): resolved for
     redaction once, before the first request is checked, so the T10 check of `send` scans for
     all of them, not only those this process happened to resolve (decision 47 H)."""
@@ -701,7 +701,7 @@ class ModelBackends:
             raise LlmError("invalid_request", "the payload was changed after it was rendered")
         if not self._primed:
             self._primed = True
-            prime_redaction(self.secrets, self.secret_names)
+            prime_redaction(self.secrets, self.redaction_names)
         held = secrets_in(body)
         if held:
             names = ", ".join(sorted(held))

@@ -69,7 +69,7 @@ async def open_ports(
     owned: ModelBackends | None = None
     if llm is None and uses_llm(instance):
         llm = owned = model_backends(
-            instance.config.models, secrets, secret_names=instance.redaction_names()
+            instance.config.models, secrets, redaction_names=instance.redaction_names()
         )
     try:
         async with host_for_instance(instance, registry, secrets=secrets) as host:
