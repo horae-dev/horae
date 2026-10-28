@@ -1,0 +1,29 @@
+# horae.lock of the walking skeleton (#25), pinning the two built-in fixture plugins.
+#
+# Hand-written until `horae plugin add` (M4, #44) writes locks. The plugins ship inside the
+# core (`horae.plugins.builtin`), so `commit` is a placeholder: the lock format requires 40
+# hex digits, and a commit of the core repository cannot name the commit that contains it.
+# `paths.write` is where file-sink writes: replace /srv/horae/vault with your vault directory
+# (an absolute path). `tests/test_e2e.py` builds its lock from this file at test time, with
+# only that path replaced by its temporary vault.
+schema_version: 1
+plugins:
+  fixture-source:
+    version: 0.1.0
+    repo: https://github.com/horae-dev/horae.git
+    commit: "0000000000000000000000000000000000000000"
+    permissions:
+      network: []
+      secrets: []
+      paths: {}
+      intents: [note.replace_owned_block]
+  file-sink:
+    version: 0.1.0
+    repo: https://github.com/horae-dev/horae.git
+    commit: "0000000000000000000000000000000000000000"
+    permissions:
+      network: []
+      secrets: []
+      paths:
+        write: [/srv/horae/vault]
+      intents: [note.append_section, note.create, note.replace_owned_block]

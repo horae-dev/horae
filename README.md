@@ -35,6 +35,19 @@ Read the [plan](docs/PLAN.md), the [roadmap](docs/ROADMAP.md) and the [estimatio
 
 Stories, estimates and acceptance criteria are in this repository's [issues](../../issues) and on the [roadmap project](https://github.com/orgs/horae-dev/projects/1).
 
+## Examples
+
+- [`examples/walking-skeleton`](examples/walking-skeleton/): the M1 walking skeleton, an
+  instance whose pipeline reads synthetic data and writes today's owned note, with dry run,
+  undo and replay. [`tests/test_e2e.py`](tests/test_e2e.py) runs it end to end with real
+  plugin subprocesses.
+- Built-in example plugins (`horae.plugins.builtin`):
+  [`fixture-source`](src/horae/plugins/builtin/fixture_source/README.md), deterministic
+  synthetic data from a JSON fixture file, and
+  [`file-sink`](src/horae/plugins/builtin/file_sink/README.md), notes in a local vault, the
+  core computing every note's bytes. They are small stdio MCP servers built with the `mcp`
+  SDK, and a starting point for writing a plugin.
+
 ## Development
 
 Setup, commands, conventions and the definition of done are in [AGENTS.md](AGENTS.md). Provenance trailers are added by `scripts/graft_trailers.py` (pre-commit `prepare-commit-msg`). `graft.yaml` is validated in tests against a vendored schema (`tests/fixtures/graft.v1.schema.json`, from mmornati/graft@3f40dd1).

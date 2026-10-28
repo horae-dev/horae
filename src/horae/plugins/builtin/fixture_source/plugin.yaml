@@ -1,0 +1,14 @@
+# The fixture-source plugin (#25): deterministic synthetic data for tests and examples.
+# `horae.plugins.builtin.install` pins the command to an interpreter that has Horae.
+name: fixture-source
+version: 0.1.0
+horae: ">=0.1,<0.2"
+description: Serves deterministic synthetic data from a JSON fixture file (tests, examples).
+license: Apache-2.0
+provides:
+  sources: [fixture-source.serve]
+permissions:
+  intents: [note.replace_owned_block]
+runtime:
+  protocol: mcp-stdio
+  command: [python3, -m, horae.plugins.builtin.fixture_source]

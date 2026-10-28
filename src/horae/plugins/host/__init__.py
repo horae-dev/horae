@@ -23,8 +23,11 @@ plugin can read the environment, hence the declared secrets, of another plugin r
 same time (accepted for first-party plugins; each plugin is stopped after its last planned
 call to narrow it, schemas decision 35 A). The proper fix
 (one container per plugin, M5 #50/#51) is tracked there. `undeclared_secret`,
-`undeclared_path` and `egress_blocked` (network) are not detected in v1. The MCP-backed `Sink`
-(apply port) is a follow-up: sinks and notifiers are not called through this host yet.
+`undeclared_path` and `egress_blocked` (network) are not detected in v1.
+
+- `horae.plugins.host.sink`: the MCP-backed `Sink` / `RestorableSink` (`McpSink`) and its
+  `SinkRegistry` (`McpSinks`): a sink's operations are tools named by convention, called by
+  the core only (`PluginHost.call_operation`), with the core computing every note's bytes (#25).
 """
 
 from horae.plugins.host.errors import HostErrorKind, PluginCallError
@@ -35,11 +38,14 @@ from horae.plugins.host.host import (
     RegistryError,
     host_for_instance,
 )
+from horae.plugins.host.sink import McpSink, McpSinks
 
 __all__ = [
     "HostErrorKind",
     "HostRegistry",
     "InstalledPlugin",
+    "McpSink",
+    "McpSinks",
     "PluginCallError",
     "PluginHost",
     "RegistryError",

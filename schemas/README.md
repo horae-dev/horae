@@ -594,8 +594,8 @@ loosened later without breaking a valid file.
       the sink an entry's tool resolves to now has another identity than the one recorded
       (e.g. `--vault` names an empty or another vault). A note missing together with its
       directory is never "already restored" when a change of it was applied
-      (`parent_missing`: `RestorableSink.parent_exists`). Carrying the identity over MCP is
-      left to #24;
+      (`parent_missing`: `RestorableSink.parent_exists`). Over MCP the identity is
+      the plugin's (decision 36);
     - **undo restores bytes, not intents.** `RestorableSink` adds `read_target(target)`,
       `parent_exists(target)` and `restore(target, content, *, expected_sha256)`
       (`content=None` removes the note), a compare-and-swap. A synthetic `apply` was
@@ -749,3 +749,62 @@ loosened later without breaking a valid file.
       call timeout; the run timeout (#19) bounds the whole. Group termination cannot reach a
       descendant that left the group (`setsid`/`setpgid`), and the final `killpg` after the
       leader is reaped has a (very unlikely) PID-reuse race; both are M5's (#50, #51).
+
+### Provisional decisions (#25, pending maintainer review)
+
+36. **Plugin sinks, fixture plugins and the walking skeleton (#25).** No contract changes.
+    The rules (`horae.plugins.host.sink`, `horae.plugins.builtin`, `horae.runner.open_ports`):
+    - **sink operations by convention.** An `act` / `notify` entry's tool (`<ns>.<tool>`, in
+      `provides.sinks` or `provides.notifiers`) is never called. The core applies the intents
+      routed to it through five tools of the same plugin, named `<ns>.read`, `<ns>.apply`,
+      `<ns>.restore`, `<ns>.parent_exists` and `<ns>.identity`, which the plugin lists in
+      `tools/list` but **not** in `provides`, so no pipeline step can call them (the engine
+      only calls provided tools); the core calls them with `PluginHost.call_operation` (same
+      process, timeouts, restart and redaction as any call). `McpSinks` is the `SinkRegistry`
+      (`Ports.sinks`): one `McpSink` per (plugin, namespace);
+    - **the core computes the bytes (D1 of decision 32).** For a `note.*` intent `McpSink.apply`
+      reads the note (`<ns>.read`), checks the planned SHA-256 (`target_changed`), computes the
+      new bytes with `horae.apply.notes.note_after` and sends them to `<ns>.apply` with
+      `expected_before_sha256`: the plugin only writes them, atomically, if the note still has
+      that digest, and reports the digest of what it wrote (another one is `apply_mismatch`).
+      Other intents are passed through (`content` and `expected_before_sha256` `null`).
+      `restore` is the same compare-and-swap for undo (`content: null` removes the note);
+    - **wire format.** Arguments are JSON; note bytes are standard base64, at most 16 MiB
+      decoded (`note_too_large`), malformed results `output_invalid`. A sink error is a result
+      `{"error": {"kind", "message"}}`: the kind must match `^[a-z_]{1,32}$` (else
+      `host_error`), the message (already redacted by the host) loses its control and format
+      characters and is capped at 500 characters. A host failure becomes `SinkError` with the
+      host's kind (`timeout`, `plugin_crashed`, `tool_missing`…). The host's JSON-RPC cap
+      (8 MiB per message from a plugin) bounds a `read` to about 6 MiB of note (a larger one
+      fails `output_too_large`). A `secret_in_output` violation of a sink call is dropped
+      (its data is redacted; there is no step to record it on);
+    - **trusted configuration.** `horae.yaml` has no per-plugin configuration in v1, so every
+      sink operation receives `paths`, the plugin's path permissions as approved in
+      `horae.lock`. `file-sink` writes to its single `paths.write` entry (`vault_unset`
+      without one, `config_invalid` otherwise); its manifest asks for no path, since where the
+      vault is is the user's choice, granted in the lock;
+    - **identity (decision 34).** `mcp:<plugin>:<what <ns>.identity returns>` (its SHA-256 when
+      longer than 512 characters), fetched on the sink's first operation and cached, failure
+      included. `sink_identity` is synchronous: undo awaits `McpSinks.prepare()` first; until
+      the identity is fetched it raises `identity_unknown`. `file-sink` returns
+      `local:<st_dev>:<st_ino>:<real path>` of its vault, so undo refuses another vault
+      (`sink_mismatch`). The prefix keeps a plugin from claiming the identity of the built-in
+      `LocalFileSink`: `horae undo --vault` refuses a run applied through `file-sink` until #26
+      wires undo to the plugin host;
+    - **built-in fixture plugins.** `fixture-source` (`fixture-source.serve`, data and intents
+      from a JSON fixture file, default the packaged one) and `file-sink`
+      (`file-sink.write_note`, built on `LocalFileSink`, so the same path and write rules) are
+      stdio MCP servers in `horae.plugins.builtin`, version 0.1.0. Their packaged manifests run
+      `python3 -m <module>`; `horae.plugins.builtin.install(directory)` writes them to
+      `<directory>/<name>/plugin.yaml` with the command pinned to the running interpreter,
+      until M4 installs plugins into their own environments (#44, #46);
+    - **live ports.** `horae.runner.open_ports(instance, plugins_dir)` builds the
+      `HostRegistry` (`HostRegistry.from_directory`), opens a `PluginHost`
+      (`host_for_instance`) and `McpSinks` for one run or one undo, and closes the host at the
+      end of the block. Where plugins are installed is M4's; the CLI wiring is #26;
+    - **the walking skeleton** (`examples/walking-skeleton`) pins both plugins with a
+      placeholder commit (40 zeros: a commit of the core cannot name itself) and a vault path
+      to replace; `tests/test_e2e.py` builds its lock from it at test time. The end-to-end
+      test runs dry run (under the write guard, which then allows the plugins' processes and
+      Horae's own state: the store, `<state_dir>/locks` and `<state_dir>/plugin-runs`; the
+      vault is also compared byte for byte), run, replay and undo with real subprocesses.

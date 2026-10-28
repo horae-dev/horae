@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Run one pipeline: lock, heartbeat, execute, persist, timeouts and stale-run recovery (#19).
 
-See `horae.runner._runner` for the lifecycle and `horae.runner._lock` for the pipeline locks."""
+See `horae.runner._runner` for the lifecycle, `horae.runner._lock` for the pipeline locks and
+`horae.runner._ports` for the live ports of a run (`open_ports`: plugin host, registry, sinks)."""
 
 from horae.runner._lock import (
     APPLY_LOCK,
@@ -12,6 +13,7 @@ from horae.runner._lock import (
     lock_path,
     try_acquire_apply_lock,
 )
+from horae.runner._ports import LivePorts, open_ports
 from horae.runner._runner import (
     APPLY_LOCK_WAIT_S,
     DEFAULT_HEARTBEAT_S,
@@ -35,6 +37,7 @@ __all__ = [
     "LOCKS_DIR",
     "LOCK_RETRY_S",
     "STOP_GRACE_S",
+    "LivePorts",
     "LocksUnsupported",
     "PipelineLock",
     "PipelineLocked",
@@ -47,6 +50,7 @@ __all__ = [
     "lock_is_free",
     "lock_path",
     "new_run_id",
+    "open_ports",
     "recover_pipeline",
     "try_acquire_apply_lock",
 ]

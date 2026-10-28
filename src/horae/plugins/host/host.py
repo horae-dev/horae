@@ -39,6 +39,9 @@ run's `ToolCaller`:
 - **results**: `isError: true` is `tool_error`; the data is `structuredContent`, else a single
   text block that parses as JSON (PR #85 answer 9), else `output_invalid`; intents come from
   `_meta["dev.horae/intents"]` (a list) and are validated by the engine;
+- **sink operations** (`call_operation`): the core, never a pipeline step, may call a tool a
+  plugin lists in `tools/list` but not in `provides`, its sink operations
+  (`horae.plugins.host.sink`, #25), through the same process, timeouts and redaction;
 - **runtime.command is not pinned** against the lock in v1: the lock pins the plugin's
   version, commit and permissions, and the installed manifest's command is used as it is.
   Pinning it (and the plugin's files) is M4's install and verify work (#44, #46);
@@ -419,15 +422,49 @@ class PluginHost:
         except Exception:  # a host bug must never crash the run, nor leak a message
             raise PluginCallError("host_error", f"{ref}: unexpected host error") from None
 
+    async def call_operation(
+        self,
+        plugin: str,
+        tool: str,
+        arguments: dict[str, Any],
+        *,
+        timeout_s: float | None = None,
+    ) -> ToolResult:
+        """Call `plugin`'s tool `tool`, which it lists in `tools/list` but not in its manifest's
+        `provides`: a sink's operations (`horae.plugins.host.sink`), which only the core calls,
+        never a pipeline step (the engine's calls go through `call`, which requires `provides`).
+        Same process, timeouts, restarts, results and redaction as `call`; no input `_meta`.
+        Raises `PluginCallError` only."""
+        try:
+            try:
+                installed = self.registry.installed(plugin)
+            except UnknownPlugin:
+                raise PluginCallError("tool_missing", f"no installed plugin {plugin}") from None
+            return await self._call_on(installed, tool, arguments, None, timeout_s)
+        except PluginCallError as error:
+            raise self._redacted(error) from None
+        except Exception:  # a host bug must never crash the run, nor leak a message
+            raise PluginCallError("host_error", f"{tool}: unexpected host error") from None
+
     async def _call(
         self, ref: str, params: dict[str, Any], input: Any, timeout_s: float | None
     ) -> ToolResult:
-        if self._group is None:
-            raise PluginCallError("host_error", "the plugin host is not open")
         try:
             installed = self.registry.installed_for_tool(ref)
         except UnknownPlugin:
             raise PluginCallError("tool_missing", f"no installed plugin provides {ref}") from None
+        return await self._call_on(installed, ref, params, input, timeout_s)
+
+    async def _call_on(
+        self,
+        installed: InstalledPlugin,
+        ref: str,
+        params: dict[str, Any],
+        input: Any,
+        timeout_s: float | None,
+    ) -> ToolResult:
+        if self._group is None:
+            raise PluginCallError("host_error", "the plugin host is not open")
         name = installed.manifest.name
         entry = self._entries.setdefault(name, _Entry(installed))
         async with entry.lock:

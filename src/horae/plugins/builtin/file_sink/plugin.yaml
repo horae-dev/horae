@@ -1,0 +1,17 @@
+# The file-sink plugin (#25): writes notes to a local vault, the core computing the bytes.
+# The vault is the single `permissions.paths.write` entry approved in horae.lock (the core
+# passes the approved paths with every sink operation): the manifest asks for none, since
+# where the vault is is the user's choice. `horae.plugins.builtin.install` pins the command
+# to an interpreter that has Horae.
+name: file-sink
+version: 0.1.0
+horae: ">=0.1,<0.2"
+description: Applies note intents to a local vault directory (tests, examples).
+license: Apache-2.0
+provides:
+  sinks: [file-sink.write_note]
+permissions:
+  intents: [note.append_section, note.create, note.replace_owned_block]
+runtime:
+  protocol: mcp-stdio
+  command: [python3, -m, horae.plugins.builtin.file_sink]
