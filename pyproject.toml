@@ -43,6 +43,7 @@ dev = [
     "regex>=2024.11",
     "types-regex>=2024.11",
     "ruff>=0.17",
+    "hypothesis>=6.100",
 ]
 
 [tool.uv]

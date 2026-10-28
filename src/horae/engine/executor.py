@@ -91,8 +91,9 @@ entry of a later step, which is recorded in `ProposedIntent.applied_by` (the ent
    `%2f`, `%5c` or `%25` (any case). The link may add its own query and fragment;
 4. a `task.update_status` is routed only if its `task` fingerprint appears, as an exact string
    value, in the data collected so far in the run (`RunRecord.inputs`, and the current
-   `collect` step's earlier sources and own output): a proposer can change the status of a
-   task it was shown, not of one it guessed. `task.create` binds no target: its title is free
+   `collect` step's earlier sources and own output; for an `llm` step with a loaded skill,
+   only its **viewed** input, what the model was shown): a proposer can change the status of
+   a task it was shown, not of one it guessed. `task.create` binds no target: its title is free
    text.
 
 An intent that no entry takes fails the step (`intent_unrouted`), as does one that several
@@ -141,8 +142,12 @@ the alias. With a `SkillSource` (#27), the skill is loaded while planning (`skil
 otherwise), `input` is the step input restricted to the skill's input view (what the model
 sees, also what `LlmRequest.input` and `LlmCall.input_hash` hold), and the key adds
 `skill_version` and `skill_digest` (prompt, output schema, view and intents), so a new version
-or an edited prompt is a cache miss; `LlmCall.skill_version` is the loaded skill's, and the
-LLM's intents are checked against the plugin's permissions narrowed to the skill's `intents`.
+or an edited prompt is a cache miss; `LlmCall.skill_version` and `LlmCall.skill_digest` are the
+loaded skill's, and the LLM's intents are checked against the plugin's permissions narrowed to
+the skill's `intents`, at most its `intent_limits` of each type (`intent_rejected`). A viewed
+input of `null` (the input does not have the view's shape) degrades the step without calling
+the LLM (`input_invalid`). The skill is loaded before the backend is checked, so an invalid
+skill is `skill_invalid` even without a backend.
 When `previous` (the last accepted output, `PreviousLlm`) has the same key, no LLM
 call is made: its output and intents are reused (validated and routed again), recorded as an
 `LlmCall` with `cached=True` and zero usage, and the run continues. If the reused intents no
@@ -646,8 +651,6 @@ def _plan(
                 fail("plan_too_large", f"the pipeline uses more than {MAX_ITEMS} plugins")
 
         if isinstance(step, LlmStep):
-            if not has_llm:
-                fail("llm_unavailable", "the pipeline has an `llm` step and no LLM backend")
             try:
                 skill_plugin = plugins.plugin_for_skill(step.llm.skill)
             except UnknownPlugin:
@@ -655,9 +658,13 @@ def _plan(
             if step.llm.skill not in skill_plugin.manifest.provides.skills:
                 fail("tool_not_provided", f"{step.llm.skill} is not in the plugin's skills")
             use(skill_plugin)
+            # The skill is loaded before the backend check: an invalid skill is reported
+            # (`skill_invalid`) even where no backend is configured.
             skill = None if skills is None else _load_skill(skills, step.llm.skill, skill_plugin)
             if isinstance(skill, StepError):
                 fail(skill.kind, skill.message)
+            if not has_llm:
+                fail("llm_unavailable", "the pipeline has an `llm` step and no LLM backend")
             planned.append(
                 _Planned(index, kind, llm=step.llm, skill_plugin=skill_plugin, skill=skill)
             )
@@ -701,6 +708,7 @@ def _load_skill(skills: SkillSource, ref: str, plugin: ResolvedPlugin) -> Loaded
     try:
         skill = skills.load_skill(ref, plugin)
         name, intents = skill.name, frozenset(skill.intents)
+        limits = dict(skill.intent_limits)
     except SkillUnavailable as error:
         return StepError(kind="skill_invalid", message=_cap(str(error) or "skill unavailable"))
     except Exception as error:  # a port bug must not crash the run
@@ -710,6 +718,11 @@ def _load_skill(skills: SkillSource, ref: str, plugin: ResolvedPlugin) -> Loaded
     extra = sorted(intents - set(plugin.manifest.permissions.intents))
     if extra:
         message = f"{ref}: intents {', '.join(extra)} are not in the plugin's permissions"
+        return StepError(kind="skill_invalid", message=_cap(message))
+    if not set(limits) <= intents or not all(
+        type(value) is int and value >= 1 for value in limits.values()
+    ):
+        message = f"{ref}: the skill's intent limits do not match its intents"
         return StepError(kind="skill_invalid", message=_cap(message))
     return skill
 
@@ -823,11 +836,16 @@ class _Run:
         by: str,
         pending: int,
         collected: tuple[Any, ...] = (),
+        shown: tuple[Any, ...] | None = None,
+        limits: Mapping[str, int] | None = None,
     ) -> tuple[list[ProposedIntent], StepError | None]:
         """Validate and route one call's proposals; `pending` intents of this step are kept.
 
         `collected` is input data of the current `collect` step not yet in `self.inputs`
-        (searched, with them, for `task.update_status` fingerprints)."""
+        (searched, with them, for `task.update_status` fingerprints). `shown`, when given, is
+        what the proposer was shown (the LLM step's viewed input): fingerprints are searched
+        there only. `limits` caps the intents of each type (a skill's `intents: {type: max}`):
+        more is `intent_rejected`."""
         raw = _intent_list(raw)
         entries = [entry for entry in self.entries if entry.step > index]
         unroutable: list[tuple[str, int, str]] = []
@@ -852,6 +870,11 @@ class _Run:
             return [], rejected.step_error()
         if unroutable:  # pragma: no cover (an unfilled target always fails its schema)
             return [], _route_error(source, unroutable)
+        for intent_type, most in sorted((limits or {}).items()):
+            count = sum(1 for intent in typed if intent.type == intent_type)
+            if count > most:
+                message = f"{source}: {count} {intent_type} intents, the skill allows {most}"
+                return [], StepError(kind="intent_rejected", message=_cap(message))
         kept = len(self.intents) + sum(len(p) for p in self.pending.values()) + pending
         if kept + len(typed) > MAX_RUN_INTENTS:
             message = f"more than {MAX_RUN_INTENTS} intents in the run"
@@ -861,7 +884,11 @@ class _Run:
         for position, intent in enumerate(typed):
             if isinstance(intent, TaskUpdateStatus):
                 if known is None:
-                    known = _strings([snap.data for snap in self.inputs], collected)
+                    known = (
+                        _strings([snap.data for snap in self.inputs], collected)
+                        if shown is None
+                        else _strings(*shown)
+                    )
                 if intent.task not in known:
                     unroutable.append(("intent_unrouted", position, intent.type))
                     continue
@@ -1138,6 +1165,7 @@ def _reuse(
             step=step.index,
             skill=spec.skill,
             skill_version=previous.skill_version if step.skill is None else step.skill.version,
+            skill_digest=None if step.skill is None else step.skill.digest,
             backend=previous.backend,
             model=previous.model,
             cached=True,
@@ -1154,7 +1182,7 @@ def _reuse(
     violations = len(run.violations)
     proposer = _proposer(plugin, step.skill)
     accepted, rejected = run.propose(
-        raw, proposer, f"skill:{spec.skill}", step.index, spec.skill, 0
+        raw, proposer, f"skill:{spec.skill}", step.index, spec.skill, 0, **_shown(step, viewed)
     )
     if rejected is not None:
         # E.g. a target bound to `{{date}}` moved on: a cache miss, not a failure.
@@ -1163,6 +1191,14 @@ def _reuse(
     run.llm_calls.append(call)
     run.data, run.input_hash, run.reused = output, key, True
     return _Outcome("ok", output=output, intents=accepted)
+
+
+def _shown(step: _Planned, viewed: Any) -> dict[str, Any]:
+    """With a skill, `task.update_status` fingerprints must come from what the model was
+    shown (the viewed input), and its per-type intent limits apply."""
+    if step.skill is None:
+        return {}
+    return {"shown": (viewed,), "limits": dict(step.skill.intent_limits)}
 
 
 async def _llm_step(run: _Run, step: _Planned) -> _Outcome:
@@ -1177,12 +1213,16 @@ async def _llm_step(run: _Run, step: _Planned) -> _Outcome:
     except Exception as error:  # a skill bug must not crash the run
         message = f"unexpected {type(error).__name__} applying the input view"
         return _Outcome("degraded", StepError(kind="host_error", message=message), stop=True)
+    if skill is not None and viewed is None:
+        # Nothing of the input matches the view's shape: no call is made.
+        message = f"{spec.skill}: the step input does not have the shape of the input view"
+        return _Outcome("degraded", StepError(kind="input_invalid", message=message), stop=True)
     key = _cache_key(run, spec, plugin, skill, viewed)
     reused = _reuse(run, step, spec, plugin, key, viewed)
     if reused is not None:
         return reused
     prompt = None if skill is None else skill.prompt
-    output_schema = None if skill is None else dict(skill.output_schema)
+    output_schema = None if skill is None else skill.output_schema
 
     def degraded(kind: str, message: str) -> _Outcome:
         return _Outcome("degraded", StepError(kind=kind, message=_cap(message)), stop=True)
@@ -1250,6 +1290,7 @@ async def _llm_step(run: _Run, step: _Planned) -> _Outcome:
                 step=step.index,
                 skill=spec.skill,
                 skill_version=response.skill_version if skill is None else skill.version,
+                skill_digest=None if skill is None else skill.digest,
                 backend=response.backend,
                 model=response.model,
                 cached=response.cached,
@@ -1277,7 +1318,9 @@ async def _llm_step(run: _Run, step: _Planned) -> _Outcome:
         if not errors:
             source = f"skill:{spec.skill}"
             proposer = _proposer(plugin, skill)
-            accepted, rejected = run.propose(raw, proposer, source, step.index, spec.skill, 0)
+            accepted, rejected = run.propose(
+                raw, proposer, source, step.index, spec.skill, 0, **_shown(step, viewed)
+            )
             if rejected is not None:
                 return _Outcome("failed", rejected, stop=True)
             run.data, run.input_hash = output, key

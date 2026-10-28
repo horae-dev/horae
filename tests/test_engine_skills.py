@@ -120,6 +120,16 @@ def _run(plugins: FixturePlugins, llm: Any, skills: Any, **kwargs: Any) -> RunRe
     return record
 
 
+def _no_intents(pack: Path) -> None:
+    """Make the fixture skill propose no intents (and drop the reserved `intents` output)."""
+    folder = skill_dir(pack, SKILL)
+    text = (folder / "skill.yaml").read_text()
+    (folder / "skill.yaml").write_text(text.replace("intents: [note.create]", "intents: []"))
+    schema = json.loads((folder / "output.schema.json").read_text())
+    del schema["properties"]["intents"]
+    (folder / "output.schema.json").write_text(json.dumps(schema))
+
+
 def _previous(record: RunRecord) -> PreviousLlm:
     assert record.input_hash is not None
     call = record.llm[-1]
@@ -207,7 +217,7 @@ def test_unchanged_skill_and_input_reuse_the_output(pack: Path) -> None:
         (lambda t: t.replace("version: 1.0.0", "version: 1.1.0"), "skill.yaml"),
         (lambda t: t + "Keep it under five lines.\n", "prompt.md"),
         (lambda t: t.replace('"maxLength": 500', '"maxLength": 400'), "output.schema.json"),
-        (lambda t: t.replace("intents: [note.create]", "intents: []"), "skill.yaml"),
+        (lambda t: t.replace("intents: [note.create]", "intents: {note.create: 1}"), "skill.yaml"),
     ],
     ids=["version", "prompt", "schema", "intents"],
 )
@@ -286,7 +296,12 @@ def _skill(pack: Path, **changes: Any) -> Skill:
     skill = _skills(pack).load_skill(SKILL, _plugins().plugin_for_skill(SKILL))
     manifest = skill.manifest.model_copy(update=changes)
     return Skill(
-        manifest, skill.prompt, skill.schema, skill.input_view, skill.digest, skill.output_bound
+        manifest,
+        skill.prompt,
+        skill.schema_json,
+        skill.input_view,
+        skill.digest,
+        skill.output_bound,
     )
 
 
@@ -328,6 +343,11 @@ class _BadView:
             skill.output_schema,
             skill.intents,
         )
+        self.intent_limits, self.output_bound, self.view_paths = (
+            skill.intent_limits,
+            skill.output_bound,
+            skill.view_paths,
+        )
 
     def view(self, data: Any) -> Any:
         if isinstance(self._value, Exception):
@@ -353,8 +373,7 @@ def test_a_failing_view_degrades_the_step(pack: Path, value: Any, kind: str) -> 
 
 
 def test_llm_intents_are_checked_against_the_skill(pack: Path) -> None:
-    text = (skill_dir(pack, SKILL) / "skill.yaml").read_text()
-    (skill_dir(pack, SKILL) / "skill.yaml").write_text(text.replace("[note.create]", "[]"))
+    _no_intents(pack)
     record = _run(_plugins(), _llm(), _skills(pack))
     assert record.status == "failed"
     assert record.steps[2].error is not None
@@ -392,3 +411,128 @@ def test_a_run_with_a_skill_replays_identically(pack: Path) -> None:
     path.write_text(path.read_text() + "Edited.\n")
     edited = replay(record, _pipeline(), plugins=plugins, skills=_skills(pack))
     assert edited.outcome != "identical"
+
+
+def test_replay_reports_a_changed_skill(pack: Path) -> None:
+    plugins = _plugins()
+    record = _run(plugins, _llm(), _skills(pack))
+    path = skill_dir(pack, SKILL) / "prompt.md"
+    path.write_text(path.read_text() + "Edited.\n")
+    result = replay(record, _pipeline(), plugins=plugins, skills=_skills(pack))
+    assert result.outcome == "different"
+    field = f"llm.{SKILL}.skill_digest"
+    (diff,) = [d for d in result.summary if d.field == field]
+    assert diff.recorded == record.llm[0].skill_digest
+    assert diff.replayed != diff.recorded
+    assert any(note.startswith(f"skill {SKILL} changed since the run") for note in result.notes)
+    assert "skill_digest" in result.render()
+
+
+# --- review of #27: backend check order, null views, limits, fingerprints, digests ------------
+
+
+def test_an_invalid_skill_is_reported_without_a_backend(pack: Path) -> None:
+    (skill_dir(pack, SKILL) / "prompt.md").write_text("")
+    record = _run(_plugins(), None, _skills(pack))
+    assert record.steps[2].error is not None
+    assert record.steps[2].error.kind == "skill_invalid"
+    # A valid skill without a backend is still `llm_unavailable`.
+    record = _run(_plugins(), None, _skills(FIXTURE))
+    assert record.steps[2].error is not None
+    assert record.steps[2].error.kind == "llm_unavailable"
+
+
+def test_a_null_view_degrades_without_calling_the_llm(pack: Path) -> None:
+    llm = _llm()
+    record = _run(_plugins(data=["not", "an", "object"]), llm, _skills(pack))
+    assert record.status == "degraded"
+    assert record.steps[2].error is not None
+    assert record.steps[2].error.kind == "input_invalid"
+    assert llm.requests == []
+    assert record.llm == []
+
+
+def test_intent_limits_are_enforced_per_step(pack: Path) -> None:
+    path = skill_dir(pack, SKILL) / "skill.yaml"
+    path.write_text(path.read_text().replace("intents: [note.create]", "intents: {note.create: 1}"))
+    record = _run(_plugins(), _llm([NOTE, NOTE]), _skills(pack))
+    assert record.status == "failed"
+    error = record.steps[2].error
+    assert error is not None
+    assert error.kind == "intent_rejected"
+    assert "2 note.create intents, the skill allows 1" in error.message
+    assert record.intents == []
+    # Within the limit: accepted. A reused output over the limit is a cache miss.
+    ok = _run(_plugins(), _llm([NOTE]), _skills(pack))
+    assert ok.status == "ok"
+    previous = PreviousLlm(**{**_previous(ok).__dict__, "intents": [NOTE, NOTE]})
+    llm = _llm([NOTE])
+    again = _run(_plugins(), llm, _skills(pack), previous=previous)
+    assert len(llm.requests) == 1
+    assert again.status == "ok"
+
+
+def _todo_setup(pack: Path) -> tuple[FixturePlugins, Pipeline]:
+    folder = skill_dir(pack, SKILL)
+    text = (folder / "skill.yaml").read_text()
+    (folder / "skill.yaml").write_text(
+        text.replace("intents: [note.create]", "intents: [task.update_status]")
+    )
+    schema = json.loads((folder / "output.schema.json").read_text())
+    schema["properties"]["intents"] = {"type": "array", "maxItems": 4, "items": False}
+    (folder / "output.schema.json").write_text(json.dumps(schema))
+    data = {"tasks": [{"title": "todo:shown", "fp": "todo:hidden"}]}
+    plugins = _plugins(data, pack_intents=("task.update_status",))
+    plugins.add(_manifest("todo", ("task.create", "task.update_status"), sinks=["todo.write"]))
+    definition = _pipeline().model_dump(mode="json", exclude_none=True)
+    definition["steps"][3] = {"act": [{"todo.write": {"mode": "tasks"}}]}
+    return plugins, Pipeline.model_validate(definition)
+
+
+def test_status_updates_need_a_fingerprint_the_model_was_shown(pack: Path) -> None:
+    plugins, pipeline = _todo_setup(pack)
+
+    def run(task: str) -> RunRecord:
+        intent = {"type": "task.update_status", "task": task, "status": "done"}
+        return asyncio.run(
+            execute(
+                pipeline,
+                run_id="20261027T053000Z-brief-01",
+                context=CONTEXT,
+                started_at=START,
+                plugins=plugins,
+                tools=plugins,
+                llm=_llm([intent]),
+                skills=_skills(pack),
+            )
+        )
+
+    # Collected, but outside the input view: the model never saw it.
+    hidden = run("todo:hidden")
+    assert hidden.status == "failed", hidden.error
+    assert hidden.steps[2].error is not None
+    assert hidden.steps[2].error.kind == "intent_unrouted"
+    shown = run("todo:shown")
+    assert shown.status == "ok", shown.steps[2].error
+    assert [i.intent.type for i in shown.intents] == ["task.update_status"]
+
+
+def test_the_skill_digest_is_recorded(pack: Path) -> None:
+    skill = _skills(pack).load_skill(SKILL, _plugins().plugin_for_skill(SKILL))
+    first = _run(_plugins(), _llm(), _skills(pack))
+    assert first.llm[0].skill_digest == skill.digest
+    reused = _run(_plugins(), FakeLlm(), _skills(pack), previous=_previous(first))
+    assert reused.llm[0].cached is True
+    assert reused.llm[0].skill_digest == skill.digest
+    assert _run(_plugins(), _llm(), None).llm[0].skill_digest is None
+
+
+def test_editing_the_input_view_invalidates_the_cache(pack: Path) -> None:
+    previous = _previous(_run(_plugins(), _llm(), _skills(pack)))
+    path = skill_dir(pack, SKILL) / "skill.yaml"
+    path.write_text(path.read_text().replace("  - events[].summary\n", ""))
+    llm = _llm()
+    record = _run(_plugins(), llm, _skills(pack), previous=previous)
+    assert len(llm.requests) == 1
+    assert "summary" not in json.dumps(llm.requests[0].input["events"])
+    assert record.input_hash != previous.input_hash

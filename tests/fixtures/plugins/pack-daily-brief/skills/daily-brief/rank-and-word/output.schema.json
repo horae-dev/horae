@@ -17,6 +17,13 @@
       "items": {
         "$ref": "#/$defs/line"
       }
+    },
+    "intents": {
+      "type": "array",
+      "maxItems": 1,
+      "items": {
+        "$ref": "#/$defs/note"
+      }
     }
   },
   "$defs": {
@@ -38,6 +45,23 @@
             "today",
             "later"
           ]
+        }
+      }
+    },
+    "note": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "content"
+      ],
+      "properties": {
+        "type": {
+          "const": "note.create"
+        },
+        "content": {
+          "type": "string",
+          "maxLength": 4000
         }
       }
     }

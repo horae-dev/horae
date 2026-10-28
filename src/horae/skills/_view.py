@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """The input view: the allow-list of fields of the step input that the model sees."""
 
-import copy
+import json
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
@@ -36,9 +36,9 @@ class InputView:
     - a value of the wrong shape (an array where a path expects an object, or the reverse)
       selects nothing; when the root itself has the wrong shape, the view is `null`.
 
-    The result is deterministic: object keys are written in sorted order and the input is
-    never shared with the result (selected values are copied). Undeclared fields never reach
-    it, at any depth."""
+    The result is deterministic: object keys are sorted at every depth (inside selected whole
+    values too: the result is re-encoded with `sort_keys`) and the input is never shared with
+    the result. Undeclared fields never reach it, at any depth."""
 
     def __init__(self, paths: Iterable[str]) -> None:
         self.paths = tuple(sorted(set(paths)))
@@ -57,12 +57,14 @@ class InputView:
 
     def apply(self, data: Any) -> Any:
         selected = _select(data, self._root)
-        return None if isinstance(selected, _Missing) else selected
+        if isinstance(selected, _Missing):
+            return None
+        return json.loads(json.dumps(selected, sort_keys=True, allow_nan=False))
 
 
 def _select(value: Any, node: _Node) -> Any:
     if node.whole:
-        return copy.deepcopy(value)
+        return value  # copied by the re-encoding in `apply`
     if node.items is not None:
         if not isinstance(value, list):
             return _MISSING

@@ -229,10 +229,10 @@ class Ports:
     tools: ToolCaller
     llm: LlmBackend | None = None
     sinks: SinkRegistry | None = None
+    """The sinks and notifiers that apply a run's intents (#22); `None` applies nothing."""
     skills: SkillSource | None = None
     """Loads the `llm` step's skill (#27): `horae.skills.DirectorySkills` over the installed
     plugins; `None` sends the whole input and no prompt (fakes only)."""
-    """The sinks and notifiers that apply a run's intents (#22); `None` applies nothing."""
 
 
 @dataclass

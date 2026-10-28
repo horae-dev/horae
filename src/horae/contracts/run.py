@@ -198,6 +198,10 @@ class LlmCall(Contract):
     skill: SkillRef
     skill_version: Token
     """Version of the skill (part of the cache key)."""
+    skill_digest: Sha256Hex | None = None
+    """SHA-256 of the loaded skill's content (prompt, output schema, input view, intents; part
+    of the cache key), set by the engine when it loaded the skill (#27). Replays report a
+    skill that changed since the run."""
     backend: Literal["claude-cli", "anthropic", "openai-compatible", "ollama"]
     model: Token
     """The concrete model the alias resolved to."""

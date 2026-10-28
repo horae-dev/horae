@@ -250,11 +250,29 @@ class LoadedSkill(Protocol):
     def prompt(self) -> str: ...
 
     @property
-    def output_schema(self) -> Mapping[str, Any]: ...
+    def output_schema(self) -> Mapping[str, Any]:
+        """The output JSON Schema (a fresh copy on each access)."""
+        ...
 
     @property
     def intents(self) -> tuple[IntentType, ...]:
         """The intents the skill may propose (within the plugin's permissions)."""
+        ...
+
+    @property
+    def intent_limits(self) -> Mapping[str, int]:
+        """The most intents of a type the skill may propose per step (types not listed: no
+        limit beyond the run's)."""
+        ...
+
+    @property
+    def output_bound(self) -> int:
+        """The output schema's size bound, in UTF-8 bytes of compact JSON."""
+        ...
+
+    @property
+    def view_paths(self) -> tuple[str, ...]:
+        """The input view paths (`SkillManifest.input_view`), sorted."""
         ...
 
     def view(self, data: Any) -> Any:

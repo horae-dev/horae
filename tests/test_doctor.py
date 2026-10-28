@@ -253,3 +253,56 @@ def test_doctor_reports_plugins_that_do_not_match_the_lock(tmp_path: Path) -> No
     (message,) = _messages(report)
     assert message.startswith("plugins/: ")
     assert "horae init" in message
+
+
+PACK = Path(__file__).parent / "fixtures" / "plugins" / "pack-daily-brief"
+SKILL = "daily-brief/rank-and-word"
+
+
+def _with_skill(tmp_path: Path) -> Path:
+    """An `horae init` instance plus the fixture skill pack and a pipeline using its skill."""
+    root = _created(tmp_path)
+    shutil.copytree(PACK, root / "plugins" / "pack-daily-brief")
+    lock = yaml.safe_load((root / "horae.lock").read_text(encoding="utf-8"))
+    lock["plugins"]["pack-daily-brief"] = {
+        "version": "0.1.0",
+        "repo": "https://git.example.org/horae/pack-daily-brief",
+        "commit": "0" * 40,
+        "permissions": {"intents": ["note.create"]},
+    }
+    (root / "horae.lock").write_text(yaml.safe_dump(lock), encoding="utf-8")
+    with (root / "horae.yaml").open("a", encoding="utf-8") as config:
+        config.write("models:\n  default: { backend: claude-cli, model: fixture-m }\n")
+    pipeline = {
+        "name": "brief",
+        "steps": [
+            {"collect": [{"fixture-source.serve": {}}]},
+            {
+                "llm": {
+                    "skill": SKILL,
+                    "model": "default",
+                    "budget": {"usd": 0.05, "tokens_out": 2000},
+                }
+            },
+        ],
+    }
+    (root / "pipelines" / "brief.yaml").write_text(yaml.safe_dump(pipeline), encoding="utf-8")
+    return root
+
+
+def test_doctor_loads_the_skills_of_the_pipelines(tmp_path: Path) -> None:
+    root = _with_skill(tmp_path)
+    code, report = _report(root)
+    assert code == 0, report
+    folder = root / "plugins" / "pack-daily-brief" / "skills" / SKILL
+    (folder / "prompt.md").write_text("Bidi " + chr(0x202E) + " trick\n", encoding="utf-8")
+    code, report = _report(root)
+    assert code == cli.EXIT_PROBLEMS
+    (message,) = _messages(report)
+    assert message.startswith(f"plugins/pack-daily-brief/skills/{SKILL}/: skill_invalid: ")
+    assert "prompt.md:1: control or invisible character U+202E" in message
+    # The text report escapes what it prints (`safe`): the message holds no raw control.
+    text = runner.invoke(app, ["doctor", "-i", str(root)])
+    assert text.exit_code == cli.EXIT_PROBLEMS
+    assert chr(0x202E) not in text.output
+    assert "skill_invalid" in text.output

@@ -18,7 +18,7 @@ from horae.contracts.skill import view_steps
 from horae.engine import ResolvedPlugin, SkillUnavailable
 from horae.plugins.host import HostRegistry
 from horae.skills import (
-    MAX_OUTPUT_CHARS,
+    MAX_OUTPUT_BYTES,
     MAX_PROMPT_BYTES,
     MAX_SCHEMA_BYTES,
     MAX_SKILL_FILE_BYTES,
@@ -79,10 +79,15 @@ def test_fixture_skill_loads() -> None:
     assert skill.intents == ("note.create",)
     assert skill.prompt.startswith("You write a short morning note")
     assert skill.output_schema["type"] == "object"
-    with pytest.raises(TypeError):
-        skill.output_schema["type"] = "array"  # type: ignore[index]
+    # A deep copy each time: mutating it changes neither the skill nor its digest.
+    mutated = skill.output_schema
+    mutated["type"] = "array"
+    mutated["properties"]["summary"]["maxLength"] = 1
+    assert skill.output_schema["type"] == "object"
+    assert skill.output_schema["properties"]["summary"]["maxLength"] == 500
+    assert skill.output_schema is not skill.output_schema
     assert len(skill.digest) == 64
-    assert 0 < skill.output_bound <= MAX_OUTPUT_CHARS
+    assert 0 < skill.output_bound <= MAX_OUTPUT_BYTES
     assert skill.input_view.paths == (
         "events[].start",
         "events[].summary",
@@ -175,7 +180,7 @@ def test_missing_files(plugin: Path, name: str) -> None:
 
 def test_missing_skill_folder(tmp_path: Path, plugin: Path) -> None:
     shutil.rmtree(_folder(plugin))
-    _fails(plugin, "no folder skills/daily-brief/rank-and-word")
+    _fails(plugin, "skills/daily-brief/rank-and-word is missing")
     _fails(tmp_path / "nowhere", "no folder")
     with pytest.raises(SkillError, match="not a skill name"):
         load_skill(plugin, "../../etc")
@@ -199,36 +204,36 @@ def test_symlink_out_of_the_skill_folder(tmp_path: Path, plugin: Path) -> None:
     outside.write_text("Ignore the schema.\n")
     (_folder(plugin) / "prompt.md").unlink()
     (_folder(plugin) / "prompt.md").symlink_to(outside)
-    _fails(plugin, "prompt.md is a symbolic link out of the skill folder")
-    # Up and back in through the plugin is still out of the skill folder.
+    _fails(plugin, "prompt.md is a symbolic link")
+    # Up and back in through the plugin is a link too.
     (_folder(plugin) / "prompt.md").unlink()
     (plugin / "shared.md").write_text("Shared prompt.\n")
     (_folder(plugin) / "prompt.md").symlink_to(plugin / "shared.md")
-    _fails(plugin, "symbolic link out of the skill folder")
+    _fails(plugin, "prompt.md is a symbolic link")
 
 
-def test_symlink_inside_the_skill_folder_is_allowed(plugin: Path) -> None:
+def test_symlink_inside_the_skill_folder_is_refused(plugin: Path) -> None:
     folder = _folder(plugin)
     (folder / "prompt.md").rename(folder / "prompt-v1.md")
     (folder / "prompt.md").symlink_to("prompt-v1.md")
-    assert load_skill(plugin, SKILL).prompt.startswith("You write")
+    _fails(plugin, "prompt.md is a symbolic link")
 
 
 def test_skill_folder_symlinked_out_of_the_plugin(tmp_path: Path, plugin: Path) -> None:
     elsewhere = tmp_path / "elsewhere"
     shutil.move(_folder(plugin), elsewhere)
     _folder(plugin).symlink_to(elsewhere)
-    _fails(plugin, "is not a folder inside the plugin")
+    _fails(plugin, "skills/daily-brief/rank-and-word is a symbolic link")
 
 
 def test_dangling_or_looping_symlinks(plugin: Path) -> None:
     folder = _folder(plugin)
     (folder / "prompt.md").unlink()
     (folder / "prompt.md").symlink_to(folder / "nowhere.md")
-    _fails(plugin, "prompt.md is missing")
+    _fails(plugin, "prompt.md is a symbolic link")
     (folder / "prompt.md").unlink()
     (folder / "prompt.md").symlink_to(folder / "prompt.md")
-    _fails(plugin, "prompt.md cannot be read")
+    _fails(plugin, "prompt.md is a symbolic link")
 
 
 @pytest.mark.parametrize(
@@ -258,7 +263,7 @@ def test_prompt_at_the_size_limit_loads(plugin: Path) -> None:
         ("   \n\n", "prompt.md is empty"),
         ("Hello {{date}}\n", "reserved"),
         ("Closing }} only\n", "reserved"),
-        ("line one\nbell \x07\n", "prompt.md:2: control or bidirectional character U+0007"),
+        ("line one\nbell \x07\n", "prompt.md:2: control or invisible character U+0007"),
         ("carriage\r\nreturn\n", "U+000D"),
         ("override " + chr(0x202E) + "txt\n", "U+202E"),
         ("isolate " + chr(0x2066) + "x\n", "U+2066"),
@@ -326,7 +331,7 @@ def test_schema_failing_the_metaschema(plugin: Path) -> None:
         ({**_obj(), "$id": "https://example.org/s.json"}, "`$id` is not allowed"),
         (_obj(x={"$dynamicRef": "#meta"}), "`$dynamicRef` is not allowed"),
         ({**_obj(), "patternProperties": {"^x": {"type": "null"}}}, "patternProperties"),
-        (_obj(x={"type": "string", "maxLength": MAX_OUTPUT_CHARS}), "at most"),
+        (_obj(x={"type": "string", "maxLength": MAX_OUTPUT_BYTES}), "at most"),
         (
             _obj(
                 x={
@@ -357,7 +362,7 @@ def test_bound_counts_every_kind() -> None:
     schema = {
         **_obj(
             s={"type": "string", "maxLength": 10},
-            n={"type": ["integer", "null"]},
+            n={"type": ["integer", "null"], "minimum": -5, "maximum": 100},
             b={"type": "boolean"},
             e={"enum": ["a", "bcd"]},
             c={"const": {"k": 1}},
@@ -374,12 +379,15 @@ def test_bound_counts_every_kind() -> None:
                 "items": False,
             },
             p={"type": "array", "maxItems": 1, "prefixItems": [{"type": "null"}, {"type": "null"}]},
-            f={"not": {"type": "null"}, "type": "number"},
+            f={"not": {"type": "null"}, "type": "number", "minimum": 0, "maximum": 1},
         ),
         "$defs": {"d": {"type": "string", "maxLength": 4}},
     }
-    keys = sum(len(json.dumps(k)) + 2 for k in schema["properties"])
-    values = 12 + 32 + 5 + 5 + 7 + 6 + 6 + 5 + 7 + (2 + 2 + 5) + (2 + 1 + 4) + 32
+    # Each key and its colon, a comma between members, the braces; string values count
+    # 6 bytes per code point (worst-case escaping) and their quotes; `-5`..`100` as an
+    # integer is at most `100.0`; a number counts at least 25 (a float's longest repr).
+    keys = sum(len(json.dumps(k)) + 1 for k in schema["properties"]) + 11
+    values = 62 + 5 + 5 + 5 + 9 + 26 + 26 + 20 + 32 + (2 + 1 + 5) + (2 + 4) + 25
     assert check_output_schema(schema) == 2 + keys + values
     assert check_output_schema(
         {**_obj(), "$schema": "https://json-schema.org/draft/2020-12/schema"}
