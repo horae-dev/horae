@@ -147,11 +147,11 @@ def _run(
 ) -> RunRecord:
     kwargs.setdefault("clock", _clock())
     kwargs.setdefault("monotonic", _Monotonic())
+    kwargs.setdefault("context", CONTEXT)
     record = asyncio.run(
         execute(
             pipeline,
             run_id="20261027T053000Z-test-01",
-            context=CONTEXT,
             started_at=START,
             plugins=plugins,
             tools=plugins,
@@ -465,15 +465,39 @@ def test_sink_must_be_allowed_to_apply_the_type() -> None:
     steps: list[dict[str, Any]] = [
         {"collect": ["src.read"]},
         {"llm": LLM},
-        {"act": [{"weak.write": {"path": "Notes/2026-10-27.md"}}]},
+        {"act": [{"weak.write": {"path": "Notes/2026-10-27.md", "mode": "append-section"}}]},
     ]
     record = _run(_pipeline(*steps), plugins, FakeLlm([llm_response(BRIEF, intents=[CREATE])]))
     assert record.status == "failed"
     assert _error_kind(record, 1) == "intent_unrouted"
 
 
-def test_an_entry_without_a_target_takes_no_targeted_intent() -> None:
-    record = _route([CREATE], "sink.write")
+@pytest.mark.parametrize("entry", ["sink.write", {"sink.write": {"path": "Notes/{{date}}.md"}}])
+def test_act_entries_need_a_mode(entry: Any) -> None:
+    plugins = _flow_plugins([])
+    record = _run(_pipeline({"collect": ["src.read"]}, {"act": [entry]}), plugins)
+    assert record.status == "failed"
+    assert _statuses(record) == ["skipped", "failed"]
+    assert _error_kind(record, 1) == "params_invalid"
+    assert "missing `mode`" in (record.steps[1].error.message or "")  # type: ignore[union-attr]
+    assert plugins.calls == []
+
+
+@pytest.mark.parametrize(
+    ("bound", "proposed"),
+    [
+        ("Notes/a.md", "Notes/A.md"),  # case
+        ("Notes/a.md", "notes/a.md"),
+        ("Notes/caf\u00e9.md", "Notes/cafe\u0301.md"),  # NFC entry, NFD intent
+        ("Notes/cafe\u0301.md", "Notes/caf\u00e9.md"),  # NFD entry, NFC intent
+        ("Notes/a.md", "Notes/a.md "),
+    ],
+)
+def test_note_targets_match_as_exact_strings(bound: str, proposed: str) -> None:
+    entry = {"sink.write": {"path": bound, "mode": "create"}}
+    assert _route([{**CREATE, "path": bound}], entry).status == "ok"
+    record = _route([{**CREATE, "path": proposed}], entry)
+    assert record.status == "failed"
     assert _error_kind(record, 1) == "intent_unrouted"
 
 
@@ -497,9 +521,133 @@ def test_http_post_binds_the_url() -> None:
     ]
     record = _run(_pipeline(*steps), plugins, FakeLlm([llm_response(BRIEF, intents=[post])]))
     assert record.status == "ok", record.error
-    other = {**post, "url": "https://hooks.example.org/y"}
-    record = _run(_pipeline(*steps), plugins, FakeLlm([llm_response(BRIEF, intents=[other])]))
+    for url in (
+        "https://hooks.example.org/y",
+        "https://hooks.example.org/x?a=1",  # query string
+        "https://hooks.example.org/X",  # case
+        "https://hooks.example.org/x/",
+        "https://hooks.example.org:443/x",
+    ):
+        other = {**post, "url": url}
+        record = _run(_pipeline(*steps), plugins, FakeLlm([llm_response(BRIEF, intents=[other])]))
+        assert _error_kind(record, 1) == "intent_unrouted", url
+
+
+def test_permissions_are_checked_before_routing() -> None:
+    """A type the proposer may not propose is rejected, even when no entry could take it."""
+    post = {"type": "http.post", "body": {}}  # no url, and no `post` entry to fill it from
+    record = _route([post])
+    assert record.status == "failed"
+    assert _error_kind(record, 1) == "intent_rejected"
+    assert "intent_undeclared" in (record.steps[1].error.message or "")  # type: ignore[union-attr]
+
+    # Mixed with an allowed, unroutable intent: still a rejection.
+    record = _route([{"type": "note.create", "content": "hi"}, post])
+    assert _error_kind(record, 1) == "intent_rejected"
+
+    # Allowed but with nowhere to go: a routing error.
+    record = _route([{"type": "note.create", "content": "hi"}])
     assert _error_kind(record, 1) == "intent_unrouted"
+
+
+TASKS = ("task.create", "task.update_status")
+FINGERPRINT = "calendar:3b1f0c"
+
+
+def _task_run(intents: list[Any], data: Any = None, *, by_source: bool = False) -> RunRecord:
+    plugins = _flow_plugins([])
+    plugins.add(_manifest("todo", TASKS, sinks=["todo.write"]))
+    plugins.add(_manifest("skills", TASKS, skills=["skills/rank"]))
+    plugins.add(_manifest("src", TASKS, sources=["src.read", "src.more"]))
+    read = data if data is not None else [{"id": FINGERPRINT, "title": "Dentist"}]
+    plugins.handlers["src.read"] = lambda p, i: ToolResult(data=read)
+    plugins.handlers["src.more"] = lambda p, i: ToolResult(
+        data={"more": True}, intents=intents if by_source else None
+    )
+    steps: list[dict[str, Any]] = [
+        {"collect": ["src.read", "src.more"]},
+        {"llm": LLM},
+        {"act": [{"todo.write": {"mode": "tasks"}}]},
+    ]
+    llm = FakeLlm([llm_response(BRIEF, intents=None if by_source else intents)])
+    return _run(_pipeline(*steps), plugins, llm)
+
+
+def test_tasks_mode_routes_task_intents() -> None:
+    create = {"type": "task.create", "title": "Call the dentist", "fingerprint": "x:1"}
+    done = {"type": "task.update_status", "task": FINGERPRINT, "status": "done"}
+    snooze = {**done, "status": "snoozed", "until": "2026-10-30"}
+    record = _task_run([create, done, snooze])
+    assert record.status == "ok", record.error
+    assert [(i.intent.type, i.applied_by, i.applied_by_step) for i in record.intents] == [
+        ("task.create", "todo.write", 2),
+        ("task.update_status", "todo.write", 2),
+        ("task.update_status", "todo.write", 2),
+    ]
+    assert record.steps[2].output == [
+        {"call": "todo.write", "params": {"mode": "tasks"}, "intents": [0, 1, 2]}
+    ]
+    # A source may update a task an earlier source of the same step returned.
+    assert _task_run([done], by_source=True).status == "ok"
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        [{"id": "calendar:other"}],  # a different task
+        [{FINGERPRINT: "Dentist"}],  # only as an object key
+        [{"id": FINGERPRINT.upper()}],
+        [{"id": f"{FINGERPRINT} "}],
+    ],
+)
+def test_task_status_needs_a_collected_fingerprint(data: Any) -> None:
+    done = {"type": "task.update_status", "task": FINGERPRINT, "status": "done"}
+    record = _task_run([done], data)
+    assert record.status == "failed"
+    assert _error_kind(record, 1) == "intent_unrouted"
+    assert FINGERPRINT not in (record.steps[1].error.message or "")  # type: ignore[union-attr]
+    record = _task_run([done], data, by_source=True)
+    assert _error_kind(record, 0) == "intent_unrouted"
+
+
+LINK = "obsidian://open?vault=Main&file=Daily%2F2026-10-27"
+
+
+@pytest.mark.parametrize(
+    ("params", "link", "routed"),
+    [
+        ({}, None, True),
+        ({}, LINK, False),  # no link_prefix: a proposed link is never routed
+        ({"link_prefix": "obsidian://open?vault=Main&file="}, LINK, True),
+        ({"link_prefix": "obsidian://open?vault=Main&file="}, None, True),
+        ({"link_prefix": "obsidian://open?vault=Other&file="}, LINK, False),
+        ({"link_prefix": "obsidian://open?vault=Main&file="}, "https://evil.example.org/", False),
+        ({"link_prefix": "https://example.org/"}, "https://example.org.evil.example/x", False),
+        ({"link_prefix": "https://example.org/"}, "https://example.org/notes/1", True),
+    ],
+)
+def test_notification_links_need_a_trusted_prefix(
+    params: dict[str, Any], link: str | None, routed: bool
+) -> None:
+    push = {**PUSH, "link": link} if link else PUSH
+    record = _route([push], notify=[{"sink.notify": params}] if params else None)
+    if routed:
+        assert record.status == "ok", record.error
+        assert record.intents[0].applied_by == "sink.notify"
+    else:
+        assert record.status == "failed"
+        assert _error_kind(record, 1) == "intent_unrouted"
+        assert "evil" not in (record.steps[1].error.message or "")  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize(
+    "prefix", [7, "", "ftp://example.org/", "https://example.org", "https://ex ample.org/"]
+)
+def test_invalid_link_prefix_is_a_plan_error(prefix: Any) -> None:
+    plugins = _flow_plugins([])
+    record = _run(_pipeline({"notify": [{"sink.notify": {"link_prefix": prefix}}]}), plugins)
+    assert record.status == "failed"
+    assert _error_kind(record, 0) == "params_invalid"
 
 
 def test_two_notifiers_for_the_same_type_are_ambiguous() -> None:
@@ -531,6 +679,7 @@ def test_two_notifiers_for_the_same_type_are_ambiguous() -> None:
         {"mode": "overwrite", "path": "Notes/a.md"},
         {"mode": 3, "path": "Notes/a.md"},
         {"mode": "replace-owned"},
+        {"mode": "create"},  # no path
         {"mode": "append-section", "path": "Notes/a.md"},  # sink may not append
         {"mode": "create", "path": "../escape.md"},
         {"mode": "create", "path": 7},
@@ -583,6 +732,25 @@ def test_collect_partial_failure_skips_act_but_notifies() -> None:
     assert record.error is not None
     assert record.error.startswith("step 0 (collect)")
     assert record.input_hash is not None  # the LLM output itself was accepted
+
+
+def test_partial_input_drops_act_intents_and_records_notify_ones() -> None:
+    plugins = _daily_brief_plugins()
+    plugins.handlers["coach.brief"] = _fail()
+    note = {**NOTE, "path": NOTE_PATH}
+    record = _run(_daily_brief(), plugins, _brief_llm(intents=[note, PUSH, note]))
+    assert record.status == "degraded"
+    assert _statuses(record) == ["degraded", "ok", "ok", "skipped", "ok"]
+    act = record.steps[3]
+    assert act.output is None
+    assert act.error is not None
+    assert act.error.kind == "partial_input"
+    assert "2 intent(s) dropped" in act.error.message
+    # Only the notification is recorded, at index 0, and listed by its entry.
+    assert [(i.intent.type, i.applied_by, i.applied_by_step) for i in record.intents] == [
+        ("notify.push", "ntfy.digest", 4)
+    ]
+    assert record.steps[4].output[0]["intents"] == [0]
 
 
 def test_collect_total_failure_fails_the_run() -> None:
@@ -977,6 +1145,24 @@ def test_same_model_target_keeps_the_key() -> None:
     assert llm.requests == []
 
 
+def test_reused_intents_that_no_longer_route_are_a_cache_miss() -> None:
+    """The cache key covers the LLM input, not the context: a reused intent with an explicit
+    `Daily/<day 1>` path no longer routes to the day-2 entry, so the LLM is called."""
+    plugins = _daily_brief_plugins()
+    explicit = {**NOTE, "path": NOTE_PATH}
+    first = _run(_daily_brief(), plugins, _brief_llm(intents=[explicit, PUSH]))
+    assert first.status == "ok", first.error
+    day2 = make_context(START + datetime.timedelta(days=1), "Europe/Paris")
+    llm = _brief_llm()
+    second = _run(_daily_brief(), plugins, llm, previous=_previous(first), context=day2)
+    assert len(llm.requests) == 1
+    assert second.status == "ok", second.error
+    assert second.input_hash == first.input_hash
+    assert [c.cached for c in second.llm] == [False]  # the reuse attempt is not recorded
+    assert second.violations == []
+    assert second.intents[0].intent.model_dump()["path"] == "Daily/2026-10-28.assistant.md"
+
+
 def test_unusable_previous_output_calls_the_llm() -> None:
     plugins = _daily_brief_plugins()
     first = _run(_daily_brief(), plugins, _brief_llm())
@@ -1185,3 +1371,55 @@ def test_route_fields_go_together() -> None:
         ProposedIntent.model_validate(
             {"step": 0, "proposed_by": "a.b", "intent": PUSH, "applied_by": "c.d"}
         )
+
+
+def _brief_record() -> RunRecord:
+    return _run(_daily_brief(), _daily_brief_plugins(), _brief_llm())
+
+
+@pytest.mark.parametrize(
+    ("change", "match"),
+    [
+        ({"step": 9}, "step 9 is out of range"),
+        ({"applied_by_step": 2}, "not a later step"),
+        ({"applied_by_step": 9}, "not a later step"),
+        ({"applied_by_step": 4}, "must be applied by a step of kind act"),
+        ({"applied_by_call": 1}, "does not list it"),
+        ({"applied_by": "ntfy.digest"}, "does not list it"),
+    ],
+)
+def test_run_record_rejects_impossible_routes(change: dict[str, Any], match: str) -> None:
+    data = json.loads(_brief_record().model_dump_json())
+    data["intents"][0].update(change)
+    with pytest.raises(ValidationError, match=match):
+        RunRecord.model_validate(data)
+
+
+def test_run_record_entry_must_list_its_intent() -> None:
+    data = json.loads(_brief_record().model_dump_json())
+    data["steps"][4]["output"][0]["intents"] = []
+    with pytest.raises(ValidationError, match="intent 1: entry 0 of step 4 does not list it"):
+        RunRecord.model_validate(data)
+    data["intents"][1]["intent"] = NOTE | {"path": NOTE_PATH}
+    with pytest.raises(ValidationError, match="must be applied by a step of kind act"):
+        RunRecord.model_validate(data)
+    # A skipped entry step records no entries: only the step and kind are checked.
+    data = json.loads(_brief_record().model_dump_json())
+    data["steps"][3]["output"] = None
+    RunRecord.model_validate(data)
+
+
+def test_store_ignores_an_unreadable_or_intentless_record(tmp_path: Path) -> None:
+    with Store.open(tmp_path / "state.db") as store:
+        record = _store_run(store, "r1", llm=_brief_llm())
+        assert store.last_accepted_llm("daily-brief") is not None
+        broken = json.loads(record.model_dump_json())
+        broken["intents"][0]["applied_by_step"] = 0
+        store._conn.execute("UPDATE runs SET record = ? WHERE id = ?", (json.dumps(broken), "r1"))
+        assert store.last_accepted_llm("daily-brief") is None
+
+        legacy = record.model_copy(
+            update={"llm": [record.llm[0].model_copy(update={"intents": None})]}
+        )
+        store.save_run(legacy)
+        assert store.last_accepted_llm("daily-brief") is None

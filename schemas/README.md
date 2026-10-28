@@ -285,5 +285,23 @@ loosened later without breaking a valid file.
     them. `llm[].intents` records the raw intents returned with the response, before the core
     fills a target from the entry's parameters, for replays and for reuse on unchanged input
     (D2). `input_hash` is the LLM step's cache key (`horae.engine`), set only when the LLM output
-    was accepted or reused. The routing and binding rules (`mode`, `path`, `url`) are the
-    engine's, documented in `horae.engine.executor`.
+    was accepted or reused. The routing and binding rules are the engine's, documented in
+    `horae.engine.executor`; in short:
+    - every `act` entry has a **required** `mode` (`create`, `append-section`,
+      `replace-owned`, `tasks`, `post`); the note modes bind `path` and `post` binds `url`,
+      compared as exact strings (no case, Unicode or URL normalisation);
+    - a `notify.push` `link` is routed only to a `notify` entry whose trusted `link_prefix` it
+      starts with; without `link_prefix` a proposed link is never routed;
+    - a `task.update_status` is routed only if its `task` fingerprint appears as a string value
+      in the run's collected input; `task.create` binds no target;
+    - two entries that may apply the same type to the same target make every such intent
+      `intent_ambiguous`, by design: untrusted data never chooses between trusted entries;
+    - the proposer's permissions are checked before routing (`intent_rejected` wins);
+    - the run record model checks that a route names a real, later entry of the right kind
+      that lists the intent.
+
+    Routing binds where an intent goes, not what it says: note content, task titles,
+    notification titles and bodies, and `http.post` bodies stay untrusted text, which appliers
+    must treat as data. Reusing an unchanged input re-proposes identical intents, `notify.push`
+    included, so appliers (#21/#22) must deduplicate notifications (e.g. by `input_hash` and
+    intent); reused intents that no longer route are a cache miss and the LLM is called.

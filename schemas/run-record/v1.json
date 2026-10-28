@@ -1058,7 +1058,7 @@
       "type": "array"
     },
     "intents": {
-      "description": "Intents proposed and accepted during the run, at most `MAX_RUN_INTENTS` in all.",
+      "description": "Intents proposed and accepted during the run, at most `MAX_RUN_INTENTS` in all. A routed\nintent's entry must exist (checked by the pydantic model only): `step` and\n`applied_by_step` index `steps`, the entry's step comes after the proposer's and is a\n`notify` step for `notify.push`, an `act` step otherwise, and when that step recorded its\nentries (`output`), entry `applied_by_call` is `applied_by` and lists this intent.",
       "items": {
         "$ref": "#/$defs/ProposedIntent"
       },

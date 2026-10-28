@@ -246,7 +246,11 @@ class RunRecord(Contract):
     """One record per pipeline step, in order."""
     llm: BoundedList[LlmCall]
     intents: Annotated[list[ProposedIntent], Field(max_length=MAX_RUN_INTENTS)]
-    """Intents proposed and accepted during the run, at most `MAX_RUN_INTENTS` in all."""
+    """Intents proposed and accepted during the run, at most `MAX_RUN_INTENTS` in all. A routed
+    intent's entry must exist (checked by the pydantic model only): `step` and
+    `applied_by_step` index `steps`, the entry's step comes after the proposer's and is a
+    `notify` step for `notify.push`, an `act` step otherwise, and when that step recorded its
+    entries (`output`), entry `applied_by_call` is `applied_by` and lists this intent."""
     changes: BoundedList[AppliedChange]
     violations: BoundedList[Violation] = Field(default_factory=list)
     cost: Usage
@@ -261,5 +265,34 @@ class RunRecord(Contract):
         for change in self.changes:
             if change.intent >= len(self.intents):
                 raise ValueError(f"change refers to intent {change.intent}, out of range")
+        for index, intent in enumerate(self.intents):
+            _check_route(index, intent, self.steps)
         _ordered(self.started_at, self.finished_at)
         return self
+
+
+def _check_route(index: int, intent: ProposedIntent, steps: list[StepRecord]) -> None:
+    """`intent` (at `index` in `RunRecord.intents`) names an entry the run really has."""
+    if intent.step >= len(steps):
+        raise ValueError(f"intent {index}: step {intent.step} is out of range")
+    target, call = intent.applied_by_step, intent.applied_by_call
+    if target is None or call is None:
+        return
+    if not intent.step < target < len(steps):
+        raise ValueError(f"intent {index}: applied_by_step {target} is not a later step")
+    kind = "notify" if intent.intent.type == "notify.push" else "act"
+    if steps[target].kind != kind:
+        raise ValueError(
+            f"intent {index}: {intent.intent.type} must be applied by a step of kind {kind}"
+        )
+    output = steps[target].output
+    if output is None:
+        return
+    entry = output[call] if isinstance(output, list) and call < len(output) else None
+    if (
+        not isinstance(entry, dict)
+        or entry.get("call") != intent.applied_by
+        or not isinstance(entry.get("intents"), list)
+        or index not in entry["intents"]
+    ):
+        raise ValueError(f"intent {index}: entry {call} of step {target} does not list it")

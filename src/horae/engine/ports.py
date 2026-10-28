@@ -168,7 +168,12 @@ class PreviousLlm:
 
     Built by the caller from the last finished, non-dry-run run when it is `ok` or `noop`
     (`horae.store.Store.last_accepted_llm`). When its `input_hash` equals this run's cache key,
-    the engine makes no LLM call and reuses `output` and `intents`."""
+    the engine makes no LLM call and reuses `output` and `intents` (or, if those intents no
+    longer validate or route, calls the LLM as on a cache miss).
+
+    Reuse re-proposes identical intents, `notify.push` included: appliers (#21/#22) must
+    deduplicate notifications, e.g. by `input_hash` and intent, so an unchanged input does not
+    notify twice."""
 
     input_hash: str
     output: Any

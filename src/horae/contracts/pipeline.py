@@ -96,15 +96,17 @@ class LlmStep(Contract):
 class ActStep(Contract):
     """Sinks, which apply the intents routed to them after the run's steps. The core first
     validates every intent against the proposing plugin's `permissions.intents`, routes it to
-    the one entry whose sink may apply it and whose trusted parameters (`mode`, `path`, `url`)
-    bind its target, shows it in a dry run and journals it."""
+    the one entry whose sink may apply it and whose trusted parameters (a required `mode`, and
+    `path` or `url`) bind its target, shows it in a dry run and journals it (rules in
+    `horae.engine.executor`)."""
 
     act: CallList
 
 
 class NotifyStep(Contract):
     """Notifiers, which apply the `notify.push` intents routed to them. Their parameters
-    (`topic`, `when`…) are trusted metadata for the notifier."""
+    (`topic`, `when`…) are trusted metadata for the notifier; a proposed `link` is routed only
+    to an entry whose trusted `link_prefix` it starts with."""
 
     notify: CallList
 

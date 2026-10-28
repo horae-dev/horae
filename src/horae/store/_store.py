@@ -29,7 +29,7 @@ from types import TracebackType
 from typing import Any, Literal, Self
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import ConfigDict, model_validator
+from pydantic import ConfigDict, ValidationError, model_validator
 
 from horae.contracts import RunRecord, StepRecord, Usage
 from horae.contracts.intents import INTENT_TYPES, ClockTime, IntentType
@@ -649,7 +649,8 @@ class Store:
         `noop`: after a `degraded`, `failed` or `undone` run (or with no run, or no accepted
         LLM output in it) this is `None`, so the next run calls the LLM again. Read from the
         stored run record: its `input_hash`, and the last schema-valid `LlmCall` of its `llm`
-        step if that step is `ok`."""
+        step if that step is `ok`. A stored record that no longer validates, or a call without
+        recorded intents (`intents` is `None`), is not reused either."""
         row = self._conn.execute(
             "SELECT status, record FROM runs WHERE pipeline = ? AND dry_run = 0 "
             "AND status != 'running' ORDER BY started_at DESC, id DESC LIMIT 1",
@@ -657,7 +658,10 @@ class Store:
         ).fetchone()
         if row is None or row[0] not in ("ok", "noop") or row[1] is None:
             return None
-        record = RunRecord.model_validate_json(row[1])
+        try:
+            record = RunRecord.model_validate_json(row[1])
+        except ValidationError:
+            return None
         if record.input_hash is None:
             return None
         steps = [i for i, step in enumerate(record.steps) if step.kind == "llm"]
@@ -667,10 +671,12 @@ class Store:
         if not calls:
             return None
         call = calls[-1]
+        if call.intents is None:
+            return None
         return PreviousLlm(
             input_hash=record.input_hash,
             output=call.response,
-            intents=list(call.intents or []),
+            intents=list(call.intents),
             skill_version=call.skill_version,
             model=call.model,
             backend=call.backend,

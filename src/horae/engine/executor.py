@@ -23,7 +23,8 @@ and every other step `skipped`, when:
   `transform` `transforms`, `act` `sinks`, `notify` `notifiers`, `llm` `skills`);
 - a parameter template is invalid (`template_error`), or a rendered parameter is not plain
   JSON data (`params_invalid`: e.g. `NaN`, a date object, nesting deeper than 64);
-- an `act` entry's binding parameters are invalid (`params_invalid`, see below);
+- an `act` entry has no valid `mode`, or its binding parameters (or a `notify` entry's
+  `link_prefix`) are invalid (`params_invalid`, see below);
 - the pipeline has more than `MAX_ITEMS` `collect` calls in all, or uses more than
   `MAX_ITEMS` plugins (`plan_too_large`: the run record could not hold them);
 - the pipeline has an `llm` step and no backend was given (`llm_unavailable`).
@@ -55,30 +56,48 @@ entry of a later step, which is recorded in `ProposedIntent.applied_by` (the ent
 
 1. its plugin's `permissions.intents` lists the intent type (the sink must be allowed to apply
    it), and the type is one the entry binds: `notify` entries bind `notify.push` only; `act`
-   entries bind the types of their `mode` (table below) or, without `mode`, every type except
-   `notify.push`;
-2. the intent's target matches the entry's **trusted** binding parameter exactly: a note
-   intent's `path` must equal the entry's `path`, an `http.post` `url` the entry's `url`. An
-   entry without that parameter takes no intent of that type. When the proposer **omits** the
+   entries bind the types of their **required** `mode` (table below);
+2. the intent's target matches the entry's **trusted** binding parameter exactly, as plain
+   strings (no case folding, Unicode, path or URL normalisation: `Notes/A.md` for `Notes/a.md`,
+   an NFD spelling of an NFC path, or `…/x?a=1` for `…/x` do not match): a note intent's
+   `path` must equal the
+   entry's `path`, an `http.post` `url` the entry's `url`. When the proposer **omits** the
    target, the core fills it from the one entry that binds the type; if there is none or more
-   than one, the intent is unrouted or ambiguous.
+   than one, the intent is unrouted or ambiguous;
+3. a `notify.push` with a `link` is taken only by a `notify` entry with a trusted
+   `link_prefix` parameter that the link starts with (a prefix must be a valid notification
+   link ending in one of `/ ? = & #`); without `link_prefix`, a proposed link is never routed;
+4. a `task.update_status` is routed only if its `task` fingerprint appears, as an exact string
+   value, in the data collected so far in the run (`RunRecord.inputs`, and the current
+   `collect` step's earlier sources and own output): a proposer can change the status of a
+   task it was shown, not of one it guessed. `task.create` binds no target: its title is free
+   text.
 
 An intent that no entry takes fails the step (`intent_unrouted`), as does one that several
 entries take (`intent_ambiguous`): untrusted data can never pick a target outside the trusted
-parameters (PLAN.md §2.1 tenet 5). Other parameters of an entry (`topic`, `when`…) are trusted
-metadata for the sink, recorded with the entry in the `act` / `notify` step's `output`:
+parameters (PLAN.md §2.1 tenet 5). This is intended: two entries that may apply the same type
+to the same target (e.g. two notifiers of `notify.push`, or two `mode: tasks` sinks) make
+every such intent ambiguous; give each its own target, or only one entry the type. The
+proposer's permissions are checked first: a type it may not propose is `intent_rejected`
+even when no entry could take it either. Other parameters of an entry (`topic`, `when`…) are
+trusted metadata for the sink, recorded with the entry in the `act` / `notify` step's `output`:
 `[{"call": <ref>, "params": {...}, "intents": [<indices into RunRecord.intents>]}]`.
+
+**Untrusted text.** Routing binds where an intent goes, never what it says: note content,
+task titles, notification titles and bodies and `http.post` bodies are untrusted text from
+the proposer. Appliers (#21/#22) must treat them as data (never as markup to interpret,
+commands, templates or further targets).
 
 | `mode` | intent types | binding parameter |
 |---|---|---|
 | `create` | `note.create` | `path` (required) |
 | `append-section` | `note.append_section` | `path` (required) |
 | `replace-owned` | `note.replace_owned_block` | `path` (required) |
-| `tasks` | `task.create`, `task.update_status` | none |
+| `tasks` | `task.create`, `task.update_status` | none (fingerprint check, rule 4) |
 | `post` | `http.post` | `url` (required) |
 
-Any other `mode`, a `mode` whose types the sink may not apply, or a missing or invalid
-binding parameter is a plan error (`params_invalid`). A step's intents are kept only if the
+A missing or unknown `mode`, a `mode` whose types the sink may not apply, or a missing or
+invalid binding parameter is a plan error (`params_invalid`). A step's intents are kept only if the
 whole step is accepted, an intent enters `RunRecord.intents` only when the step of its entry
 runs, and the run-wide total is capped at `MAX_RUN_INTENTS` (`run_intents_exceeded`). Nothing
 is applied here: that is #21/#22, which must not apply a `failed` run.
@@ -88,11 +107,14 @@ accepted, is the SHA-256 of the canonical JSON of `{skill, plugin: {name, versio
 model, input}`, where `model` is the alias's target from `models` when the caller knows it, else
 the alias. When `previous` (the last accepted output, `PreviousLlm`) has the same key, no LLM
 call is made: its output and intents are reused (validated and routed again), recorded as an
-`LlmCall` with `cached=True` and zero usage, and the run continues. Without a usable `previous`
-the LLM is called. `timeout_s` (default `DEFAULT_LLM_TIMEOUT_S`) is one deadline for both
-attempts. The budget counts what every attempt cost, including the `usage` of a failed attempt
-(`LlmError.usage`); a backend's cached response costs nothing and counts towards neither the
-cost nor the budget.
+`LlmCall` with `cached=True` and zero usage, and the run continues. If the reused intents no
+longer validate or route (e.g. an explicit target bound to `{{date}}` moved to a new day), it
+is a cache miss: nothing of `previous` is recorded and the LLM is called. Without a usable
+`previous` the LLM is called. A reused run re-proposes the same intents, including
+`notify.push`: appliers must deduplicate notifications (e.g. by `input_hash` and intent).
+`timeout_s` (default `DEFAULT_LLM_TIMEOUT_S`) is one deadline for both attempts. The budget
+counts what every attempt cost, including the `usage` of a failed attempt (`LlmError.usage`);
+a backend's cached response costs nothing and counts towards neither the cost nor the budget.
 
 **Step policy** (step status, then the effect on the run; the run status is the worst of
 `failed` > `degraded` > `noop` > `ok`):
@@ -136,7 +158,7 @@ from typing import Any, NoReturn
 
 from pydantic import TypeAdapter, ValidationError
 
-from horae.contracts.intents import INTENT_TYPES, Intent, IntentType
+from horae.contracts.intents import Intent, IntentType, NotifyLink, NotifyPush, TaskUpdateStatus
 from horae.contracts.pipeline import (
     ActStep,
     Budget,
@@ -214,7 +236,8 @@ TARGET_FIELDS: dict[IntentType, str] = {
 """The intent field an `act` entry's parameter of the same name binds."""
 
 _NOTIFY_TYPES: frozenset[IntentType] = frozenset({"notify.push"})
-_ACT_TYPES: frozenset[IntentType] = frozenset(INTENT_TYPES) - _NOTIFY_TYPES
+_LINK: TypeAdapter[str] = TypeAdapter(NotifyLink)
+_PREFIX_ENDS = frozenset("/?=&#")
 _BINDING_TYPES: dict[str, TypeAdapter[str]] = {
     "path": TypeAdapter(NotePath),
     "url": TypeAdapter(HttpsUrl),
@@ -357,11 +380,15 @@ class _Entry:
     types: frozenset[IntentType]
     binds: dict[str, str]
 
-    def takes(self, intent_type: str, target: str | None) -> bool:
-        if intent_type not in self.types:
+    def takes(self, intent: Intent) -> bool:
+        """Exact string comparison: no case folding, Unicode or URL normalisation."""
+        if intent.type not in self.types:
             return False
-        bound = TARGET_FIELDS.get(intent_type)
-        return bound is None or self.binds.get(bound) == target
+        if isinstance(intent, NotifyPush):
+            prefix = self.binds.get("link_prefix")
+            return intent.link is None or (prefix is not None and intent.link.startswith(prefix))
+        bound = TARGET_FIELDS.get(intent.type)
+        return bound is None or self.binds.get(bound) == getattr(intent, bound)
 
 
 @dataclass(frozen=True)
@@ -412,9 +439,18 @@ def _entry_binding(
     """The intent types and targets an `act` / `notify` entry binds; `ValueError` if its
     binding parameters are invalid."""
     allowed = frozenset(plugin.manifest.permissions.intents)
-    if kind == "notify":
-        return _NOTIFY_TYPES & allowed, {}
     binds: dict[str, str] = {}
+    if kind == "notify":
+        prefix = params.get("link_prefix")
+        if prefix is not None:
+            try:
+                binds["link_prefix"] = _LINK.validate_python(prefix)
+            except ValidationError:
+                raise ValueError(f"{ref}: `link_prefix` is not a valid link") from None
+            if prefix[-1] not in _PREFIX_ENDS:
+                ends = " ".join(sorted(_PREFIX_ENDS))
+                raise ValueError(f"{ref}: `link_prefix` must end with one of {ends}")
+        return _NOTIFY_TYPES & allowed, binds
     for name, adapter in _BINDING_TYPES.items():
         if name in params:
             try:
@@ -422,21 +458,17 @@ def _entry_binding(
             except ValidationError:
                 raise ValueError(f"{ref}: `{name}` is not a valid target") from None
     mode = params.get("mode")
-    if mode is None:
-        types = _ACT_TYPES & allowed
-    else:
-        if not isinstance(mode, str) or mode not in ACT_MODES:
-            raise ValueError(f"{ref}: unknown `mode` (one of {', '.join(sorted(ACT_MODES))})")
-        types = ACT_MODES[mode]
-        if not types <= allowed:
-            raise ValueError(f"{ref}: plugin may not apply mode {mode} (permissions.intents)")
-        for intent_type in sorted(types):
-            target = TARGET_FIELDS.get(intent_type)
-            if target is not None and target not in binds:
-                raise ValueError(f"{ref}: mode {mode} needs a `{target}` parameter")
-    # A type with a target is bound only by an entry that names that target.
-    bound = frozenset(t for t in types if t not in TARGET_FIELDS or TARGET_FIELDS[t] in binds)
-    return bound, binds
+    if not isinstance(mode, str) or mode not in ACT_MODES:
+        what = "a missing" if mode is None else "an unknown"
+        raise ValueError(f"{ref}: {what} `mode` (one of {', '.join(sorted(ACT_MODES))})")
+    types = ACT_MODES[mode]
+    if not types <= allowed:
+        raise ValueError(f"{ref}: plugin may not apply mode {mode} (permissions.intents)")
+    for intent_type in sorted(types):
+        target = TARGET_FIELDS.get(intent_type)
+        if target is not None and target not in binds:
+            raise ValueError(f"{ref}: mode {mode} needs a `{target}` parameter")
+    return types, binds
 
 
 def _plan(
@@ -587,35 +619,57 @@ class _Run:
             self.stderr.append((call.plugin.manifest.name, stderr))
 
     def propose(
-        self, raw: Any, plugin: ResolvedPlugin, source: str, index: int, by: str, pending: int
+        self,
+        raw: Any,
+        plugin: ResolvedPlugin,
+        source: str,
+        index: int,
+        by: str,
+        pending: int,
+        collected: tuple[Any, ...] = (),
     ) -> tuple[list[ProposedIntent], StepError | None]:
-        """Validate and route one call's proposals; `pending` intents of this step are kept."""
+        """Validate and route one call's proposals; `pending` intents of this step are kept.
+
+        `collected` is input data of the current `collect` step not yet in `self.inputs`
+        (searched, with them, for `task.update_status` fingerprints)."""
         raw = _intent_list(raw)
         entries = [entry for entry in self.entries if entry.step > index]
         unroutable: list[tuple[str, int, str]] = []
         if isinstance(raw, list):
             raw = [self._fill(payload, i, entries, unroutable) for i, payload in enumerate(raw)]
-        if unroutable:
-            return [], _route_error(source, unroutable)
         try:
             typed: tuple[Intent, ...] = validate_intents(
                 raw, permissions=plugin.manifest.permissions, source=source
             )
         except IntentRejected as rejected:
+            # An intent whose target could not be filled fails its schema (the target is
+            # required): that is a routing error, reported once permissions passed.
+            unfilled = {position for _, position, _ in unroutable}
+            if unroutable and all(
+                r.index in unfilled and r.code == "intent_invalid" for r in rejected.rejections
+            ):
+                return [], _route_error(source, unroutable)
             for rejection in rejected.rejections:
                 if rejection.code == "host_undeclared":
                     detail = _cap(f"{source}: {rejection.describe()}")
                     self.violations.append(Violation(kind="egress_blocked", detail=detail))
             return [], rejected.step_error()
+        if unroutable:  # pragma: no cover (an unfilled target always fails its schema)
+            return [], _route_error(source, unroutable)
         kept = len(self.intents) + sum(len(p) for p in self.pending.values()) + pending
         if kept + len(typed) > MAX_RUN_INTENTS:
             message = f"more than {MAX_RUN_INTENTS} intents in the run"
             return [], StepError(kind="run_intents_exceeded", message=message)
+        known: frozenset[str] | None = None
         routed: list[ProposedIntent] = []
         for position, intent in enumerate(typed):
-            target_field = TARGET_FIELDS.get(intent.type)
-            target = None if target_field is None else getattr(intent, target_field)
-            takers = [entry for entry in entries if entry.takes(intent.type, target)]
+            if isinstance(intent, TaskUpdateStatus):
+                if known is None:
+                    known = _strings([snap.data for snap in self.inputs], collected)
+                if intent.task not in known:
+                    unroutable.append(("intent_unrouted", position, intent.type))
+                    continue
+            takers = [entry for entry in entries if entry.takes(intent)]
             if len(takers) != 1:
                 code = "intent_unrouted" if not takers else "intent_ambiguous"
                 unroutable.append((code, position, intent.type))
@@ -639,7 +693,8 @@ class _Run:
     def _fill(
         payload: Any, position: int, entries: list[_Entry], unroutable: list[tuple[str, int, str]]
     ) -> Any:
-        """`payload` with its omitted target filled from the one entry that binds its type."""
+        """`payload` with its omitted target filled from the one entry that binds its type;
+        unchanged (and noted in `unroutable`) when no single entry does."""
         if not isinstance(payload, dict):
             return payload
         intent_type = payload.get("type")
@@ -654,6 +709,21 @@ class _Run:
             unroutable.append((code, position, intent_type))
             return payload
         return {**payload, name: takers[0].binds[name]}
+
+
+def _strings(*values: Any) -> frozenset[str]:
+    """Every string value (not object key) inside `values`, iteratively."""
+    found: set[str] = set()
+    stack: list[Any] = list(values)
+    while stack:
+        item = stack.pop()
+        if isinstance(item, str):
+            found.add(item)
+        elif isinstance(item, dict):
+            stack.extend(item.values())
+        elif isinstance(item, (list, tuple)):
+            stack.extend(item)
+    return frozenset(found)
 
 
 def _route_error(source: str, unroutable: list[tuple[str, int, str]]) -> StepError:
@@ -703,8 +773,9 @@ async def _collect(run: _Run, step: _Planned) -> _Outcome:
             messages.append(result.message)
             continue
         name = call.plugin.manifest.name
+        seen = (*(entry["data"] for entry in collected), result.data)
         accepted, rejected = run.propose(
-            result.intents, call.plugin, name, step.index, call.ref, len(kept)
+            result.intents, call.plugin, name, step.index, call.ref, len(kept), seen
         )
         if rejected is not None:
             return _Outcome("failed", rejected, output=failed or None)
@@ -805,10 +876,13 @@ def _reuse(
         )
     except (_DataError, ValidationError):
         return None
-    run.llm_calls.append(call)
+    violations = len(run.violations)
     accepted, rejected = run.propose(raw, plugin, f"skill:{spec.skill}", step.index, spec.skill, 0)
     if rejected is not None:
-        return _Outcome("failed", rejected, stop=True)
+        # E.g. a target bound to `{{date}}` moved on: a cache miss, not a failure.
+        del run.violations[violations:]
+        return None
+    run.llm_calls.append(call)
     run.data, run.input_hash, run.reused = output, key, True
     return _Outcome("ok", output=output, intents=accepted)
 
