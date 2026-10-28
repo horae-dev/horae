@@ -10,16 +10,24 @@ cache), after schema validation and before routing:
 
 1. **Per-type limits.** At most `limits[type]` intents of each type (the skill's
    `intents: {type: max}`, schemas decision 39 F).
-2. **Embeds are always refused**, even with a URL from the input: they fetch when the note
+2. **No control or format character.** Any Cc character but `\\n` (tab and carriage return
+   included), any Cf character (zero-width, joiners, bidi controls, BOM, soft hyphen) and
+   U+2028 / U+2029 refuse the text, before any other scan, on every decoded view: nothing can
+   split or hide a token (`h\\tttps:`).
+3. **Embeds are always refused**, even with a URL from the input: they fetch when the note
    renders, without a click. Markdown images `![…](…)`, reference images `![…][…]` and
    Obsidian embeds `![[…]]` (any `![`).
-3. **HTML: an allowlist, without attributes.** Any tag (`<name` or `</name`) whose name is
-   not in `INERT_TAGS` (`b`, `i`, `em`, `strong`, `code`, `p`, `li`, `h1`…) is refused, and an
-   allowed tag must carry nothing but an optional `/` before its `>`: no attribute at all
-   (so no `on*`, `style`, `background`, `poster`, `srcset`, `ping`, `href`, `url(` or
-   `@import`). `<scheme:…>` with no whitespace before its `>` is a Markdown autolink, checked
-   as a URL (4).
-4. **URLs.** Backslashes are read as `/` first (`https:/\\host`, `\\\\host`). A URL is a run
+4. **Tag-like tokens.** Every `<` followed by a letter, `/`, `!` or `?` is a tag-like token
+   up to its `>`. It is allowed only as exactly `<name>`, `</name>` or `<name/>` with a name of
+   `INERT_TAGS` (`b`, `i`, `em`, `strong`, `code`, `p`, `li`, `h1`…: no attribute, no `:`, no
+   space), or as an autolink: content that `urls` reads as one URL with a `scheme://` or a
+   special scheme, and no whitespace, quote or `=` (that URL then goes through 6). Anything
+   else (other tags, attributes, comments, an unclosed `<b`) is refused.
+5. **Link destinations.** After `](` (up to the next `)`, or the line end when there is
+   none) and after a line's leading `[label]:` (not a `[^footnote]:`, up to the line end),
+   leading spaces skipped: a destination holding whitespace, or starting with a refused
+   scheme (also inside `<…>`), is refused.
+6. **URLs.** Backslashes are read as `/` first (`https:/\\host`, `\\\\host`). A URL is a run
    (up to whitespace, `<`, `>` or a control character) starting at
    - `scheme:` followed by `/` (any scheme, `[a-z][a-z0-9+.-]*`), or a scheme of
      `SPECIAL_SCHEMES` (`http`, `ftp`, `mailto`, `obsidian`, `javascript`…) followed by any
@@ -34,14 +42,12 @@ cache), after schema validation and before routing:
    characters) may be dropped on either side, so `[a](https://x/p)` matches `https://x/p.` in
    the input. A `notify.push` `link` must be exactly such a URL (and is also routed only under
    a trusted `link_prefix`, decision 30).
-5. **Link contexts.** After `](` (a Markdown link destination), `]:` (a link reference
-   definition) and `<`, whitespace and control characters are dropped (`[x]( java\\tscript :…)`)
-   and a refused scheme, whatever follows its colon, or `//` is refused.
 
 A refused scheme in prose (`data: three items`, colon then a space) is not a link in Markdown
 and passes. Every check runs on the text as written and on its HTML-entity-decoded forms (up
 to three passes: `&#x3c;img`, `&amp;lt;img`), ASCII case-insensitively. All scans are linear:
-`find` loops whose next search starts after the previous match (or a bounded window), and
+`find` loops whose next search starts after the previous match, pointers to the next `)`,
+line end or whitespace reused while ahead, and
 regular expressions without nested quantifiers.
 
 A violation is reported as a short, **content-free** detail: the proposer, the intent type and
@@ -51,6 +57,7 @@ position, the field and the kind of problem, from closed sets only, never the UR
 import html
 import re
 import string
+import unicodedata
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from typing import Any
 
@@ -101,12 +108,10 @@ _SCHEME_CHARS = frozenset(string.ascii_lowercase + string.digits + "+.-")
 _WORD = frozenset(string.ascii_lowercase + string.digits + "-_.")
 _RUN = re.compile(r"[^\s<>\x00-\x1f\x7f]*")
 _TAG_NAME = re.compile(r"[a-z][a-z0-9-]{0,31}")
-_AUTOLINK = re.compile(r"[a-z][a-z0-9+.-]{0,31}:")
-_SPACE = re.compile(r"[\s\x00-\x1f\x7f]+")
+_CONTROL = re.compile("[\\x00-\\x09\\x0b-\\x1f\\x7f-\\x9f\\u2028\\u2029]")
+_WHITESPACE = re.compile(r"\s")
 _TRAILING = frozenset(".,;:!?)]}'\"*_~`")
 _REFUSED_PREFIXES = tuple(f"{scheme}:" for scheme in sorted(REFUSED_SCHEMES))
-_CONTEXTS = ("](", "]:", "<")
-_WINDOW = 64
 _MAX_STRIP = 16
 _DECODE_PASSES = 3
 
@@ -189,48 +194,99 @@ def _scheme_of(url: str) -> str | None:
     return head if head and set(head) <= _SCHEME_CHARS else None
 
 
-def _context_problem(low: str) -> str | None:
-    """A refused scheme or `//` right after `](`, `]:` or `<`, whitespace dropped."""
-    for marker in _CONTEXTS:
-        found = low.find(marker)
-        while found != -1:
-            after = found + len(marker)
-            window = _SPACE.sub("", low[after : after + _WINDOW]).lstrip("<")
-            if window.startswith(_REFUSED_PREFIXES):
-                return "a script, data or file link"
-            if window.startswith("//"):
-                return "a protocol-relative link"
-            found = low.find(marker, after)
+def _control_problem(text: str) -> bool:
+    """A control character other than `\\n`, a format character (Cf: zero-width, bidi…) or a
+    line or paragraph separator (U+2028, U+2029, NEL)."""
+    if _CONTROL.search(text) is not None:
+        return True
+    return not text.isascii() and any(unicodedata.category(char) == "Cf" for char in text)
+
+
+def _destination_problem(low: str) -> str | None:
+    """A Markdown link destination that holds whitespace or starts with a refused scheme:
+    after `](`, up to the next `)` (or the line end when there is none), and after a line's
+    leading `[label]:` (not a `[^footnote]:`), up to the line end; leading spaces are skipped.
+    The next `)`, line end and whitespace are found once per position (amortised linear)."""
+    close = newline = space = -1
+    found = low.find("](")
+    while found != -1:
+        start = found + 2
+        while start < len(low) and low[start] == " ":
+            start += 1
+        if close < start:
+            close = _find(low, ")", start)
+        if newline < start:
+            newline = _find(low, "\n", start)
+        if space < start:
+            match = _WHITESPACE.search(low, start)
+            space = len(low) if match is None else match.start()
+        # Up to the `)` (a line break before it is whitespace), else to the line end.
+        problem = _destination(low, start, newline if close == len(low) else close, space)
+        if problem is not None:
+            return problem
+        found = low.find("](", start)
+    for line in low.split("\n"):
+        label = line.lstrip(" ")
+        if label.startswith("[") and not label.startswith("[^") and "]:" in label:
+            rest = label[label.index("]:") + 2 :].lstrip(" ")
+            match = _WHITESPACE.search(rest)
+            problem = _destination(
+                rest, 0, len(rest), len(rest) if match is None else match.start()
+            )
+            if problem is not None:
+                return problem
     return None
 
 
-def _autolink(low: str, at: int) -> bool:
-    """`<scheme:…>` with nothing but URL characters up to its `>` (a Markdown autolink)."""
-    if _AUTOLINK.match(low, at) is None:
+def _find(text: str, what: str, start: int) -> int:
+    found = text.find(what, start)
+    return len(text) if found == -1 else found
+
+
+def _destination(text: str, start: int, end: int, space: int) -> str | None:
+    """The destination `text[start:end]`, whose first whitespace is at `space`."""
+    if space < end:
+        return "whitespace in a link destination"
+    at = start + 1 if text.startswith("<", start) else start
+    if text.startswith(_REFUSED_PREFIXES, at):
+        return "a script, data or file link"
+    return None
+
+
+def _autolink(content: str) -> bool:
+    """`content` (between `<` and `>`) is one URL `urls` recognises, with a `scheme://` or a
+    special scheme, and no whitespace, quote or `=`."""
+    if not content or any(char.isspace() or char in "\"'=<" for char in content):
         return False
-    end = _run_end(low, at)
-    return low[end : end + 1] == ">"
+    found = list(urls(content))
+    if found != [content.replace("\\", "/")]:
+        return False
+    scheme = _scheme_of(content)
+    return scheme is not None and (scheme in SPECIAL_SCHEMES or "://" in content)
 
 
 def _tag_problem(low: str) -> str | None:
-    """A tag outside `INERT_TAGS`, or an allowed tag with an attribute. Each tag's body ends at
-    its `>` or the next `<`, so the scans are disjoint."""
+    """Every `<` followed by a letter, `/`, `!` or `?` is a tag-like token: allowed only as
+    exactly `<name>`, `</name>` or `<name/>` with a name of `INERT_TAGS`, or as an autolink.
+    Each token ends at its `>` or the next `<`, so the scans are disjoint."""
     found = low.find("<")
     while found != -1:
         following = low.find("<", found + 1)
         stop = len(low) if following == -1 else following
-        at = found + 2 if low.startswith("</", found) else found + 1
-        name = _TAG_NAME.match(low, at)
-        if name is not None and not _autolink(low, at):
-            tag = name.group()
-            if tag not in INERT_TAGS:
-                if tag in EMBED_TAGS:
-                    return f"an HTML <{tag}> embed"
-                return "an HTML tag outside the allowlist"
-            close = low.find(">", name.end(), stop)
-            body = _SPACE.sub("", low[name.end() : stop if close == -1 else close])
-            if body not in ("", "/"):
-                return "an HTML attribute"
+        first = low[found + 1 : found + 2]
+        if first and (first in _LETTERS or first in "/!?"):
+            close = low.find(">", found + 1, stop)
+            token = low[found + 1 : stop if close == -1 else close]
+            name = token[1:] if token.startswith("/") else token
+            name = name[:-1] if name.endswith("/") and not token.startswith("/") else name
+            if close == -1 or name not in INERT_TAGS:
+                if close != -1 and _autolink(token):
+                    found = following
+                    continue
+                tag = _TAG_NAME.match(low, found + (2 if first == "/" else 1))
+                if tag is not None and tag.group() in EMBED_TAGS:
+                    return f"an HTML <{tag.group()}> embed"
+                return "an HTML tag outside the allowlist or with attributes"
         found = following
     return None
 
@@ -271,14 +327,17 @@ def _strings(value: Any) -> Iterator[str]:
 def text_problem(text: str, known: Callable[[str], bool]) -> str | None:
     """What the guard refuses in one untrusted text (a closed-set description), or `None`.
 
-    `known(url)` says whether a URL is in the input set. Markup is checked on every view
-    first, so an embed is reported as one even when its URL is also unknown."""
+    `known(url)` says whether a URL is in the input set. Control and format characters are
+    refused first, then markup on every view, so an embed is reported as one even when its
+    URL is also unknown."""
     views = list(_views(text))
+    if any(_control_problem(view) for view in views):
+        return "a control or format character"
     for view in views:
         low = view.replace("\\", "/").translate(_LOWER)
         if "![" in low:
             return "an image or embed"
-        problem = _tag_problem(low) or _context_problem(low)
+        problem = _tag_problem(low) or _destination_problem(low)
         if problem is not None:
             return problem
     unknown = False

@@ -8,6 +8,7 @@ and is deleted)."""
 
 import asyncio
 import datetime
+import random
 import time
 from collections.abc import Mapping
 from pathlib import Path
@@ -168,7 +169,7 @@ UNKNOWN = [
     EVIL,
     f"see {EVIL}.",
     f"[report]({EVIL})",
-    f"<{EVIL}>",
+    "<https://evil.example.net/c>",
     "HTTPS://EVIL.EXAMPLE.NET/c",
     "ftp:evil.example.net",
     "http:evil.example.net",
@@ -221,6 +222,144 @@ ALLOWED = [
 @pytest.mark.parametrize("text", ALLOWED)
 def test_plain_text_and_known_links_are_allowed(text: str) -> None:
     assert text_problem(text, _known(KNOWN, KNOWN + ".")) is None
+
+
+CONTROLS = [
+    "h\tttps://evil.example.net/c",  # reported: a tab splits the run, no URL was found
+    "https://evil\t.example.net/c",
+    "x\ty",
+    "carriage\rreturn",
+    "nul\x00",
+    "bell\x07",
+    "del\x7f",
+    "nel\x85",
+    "line\u2028sep",
+    "para\u2029sep",
+    "zero\u200bwidth",
+    "joiner\u200d",
+    "bidi\u202eoverride",
+    "isolate\u2066x\u2069",
+    "bom\ufeff",
+    "soft\xadhyphen",
+    "h&#9;ttps://evil.example.net/c",
+    "h&Tab;ttps://evil.example.net/c",
+    "java&#x0d;script:alert(1)",
+    "zero&#x200b;width",
+]
+
+
+@pytest.mark.parametrize("text", CONTROLS)
+def test_control_and_format_characters_are_refused(text: str) -> None:
+    assert text_problem(text, _known(KNOWN)) == "a control or format character"
+
+
+def test_line_feeds_are_allowed() -> None:
+    assert text_problem(f"one\ntwo\n\n- {KNOWN}\n", _known(KNOWN)) is None
+
+
+TAG_TOKENS = [
+    # reported: `<name:…>` that HTML parses as a tag with attributes
+    "<b:x onmouseover=alert(1)>",
+    "<svg:svg onload=alert(1)>",
+    "<a:b>",
+    "<https://evil.example.net/c onmouseover=x>",
+    "<https://evil.example.net/c'x>",
+    '<https://evil.example.net/c"x>',
+    "<https://evil.example.net/c=x>",
+    "<mailto:x onclick=y>",
+    "<foo:bar>",  # not a URL `urls` recognises
+    "<b >",
+    "<br />",
+    "</b x>",
+    "<b",
+    "<!-- comment -->",
+    "<!doctype html>",
+    "<?xml version=1?>",
+    "</>",
+    "<b/x>",
+]
+
+
+@pytest.mark.parametrize("text", TAG_TOKENS)
+def test_tag_like_tokens_must_be_exact_inert_tags_or_autolinks(text: str) -> None:
+    problem = text_problem(text, _known(KNOWN))
+    assert problem is not None
+    assert problem.startswith("an HTML")
+
+
+def test_autolinks_go_through_the_input_set() -> None:
+    assert text_problem(f"<{KNOWN}>", _known(KNOWN)) is None
+    assert text_problem("<https://evil.example.net/c>", _known(KNOWN)) == "a link not in the input"
+    assert text_problem("<javascript:alert(1)>", _known()) == "a script, data or file link"
+
+
+DESTINATIONS = [
+    f"[x]({KNOWN} 'title')",
+    f"[x](<{KNOWN} x>)",
+    "[x](a\nb)",
+    f"[ref]: {KNOWN} title",
+    "  [ref]: a b",
+    "[x](javascript:)",
+    "[x](<data:,x>)",
+    "[x](file:)",
+    "[x](blob:x)",
+    "[unclosed](a b",
+]
+
+
+@pytest.mark.parametrize("text", DESTINATIONS)
+def test_link_destinations_hold_no_whitespace_and_no_refused_scheme(text: str) -> None:
+    problem = text_problem(text, _known(KNOWN))
+    assert problem is not None
+    assert problem.startswith(("whitespace", "a script", "an HTML")), problem
+
+
+def test_footnotes_and_prose_are_not_destinations() -> None:
+    assert text_problem("[^1]: a footnote with words", _known()) is None
+    assert text_problem("see [a](b) and [c](d) then (e f)", _known()) is None
+    assert text_problem("text [ref]: not at a line start", _known()) is None
+
+
+_MUTATIONS = ("\t", "\x00", "\x0b", "\x1f", "\x7f", "\u200b", "\u200d", "\ufeff", "&#9;", "&Tab;")
+_FORBIDDEN = [
+    f"![x]({KNOWN})",
+    "![[Secret.md]]",
+    f"<img src={KNOWN}>",
+    f"<iframe src={KNOWN}>",
+    "[x](javascript:alert(1))",
+    "<a href=javascript:alert(1)>x</a>",
+    "[x](data:text/html,hi)",
+    EVIL,
+    f"[x]({EVIL})",
+    f"<{EVIL}>",
+    "//evil.example.net/c",
+    "ftp:evil.example.net",
+]
+
+
+def _mutate(rng: random.Random, text: str) -> str:
+    """Flip the case of, entity-encode (decimal or hex) and insert controls, format characters
+    or their entities around characters of `text`, as one renderer pass would read them."""
+    tokens = list(text)
+    for _ in range(rng.randint(1, 6)):
+        at = rng.randrange(len(tokens))
+        kind = rng.randrange(3)
+        if kind == 0:
+            tokens[at] = rng.choice(_MUTATIONS) + tokens[at]
+        elif kind == 1 and len(tokens[at]) == 1:
+            code = ord(tokens[at])
+            tokens[at] = f"&#{code};" if rng.random() < 0.5 else f"&#x{code:x};"
+        elif len(tokens[at]) == 1:
+            tokens[at] = tokens[at].swapcase()
+    return "".join(tokens)
+
+
+@pytest.mark.parametrize("seed", range(8))
+def test_random_obfuscations_never_pass(seed: int) -> None:
+    rng = random.Random(seed)  # noqa: S311 (a reproducible fuzz, not cryptography)
+    for _ in range(500):
+        text = _mutate(rng, rng.choice(_FORBIDDEN))
+        assert text_problem(text, _known(KNOWN)) is not None, repr(text)
 
 
 def test_url_extraction() -> None:
@@ -334,6 +473,10 @@ def test_one_mib_of_hostile_text_is_scanned_in_linear_time() -> None:
         "<b " * (size // 3),
         "<https:" * (size // 7),
         "<b>" * (size // 3),
+        "\n[r]: x" * (size // 7),
+        "](a" * (size // 3) + ")",
+        "é" * size,
+        "<a:" * (size // 3),
         "javascript" * (size // 10),
         (KNOWN + " ") * (size // 40),
     ]

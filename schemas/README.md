@@ -1718,17 +1718,30 @@ loosened later without breaking a valid file.
     - **(1) per-type limits.** A skill's `intents: {type: max}` (decision 39 F) caps the intents
       of each type per step; more is a guard violation (it was `intent_rejected`). A type the
       skill does not declare stays `intent_rejected` (a permission breach, the run fails);
+    - **(0) structurally conservative** (security review): rather than chasing each
+      obfuscation, the guard refuses whole classes of text the parsers it guards against could
+      read differently: control and format characters, any non-trivial tag-like token, any
+      link destination with whitespace (rules 0a, 3, 5);
+    - **(0a) no control or format character.** Any Cc character but `\n` (tab and carriage
+      return included), any Cf character (zero-width, joiners, bidi controls, BOM, soft
+      hyphen) and U+2028 / U+2029 refuse the text before any other scan, also when an entity
+      decodes to one (`h&#9;ttps:`). Note text already refused lone CR and U+2028 / U+2029
+      (`content_line_break`); this extends it to all guarded text. A ZWJ emoji sequence is
+      refused too (known cost);
     - **(2) embeds are always refused**, even when the URL is in the input (they fetch when the
       note renders, without a click): any `![` (Markdown and reference images, Obsidian
       `![[…]]` embeds);
-    - **(3) HTML: an allowlist without attributes.** A tag (`<name` or `</name`) is allowed only
-      if its name is one of `b i u s em strong code pre br hr p ul ol li blockquote h1`–`h6
-      kbd sup sub mark del`, and only with nothing but an optional `/` before its `>`: any
-      other tag (`img`, `iframe`, `svg`, `a`, `div`, `span`, `table`, custom elements…) and any
-      attribute (`on*`, `style`, `background`, `poster`, `srcset`, `ping`, `href`, so also
-      `url(` and `@import`) is refused. A denylist of embed tags was rejected in review: HTML
-      has too many fetching tags and attributes. `<scheme:…>` with no whitespace before its
-      `>` is a Markdown autolink and is checked as a URL;
+    - **(3) tag-like tokens: an allowlist, exact form.** Every `<` followed by a letter, `/`,
+      `!` or `?` starts a tag-like token, up to its `>`. It is allowed only as exactly
+      `<name>`, `</name>` or `<name/>` with a name of `b i u s em strong code pre br hr p ul ol
+      li blockquote h1`–`h6 kbd sup sub mark del` (no attribute, no `:`, no space), or as an
+      autolink: content up to `>` that `urls` reads as one URL with a `scheme://` or a
+      special scheme, and no whitespace, quote or `=` (the URL then goes through (4)).
+      Everything else is refused: other tags (`img`, `iframe`, `svg`, `a`, `div`, `span`,
+      custom elements…), any attribute (`on*`, `style`, `background`, `poster`, `srcset`,
+      `ping`, `href`, so also `url(` and `@import`), `<name:…>` forms, comments, doctype,
+      processing instructions and an unclosed `<b`. A denylist of embed tags, then an
+      autolink exemption, were rejected in review;
     - **(4) URLs.** Backslashes are read as `/` first (`https:/\host`, `\\host`). A URL is
       a run (up to whitespace, `<`, `>` or a control character) starting at `scheme:` followed
       by `/` (any `[a-z][a-z0-9+.-]*`, whatever precedes it), at a scheme of `http https ftp ws
@@ -1743,18 +1756,22 @@ loosened later without breaking a valid file.
       `…/<data>`). A `notify.push` `link` must be exactly such a URL **and** fall under the
       entry's `link_prefix` (decision 30). A per-pipeline `strict_links` (only trusted
       parameters and `link_prefix`) is a follow-up;
-    - **(5) link contexts.** Right after `](` (a link destination), `]:` (a reference
-      definition) and `<`, whitespace and control characters are dropped (also inside the
-      scheme: `[x]( java\tscript :…)`) and a refused scheme, whatever follows its colon, or
-      `//` is refused. A refused scheme in prose (`data: three items`: colon then a space) is
-      not a link in Markdown and passes;
+    - **(5) link destinations.** After `](` (up to the next `)`, or the line end when there
+      is none) and after a line's leading `[label]:` (not a `[^footnote]:`; up to the line
+      end), leading spaces skipped: a destination holding **any whitespace** (so also a title,
+      `[x]( javascript :…)` or a line break) or starting with a refused scheme (also inside
+      `<…>`) is refused; its URLs go through (4). A refused scheme in prose (`data: three
+      items`: colon then a space) is not a link in Markdown and passes;
     - **fields scanned**: `note.*` `content` and `heading`, `task.create` `title` and
       `fingerprint`, `notify.push` `title`, `body` and `link`, every string and object key of an
       `http.post` `body`. Targets bound by routing (`path`, `http.post` `url`) are not text;
     - **robust parsing, bounded work.** Every check runs on the text as written and on its
       HTML-entity-decoded forms (up to three passes: `&#x3c;img`, `&amp;lt;img`), ASCII
       case-insensitively. Scans are linear (`find` loops that resume after each match, regular
-      expressions without nested quantifiers); a test scans 1 MiB of hostile text per field;
+      expressions without nested quantifiers, pointers to the next `)`, line end or whitespace
+      reused while ahead); a test scans 1 MiB of hostile text per field, and a seeded fuzz
+      (case flips, decimal and hex entities, controls and format characters inserted into
+      embeds, script links and unknown URLs) never passes;
     - **(answer 4) the whole step degrades.** A violation records one `Violation(kind="guard")`
       and the step `degraded` with `error.kind` `guard_violation`: none of its intents is
       routed (also the valid ones), its output is not used, later steps are `skipped`, the
@@ -1778,8 +1795,8 @@ loosened later without breaking a valid file.
       the fence (`tests/test_llm_backends_shared.py`). A per-call nonce adds nothing to that
       and would make requests non-deterministic, so none is added and `LLM_KEY_VERSION` is
       unchanged;
-    - **known limits**: obfuscated URLs (`hxxps`, zero-width characters inside the scheme)
-      are not links in Obsidian and pass; a URL the input brings may be copied (tenet 5 as
+    - **known limits**: obfuscated URLs that are not links in Obsidian (`hxxps://`) pass;
+      zero-width and other format characters are refused (0a); a URL the input brings may be copied (tenet 5 as
       written); a brief citing a new URL from the model's own knowledge is refused; being
-      conservative, a Windows path (`C:\x`), `a:/b` or `x<b and c` (a `<` and a letter, then
-      text) not in the input is refused too.
+      conservative, a Windows path (`C:\x`), `a:/b`, `x<b and c` (an unclosed tag-like
+      token), a Markdown link title and a ZWJ emoji not in the input are refused too.
