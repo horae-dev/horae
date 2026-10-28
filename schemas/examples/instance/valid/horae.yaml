@@ -21,3 +21,4 @@ secrets:
     ANTHROPIC_API_KEY: { file: anthropic_api_key }
     OPENROUTER_API_KEY: { env: OPENROUTER_KEY }
 scheduler: { mode: external }
+runs: { timeout_s: 1200 }
