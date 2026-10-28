@@ -23,7 +23,7 @@ from horae.config import Instance
 from horae.contracts import InstanceConfig, Lockfile, RunRecord
 from horae.contracts.instance import ModelAlias
 from horae.engine import LlmRequest
-from horae.llm import ModelBackends, Prompt
+from horae.llm import UNVALIDATED, ModelBackends, Prompt
 from horae.llm.backends import AnthropicBackend
 from horae.runner import Ports, Runner, open_ports, uses_llm
 from horae.secrets import SecretResolver
@@ -74,7 +74,7 @@ def _llm(inst: Instance, recorder: Recorder) -> ModelBackends:
         return AnthropicBackend(alias, spec, secrets, transport=recorder.transport)
 
     return ModelBackends(
-        inst.config.models, inst.secret_resolver({}), {"anthropic": factory}, Prompts()
+        inst.config.models, inst.secret_resolver({}), {"anthropic": factory}, Prompts(), UNVALIDATED
     )
 
 

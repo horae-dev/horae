@@ -22,7 +22,9 @@
    also of a failed call; zero for a backend's cached response). A settled cost above the
    reservation is logged (amounts only) and marked `over_reservation`. A refusal that cost
    nothing (`NOT_BILLED`) releases it. A call whose cost is unknown (a timeout, a lost
-   connection, a cancellation) keeps its reservation as an estimate. A process that dies
+   connection, a cancellation) keeps its reservation as an estimate; a cancellation while
+   the output was being validated knows it (`horae.engine.ports.attached_usage`, decision
+   44 E) and settles with it. A process that dies
    before settling leaves the reservation, which keeps counting (a crash never frees
    budget) until its run is abandoned or recovered (`Store.abandon_run`), which settles it
    at the reservation, `estimated`.
@@ -44,7 +46,7 @@ from horae.contracts.instance import BudgetsConfig, DailyBudget
 from horae.contracts.pipeline import Budget
 from horae.contracts.run import Usage
 from horae.engine import LlmBackend
-from horae.engine.ports import LlmError, LlmRequest, LlmResponse
+from horae.engine.ports import LlmError, LlmRequest, LlmResponse, attached_usage
 from horae.llm import ModelBackends
 from horae.llm.base import PreparedRequest, RenderedRequest
 from horae.store import DaySpend, Store, StoreError
@@ -264,8 +266,10 @@ class LedgerLlm:
             else:
                 self._settle(entry, None)
             raise
-        except BaseException:
-            self._settle(entry, None)
+        except BaseException as error:
+            # A cancellation while the output was being validated carries what the attempt
+            # cost (schemas decision 44 E); any other one keeps the reservation, estimated.
+            self._settle(entry, attached_usage(error))
             raise
         usage = getattr(response, "usage", None)
         if getattr(response, "cached", False) is True:

@@ -1199,7 +1199,12 @@ loosened later without breaking a valid file.
       output in that form, so the bound holds for what it stores. A property test
       (`hypothesis`, a new dev dependency) checks it on random bounded schemas. The bound
       must be at most `MAX_OUTPUT_BYTES` (256 KiB); the file nests at most 64 levels and is
-      strict JSON (no duplicate keys, no `NaN`, no number overflowing to infinity). This adds
+      strict JSON (no duplicate keys, no `NaN`, no number overflowing to infinity).
+      **Amended by #31 (decision 44 G):** the product of `anyOf` / `oneOf` branch counts
+      along any path of the schema, `$ref`s followed (memoised per `$ref`), is at most
+      `MAX_COMBINATOR_FANOUT` = 1024 (a validator tries every branch, so nested alternatives,
+      through a chain of `$defs` say, make one validation exponential); alternatives side by
+      side (`properties`, `allOf`) do not multiply. This adds
       **`jsonschema` as a runtime dependency** (it was a dev dependency; #31 needs it to
       validate outputs);
     - **(F) intents.** `intents` is a list of types or a mapping `type: max` (1 to 256, #35):
@@ -1603,39 +1608,64 @@ loosened later without breaking a valid file.
 
 44. **Schema-validated output with one repair retry (#31).** (42 is taken by #29.) Contract
     change: none (`llm[].schema_valid`, `repair` and `schema_errors` exist since decisions 21
-    and 33). Rules of `horae.llm.validate`, `horae.llm._schema_errors` and `ModelBackends`:
-    - **A. the validator is installed in production**: `horae.llm.backends.model_backends`
-      (what `open_ports` builds) passes `validate_output` unless given another validator, so
-      decision 38 G holds for every run. `Validator` may now return an awaitable; a
+    and 33; `validator_unavailable` is a new step error kind, an `ErrorKind` string). Rules of
+    `horae.llm.validate`, `horae.llm._schema_errors` and `ModelBackends`. A security review
+    of the first implementation found 8 issues; **review decisions A to F** below are
+    provisional, for the maintainer to confirm:
+    - **A. the validator is the default** (review decision D): `ModelBackends.validate`
+      defaults to `horae.llm.validate.validate_output` (imported lazily: `horae.llm.validate`
+      imports `horae.skills`, which imports `horae.llm.base`), and so does
+      `horae.llm.backends.model_backends` (what `open_ports` builds), so decision 38 G holds
+      for every `ModelBackends`, not only the one the runner builds. The only opt-out is the
+      explicit sentinel `horae.llm.UNVALIDATED` (test doubles of the backends). A `Validator`
+      is called `validate(output, schema, timeout_s=...)` and may return an awaitable; a
       synchronous one (test doubles) runs inline;
     - **B. what is validated**: the provider's parsed output, **before** the reserved
       `intents` are split off, against the skill's **full** output schema
       (`RenderedRequest.output_schema`, the skill file; never the provider's transformed
-      copy, which drops constraints), with `jsonschema`'s `Draft202012Validator`. Formats are
-      annotations (draft 2020-12's default): asserting them would depend on optional
-      packages (`rfc3339-validator`...), so the same output would be valid in one install and
-      not in another. Then the reserved `intents`, when present, must be an array of objects.
-      First, in the parent, the output re-serialised as decision 39 E bounds it (compact,
-      `ensure_ascii=False`, UTF-8) must fit `MAX_OUTPUT_BYTES`; a larger one is the single
-      error `SIZE_ERROR` and never reaches the worker;
-    - **C. a killable worker**: each validation runs in a fresh child process (`sys.executable
-      -I horae/llm/_schema_errors.py`, empty environment, request on stdin, stderr
-      discarded), awaited through asyncio pipes, so the event loop is never blocked. It is
-      killed (and reaped) after `VALIDATION_TIMEOUT_S` (10 s, the interpreter start
-      included), or as soon as the awaiting task is cancelled (the step's single deadline),
-      and it sets `RLIMIT_CPU` on itself as a backstop. Not a thread (it cannot be stopped)
-      nor a process pool (one task cannot be killed without breaking the pool, and a forked
-      pool inherits the parent's resolved secrets, descriptors and threads). The cost is one
-      interpreter start, about 0.5 s with `jsonschema`, at most twice per `llm` step. The
-      worker imports only the standard library and `jsonschema` (nothing of `horae`, no
-      instance state; `-I` keeps the script's folder, `PYTHON*` variables and the user site
-      off its path);
-    - **D. fail closed, fixed messages**: a timeout is `/: timeout: the output could not be
-      validated in time`; a worker that cannot start, exits non-zero or answers anything but
-      a JSON array of at most 16 strings of 1 to 200 characters (64 KiB at most) is `/:
-      validator: the output could not be validated`; an output that is not plain JSON is
-      `/: json: ...`; an unusable schema `/: schema: ...`. Each is an error, never a pass, so
-      such an output drives the repair, then degrades the step;
+      copy, which drops constraints: `anthropic.transform_schema` moves `maxLength` into a
+      description, and the validator still reports `/x: maxLength`), with `jsonschema`'s
+      `Draft202012Validator`. Formats are annotations (draft 2020-12's default): asserting
+      them would depend on optional packages (`rfc3339-validator`...), so the same output
+      would be valid in one install and not in another. Then the reserved `intents`, when
+      present, must be an array of objects. First, in the parent, the output re-serialised as
+      decision 39 E bounds it (compact, `ensure_ascii=False`, UTF-8) must fit
+      `MAX_OUTPUT_BYTES`; a larger one is the single repair error `SIZE_ERROR` (the model's
+      fault) and never reaches the worker;
+    - **C. a killable, isolated worker**: each validation runs in a fresh child process,
+      awaited through asyncio pipes, so the event loop is never blocked:
+
+      | | |
+      |---|---|
+      | interpreter | `sys.executable -I -B horae/llm/_schema_errors.py` (isolated: no `PYTHON*` variables, no user site, not the script's folder on `sys.path`; no bytecode written) |
+      | environment | empty (`env={}`) |
+      | descriptors | stdin (the request) and stdout (the answer) pipes, stderr `/dev/null`, nothing else (`close_fds`) |
+      | working directory | `/` |
+      | session | its own (`start_new_session`): no signal of the terminal reaches it |
+      | CPU | `RLIMIT_CPU` of the timeout plus one second, set by the worker on itself |
+      | memory | `RLIMIT_AS` at `MAX_WORKER_MEMORY` (256 MiB; the worker is about 26 MiB once `jsonschema` is imported), `RLIMIT_DATA` where that cannot be set; macOS refuses both, so the ceiling is Linux only there (review decision A). An allocation past it is a `MemoryError`: exit status 3, `WORKER_ERROR` |
+      | timeout | `min(VALIDATION_TIMEOUT_S, the attempt's remaining deadline - VALIDATION_MARGIN_S)` (10 s and 0.5 s; the interpreter start included), then killed and reaped |
+      | cancellation | the awaiting task cancelled (the step's or the run's deadline): killed and reaped |
+      | answer | read with a bound: at most `MAX_WORKER_OUTPUT` + 1 bytes (64 KiB), a longer answer is not read and the worker is killed; it must be a JSON array of at most 16 strings of 1 to 200 characters |
+
+      Not a thread (it cannot be stopped) nor a process pool (one task cannot be killed
+      without breaking the pool, and a forked pool inherits the parent's resolved secrets,
+      descriptors and threads). The cost is one interpreter start, about 0.5 s with
+      `jsonschema`, at most twice per `llm` step. The worker imports only the standard
+      library and `jsonschema` (nothing of `horae`, no instance state). `horae doctor`
+      checks, when a pipeline has an `llm` step, that `sys.executable` and the worker script
+      exist and that a trivial validation, run exactly as above, gives the expected error
+      (`horae.llm.validate.worker_problem`);
+    - **D. fail closed, and no repair for the validator's own failure** (review decision
+      C): a timeout (`/: timeout: the output could not be validated in time`), a worker that
+      cannot start, exits non-zero or answers anything else (`/: validator: the output could
+      not be validated`), an unusable schema (`/: schema: ...`) or an output that is not plain
+      JSON (`/: json: ...`) is never a pass: `validate_output` raises, and `ModelBackends`
+      raises `LlmError("validator_unavailable", <that fixed message>, usage=<the attempt's
+      usage>)` (so does any exception of another validator: `the validator failed
+      (<type>)`). It is not the model's fault, so **no repair** is made: the step degrades at
+      once with kind `validator_unavailable`, its cost charged to the run and settled in the
+      ledger (decision 41). No intent of the attempt is kept, as for any failed attempt;
     - **E. repair errors carry no data**: each error is `<pointer>: <keyword>: <description>`,
       where the pointer holds array indexes and property names **the schema declares** only
       (any other segment is `*`; at most 120 characters, cut on a segment), the keyword is
@@ -1643,12 +1673,16 @@ loosened later without breaking a valid file.
       unlisted one) and the description is Horae's fixed wording, with at most a number or
       type names taken from the **schema** (trusted, the skill author's). Never an instance
       value, an excerpt of the output, an undeclared key, or `jsonschema`'s own message
-      (which quotes the value). The errors are de-duplicated, **sorted** (one output, one
-      list: a replay sends the same repair), at most `MAX_ERRORS` = 16 (the last one then
-      says how many more there were) of at most 200 characters each; at most 1000 failures
-      are examined. The provider backends still frame them as data inside `<schema_errors>`
-      (decision 38). The repair attempt sends the same viewed input, prompt and schema plus
-      these errors: nothing new;
+      (which quotes the value). The errors are de-duplicated, sorted in the **natural order**
+      of their pointers (segment by segment, an index before a name, indexes by value:
+      `/b/2` before `/b/10`; then by keyword and description), at most `MAX_ERRORS` = 16 (the
+      last one then says how many more there were) of at most 200 characters each; at most
+      1000 failures are examined. One output and one schema give one list, so a live run
+      sends the same repair for the same output; a replay serves the **recorded** errors
+      (`horae.replay`), so a later change of this order (or of the wording) changes no
+      replay of a recorded run, but changes what a new run records. The provider backends
+      still frame the errors as data inside `<schema_errors>` (decision 38). The repair
+      attempt sends the same viewed input, prompt and schema plus these errors: nothing new;
     - **F. an invalid output proposes nothing**: when the validator reports errors,
       `ModelBackends` drops the output's `intents` whatever their shape (`LlmResponse.intents`
       is empty, so `LlmCall.intents` of an invalid attempt is `[]`; a non-list `intents` is a
@@ -1658,5 +1692,26 @@ loosened later without breaking a valid file.
       decision 41), and after a second invalid output degrades the step (`schema_invalid`):
       no intent of the step enters the record, later steps are skipped, the run is
       `degraded`, which `horae runs` shows (and `--status degraded` lists);
+    - **G. a schema cannot make one validation exponential** (review decision B): the
+      loader caps the product of `anyOf` / `oneOf` branch counts along any path of the
+      output schema, `$ref`s followed (memoised per `$ref`), at `MAX_COMBINATOR_FANOUT` =
+      1024, else `skill_invalid` (decision 39 E, amended). An 18-level `$defs` chain that
+      branches twice per level (2^18 paths) is refused; alternatives side by side (in
+      `properties`, `allOf`) do not multiply. What the cap does not bound (an `anyOf` over a
+      long array keeps every branch's errors for every item) the worker's memory ceiling
+      does;
+    - **H. the deadline and the attempt's cost** (review decision E): the validator is
+      given what is left of the attempt's deadline less `VALIDATION_MARGIN_S`, so it times
+      out (D: `validator_unavailable`, the usage charged) before the engine's own deadline
+      cancels the step. Should the step or the run be cancelled during the validation all
+      the same, the cancellation carries the attempt's usage
+      (`horae.engine.ports.attach_usage` / `attached_usage`): the ledger settles with it
+      (not with the reservation as an estimate) and the engine adds it to the run's cost;
+    - **I. `jsonschema` is pinned to one minor version** (review decision F): `jsonschema
+      >=4.26,<4.27`. Which outputs are valid, and which errors (keyword, path, order) a
+      repair sends, depend on the validator's behaviour, so its version is part of the
+      replay contract: the record holds the errors sent, and a new minor version is an
+      explicit upgrade (with this decision's tests), not a silent change between installs;
     - **follow-ups**: a warm worker if the start-up cost matters (#29's CLI backend is
-      slower anyway); a memory ceiling for the worker (#51).
+      slower anyway); a memory ceiling on macOS (none of its `setrlimit` limits applies);
+      #51 (sandboxing plugins) may reuse the worker's isolation.

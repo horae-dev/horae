@@ -76,6 +76,31 @@ class LlmError(EngineCallError):
         self.usage = usage
 
 
+_USAGE = "horae_usage"
+
+
+def attach_usage(error: BaseException, usage: Usage) -> None:
+    """Record on `error` (a cancellation, typically) what the attempt cost before it: an
+    attempt cancelled while its output was being validated was already billed (#31, schemas
+    decision 44 E). The usage ledger settles with it and the engine adds it to the run's
+    cost (`attached_usage`)."""
+    setattr(error, _USAGE, usage)
+
+
+def attached_usage(error: BaseException) -> Usage | None:
+    """The usage `attach_usage` put on `error`, its `__cause__` or its `__context__` (a
+    `TimeoutError` that `asyncio.timeout` raised from the cancellation), or `None`."""
+    seen: BaseException | None = error
+    for _ in range(3):
+        if seen is None:
+            return None
+        usage = getattr(seen, _USAGE, None)
+        if isinstance(usage, Usage):
+            return usage
+        seen = seen.__cause__ or seen.__context__
+    return None
+
+
 class UnknownPlugin(LookupError):
     """No installed plugin provides this tool or skill."""
 

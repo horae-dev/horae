@@ -983,7 +983,7 @@ def _backends(
         SecretResolver({}, tmp_path),
         {"ollama": lambda alias, spec, secrets: provider},
         prompts,
-        validate=lambda output, schema: [] if valid else [f"bad value {LONG}"],
+        validate=lambda output, schema, *, timeout_s: [] if valid else [f"bad value {LONG}"],
     )
 
 

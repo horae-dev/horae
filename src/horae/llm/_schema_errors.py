@@ -11,14 +11,17 @@ carries no text the model (or the data it was shown) chose: a second-order injec
 the error messages is not possible. Numbers in a description come from the schema (trusted:
 the skill's author wrote it), never from the output.
 
-The errors are de-duplicated, sorted (deterministic for a given output and schema, so a
-replay sends the same repair) and capped: at most `MAX_ERRORS` of at most `MAX_ERROR_CHARS`
-characters each.
+The errors are de-duplicated, sorted in the natural order of their pointers (`/b/2` before
+`/b/10`; deterministic for a given output and schema, so a live run sends the same repair for
+the same output; a replay serves the recorded errors) and capped: at most `MAX_ERRORS` of at
+most `MAX_ERROR_CHARS` characters each.
 
 This module is also the validation **worker** (`main`): `horae.llm.validate` runs it as a
-script in a short-lived child process (`python -I <this file>`), which it kills on a timeout.
-It therefore imports nothing but the standard library and `jsonschema`, and nothing of
-`horae`, so the child starts fast and reads no instance state."""
+script in a short-lived child process (`python -I -B <this file>`), which it kills on a
+timeout. It therefore imports nothing but the standard library and `jsonschema`, and nothing
+of `horae`, so the child starts fast and reads no instance state. The worker sets its own
+CPU and memory ceilings (`RLIMIT_CPU`; `RLIMIT_AS`, or `RLIMIT_DATA`, at
+`MAX_WORKER_MEMORY`) before it validates."""
 
 import itertools
 import json
@@ -41,6 +44,13 @@ MAX_SCANNED = 1000
 """Most validation failures examined before sorting (the validator stops there)."""
 MAX_POINTER_CHARS = 120
 """Longest JSON Pointer kept in an error (a longer one is cut, ending with `/...`)."""
+
+MAX_WORKER_MEMORY = 256 * 1024 * 1024
+"""The worker's memory ceiling, in bytes (`RLIMIT_AS`; `RLIMIT_DATA` where that cannot be
+set). The worker's own address space is about 26 MiB once `jsonschema` is imported (Linux,
+CPython 3.12); the largest output is `MAX_OUTPUT_BYTES` (256 KiB), so a legitimate validation
+stays far below it, while an error-heavy one (an `anyOf` over a long array keeps every
+branch's errors) is stopped at it."""
 
 SCHEMA_ERROR = "/: schema: the output schema cannot be used for validation"
 """The error when the schema itself is unusable (a skill bug: the loader checks schemas)."""
@@ -197,6 +207,17 @@ def _failures(output: Any, schema: Mapping[str, Any], declared: frozenset[str]) 
         yield _line(pointer, keyword, description)
 
 
+def _order(error: str) -> tuple[tuple[tuple[int, int, str], ...], str]:
+    """The natural order of errors: by pointer, segment by segment, an index before a name
+    and indexes by value (`/b/2` before `/b/10`), then by the rest of the line."""
+    pointer, _, rest = error.partition(": ")
+    segments = tuple(
+        (0, int(part), "") if part.isdigit() and len(part) < 19 else (1, 0, part)
+        for part in pointer.split("/")[1:]
+    )
+    return segments, rest
+
+
 def schema_errors(output: Any, schema: Mapping[str, Any]) -> list[str]:
     """The repair errors of `output` against `schema` (empty when it is valid): see the
     module docstring. Formats are annotations (draft 2020-12's default), as in every
@@ -208,7 +229,7 @@ def schema_errors(output: Any, schema: Mapping[str, Any]) -> list[str]:
     except (SchemaError, RecursionError, TypeError, ValueError):
         return [SCHEMA_ERROR]
     found.update(_intents(output))
-    errors = sorted(found)
+    errors = sorted(found, key=_order)
     if len(errors) > MAX_ERRORS:
         more = len(errors) - (MAX_ERRORS - 1)
         errors = [*errors[: MAX_ERRORS - 1], f"/: more: {more} more errors not shown"]
@@ -225,19 +246,53 @@ def _cpu_limit(seconds: int) -> None:
         return
 
 
-def main(stdin: BinaryIO, stdout: BinaryIO, limit_cpu: Callable[[int], None] = _cpu_limit) -> int:
-    """The worker: reads `{"output", "schema", "cpu_s"}` as JSON from `stdin`, sets the CPU
-    ceiling of **this process** (`limit_cpu`: only ever in the child), and writes the errors
-    as a JSON array to `stdout`. Exit status 0, or 2 for a malformed request."""
+def _memory_limit(size: int) -> str | None:
+    """A memory ceiling for this process: `RLIMIT_AS` (Linux), else `RLIMIT_DATA`; the name
+    of the limit set, or `None` where neither can be set (macOS refuses both: its address
+    space is far larger than any useful ceiling). An allocation past it is a `MemoryError`."""
+    try:
+        import resource
+    except ImportError:  # pragma: no cover (not POSIX)
+        return None
+    for name in ("RLIMIT_AS", "RLIMIT_DATA"):
+        which = getattr(resource, name, None)
+        if which is None:  # pragma: no cover (platform specific)
+            continue
+        try:
+            resource.setrlimit(which, (size, size))
+        except (ValueError, OSError):
+            continue
+        return name
+    return None
+
+
+def main(
+    stdin: BinaryIO,
+    stdout: BinaryIO,
+    limit_cpu: Callable[[int], None] = _cpu_limit,
+    limit_memory: Callable[[int], object] = _memory_limit,
+) -> int:
+    """The worker: sets the memory ceiling of **this process** (`limit_memory`,
+    `MAX_WORKER_MEMORY`: only ever in the child), reads `{"output", "schema", "cpu_s"}` as
+    JSON from `stdin`, sets its CPU ceiling (`limit_cpu`) and writes the errors as a JSON
+    array to `stdout`. Exit status 0, 2 for a malformed request, 3 when the validation ran
+    out of memory (the parent reads any non-zero status as `WORKER_ERROR`)."""
+    limit_memory(MAX_WORKER_MEMORY)
     try:
         request = json.loads(stdin.read())
         output, schema, cpu_s = request["output"], request["schema"], request["cpu_s"]
     except (ValueError, KeyError, TypeError):
         return 2
+    except MemoryError:
+        return 3
     if not isinstance(schema, dict) or not isinstance(cpu_s, int) or cpu_s < 1:
         return 2
     limit_cpu(cpu_s)
-    stdout.write(json.dumps(schema_errors(output, schema)).encode("ascii"))
+    try:
+        answer = json.dumps(schema_errors(output, schema)).encode("ascii")
+    except MemoryError:
+        return 3
+    stdout.write(answer)
     stdout.flush()
     return 0
 

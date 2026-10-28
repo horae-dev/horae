@@ -78,14 +78,20 @@ backends disable their SDK's own retries.
   repair errors (`LlmResponse.schema_errors`, which drive the repair retry), validated
   against the skill's **full** output schema (`RenderedRequest.output_schema`, not the
   provider's transformed copy) before the intents are split off. The validator may be
-  asynchronous: `horae.llm.validate.validate_output`, which `model_backends` installs, runs
-  in a killable child process and never blocks the event loop. An output with errors
-  proposes nothing: its `intents` are dropped (`LlmResponse.intents` is empty, whatever
-  their shape). Without a validator the provider's structured output is the only check and
-  `schema_errors` is empty. **The validator is mandatory before production use** (decision
-  38 G): structured outputs drop the constraints they do not support
-  (`anthropic.transform_schema` moves them into descriptions), so only the validator
-  enforces the full schema.
+  asynchronous: `horae.llm.validate.validate_output`, the **default** (imported lazily;
+  `model_backends` installs it too), runs in a killable child process and never blocks the
+  event loop; it is given what is left of the attempt's deadline less
+  `VALIDATION_MARGIN_S`, so it gives up before the engine's deadline cancels the step. An
+  output with errors proposes nothing: its `intents` are dropped (`LlmResponse.intents` is
+  empty, whatever their shape). An output that **could not be validated** (the validator
+  raised: a timeout, a failing worker) is not the model's fault: `send` raises
+  `LlmError(VALIDATOR_UNAVAILABLE)` with the attempt's usage, so no repair is made and the
+  step degrades at once; a cancellation during the validation carries the usage too
+  (`horae.engine.ports.attach_usage`). Only the explicit `UNVALIDATED` (test doubles) skips
+  validation, so that the provider's structured output is the only check. **The validator
+  is mandatory in production** (decision 38 G): structured outputs drop the constraints
+  they do not support (`anthropic.transform_schema` moves them into descriptions), so only
+  the validator enforces the full schema.
 - **#33 (budgets).** `worst_case` is what the usage ledger reserves before `send`; the
   runner's `LedgerLlm` (`horae.runner._budget`) calls `prepare` (the prompt, the provider
   backend and the input bound: the `PromptSource` reads happen there, outside the store's
@@ -98,11 +104,14 @@ backends disable their SDK's own retries.
   and `worst_case`, so that a settled call never costs more than its reservation.
 """
 
+import asyncio
+import enum
 import hashlib
 import inspect
 import json
 import logging
 import math
+import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
@@ -110,7 +119,13 @@ from typing import Any, Protocol
 from horae.contracts.instance import ModelAlias, ModelPrice
 from horae.contracts.run import Usage
 from horae.engine.canonical import canonical_json
-from horae.engine.ports import LlmBackendName, LlmError, LlmRequest, LlmResponse
+from horae.engine.ports import (
+    LlmBackendName,
+    LlmError,
+    LlmRequest,
+    LlmResponse,
+    attach_usage,
+)
 from horae.secrets import SecretResolver
 from horae.secrets.redact import current as current_redactor
 
@@ -306,11 +321,47 @@ ERROR_KINDS = (
 BackendFactory = Callable[[str, ModelAlias, SecretResolver], ProviderBackend]
 """Builds the provider backend of one model alias: `(alias, spec, secrets)`."""
 
-Validator = Callable[[Any, Mapping[str, Any]], Sequence[str] | Awaitable[Sequence[str]]]
-"""`validate(output, schema)`: the repair errors of `output` against the skill's full output
-schema (empty when valid), or an awaitable of them (#31). `horae.llm.validate.validate_output`
-is the production one (a killable worker); a synchronous validator runs inline, on the event
-loop (test doubles only)."""
+VALIDATOR_UNAVAILABLE = "validator_unavailable"
+"""The `LlmError` kind of an attempt whose output could not be validated (a validator
+timeout, a failing worker, an unusable schema, an output that is not plain JSON): not the
+model's fault, so no repair is made and the step degrades at once, the attempt's usage
+charged (schemas decision 44 C)."""
+
+VALIDATION_MARGIN_S = 0.5
+"""What a validation leaves of the attempt's deadline, so that it times out (and reports the
+attempt's usage) before the engine's own deadline cancels the step (decision 44 E)."""
+
+
+class Validator(Protocol):
+    """`validate(output, schema, timeout_s=...)`: the repair errors of `output` against the
+    skill's full output schema (empty when valid), or an awaitable of them (#31). It returns
+    within about `timeout_s` and raises `LlmError` (any kind: it is reported as
+    `validator_unavailable`) when it cannot validate. `horae.llm.validate.validate_output` is
+    the production one (a killable worker); a synchronous validator runs inline, on the event
+    loop (test doubles only)."""
+
+    def __call__(
+        self, output: Any, schema: Mapping[str, Any], /, *, timeout_s: float
+    ) -> Sequence[str] | Awaitable[Sequence[str]]: ...
+
+
+class Unvalidated(enum.Enum):
+    """`UNVALIDATED`: the explicit opt-out of output validation (test doubles only)."""
+
+    UNVALIDATED = "unvalidated"
+
+
+UNVALIDATED = Unvalidated.UNVALIDATED
+"""`ModelBackends(validate=UNVALIDATED)`: no validator, the provider's structured output is
+the only check. Never in production (decision 38 G): it must be written out."""
+
+
+def production_validator() -> Validator:
+    """`horae.llm.validate.validate_output`, imported lazily (it imports `horae.skills`,
+    which imports this module): the default of `ModelBackends.validate`."""
+    from horae.llm.validate import validate_output  # lazily: an import cycle
+
+    return validate_output
 
 
 def cost(
@@ -454,7 +505,9 @@ class ModelBackends:
     secrets: SecretResolver
     factories: Mapping[str, BackendFactory]
     prompts: PromptSource = field(default_factory=RequestPrompts)
-    validate: Validator | None = None
+    validate: Validator | Unvalidated = field(default_factory=production_validator)
+    """The output validator: `horae.llm.validate.validate_output` unless another one, or the
+    explicit `UNVALIDATED`, is given (decisions 38 G and 44 D)."""
     _backends: dict[str, ProviderBackend] = field(default_factory=dict, init=False, repr=False)
 
     def _backend(self, alias: str, spec: ModelAlias) -> ProviderBackend:
@@ -580,6 +633,7 @@ class ModelBackends:
         if not unchanged:
             raise LlmError("invalid_request", "the payload was changed after it was rendered")
         backend = self._backend(rendered.alias, spec)
+        started = time.monotonic()
         failure: LlmError | None = None
         try:
             result = await backend.send(json.loads(body), rendered.timeout_s)
@@ -587,12 +641,22 @@ class ModelBackends:
             failure = redacted_error(error, rendered.alias)
         if failure is not None:
             raise failure  # outside the handler: no `__context__` leads to the original
-        errors: tuple[str, ...] = ()
-        if self.validate is not None:
-            found = self.validate(result.output, rendered.output_schema)
-            if inspect.isawaitable(found):
-                found = await found
-            errors = tuple(str(error) for error in found)
+        left = rendered.timeout_s - (time.monotonic() - started) - VALIDATION_MARGIN_S
+        try:
+            errors = await self._errors(result.output, rendered.output_schema, max(0.0, left))
+        except asyncio.CancelledError as cancelled:
+            # The step's deadline (or the run's) cancelled the validation: the attempt was
+            # billed all the same, so its usage travels with the cancellation (decision 44 E).
+            attach_usage(cancelled, result.usage)
+            raise
+        except LlmError as error:
+            failure = LlmError(VALIDATOR_UNAVAILABLE, error.message, usage=result.usage)
+        except Exception as error:  # a validator bug: fail closed, never a pass
+            message = f"the validator failed ({type(error).__name__})"
+            failure = LlmError(VALIDATOR_UNAVAILABLE, message, usage=result.usage)
+        if failure is not None:
+            # Not the model's fault: no repair, the step degrades now (decision 44 C).
+            raise redacted_error(failure, rendered.alias)
         intents: list[Any]
         if errors:
             # An invalid output proposes nothing (decision 44): its intents are dropped here,
@@ -611,6 +675,17 @@ class ModelBackends:
             request=dict(rendered.summary),
             intents=intents,
         )
+
+    async def _errors(
+        self, output: Any, schema: Mapping[str, Any], timeout_s: float
+    ) -> tuple[str, ...]:
+        """The validator's repair errors of `output` (none `UNVALIDATED`)."""
+        if self.validate is UNVALIDATED:
+            return ()
+        found = self.validate(output, schema, timeout_s=timeout_s)
+        if inspect.isawaitable(found):
+            found = await found
+        return tuple(str(error) for error in found)
 
     async def complete(self, request: LlmRequest) -> LlmResponse:
         """`send(render(request))`: the engine's `LlmBackend.complete`."""
@@ -664,6 +739,9 @@ __all__ = [
     "INPUT_TOKEN_MARGIN",
     "INTENTS_KEY",
     "MAX_ERROR_CHARS",
+    "UNVALIDATED",
+    "VALIDATION_MARGIN_S",
+    "VALIDATOR_UNAVAILABLE",
     "BackendFactory",
     "Completion",
     "CompletionResult",
@@ -674,11 +752,13 @@ __all__ = [
     "ProviderBackend",
     "RenderedRequest",
     "RequestPrompts",
+    "Unvalidated",
     "Validator",
     "cost",
     "input_bound",
     "input_price",
     "max_tokens",
+    "production_validator",
     "redacted_error",
     "split_intents",
     "summary",

@@ -82,7 +82,7 @@ class FakeProvider:
         return None
 
 
-def validate(output: Any, schema: Mapping[str, Any]) -> list[str]:
+def validate(output: Any, schema: Mapping[str, Any], *, timeout_s: float) -> list[str]:
     errors = output.get("errors") if isinstance(output, dict) else None
     return list(errors) if isinstance(errors, list) else []
 

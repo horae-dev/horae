@@ -30,7 +30,7 @@ import pytest
 from horae.contracts.instance import BudgetsConfig, ModelAlias
 from horae.contracts.pipeline import Budget
 from horae.engine import LlmError, LlmRequest
-from horae.llm import Completion, ModelBackends, Prompt, RenderedRequest
+from horae.llm import UNVALIDATED, Completion, ModelBackends, Prompt, RenderedRequest
 from horae.llm.backends import FACTORIES
 from horae.llm.backends._shared import (
     MAX_ERROR_BYTES,
@@ -105,6 +105,7 @@ def backends(
     def factory(name: str, spec: ModelAlias, resolver: SecretResolver) -> Any:
         return kind.backend(name, spec, resolver, recorder)
 
+    kw.setdefault("validate", UNVALIDATED)  # the backends, not the validator (#31)
     return ModelBackends(
         models={"default": spec or kind.alias()},
         secrets=secrets,
@@ -728,7 +729,7 @@ def test_intents_are_moved_out_of_the_output(kind: Kind, secrets: SecretResolver
     output = {"items": ["a"], "intents": [intent]}
     seen: list[Any] = []
 
-    def validate(value: Any, schema: Mapping[str, Any]) -> list[str]:
+    def validate(value: Any, schema: Mapping[str, Any], *, timeout_s: float) -> list[str]:
         seen.append(value)
         return ["$.items: synthetic"]
 
