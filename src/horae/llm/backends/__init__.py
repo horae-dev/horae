@@ -5,10 +5,17 @@
 adds its factory to `FACTORIES` when it lands. `horae doctor` reports a model alias
 used by a pipeline whose backend is not in `FACTORIES`."""
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from typing import Any
 
 from horae.contracts.instance import ModelAlias
+from horae.llm.backends._shared import (
+    REFUSAL_STOP_REASONS,
+    TRUNCATION_STOP_REASONS,
+    UNUSABLE_STOP_REASONS,
+)
 from horae.llm.backends.anthropic import AnthropicBackend, anthropic_backend
+from horae.llm.backends.anthropic import schema_problem as anthropic_schema_problem
 from horae.llm.backends.ollama import OllamaBackend, ollama_backend
 from horae.llm.backends.openai_compatible import (
     OpenAICompatibleBackend,
@@ -32,6 +39,23 @@ FACTORIES: Mapping[str, BackendFactory] = {
 }
 """The available backends."""
 
+SCHEMA_CHECKS: Mapping[str, Callable[[Mapping[str, Any]], str | None]] = {
+    "anthropic": anthropic_schema_problem,
+}
+"""Per backend, why a skill's output schema cannot be used for its structured output (`None`:
+it can); a backend without an entry takes any schema the skill loader accepts (`horae
+doctor`, schemas decision 48 D4)."""
+
+
+def schema_problems(schema: Mapping[str, Any]) -> dict[str, str]:
+    """`{backend: why}` for each backend of `SCHEMA_CHECKS` that refuses `schema`."""
+    found = {}
+    for backend, check in SCHEMA_CHECKS.items():
+        problem = check(schema)
+        if problem is not None:
+            found[backend] = problem
+    return found
+
 
 def model_backends(
     models: Mapping[str, ModelAlias],
@@ -53,8 +77,13 @@ def model_backends(
 
 __all__ = [
     "FACTORIES",
+    "REFUSAL_STOP_REASONS",
+    "SCHEMA_CHECKS",
+    "TRUNCATION_STOP_REASONS",
+    "UNUSABLE_STOP_REASONS",
     "AnthropicBackend",
     "OllamaBackend",
     "OpenAICompatibleBackend",
     "model_backends",
+    "schema_problems",
 ]

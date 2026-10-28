@@ -227,7 +227,7 @@ import json
 import logging
 import math
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, NoReturn
 from urllib.parse import urlsplit
@@ -941,19 +941,13 @@ class _Run:
         if kept + len(typed) > MAX_RUN_INTENTS:
             message = f"more than {MAX_RUN_INTENTS} intents in the run"
             return [], StepError(kind="run_intents_exceeded", message=message)
-        known: frozenset[str] | None = None
+        seen = ([snap.data for snap in self.inputs], collected) if shown is None else shown
+        unknown = set(check_task_fingerprints(typed, seen))
         routed: list[ProposedIntent] = []
         for position, intent in enumerate(typed):
-            if isinstance(intent, TaskUpdateStatus):
-                if known is None:
-                    known = (
-                        _strings([snap.data for snap in self.inputs], collected)
-                        if shown is None
-                        else _strings(*shown)
-                    )
-                if intent.task not in known:
-                    unroutable.append(("intent_unrouted", position, intent.type))
-                    continue
+            if position in unknown:
+                unroutable.append(("intent_unrouted", position, intent.type))
+                continue
             takers = [entry for entry in entries if entry.takes(intent)]
             if len(takers) != 1:
                 code = "intent_unrouted" if not takers else "intent_ambiguous"
@@ -993,7 +987,34 @@ class _Run:
             code = "intent_unrouted" if not takers else "intent_ambiguous"
             unroutable.append((code, position, intent_type))
             return payload
-        return {**payload, name: takers[0].binds[name]}
+        return fill_target(payload, takers[0].binds)
+
+
+def fill_target(payload: Any, binds: Mapping[str, Any]) -> Any:
+    """`payload` (one raw intent) with its omitted target field (`TARGET_FIELDS`: `path`, or
+    `url` for `http.post`) taken from `binds` (an `act` entry's parameters, or a skill eval
+    case's `targets`); unchanged when it has one, binds none, or is not target-bound."""
+    if not isinstance(payload, dict):
+        return payload
+    intent_type = payload.get("type")
+    if not isinstance(intent_type, str) or intent_type not in TARGET_FIELDS:
+        return payload
+    name = TARGET_FIELDS[intent_type]
+    if payload.get(name) is not None or binds.get(name) is None:
+        return payload
+    return {**payload, name: binds[name]}
+
+
+def check_task_fingerprints(typed: Sequence[Intent], shown: Sequence[Any]) -> list[int]:
+    """The positions in `typed` of the `task.update_status` intents whose `task` fingerprint
+    is not, as an exact string value, in `shown` (what the proposer was shown; rule 4 of the
+    module docstring): a proposer can change the status of a task it was shown, not of one it
+    guessed. Shared by the engine (`_Run.propose`) and the skill eval judge (decision 48)."""
+    updates = [(i, it) for i, it in enumerate(typed) if isinstance(it, TaskUpdateStatus)]
+    if not updates:
+        return []
+    known = _strings(*shown)
+    return [position for position, intent in updates if intent.task not in known]
 
 
 def _violations(raw: object) -> tuple[Violation, ...]:
@@ -1658,6 +1679,8 @@ __all__ = [
     "PlannedCall",
     "RunCancelled",
     "StepHook",
+    "check_task_fingerprints",
     "execute",
+    "fill_target",
     "planned_calls",
 ]

@@ -9,6 +9,7 @@ same render, validation, intent and guard path as the `llm` step of a run."""
 from horae.evals._cases import (
     EVALS_DIR,
     RECORDED_DIR,
+    CaseScan,
     EvalError,
     LoadedCase,
     case_names,
@@ -17,6 +18,7 @@ from horae.evals._cases import (
     load_cases,
     load_recorded,
     recorded_path,
+    scan_cases,
     write_recorded,
 )
 from horae.evals._harness import (
@@ -24,6 +26,7 @@ from horae.evals._harness import (
     DEFAULT_TIMEOUT_S,
     CaseResult,
     Check,
+    Complete,
     LiveEval,
     Planned,
     SkillUnderEval,
@@ -45,7 +48,9 @@ __all__ = [
     "EVALS_DIR",
     "RECORDED_DIR",
     "CaseResult",
+    "CaseScan",
     "Check",
+    "Complete",
     "EvalError",
     "LiveEval",
     "LoadedCase",
@@ -63,6 +68,7 @@ __all__ = [
     "recorded_path",
     "resolve",
     "run_offline",
+    "scan_cases",
     "send_live",
     "summary",
     "total",

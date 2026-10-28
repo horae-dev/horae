@@ -26,7 +26,7 @@ recording, a backend or validator error, an input that does not fit the view).
 import difflib
 import json
 from collections import Counter
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -43,12 +43,12 @@ from horae.contracts.intents import IntentType
 from horae.contracts.pipeline import Budget
 from horae.contracts.plugin import PluginManifest
 from horae.contracts.run import Usage
-from horae.engine import TARGET_FIELDS
+from horae.engine import TARGET_FIELDS, check_task_fingerprints, fill_target
 from horae.engine.guard import check_intents
 from horae.engine.ports import LlmError, LlmRequest, LlmResponse
 from horae.evals._cases import LoadedCase
 from horae.intents import IntentRejected, validate_intents
-from horae.llm.backends import FACTORIES
+from horae.llm.backends import FACTORIES, UNUSABLE_STOP_REASONS
 from horae.llm.base import (
     BackendFactory,
     CompletionResult,
@@ -117,6 +117,11 @@ class CaseResult:
     nothing recorded)."""
     recorded_path: str | None = None
     """Live with `--record`: the recording written."""
+    recorded_skipped: str | None = None
+    """Live with `--record`: why this answer was not recorded (only an answer that passes
+    the case is, decision 48 G)."""
+    stop_reason: str | None = None
+    """The provider's stop reason (recorded, or of the live answer)."""
     error: dict[str, str] | None = None
     output: Any = None
 
@@ -143,6 +148,8 @@ class CaseResult:
             ),
             "recorded_diff": self.recorded_diff,
             "recorded_path": self.recorded_path,
+            "recorded_skipped": self.recorded_skipped,
+            "stop_reason": self.stop_reason,
             "error": self.error,
         }
 
@@ -254,8 +261,19 @@ def _counts(intents: Sequence[Any]) -> dict[str, int]:
     return dict(sorted(types.items()))
 
 
-def compare(expect: EvalExpect, result: CaseResult) -> list[Check]:
-    """Every check of `expect` against `result` (its output, intents, validity and guard)."""
+def _within(usage: Usage, budget: Budget) -> str | None:
+    """Why `usage` is over `budget` (`None`: it is not); an unpriced usage has no cost."""
+    if usage.tokens_out > budget.tokens_out:
+        return f"{usage.tokens_out} output tokens, over the budget's {budget.tokens_out}"
+    if usage.priced is not False and usage.usd > budget.usd * (1 + 1e-9) + 1e-12:
+        return f"${usage.usd:.6f}, over the budget's ${budget.usd:.6f}"
+    return None
+
+
+def compare(expect: EvalExpect, result: CaseResult, budget: Budget | None = None) -> list[Check]:
+    """Every check of `expect` against `result` (its output, intents, validity and guard),
+    plus: the answer did not stop on a refusal or a truncation, and (with `budget`) its usage
+    is within the case's budget."""
     checks: list[Check] = []
     ok = result.schema_valid is expect.schema_valid
     message = None
@@ -285,28 +303,35 @@ def compare(expect: EvalExpect, result: CaseResult) -> list[Check]:
     else:
         ok = result.guard == "violation"
         checks.append(Check("guard", ok, None if ok else f"the guard result is {result.guard}"))
+    if result.stop_reason in UNUSABLE_STOP_REASONS:
+        stopped = f"the answer stopped with {result.stop_reason} (a refusal or a truncation)"
+        checks.append(Check("stop_reason", False, stopped))
+    if budget is not None and result.usage is not None:
+        over = _within(result.usage, budget)
+        checks.append(Check("usage_within_budget", over is None, over))
     return checks
 
 
 # --- intents ----------------------------------------------------------------------------------
 
 
+def _binds(payload: Any, loaded: LoadedCase) -> dict[str, str]:
+    """What the case binds for `payload`'s type, as an `act` entry's parameters (its
+    `targets`; a note type without one: `Evals/<case>.md`)."""
+    kind = payload.get("type") if isinstance(payload, dict) else None
+    name = TARGET_FIELDS.get(cast(IntentType, kind)) if isinstance(kind, str) else None
+    if name is None:
+        return {}
+    target = loaded.case.targets.get(cast(TargetType, kind))
+    if target is None and name == "path":
+        target = f"{DEFAULT_NOTE_DIR}/{loaded.name}.md"
+    return {} if target is None else {name: target}
+
+
 def _filled(raw: list[Any], loaded: LoadedCase) -> list[Any]:
-    """`raw` with each omitted target filled from the case's `targets` (a note type without
-    one: `Evals/<case>.md`), as a pipeline's `act` entries fill them in a run."""
-    out = []
-    for payload in raw:
-        if isinstance(payload, dict):
-            kind = payload.get("type")
-            name = TARGET_FIELDS.get(cast(IntentType, kind)) if isinstance(kind, str) else None
-            if name is not None and payload.get(name) is None:
-                target = loaded.case.targets.get(cast(TargetType, kind))
-                if target is None and name == "path":
-                    target = f"{DEFAULT_NOTE_DIR}/{loaded.name}.md"
-                if target is not None:
-                    payload = {**payload, name: target}
-        out.append(payload)
-    return out
+    """`raw` with each omitted target filled from the case (`horae.engine.fill_target`, as a
+    pipeline's `act` entries fill them in a run)."""
+    return [fill_target(payload, _binds(payload, loaded)) for payload in raw]
 
 
 def judge_intents(sue: SkillUnderEval, loaded: LoadedCase, viewed: Any, result: CaseResult) -> None:
@@ -326,6 +351,14 @@ def judge_intents(sue: SkillUnderEval, loaded: LoadedCase, viewed: Any, result: 
     detail = check_intents(typed, shown=viewed, source=sue.source, limits=sue.skill.intent_limits)
     result.guard = "pass" if detail is None else "violation"
     result.guard_detail = detail
+    # A run routes a `task.update_status` only for a task the model was shown (engine rule 4).
+    unknown = check_task_fingerprints(typed, (viewed,))
+    if unknown:
+        where = ", ".join(str(position) for position in unknown)
+        result.intents_error = (
+            f"task.update_status of a task the model was not shown (intents {where}): "
+            "a run leaves it unrouted"
+        )
 
 
 # --- requests ---------------------------------------------------------------------------------
@@ -399,7 +432,7 @@ def absorb(response: LlmResponse, result: CaseResult) -> None:
 def finish(sue: SkillUnderEval, loaded: LoadedCase, viewed: Any, result: CaseResult) -> CaseResult:
     """Judge the intents, compare with `expect` and set the status."""
     judge_intents(sue, loaded, viewed, result)
-    result.checks = compare(loaded.case.expect, result)
+    result.checks = compare(loaded.case.expect, result, loaded.case.budget or DEFAULT_BUDGET)
     if result.status != "error":
         result.status = "pass" if all(check.ok for check in result.checks) else "fail"
     return result
@@ -521,6 +554,7 @@ async def _offline_case(
     try:
         rendered = backends.render(request_for(sue, name, loaded, viewed, timeout_s))
         result.stale = staleness(sue, rendered, recorded)
+        result.stop_reason = recorded.stop_reason
         absorb(await backends.send(rendered), result)
     except LlmError as error:
         return result.fail(error.kind, error.message)
@@ -602,6 +636,7 @@ class Planned:
 
     loaded: LoadedCase
     viewed: Any
+    request: LlmRequest
     rendered: RenderedRequest
     worst_case: Usage
 
@@ -619,12 +654,14 @@ def plan_live(
         if viewed is None:
             errors.append(result)
             continue
+        request = request_for(sue, live.alias, loaded, viewed, timeout_s)
         try:
-            rendered = live.backends.render(request_for(sue, live.alias, loaded, viewed, timeout_s))
+            rendered = live.backends.render(request)
         except LlmError as error:
             errors.append(result.fail(error.kind, error.message))
             continue
-        planned.append(Planned(loaded, viewed, rendered, live.backends.worst_case(rendered)))
+        worst = live.backends.worst_case(rendered)
+        planned.append(Planned(loaded, viewed, request, rendered, worst))
     return planned, errors
 
 
@@ -664,30 +701,51 @@ def recording(sue: SkillUnderEval, planned: Planned, raw: CompletionResult) -> R
         return RecordedResponse.model_validate({**data, "stop_reason": None})
 
 
+Complete = Callable[["Planned", int], Awaitable[LlmResponse]]
+"""How a live case is sent: `(planned case, its index) -> response` (the CLI's goes through
+the usage ledger, `horae.runner.LedgerLlm`); by default `ModelBackends.send` itself."""
+
+
 async def send_live(
     live: LiveEval,
     sue: SkillUnderEval,
     planned: Sequence[Planned],
     *,
+    complete: Complete | None = None,
     on_record: Callable[[str, RecordedResponse], str | None] | None = None,
+    results: list[CaseResult] | None = None,
 ) -> list[CaseResult]:
-    """Send every planned case (one request each, in order) and judge the answers; with
-    `on_record`, each answer that came back is handed over (redacted) to be written, and
-    returns where."""
-    results = []
-    for item in planned:
+    """Send every planned case (one request each, in order) and judge the answers. Each
+    result is appended to `results` as soon as it is known (so a caller interrupted midway
+    keeps the cases already sent); a case whose sending raises anything but a cancellation is
+    an error result, and the next case is sent. With `on_record`, each answer that passes its
+    case is handed over (redacted) to be written, and returns where; another answer is not
+    (`recorded_skipped`)."""
+    out: list[CaseResult] = [] if results is None else results
+    for index, item in enumerate(planned):
         loaded = item.loaded
         result = CaseResult(loaded.name, item.rendered.backend, item.rendered.model)
         result.worst_case = item.worst_case
+        capture = live.captures.get(live.alias)
+        if capture is not None:
+            capture.last = None
         try:
-            response = await live.backends.send(item.rendered)
+            if complete is None:
+                response = await live.backends.send(item.rendered)
+            else:
+                response = await complete(item, index)
         except LlmError as error:
             result.usage = error.usage if isinstance(error.usage, Usage) else None
-            results.append(result.fail(error.kind, error.message))
+            out.append(result.fail(error.kind, error.message))
+            continue
+        except Exception as error:  # this case only: the next one is still sent
+            message = f"sending the case failed ({type(error).__name__})"
+            out.append(result.fail("case_failed", message))
             continue
         absorb(response, result)
-        capture = live.captures.get(live.alias)
         raw = None if capture is None else capture.last
+        if raw is not None:
+            result.stop_reason = raw.stop_reason
         recorded = loaded.recorded.get(item.rendered.backend)
         if recorded is not None:
             result.stale = staleness(sue, item.rendered, recorded)
@@ -695,10 +753,14 @@ async def send_live(
                 before, _ = current_redactor().scrub_data(recorded.output)
                 after, _ = current_redactor().scrub_data(raw.output)
                 result.recorded_diff = unified(before, after, "recorded", "live")
+        finish(sue, loaded, item.viewed, result)
         if on_record is not None and raw is not None:
-            result.recorded_path = on_record(loaded.name, recording(sue, item, raw))
-        results.append(finish(sue, loaded, item.viewed, result))
-    return results
+            if result.status == "pass":
+                result.recorded_path = on_record(loaded.name, recording(sue, item, raw))
+            else:
+                result.recorded_skipped = "the answer does not pass the case: not recorded"
+        out.append(result)
+    return out
 
 
 def summary(results: Sequence[CaseResult]) -> dict[str, Any]:
@@ -721,6 +783,7 @@ __all__ = [
     "OFFLINE_SECRET",
     "CaseResult",
     "Check",
+    "Complete",
     "LiveEval",
     "Planned",
     "SkillUnderEval",

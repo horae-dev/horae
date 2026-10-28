@@ -3,8 +3,8 @@
 
 Every file is opened with `O_NOFOLLOW` (a symbolic link is refused), must be a regular file
 and is read with a size bound. The `evals` and `recorded` folders and each backend folder
-must be real directories too (not links). A recording is written atomically: a new temporary
-file in the same folder (opened `x`, mode 0644), then a `rename` over the old one.
+must be real directories too (not links); dotfiles in them (`.DS_Store`) are skipped. A
+recording is written atomically and durably (`write_recorded`).
 """
 
 import contextlib
@@ -14,6 +14,7 @@ import math
 import os
 import re
 import stat
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, get_args
@@ -186,52 +187,105 @@ def load_recorded(path: Path) -> RecordedResponse | None:
         raise EvalError(f"{path}: {where}: {first['msg']}") from None
 
 
-def case_names(folder: Path) -> list[str]:
-    """The case names of `folder` (`evals/`), sorted; none when it does not exist."""
+def _hidden(entry: Path) -> bool:
+    """A dotfile (`.DS_Store`, an editor's swap file, a recording's temporary file)."""
+    return entry.name.startswith(".")
+
+
+def _case_entries(folder: Path) -> list[Path]:
+    """The `*.yaml` entries of `folder` (`evals/`), dotfiles skipped, sorted; none when it
+    does not exist."""
     if not _is_dir(folder):
         if folder.exists() or folder.is_symlink():
             raise EvalError(f"{folder}: not a directory (or a symbolic link)")
         return []
-    names = []
-    for entry in sorted(folder.iterdir()):
-        if entry.suffix != CASE_SUFFIX:
-            continue
-        if not _CASE_NAME.fullmatch(entry.stem):
-            raise EvalError(f"{entry}: not a case name (lower case, digits, `_` and `-`)")
-        names.append(entry.stem)
-    if len(names) > MAX_CASES:
+    entries = [e for e in sorted(folder.iterdir()) if not _hidden(e) and e.suffix == CASE_SUFFIX]
+    if len(entries) > MAX_CASES:
         raise EvalError(f"{folder}: more than {MAX_CASES} cases")
+    return entries
+
+
+def _bad_name(entry: Path) -> str:
+    return f"{entry}: not a case name (lower case, digits, `_` and `-`, at most 64)"
+
+
+def case_names(folder: Path) -> list[str]:
+    """The case names of `folder` (`evals/`), sorted; none when it does not exist. A
+    `*.yaml` file whose name is not a case name is an `EvalError`."""
+    names = []
+    for entry in _case_entries(folder):
+        if not _CASE_NAME.fullmatch(entry.stem):
+            raise EvalError(_bad_name(entry))
+        names.append(entry.stem)
     return names
 
 
-def load_cases(folder: Path, only: str | None = None) -> list[LoadedCase]:
-    """Every case of `folder` (`evals/`), or only `only`, with its recorded responses."""
-    names = case_names(folder)
-    if only is not None:
-        names = [name for name in names if name == only]
+def _backends(folder: Path) -> list[str]:
     recorded_root = folder / RECORDED_DIR
     backends: list[str] = []
     if _is_dir(recorded_root):
         for entry in sorted(recorded_root.iterdir()):
+            if _hidden(entry):
+                continue
             if entry.name not in BACKENDS or not _is_dir(entry):
                 raise EvalError(f"{entry}: not a backend folder ({', '.join(BACKENDS)})")
             backends.append(entry.name)
     elif recorded_root.exists() or recorded_root.is_symlink():
         raise EvalError(f"{recorded_root}: not a directory (or a symbolic link)")
-    loaded = []
-    for name in names:
-        case = load_case(folder / f"{name}{CASE_SUFFIX}")
-        recorded: dict[str, RecordedResponse] = {}
-        for backend in backends:
-            path = recorded_path(folder, backend, name)
-            response = load_recorded(path)
-            if response is None:
-                continue
-            if response.backend != backend:
-                raise EvalError(f"{path}: recorded for backend {response.backend!r}")
-            recorded[backend] = response
-        loaded.append(LoadedCase(name, case, recorded))
-    return loaded
+    return backends
+
+
+def _load_one(folder: Path, name: str, backends: list[str]) -> LoadedCase:
+    case = load_case(folder / f"{name}{CASE_SUFFIX}")
+    recorded: dict[str, RecordedResponse] = {}
+    for backend in backends:
+        path = recorded_path(folder, backend, name)
+        response = load_recorded(path)
+        if response is None:
+            continue
+        if response.backend != backend:
+            raise EvalError(f"{path}: recorded for backend {response.backend!r}")
+        recorded[backend] = response
+    return LoadedCase(name, case, recorded)
+
+
+@dataclass(frozen=True)
+class CaseScan:
+    """The cases of a skill that load, and the problem of each one that does not (by case
+    name, or by file name when it is not a case name), sorted by name."""
+
+    cases: list[LoadedCase]
+    problems: list[tuple[str, str]]
+
+
+def scan_cases(folder: Path, only: str | None = None) -> CaseScan:
+    """Every case of `folder` (`evals/`), or only `only`, with its recorded responses. A case
+    file or recording that cannot be used (a name that is not a case name, an invalid case or
+    recording) is a problem of that case, not of the eval; a folder that cannot be used
+    (`evals/`, `recorded/`, a backend folder) is an `EvalError`."""
+    entries = _case_entries(folder)
+    backends = _backends(folder)
+    cases: list[LoadedCase] = []
+    problems: list[tuple[str, str]] = []
+    for entry in entries:
+        if only is not None and entry.stem != only:
+            continue
+        if not _CASE_NAME.fullmatch(entry.stem):
+            problems.append((entry.name, _bad_name(entry)))
+            continue
+        try:
+            cases.append(_load_one(folder, entry.stem, backends))
+        except EvalError as error:
+            problems.append((entry.stem, error.message))
+    return CaseScan(cases, problems)
+
+
+def load_cases(folder: Path, only: str | None = None) -> list[LoadedCase]:
+    """Every case of `folder` (`evals/`), or only `only`, with its recorded responses; the
+    first problem (`scan_cases`) is an `EvalError`."""
+    names = case_names(folder)
+    backends = _backends(folder)
+    return [_load_one(folder, name, backends) for name in names if only in (None, name)]
 
 
 def _mkdir(path: Path) -> None:
@@ -242,25 +296,46 @@ def _mkdir(path: Path) -> None:
     path.mkdir(mode=0o755)
 
 
+def _fsync_dir(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def write_recorded(folder: Path, case: str, recorded: RecordedResponse) -> Path:
-    """Write `recorded` as `recorded/<backend>/<case>.json` under `folder`, atomically; the
-    content is the canonical JSON of the model (indented, ASCII, sorted keys)."""
-    if not _CASE_NAME.fullmatch(case):  # pragma: no cover - names come from case_names
+    """Write `recorded` as `recorded/<backend>/<case>.json` under `folder`, atomically and
+    durably: a new temporary file in the same folder (`mkstemp`: `O_EXCL`, a random name,
+    0600, then 0644), written and `fsync`ed, `os.replace`d over the old one, then the folder
+    `fsync`ed. The content is the canonical JSON of the model (indented, ASCII, sorted
+    keys)."""
+    if not _CASE_NAME.fullmatch(case):
         raise EvalError(f"{case!r}: not a case name")
-    _mkdir(folder)
-    _mkdir(folder / RECORDED_DIR)
-    _mkdir(folder / RECORDED_DIR / recorded.backend)
+    try:
+        _mkdir(folder)
+        _mkdir(folder / RECORDED_DIR)
+        _mkdir(folder / RECORDED_DIR / recorded.backend)
+    except OSError as error:
+        raise EvalError(f"{folder}: cannot be written ({error.strerror})") from None
     target = recorded_path(folder, recorded.backend, case)
     data = recorded.model_dump(mode="json")
     text = json.dumps(data, indent=2, sort_keys=True, ensure_ascii=True, allow_nan=False) + "\n"
-    temporary = target.with_name(f".{case}.{os.getpid()}.tmp")
+    temporary: str | None = None
     try:
-        with open(temporary, "x", encoding="utf-8") as handle:
+        fd, temporary = tempfile.mkstemp(prefix=f".{case}.", suffix=".tmp", dir=target.parent)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(text)
+            handle.flush()
+            os.fchmod(handle.fileno(), 0o644)
+            os.fsync(handle.fileno())
         os.replace(temporary, target)
+        temporary = None
+        _fsync_dir(target.parent)
     except OSError as error:
-        with contextlib.suppress(OSError):
-            temporary.unlink()
+        if temporary is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(temporary)
         raise EvalError(f"{target}: cannot be written ({error.strerror})") from None
     return target
 
@@ -273,6 +348,7 @@ __all__ = [
     "MAX_CASE_BYTES",
     "MAX_RECORDED_BYTES",
     "RECORDED_DIR",
+    "CaseScan",
     "EvalError",
     "LoadedCase",
     "case_names",
@@ -282,5 +358,6 @@ __all__ = [
     "load_recorded",
     "read_bounded",
     "recorded_path",
+    "scan_cases",
     "write_recorded",
 ]

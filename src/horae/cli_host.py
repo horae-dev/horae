@@ -15,14 +15,16 @@ import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Literal
 
 from horae.apply import SinkRegistry
 from horae.cli_output import EXIT_PROBLEMS, CommandFailed, plural
 from horae.config import CONFIG_FILE, Instance, InstanceError, Problem, ProblemsError, load_instance
 from horae.contracts.pipeline import LlmStep
 from horae.contracts.plugin import StdioRuntime
+from horae.contracts.skill import OUTPUT_SCHEMA_FILE
 from horae.engine import UnknownPlugin
-from horae.llm.backends import FACTORIES
+from horae.llm.backends import FACTORIES, schema_problems
 from horae.llm.validate import worker_problem
 from horae.plugins.host import HostRegistry, PluginCallError, RegistryError
 from horae.plugins.host.host import resolve_command
@@ -241,15 +243,19 @@ def _budget_problems(instance: Instance) -> list[Problem]:
 
 def _skill_problems(instance: Instance, registry: HostRegistry) -> list[Problem]:
     """Each skill an `llm` step of a pipeline uses that does not load (`SkillError`), as the
-    engine would load it (with the plugin's locked `permissions.intents`)."""
-    used = sorted(
-        {
-            step.llm.skill
-            for pipeline in instance.pipelines.values()
-            for step in pipeline.steps
-            if isinstance(step, LlmStep)
-        }
-    )
+    engine would load it (with the plugin's locked `permissions.intents`), and each loaded
+    skill whose output schema a backend's structured output refuses (`schema_problems`, with
+    the offending JSON pointer): an error when an alias of that backend runs the skill, else a
+    warning (schemas decision 48 D4)."""
+    backends: dict[str, set[str]] = {}
+    for pipeline in instance.pipelines.values():
+        for step in pipeline.steps:
+            if isinstance(step, LlmStep):
+                alias = instance.config.models.get(step.llm.model)
+                used_by = backends.setdefault(step.llm.skill, set())
+                if alias is not None:
+                    used_by.add(alias.backend)
+    used = sorted(backends)
     problems: list[Problem] = []
     for skill in used:
         try:
@@ -260,9 +266,20 @@ def _skill_problems(instance: Instance, registry: HostRegistry) -> list[Problem]
         if plugin.root is None:  # pragma: no cover (from_directory sets every root)
             continue
         try:
-            load_skill(plugin.root, skill, allowed_intents=plugin.manifest.permissions.intents)
+            loaded = load_skill(
+                plugin.root, skill, allowed_intents=plugin.manifest.permissions.intents
+            )
         except SkillError as error:
             problems.append(Problem(where, None, None, f"skill_invalid: {error.problem}"))
+            continue
+        for backend, why in sorted(schema_problems(loaded.output_schema).items()):
+            severity: Literal["error", "warning"] = (
+                "error" if backend in backends[skill] else "warning"
+            )
+            message = f"output schema unusable for {backend} structured output: {why}"
+            problems.append(
+                Problem(f"{where}{OUTPUT_SCHEMA_FILE}", None, None, message, severity=severity)
+            )
     return problems
 
 

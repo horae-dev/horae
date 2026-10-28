@@ -27,6 +27,7 @@ from horae.store._errors import (
 from horae.store._schema import SCHEMA_VERSION, Migration, load_migrations, migrate
 from horae.store._store import (
     DEFAULT_BUSY_TIMEOUT_MS,
+    EVAL_PIPELINE_PREFIX,
     HEARTBEAT_BUSY_TIMEOUT_MS,
     MAX_JOURNAL_BYTES,
     MAX_LIST_RUNS,
@@ -46,6 +47,7 @@ from horae.store._store import (
 
 __all__ = [
     "DEFAULT_BUSY_TIMEOUT_MS",
+    "EVAL_PIPELINE_PREFIX",
     "HEARTBEAT_BUSY_TIMEOUT_MS",
     "MAX_JOURNAL_BYTES",
     "MAX_LIST_RUNS",

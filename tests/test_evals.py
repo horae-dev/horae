@@ -123,10 +123,12 @@ def test_offline_report_shape() -> None:
         "skill_digest",
         "plugin",
         "alias",
+        "run",
         "cases",
         "summary",
         "estimate",
         "report",
+        "report_error",
         "error",
     }
     assert document["mode"] == "offline"
@@ -359,11 +361,15 @@ def test_a_plugin_dir_that_is_not_a_directory(tmp_path: Path) -> None:
 
 
 def test_an_invalid_case_file_is_a_problem(pack: Path) -> None:
+    # A broken case is an error result of its own; the other cases still run.
     (_evals(pack) / "broken.yaml").write_text("schema_version: 1\nexpect: {}\n")
     code, document, _output = _invoke(SKILL, "--plugin-dir", str(pack), "--json")
     assert code == 1
-    assert document["error"]["kind"] == "eval_invalid"
-    assert "broken.yaml" in document["error"]["message"]
+    assert document["error"]["kind"] == "eval_errors"
+    by_case = {c["case"]: c for c in document["cases"]}
+    assert by_case["broken"]["error"]["kind"] == "eval_invalid"
+    assert "broken.yaml" in by_case["broken"]["error"]["message"]
+    assert by_case["tasks-only"]["status"] == "pass"
 
 
 def test_a_skill_without_cases_is_a_problem(pack: Path) -> None:
@@ -702,8 +708,14 @@ def test_live_sends_each_case_and_writes_a_report(
     text = report.with_suffix(".txt").read_text()
     assert "3 cases: 3 passed" in text
     assert f"spent 1800 tokens in, {spent} out" in text
-    # Nothing is written to the store or its ledger: the eval is not a run.
-    assert not (instance / "state" / "horae.db").exists()
+    # The spend is in the usage ledger, under a run of pipeline `eval:<skill>`.
+    with Store.open(instance / "state" / "horae.db", read_only=True) as store:
+        (run,) = store.list_runs(status="ok")
+        assert run.id == document["run"]
+        assert run.pipeline == f"eval:{SKILL}"
+        assert run.cost.tokens_out == spent
+        groups = store.usage_report()
+    assert [(g.pipeline, g.calls, g.tokens_out) for g in groups] == [(f"eval:{SKILL}", 3, spent)]
     # Every request carried the alias' key and nothing else.
     assert all(r.headers["x-api-key"] == SECRET_VALUE for r in fake.requests)
 
@@ -739,7 +751,7 @@ def test_live_reports_differences_and_backend_errors(
 
 
 def test_live_record_writes_redacted_recordings(
-    tmp_path: Path, provider: Callable[..., FakeProvider]
+    tmp_path: Path, provider: Callable[..., FakeProvider], pack: Path
 ) -> None:
     root = _instance(tmp_path / "instance")
     leaky = {
@@ -749,11 +761,18 @@ def test_live_record_writes_redacted_recordings(
             {"title": "Read the onboarding guide", "why": "later"},
         ],
     }
+    # The case asserts what the answer must hold, not its exact words: a leaky one passes.
+    _edit_yaml(
+        _evals(pack) / "tasks-only.yaml",
+        lambda d: d.update(expect={"assertions": [{"pointer": "/output/ranked", "length": 2}]}),
+    )
     provider(leaky)
     code, document, _ = _invoke(
         SKILL,
         "-i",
         str(root),
+        "--plugin-dir",
+        str(pack),
         "--live",
         "--yes",
         "--max-usd",
@@ -763,10 +782,10 @@ def test_live_record_writes_redacted_recordings(
         "--record",
         "--json",
     )
-    assert code == 4  # the redacted summary differs from the expected one
-    target = root / "plugins" / "pack-daily-brief" / "skills" / "daily-brief" / "rank-and-word"
-    path = target / "evals" / "recorded" / "anthropic" / "tasks-only.json"
+    assert code == 0, document
+    path = _recorded(pack, "tasks-only")
     assert document["cases"][0]["recorded_path"] == str(path)
+    assert oct(path.stat().st_mode & 0o777) == oct(0o644)
     text = path.read_text()
     assert SECRET_VALUE not in text
     assert "[REDACTED:ANTHROPIC_API_KEY]" in text
@@ -779,33 +798,25 @@ def test_live_record_writes_redacted_recordings(
         if report.is_file():
             assert SECRET_VALUE not in report.read_text()
     # The new recording is what an offline eval now replays.
-    code, document, _ = _invoke(SKILL, "-i", str(root), "--case", "tasks-only", "--json")
-    assert code == 4
+    code, document, _ = _invoke(SKILL, "--plugin-dir", str(pack), "--case", "tasks-only", "--json")
+    assert code == 0, document
     assert document["cases"][0]["stale"] == []
 
 
 def test_live_record_reports_a_write_failure(
-    tmp_path: Path, provider: Callable[..., FakeProvider]
+    tmp_path: Path, provider: Callable[..., FakeProvider], pack: Path
 ) -> None:
     root = _instance(tmp_path / "instance")
     provider(_recorded_outputs()["tasks-only"])
-    backend = (
-        root
-        / "plugins"
-        / "pack-daily-brief"
-        / "skills"
-        / "daily-brief"
-        / "rank-and-word"
-        / "evals"
-        / "recorded"
-        / "anthropic"
-    )
+    backend = _evals(pack) / "recorded" / "anthropic"
     os.chmod(backend, 0o500)
     try:
         code, _document, output = _invoke(
             SKILL,
             "-i",
             str(root),
+            "--plugin-dir",
+            str(pack),
             "--live",
             "--yes",
             "--max-usd",
@@ -879,10 +890,17 @@ def test_live_respects_the_daily_budget(
     assert code == 3
     assert "daily budget" in document["error"]["message"]
     assert fake.requests == []
+    # A tokens_out-only ceiling does not bound the cost: --max-usd is still required.
     root = _instance(tmp_path / "c", budgets={"daily": {"tokens_out": 100}})
     code, document, _ = _invoke(SKILL, "-i", str(root), "--live", "--yes", "--json")
+    assert code == 2
+    assert "--max-usd" in document["error"]["message"]
+    code, document, _ = _invoke(
+        SKILL, "-i", str(root), "--live", "--yes", "--max-usd", "1", "--json"
+    )
     assert code == 3
     assert "output tokens" in document["error"]["message"]
+    assert fake.requests == []
 
 
 def test_live_counts_what_the_ledger_spent_today(
@@ -924,3 +942,542 @@ def test_live_reports_a_broken_store(tmp_path: Path, provider: Callable[..., Fak
     code, document, _ = _invoke(SKILL, "-i", str(root), "--live", "--yes", "--json")
     assert code == 1
     assert document["error"]["kind"] == "store_error"
+
+
+# --- review fixes (decision 48 J to N) --------------------------------------------------------
+
+
+def _live_args(root: Path, *extra: str) -> list[str]:
+    return [SKILL, "-i", str(root), "--live", "--yes", "--max-usd", "1", *extra, "--json"]
+
+
+def test_live_refuses_an_unpriced_cloud_alias(
+    tmp_path: Path, provider: Callable[..., FakeProvider]
+) -> None:
+    unpriced = {k: v for k, v in ANTHROPIC.items() if k != "price"}
+    root = _instance(tmp_path / "instance", {"default": unpriced})
+    fake = provider(_recorded_outputs()["tasks-only"])
+    code, document, _ = _invoke(*_live_args(root, "--case", "tasks-only"))
+    assert code == 3
+    assert document["error"]["kind"] == "unpriced_alias"
+    assert fake.requests == []
+    code, document, _ = _invoke(*_live_args(root, "--case", "tasks-only", "--allow-unpriced"))
+    assert code == 0, document
+    assert len(fake.requests) == 1
+    assert document["cases"][0]["usage"]["priced"] is False
+
+
+@pytest.mark.parametrize("value", ["inf", "nan", "-inf", "0"])
+def test_live_refuses_a_non_finite_max_usd(instance: Path, value: str) -> None:
+    code, document, _ = _invoke(SKILL, "-i", str(instance), "--live", "--max-usd", value, "--json")
+    assert code == 2
+    assert "finite" in document["error"]["message"]
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["--allow-unpriced"],
+        ["--live", "--record"],  # --record needs --plugin-dir
+        ["--case", "Bad Name"],
+        ["--case", "../tasks-only"],
+    ],
+)
+def test_more_usage_errors(instance: Path, args: list[str]) -> None:
+    code, document, _ = _invoke(SKILL, "-i", str(instance), *args, "--json")
+    assert code == 2, document
+    assert document["error"]["kind"] == "usage"
+
+
+def test_runs_hides_live_evals_unless_all(
+    instance: Path, provider: Callable[..., FakeProvider]
+) -> None:
+    provider(_recorded_outputs()["tasks-only"])
+    code, document, _ = _invoke(*_live_args(instance, "--case", "tasks-only"))
+    assert code == 0, document
+    listed = runner.invoke(app, ["runs", "-i", str(instance), "--json"])
+    assert json.loads(listed.stdout)["runs"] == []
+    listed = runner.invoke(app, ["runs", "-i", str(instance), "--all", "--json"])
+    (run,) = json.loads(listed.stdout)["runs"]
+    assert run["id"] == document["run"]
+    assert run["pipeline"] == f"eval:{SKILL}"
+    assert run["status"] == "ok"
+    listed = runner.invoke(app, ["runs", "-i", str(instance), "-p", f"eval:{SKILL}", "--json"])
+    assert len(json.loads(listed.stdout)["runs"]) == 1
+    # The ledger counts the eval's spend with the other pipelines' (`horae usage`).
+    with Store.open(instance / "state" / "horae.db", read_only=True) as store:
+        (group,) = store.usage_report()
+        assert group.pipeline == f"eval:{SKILL}"
+        assert group.tokens_out == document["summary"]["usage"]["tokens_out"]
+
+
+def test_live_rechecks_the_allowance_after_the_confirmation(
+    tmp_path: Path, provider: Callable[..., FakeProvider], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _instance(tmp_path / "instance", budgets={"daily": {"usd": 1.0}})
+    fake = provider(_recorded_outputs()["tasks-only"])
+    seen = iter([(1.0, None), (0.0001, None)])
+    monkeypatch.setattr(cli_eval, "_allowance", lambda *args: next(seen))
+    code, document, _ = _invoke(*_live_args(root, "--case", "tasks-only"))
+    assert code == 3
+    assert document["error"]["kind"] == "budget_exceeded"
+    assert fake.requests == []
+    assert not (root / "state" / "evals").exists()  # refused: no run, no report
+
+
+def test_the_ledger_reservation_refuses_what_the_preflight_missed(
+    tmp_path: Path, provider: Callable[..., FakeProvider], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The pre-flight saw an allowance another run then spent: the ledger's own reservation
+    # (read inside `BEGIN IMMEDIATE`) refuses the case, and nothing is sent.
+    from datetime import UTC, datetime
+
+    from horae.runner._budget import local_day
+
+    root = _instance(tmp_path / "instance", budgets={"daily": {"usd": 1.0}})
+    fake = provider(_recorded_outputs()["tasks-only"])
+    monkeypatch.setattr(cli_eval, "_allowance", lambda *args: (1.0, None))
+    confirm = cli_eval._confirm
+
+    def confirm_then_spend(*args: Any) -> None:
+        confirm(*args)
+        now = datetime.now(UTC)
+        with Store.open(root / "state" / "horae.db") as store:
+            store.begin_run("other", "brief", now)
+            day = local_day(now, "UTC")
+            store.reserve_usage(
+                "other", step=0, attempt=1, alias="default", at=now, day=day, usd=0.999,
+                tokens_out=10,
+            )  # fmt: skip
+
+    monkeypatch.setattr(cli_eval, "_confirm", confirm_then_spend)
+    code, document, _ = _invoke(*_live_args(root, "--case", "tasks-only"))
+    assert code == 1, document
+    assert document["cases"][0]["error"]["kind"] == "budget_exceeded"
+    assert fake.requests == []
+
+
+def test_live_is_refused_while_another_eval_of_the_skill_runs(
+    instance: Path, provider: Callable[..., FakeProvider]
+) -> None:
+    from horae.runner import PipelineLock
+
+    fake = provider(_recorded_outputs()["tasks-only"])
+    lock = PipelineLock.try_acquire(instance / "state", f"eval:{SKILL}")
+    assert lock is not None
+    with lock:
+        code, document, _ = _invoke(*_live_args(instance, "--case", "tasks-only"))
+    assert code == 3
+    assert document["error"]["kind"] == "eval_busy"
+    assert fake.requests == []
+
+
+def test_a_dead_eval_is_abandoned_by_the_next_one(
+    instance: Path, provider: Callable[..., FakeProvider]
+) -> None:
+    from datetime import UTC, datetime
+
+    with Store.open(instance / "state" / "horae.db") as store:
+        store.begin_run("dead", f"eval:{SKILL}", datetime.now(UTC))
+    provider(_recorded_outputs()["tasks-only"])
+    code, document, _ = _invoke(*_live_args(instance, "--case", "tasks-only"))
+    assert code == 0, document
+    with Store.open(instance / "state" / "horae.db", read_only=True) as store:
+        dead = store.run_summary("dead")
+    assert dead is not None
+    assert dead.status == "failed"
+    assert dead.abandoned_at is not None
+
+
+class _Interrupting(FakeProvider):
+    """Answers the first request, then raises `error` (a Ctrl-C, say) on the next."""
+
+    def __init__(self, output: Any, error: BaseException) -> None:
+        super().__init__(output)
+        self.error = error
+
+    def __call__(self, request: httpx2.Request) -> httpx2.Response:
+        if self.requests:
+            self.requests.append(request)
+            raise self.error
+        return super().__call__(request)
+
+
+def test_ctrl_c_midway_writes_the_report_and_settles_the_ledger(
+    instance: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = _Interrupting(_recorded_outputs()["injected-embed"], KeyboardInterrupt())
+    original = AnthropicBackend.__init__
+
+    def patched(self: AnthropicBackend, *args: Any, **kwargs: Any) -> None:
+        original(self, *args, **kwargs, transport=httpx2.MockTransport(fake))
+
+    monkeypatch.setattr(AnthropicBackend, "__init__", patched)
+    code, document, output = _invoke(*_live_args(instance))
+    assert code == 130
+    assert document["error"]["kind"] == "interrupted"
+    assert len(fake.requests) == 2
+    (report,) = (instance / "state" / "evals").rglob("*.json")
+    written = json.loads(report.read_text())
+    assert written["error"]["kind"] == "interrupted"
+    assert [case["case"] for case in written["cases"]] == ["injected-embed"]
+    assert "interrupted" in output
+    with Store.open(instance / "state" / "horae.db", read_only=True) as store:
+        (run,) = store.list_runs()
+        assert run.status == "failed"
+        assert run.error is not None
+        rows = store._conn.execute("SELECT state, estimated FROM llm_usage ORDER BY id").fetchall()
+    # The answered case is settled at its cost; the interrupted one keeps its reservation.
+    assert rows == [("settled", 0), ("settled", 1)]
+
+
+def test_an_exception_while_sending_fails_that_case_only() -> None:
+    import asyncio
+
+    from horae.contracts.instance import ModelAlias
+    from horae.evals import LiveEval, plan_live, send_live
+    from horae.secrets import SecretResolver
+
+    sue = cli_eval.locate(SKILL, None, PLUGINS).sue
+    cases = load_cases(_evals(PLUGINS / "pack-daily-brief"))
+    models = {"default": ModelAlias.model_validate(ANTHROPIC)}
+    live = LiveEval.build("default", models, SecretResolver({}, Path("/nonexistent"), {}))
+    planned, errors = plan_live(live, sue, cases, 10.0)
+    assert not errors
+    sent: list[int] = []
+
+    async def complete(item: Any, index: int) -> Any:
+        sent.append(index)
+        raise RuntimeError("boom")
+
+    async def go() -> list[Any]:
+        try:
+            return await send_live(live, sue, planned, complete=complete)
+        finally:
+            await live.backends.aclose()
+
+    results = asyncio.run(go())
+    assert sent == [0, 1, 2]
+    assert {r.error["kind"] for r in results if r.error} == {"case_failed"}
+    assert all("boom" not in r.error["message"] for r in results if r.error)
+
+
+def test_report_files_and_folders_are_private(
+    instance: Path, provider: Callable[..., FakeProvider]
+) -> None:
+    provider(_recorded_outputs()["tasks-only"])
+    code, document, _ = _invoke(*_live_args(instance, "--case", "tasks-only"))
+    assert code == 0, document
+    report = Path(document["report"])
+    for folder in (report.parent, report.parent.parent, report.parent.parent.parent):
+        assert folder.stat().st_mode & 0o777 == 0o700, folder
+    for path in (report, report.with_suffix(".txt")):
+        assert path.stat().st_mode & 0o777 == 0o600, path
+    assert not [p for p in report.parent.iterdir() if p.name.startswith(".")]
+
+
+def test_a_report_that_cannot_be_written_is_said_and_the_json_still_printed(
+    instance: Path, provider: Callable[..., FakeProvider]
+) -> None:
+    provider(_recorded_outputs()["tasks-only"])
+    (instance / "state").mkdir()
+    (instance / "state" / "evals").write_text("not a folder")
+    code, document, output = _invoke(*_live_args(instance, "--case", "tasks-only"))
+    assert code == 1
+    assert document["report"] is None
+    assert "evals" in document["report_error"]
+    assert document["cases"][0]["status"] == "pass"
+    assert "the report cannot be written" in output
+
+
+def test_report_links_are_refused(instance: Path, tmp_path: Path) -> None:
+    from datetime import UTC, datetime
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (instance / "state").mkdir()
+    (instance / "state" / "evals").symlink_to(elsewhere)
+    document = {"skill": SKILL, "cases": [], "summary": {}, "report": None}
+    with pytest.raises(cli_eval.CommandFailed):
+        cli_eval.write_report(instance / "state", document, datetime.now(UTC))
+    assert list(elsewhere.iterdir()) == []
+
+
+def test_record_writes_only_answers_that_pass(
+    instance: Path, provider: Callable[..., FakeProvider], pack: Path
+) -> None:
+    before = _recorded(pack, "tasks-only").read_text()
+    different = {**_recorded_outputs()["tasks-only"], "summary": "Something else."}
+    provider(different)
+    code, document, _ = _invoke(
+        *_live_args(instance, "--plugin-dir", str(pack), "--case", "tasks-only", "--record")
+    )
+    assert code == 4
+    (case,) = document["cases"]
+    assert case["recorded_path"] is None
+    assert "not recorded" in case["recorded_skipped"]
+    assert _recorded(pack, "tasks-only").read_text() == before
+
+
+def test_record_keeps_a_bad_answer_a_case_expects(
+    instance: Path, provider: Callable[..., FakeProvider], pack: Path
+) -> None:
+    # A case that proves an invalid output is caught records the invalid answer it got.
+    _edit_yaml(_evals(pack) / "tasks-only.yaml", lambda d: d.update(expect={"schema_valid": False}))
+    invalid = {"summary": "x", "ranked": [{"title": "t", "why": "soon"}]}
+    provider(invalid)
+    code, document, _ = _invoke(
+        *_live_args(instance, "--plugin-dir", str(pack), "--case", "tasks-only", "--record")
+    )
+    assert code == 0, document
+    recorded = load_recorded(_recorded(pack, "tasks-only"))
+    assert recorded is not None
+    assert recorded.output == invalid
+
+
+def test_write_recorded_is_atomic_and_leaves_no_temporary(tmp_path: Path) -> None:
+    from horae.evals import write_recorded
+
+    recorded = load_recorded(_recorded(PLUGINS / "pack-daily-brief", "tasks-only"))
+    assert recorded is not None
+    path = write_recorded(tmp_path / "evals", "tasks-only", recorded)
+    assert load_recorded(path) == recorded
+    assert path.stat().st_mode & 0o777 == 0o644
+    assert write_recorded(tmp_path / "evals", "tasks-only", recorded) == path
+    assert sorted(p.name for p in path.parent.iterdir()) == ["tasks-only.json"]
+    with pytest.raises(EvalError, match="not a case name"):
+        write_recorded(tmp_path / "evals", "Bad", recorded)
+
+
+def test_dotfiles_in_eval_folders_are_skipped(pack: Path) -> None:
+    folder = _evals(pack)
+    (folder / ".DS_Store").write_bytes(b"\x00\x01")
+    (folder / ".hidden.yaml").write_text("not: a case")
+    (folder / "recorded" / ".DS_Store").write_bytes(b"\x00")
+    (folder / "recorded" / "anthropic" / ".DS_Store").write_bytes(b"\x00")
+    code, document, _ = _invoke(SKILL, "--plugin-dir", str(pack), "--json")
+    assert code == 0, document
+    assert len(document["cases"]) == 3
+
+
+def test_a_bad_case_file_name_is_an_error_result(pack: Path) -> None:
+    (_evals(pack) / "Bad Name.yaml").write_text("schema_version: 1\ninput: {}\n")
+    code, document, _ = _invoke(SKILL, "--plugin-dir", str(pack), "--json")
+    assert code == 1
+    by_case = {c["case"]: c for c in document["cases"]}
+    assert "not a case name" in by_case["Bad Name.yaml"]["error"]["message"]
+    assert by_case["tasks-only"]["status"] == "pass"
+    code, _, output = _invoke(SKILL, "--plugin-dir", str(pack))
+    assert "ERROR Bad Name.yaml: eval_invalid" in output
+
+
+def test_an_invalid_recording_is_an_error_result(pack: Path) -> None:
+    _recorded(pack, "tasks-only").write_text("{")
+    code, document, _ = _invoke(SKILL, "--plugin-dir", str(pack), "--json")
+    assert code == 1
+    by_case = {c["case"]: c for c in document["cases"]}
+    assert by_case["tasks-only"]["error"]["kind"] == "eval_invalid"
+    assert by_case["overdue-first"]["status"] == "pass"
+
+
+def test_an_invalid_target_manifest_is_a_problem(pack: Path) -> None:
+    (pack / "plugin.yaml").write_text("name: [")
+    code, document, _ = _invoke(SKILL, "--plugin-dir", str(pack), "--json")
+    assert code == 1
+    assert document["error"]["kind"] == "plugins_invalid"
+    # In a folder of plugins, the skill may be the invalid one's: not "unknown".
+    code, document, _ = _invoke(SKILL, "--plugin-dir", str(pack.parent), "--json")
+    assert code == 1
+    assert document["error"]["kind"] == "plugins_invalid"
+    assert "invalid manifests" in document["error"]["message"]
+
+
+def test_two_plugins_providing_the_skill_are_refused(pack: Path) -> None:
+    shutil.copytree(pack, pack.parent / "pack-copy")
+    code, document, _ = _invoke(SKILL, "--plugin-dir", str(pack.parent), "--json")
+    assert code == 1
+    assert document["error"]["kind"] == "plugins_invalid"
+    assert "several plugins" in document["error"]["message"]
+
+
+@pytest.mark.parametrize("stop", ["max_tokens", "refusal", "length", "content_filter"])
+def test_a_recording_that_stopped_on_a_truncation_or_refusal_fails(pack: Path, stop: str) -> None:
+    _edit_json(_recorded(pack, "tasks-only"), lambda d: d.update(stop_reason=stop))
+    code, document, _ = _invoke(SKILL, "--plugin-dir", str(pack), "--case", "tasks-only", "--json")
+    assert code == 4
+    (check,) = [c for c in document["cases"][0]["checks"] if c["name"] == "stop_reason"]
+    assert check["ok"] is False
+    assert stop in check["message"]
+    assert document["cases"][0]["stop_reason"] == stop
+
+
+def test_the_backends_share_their_stop_reasons() -> None:
+    from horae.llm.backends import (
+        REFUSAL_STOP_REASONS,
+        TRUNCATION_STOP_REASONS,
+        UNUSABLE_STOP_REASONS,
+    )
+    from horae.llm.backends.openai_compatible import TRUNCATED
+
+    assert set(TRUNCATED) <= TRUNCATION_STOP_REASONS
+    assert {"max_tokens", "model_context_window_exceeded"} <= TRUNCATION_STOP_REASONS
+    assert {"refusal", "content_filter"} == REFUSAL_STOP_REASONS
+    assert UNUSABLE_STOP_REASONS == REFUSAL_STOP_REASONS | TRUNCATION_STOP_REASONS
+    assert not {"end_turn", "stop", "stop_sequence"} & UNUSABLE_STOP_REASONS
+
+
+def test_usage_over_the_case_budget_fails(pack: Path) -> None:
+    _edit_yaml(
+        _evals(pack) / "tasks-only.yaml",
+        lambda d: d.update(budget={"usd": 0.05, "tokens_out": 10}),
+    )
+    code, document, _ = _invoke(SKILL, "--plugin-dir", str(pack), "--case", "tasks-only", "--json")
+    assert code == 4
+    (check,) = [c for c in document["cases"][0]["checks"] if c["name"] == "usage_within_budget"]
+    assert check["ok"] is False
+    assert "over the budget's 10" in check["message"]
+
+
+def _task_pack(pack: Path) -> None:
+    """The pack's skill, allowed to propose `task.update_status` too."""
+    both = ["note.create", "task.update_status"]
+    _edit_yaml(pack / "plugin.yaml", lambda d: d["permissions"].update(intents=both))
+    folder = pack / "skills" / "daily-brief" / "rank-and-word"
+    _edit_yaml(folder / "skill.yaml", lambda d: d.update(intents=both))
+
+    def schema(data: Any) -> None:
+        data["$defs"]["update"] = {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["type", "task", "status"],
+            "properties": {
+                "type": {"type": "string", "const": "task.update_status"},
+                "task": {"type": "string", "maxLength": 128},
+                "status": {"type": "string", "enum": ["done", "todo"]},
+            },
+        }
+        data["properties"]["intents"]["items"] = {
+            "anyOf": [{"$ref": "#/$defs/note"}, {"$ref": "#/$defs/update"}]
+        }
+        data["properties"]["intents"]["maxItems"] = 2
+
+    _edit_json(folder / "output.schema.json", schema)
+
+
+def test_a_hallucinated_task_fingerprint_is_reported(pack: Path) -> None:
+    _task_pack(pack)
+    case = yaml.safe_load((_evals(pack) / "tasks-only.yaml").read_text())
+    case["input"]["tasks"][0]["title"] = "task-1"
+    case["expect"] = {}
+    (_evals(pack) / "tasks-only.yaml").write_text(yaml.safe_dump(case))
+
+    def answer(task: str) -> Callable[[Any], None]:
+        def change(data: Any) -> None:
+            data["output"]["intents"] = [
+                {"type": "task.update_status", "task": task, "status": "done"}
+            ]
+
+        return change
+
+    _edit_json(_recorded(pack, "tasks-only"), answer("task-1"))
+    code, document, _ = _invoke(SKILL, "--plugin-dir", str(pack), "--case", "tasks-only", "--json")
+    assert code == 0, document  # a task the model was shown
+    _edit_json(_recorded(pack, "tasks-only"), answer("task-999"))
+    code, document, _ = _invoke(SKILL, "--plugin-dir", str(pack), "--case", "tasks-only", "--json")
+    assert code == 4
+    (result,) = document["cases"]
+    assert "not shown" in result["intents_error"]
+
+
+def test_engine_helpers_shared_with_the_eval() -> None:
+    from horae.contracts.intents import TaskUpdateStatus
+    from horae.engine import check_task_fingerprints, fill_target
+
+    filled = fill_target({"type": "note.create", "content": "x"}, {"path": "A.md"})
+    assert filled == {"type": "note.create", "content": "x", "path": "A.md"}
+    kept = {"type": "note.create", "content": "x", "path": "B.md"}
+    assert fill_target(kept, {"path": "A.md"}) == kept
+    push = {"type": "notify.push", "title": "t"}
+    assert fill_target(push, {"path": "A.md"}) == push
+    assert fill_target("not a dict", {"path": "A.md"}) == "not a dict"
+    update = TaskUpdateStatus(type="task.update_status", task="t-1", status="done")
+    other = TaskUpdateStatus(type="task.update_status", task="t-2", status="done")
+    assert check_task_fingerprints([update, other], ({"tasks": [{"id": "t-1"}]},)) == [1]
+    assert check_task_fingerprints([], ({"tasks": []},)) == []
+
+
+def test_eval_pipeline_names_fit_the_store() -> None:
+    assert cli_eval.eval_pipeline(SKILL) == f"eval:{SKILL}"
+    long = "a" * 30 + "/" + "b" * 60
+    name = cli_eval.eval_pipeline(long)
+    assert len(name) == 64
+    assert name.startswith("eval:aaa")
+    assert name != cli_eval.eval_pipeline("a" * 30 + "/" + "b" * 59 + "c")
+
+
+# --- D4: every skill renders through every backend ---------------------------------------------
+
+
+def _all_skills() -> list[tuple[Path, str]]:
+    found = []
+    for directory in (PLUGINS, BUILTIN):
+        for manifest in sorted(directory.glob("*/plugin.yaml")):
+            data = yaml.safe_load(manifest.read_text())
+            for skill in (data.get("provides") or {}).get("skills") or []:
+                found.append((manifest.parent, skill))
+    return found
+
+
+@pytest.mark.parametrize(("plugin", "skill"), _all_skills(), ids=lambda v: str(v))
+def test_every_skill_renders_for_every_backend(plugin: Path, skill: str) -> None:
+    from horae.evals import CaseResult as Result
+    from horae.evals import LoadedCase as Loaded
+    from horae.evals import offline_alias
+    from horae.evals._harness import request_for, viewed_input
+    from horae.llm.backends import FACTORIES, schema_problems
+    from horae.llm.base import ModelBackends
+    from horae.secrets import SecretResolver
+
+    sue = cli_eval.locate(skill, None, plugin).sue
+    assert schema_problems(sue.skill.output_schema) == {}
+    loaded = Loaded("render", EvalCase.model_validate({"schema_version": 1, "input": {}}))
+    viewed = viewed_input(sue, loaded, Result("render"))
+    for backend in FACTORIES:
+        backends = ModelBackends(
+            models={"x": offline_alias(backend, "render-model")},
+            secrets=SecretResolver({}, Path("/nonexistent"), {}),
+            factories=FACTORIES,
+        )
+        rendered = backends.render(request_for(sue, "x", loaded, viewed, 10.0))  # never sent
+        assert rendered.backend == backend
+
+
+def test_an_enum_without_type_is_refused_by_the_loader(pack: Path) -> None:
+    folder = pack / "skills" / "daily-brief" / "rank-and-word"
+    _edit_json(
+        folder / "output.schema.json",
+        lambda d: d["$defs"]["line"]["properties"]["why"].pop("type"),
+    )
+    code, document, _ = _invoke(SKILL, "--plugin-dir", str(pack), "--json")
+    assert code == 1
+    assert document["error"]["kind"] == "skill_invalid"
+    assert "`enum` needs a `type` beside it" in document["error"]["message"]
+    assert "#/$defs/line/properties/why" in document["error"]["message"]
+
+
+def test_the_anthropic_render_error_names_the_schema_path() -> None:
+    from horae.engine.ports import LlmError
+    from horae.llm.backends.anthropic import _schema, schema_problem
+
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"a": {"type": "object", "properties": {"b": {"enum": ["x"]}}}},
+    }
+    problem = schema_problem(schema)
+    assert problem is not None
+    assert problem.startswith("#/properties/a/properties/b: ValueError")
+    with pytest.raises(LlmError, match="#/properties/a/properties/b") as raised:
+        _schema(schema)
+    assert raised.value.__cause__ is not None
+    assert schema_problem({"type": "object", "properties": {}}) is None
