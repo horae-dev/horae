@@ -36,6 +36,7 @@ class RecordedCall:
     ref: str
     params: dict[str, Any]
     input: Any
+    timeout_s: float | None = None
 
 
 @dataclass
@@ -78,8 +79,10 @@ class FixturePlugins:
     def plugin_for_skill(self, skill: str) -> ResolvedPlugin:
         return self._resolve(skill.split("/", 1)[0])
 
-    async def call(self, ref: str, params: dict[str, Any], input: Any) -> ToolResult:
-        self.calls.append(RecordedCall(ref, copy.deepcopy(params), copy.deepcopy(input)))
+    async def call(
+        self, ref: str, params: dict[str, Any], input: Any, *, timeout_s: float | None = None
+    ) -> ToolResult:
+        self.calls.append(RecordedCall(ref, copy.deepcopy(params), copy.deepcopy(input), timeout_s))
         result = self.handlers[ref](params, input)
         return result if isinstance(result, ToolResult) else ToolResult(data=result)
 

@@ -27,8 +27,43 @@ CallWithParams = Annotated[
 ]
 """`{<namespace>.<tool>: {params}}`: one plugin tool with its parameters."""
 
-PluginCall = PluginRef | CallWithParams
-"""A plugin tool, either bare (`tasks.normalize`) or with parameters."""
+MIN_CALL_TIMEOUT_S = 1.0
+MAX_CALL_TIMEOUT_S = 600.0
+
+CallTimeout = Annotated[StrictFloat, Field(ge=MIN_CALL_TIMEOUT_S, le=MAX_CALL_TIMEOUT_S)]
+"""A per-call timeout in seconds, 1 to 600 (the range of `plugin_defaults.call_timeout_s`)."""
+
+
+class ToolCall(Contract):
+    """A plugin call in the explicit form, `{tool: <ref>, params: {...}, timeout_s: N}`.
+
+    Needed only for a per-call `timeout_s`; `{tool: x.y, params: {...}}` without one is the same
+    call as `{x.y: {...}}` (and digests the same). `tool` and `params` can never be confused with
+    the mapping form: a tool ref always contains a dot."""
+
+    tool: PluginRef
+    """The plugin tool, `<namespace>.<tool>`."""
+    params: dict[str, Any] = Field(default_factory=dict)
+    """Its parameters (templated like the mapping form's)."""
+    timeout_s: CallTimeout | None = None
+    """Seconds this call may take. When omitted, the plugin's `call_timeout_s` in `horae.yaml`
+    (else `plugin_defaults.call_timeout_s`) applies."""
+
+
+PluginCall = PluginRef | CallWithParams | ToolCall
+"""A plugin tool: bare (`tasks.normalize`), with parameters (`{calendar.events: {days: 2}}`),
+or in the explicit form with a per-call timeout (`ToolCall`)."""
+
+
+def call_parts(call: PluginCall) -> tuple[str, dict[str, Any], float | None]:
+    """`(ref, params, timeout_s)` of a call in any of its three forms (`params` not copied)."""
+    if isinstance(call, str):
+        return call, {}, None
+    if isinstance(call, ToolCall):
+        return call.tool, call.params, call.timeout_s
+    ref, params = next(iter(call.items()))
+    return ref, params, None
+
 
 CallList = Annotated[list[PluginCall], Field(min_length=1, max_length=MAX_ITEMS)]
 

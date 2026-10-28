@@ -24,6 +24,7 @@ from horae.contracts.pipeline import (
     NotifyStep,
     Pipeline,
     TransformStep,
+    call_parts,
 )
 from horae.contracts.plugin import PluginManifest, Provides
 from horae.contracts.run import RunRecord
@@ -48,7 +49,7 @@ def pipeline_refs(pipeline: Pipeline | None) -> dict[str, set[str]]:
         for model, attribute, provides in _KINDS:
             if isinstance(step, model):
                 for call in getattr(step, attribute):
-                    used[provides].add(call if isinstance(call, str) else next(iter(call)))
+                    used[provides].add(call_parts(call)[0])
     return used
 
 

@@ -67,7 +67,9 @@ class Stubborn(Plugins):
         self.late = late
         self.ignored = asyncio.Event()
 
-    async def call(self, ref: str, params: dict[str, Any], input: Any) -> ToolResult:
+    async def call(
+        self, ref: str, params: dict[str, Any], input: Any, *, timeout_s: float | None = None
+    ) -> ToolResult:
         if ref != "fixture.slow":
             return await super().call(ref, params, input)
         self.started.set()
@@ -683,15 +685,29 @@ def test_a_step_that_ignores_the_timeout_is_abandoned_after_the_grace_period(
 def test_a_run_that_finishes_after_its_timeout_is_failed_not_ok(
     inst: Instance, store: Store
 ) -> None:
+    # A transform ignoring the cancellation: the step (and so the run) finishes late.
     plugins = Stubborn(late=True)
     with pytest.raises(RunTimedOut) as info:
-        asyncio.run(_runner(inst, store, plugins, timeout_s=0.1).run("slow"))
+        asyncio.run(_runner(inst, store, plugins, timeout_s=0.1).run("slow-transform"))
     record = info.value.record
     assert record is not None
     assert record.status == "failed"
     assert record.error == "the run timed out after 0.1 s (it finished after the deadline)"
     assert [step.status for step in record.steps] == ["ok", "ok"]
     assert store.get_run(record.id) == record
+
+
+def test_a_collect_call_ignoring_the_cancellation_still_stops_its_step(
+    inst: Instance, store: Store
+) -> None:
+    # The collect step's task group re-raises the cancellation even when a call ignores it.
+    plugins = Stubborn(late=True)
+    with pytest.raises(RunTimedOut) as info:
+        asyncio.run(_runner(inst, store, plugins, timeout_s=0.1).run("slow"))
+    record = info.value.record
+    assert record is not None
+    assert record.error == "step 0 (collect): the run timed out after 0.1 s"
+    assert [step.status for step in record.steps] == ["failed", "skipped"]
 
 
 # --- cancellation and crashes --------------------------------------------------------------

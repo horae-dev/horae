@@ -22,6 +22,7 @@ BUDGET = {"usd": 0.05, "tokens_out": 2000}
 PIPELINES: dict[str, list[dict[str, Any]]] = {
     "collect": [{"collect": ["fixture.items"]}],
     "slow": [{"collect": ["fixture.slow"]}, {"notify": ["ntfy.push"]}],
+    "slow-transform": [{"collect": ["fixture.items"]}, {"transform": ["fixture.slow"]}],
     "partial": [{"collect": ["fixture.items", "fixture.broken"]}],
     "broken": [{"collect": ["fixture.items"]}, {"transform": ["fixture.broken_transform"]}],
     "brief": [
@@ -90,7 +91,7 @@ class Plugins(FixturePlugins):
             _manifest(
                 "fixture",
                 sources=["fixture.items", "fixture.slow", "fixture.broken"],
-                transforms=["fixture.broken_transform"],
+                transforms=["fixture.broken_transform", "fixture.slow"],
             ),
             {
                 "fixture.items": lambda p, i: [{"title": "Review PR 42"}],
@@ -101,7 +102,9 @@ class Plugins(FixturePlugins):
         self.add(_manifest("pack", skills=[SKILL]))
         self.add(_manifest("ntfy", ("notify.push",), notifiers=["ntfy.push"]))
 
-    async def call(self, ref: str, params: dict[str, Any], input: Any) -> ToolResult:
+    async def call(
+        self, ref: str, params: dict[str, Any], input: Any, *, timeout_s: float | None = None
+    ) -> ToolResult:
         if ref != "fixture.slow":
             return await super().call(ref, params, input)
         self.started.set()

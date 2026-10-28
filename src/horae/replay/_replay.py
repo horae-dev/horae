@@ -165,6 +165,8 @@ def diff_intents(recorded: RunRecord, replayed: RunRecord) -> str:
 
 
 _RANK: dict[RunStatus, int] = {"ok": 0, "noop": 1, "degraded": 2, "failed": 3}
+_HOST_FINDINGS = frozenset({"secret_in_output"})
+"""Violation kinds the live plugin host records, which a replay cannot reproduce."""
 
 
 def status_before_undo(record: RunRecord) -> RunStatus:
@@ -190,7 +192,7 @@ def _summary(record: RunRecord) -> dict[str, Any]:
         "inputs": len(record.inputs),
         "llm_calls": len(record.llm),
         "intents": len(record.intents),
-        "violations": [violation.kind for violation in record.violations],
+        "violations": [v.kind for v in record.violations if v.kind not in _HOST_FINDINGS],
         "plugins": {
             name: version.model_dump(mode="json") for name, version in record.plugins.items()
         },

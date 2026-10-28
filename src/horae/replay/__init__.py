@@ -59,6 +59,9 @@ timings, `stderr` and cost are not compared.
   may differ; messages are not compared);
 - intermediate outputs of a multi-call `transform` step: only the final output and each
   call's input hash are recorded, so only the first call's input is checked;
+- the plugin host's own findings (`secret_in_output` violations, #24): they describe what a
+  live process returned, which the record keeps only redacted, so they are left out of the
+  compared violation kinds;
 - records written before the per-call fields existed (`InputSnapshot.call`,
   `StepRecord.calls`, the `LlmCall` engine fields) are not replayable.
 """

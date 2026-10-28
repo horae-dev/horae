@@ -8,9 +8,10 @@ in-memory implementations for tests.
 **Async.** `ToolCaller.call` and `LlmBackend.complete` are coroutines: the MCP SDK's
 `ClientSession.call_tool` is async (anyio), and so are the HTTP clients the LLM backends will
 use, so an async engine calls them directly, without a thread per call or a nested event loop.
-Calls are still awaited one at a time, in declaration order; parallel `collect` can come later
-without changing these protocols. Plugin resolution (`PluginRegistry`) is plain data lookup,
-hence synchronous.
+The calls of one `collect` step run concurrently (at most `MAX_PARALLEL_CALLS` in flight,
+started in declaration order); transforms run one at a time, each fed the previous output. A
+`ToolCaller` must therefore accept concurrent calls. Plugin resolution (`PluginRegistry`) is
+plain data lookup, hence synchronous.
 
 **Which tools are called.** `ToolCaller` is used for `collect` sources and `transform` tools
 only. `act` sinks and `notify` notifiers are never called while a pipeline executes: they apply
@@ -36,7 +37,7 @@ from typing import Any, Literal, Protocol
 
 from horae.contracts.pipeline import Budget
 from horae.contracts.plugin import PluginManifest
-from horae.contracts.run import ErrorKind, Usage
+from horae.contracts.run import ErrorKind, Usage, Violation
 
 LlmBackendName = Literal["claude-cli", "anthropic", "openai-compatible", "ollama"]
 
@@ -116,15 +117,32 @@ class ToolResult:
     engine (sources and transforms propose; ADR 0002)."""
     stderr: str | None = None
     """The plugin's (already redacted) standard error for this call."""
+    violations: tuple[Violation, ...] = ()
+    """What the host flagged in this call (e.g. `secret_in_output`), added to
+    `RunRecord.violations` in declaration order."""
 
 
 class ToolCaller(Protocol):
     """Calls one plugin tool."""
 
-    async def call(self, ref: str, params: dict[str, Any], input: Any) -> ToolResult:
+    async def call(
+        self, ref: str, params: dict[str, Any], input: Any, *, timeout_s: float | None = None
+    ) -> ToolResult:
         """Call tool `ref` with trusted `params` and untrusted `input`; raises
-        `ToolCallError`. The host applies its own per-call timeout."""
+        `ToolCallError`. `timeout_s` is the call's own timeout from the pipeline (`ToolCall`);
+        `None` means the host's per-plugin default. The host enforces it (kind `timeout`)."""
         ...
+
+
+class ReleasingToolCaller(ToolCaller, Protocol):
+    """A `ToolCaller` that can stop a plugin the run will not call again (optional).
+
+    When `tools` has a `release` method, the engine awaits `release(plugin)` (the plugin's
+    manifest name) right after the last step of the plan that calls one of its tools, or when
+    the run stops early, so a plugin's process is not alive during later steps that do not use
+    it (schemas decision 35 A). `release` must not raise; if it does, the error is ignored."""
+
+    async def release(self, plugin: str) -> None: ...
 
 
 @dataclass(frozen=True)

@@ -217,6 +217,11 @@ class SecretResolver:
     def directory(self) -> Path:
         return self._directory
 
+    def referenced(self) -> tuple[str, ...]:
+        """The names with an explicit reference (`secrets.refs`), sorted. The plugin host
+        resolves them all when it opens, so that it can redact them (schemas decision 35 B)."""
+        return tuple(sorted(self._refs))
+
     def resolved(self) -> tuple[Secret, ...]:
         """Every secret this resolver returned so far, in resolution order (for redaction)."""
         return tuple(self._resolved.values())

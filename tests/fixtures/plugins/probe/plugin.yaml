@@ -1,0 +1,27 @@
+# The probe plugin's manifest (#24). Synthetic: no network, no paths. The tests build the same
+# manifest in code with an absolute interpreter path (`tests/plugin_fixtures.py`).
+name: probe
+version: 0.1.0
+horae: ">=0"
+description: Test plugin for the plugin host.
+provides:
+  sources:
+    - probe.env
+    - probe.sleep
+    - probe.crash
+    - probe.stderr
+    - probe.intents
+    - probe.echo
+    - probe.text
+    - probe.fail
+    - probe.log
+    - probe.big
+    - probe.child
+  transforms:
+    - probe.echo
+permissions:
+  secrets: [PROBE_TOKEN]
+  intents: [notify.push]
+runtime:
+  protocol: mcp-stdio
+  command: [python3, server.py]

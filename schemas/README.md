@@ -57,8 +57,9 @@ pydantic may change them; the drift test then fails in CI and the fix is to rege
   an unquoted `2026-10-27` is a YAML timestamp, not a string, and the JSON Schema rejects it.
 - A pipeline step is an object with exactly one key: `collect`, `transform`, `llm`, `act` or
   `notify`. Each lists plugin calls, either bare (`tasks.normalize`) or with parameters
-  (`calendar.events: { days: 2 }`). A pipeline has **at most one** `llm` step
-  (`contains` + `maxContains: 1`).
+  (`calendar.events: { days: 2 }`), or in the explicit form with a per-call timeout
+  (`{ tool: calendar.events, params: { days: 2 }, timeout_s: 90 }`, decision 35). A pipeline
+  has **at most one** `llm` step (`contains` + `maxContains: 1`).
 - The `llm` step has no `tools` key, and requires a budget with both `usd` and `tokens_out`.
 - Plugin permissions (`network`, `secrets`, `paths`, `intents`) default to empty: no access.
 - Sinks apply intents (PLAN.md §3.1, §3.3); `permissions.intents` lists the intents a plugin may
@@ -647,3 +648,104 @@ loosened later without breaking a valid file.
       later_runs, overwrote_sha256}], not_undoable: [{intent, intent_type, target,
       applied_by, applied}], problems}`; errors are `{"schema_version": 1, "error": {kind,
       message}}`.
+
+### Provisional decisions (#24, pending maintainer review)
+
+35. **Plugin host v1 (#24, design note and maintainer answers on #85).** Contract changes,
+    both compatible v1 additions:
+    - **per-call timeout (answer 8).** A plugin call has a third, explicit form,
+      `{tool: <ref>, params: {...}, timeout_s: N}` (`ToolCall`; `params` optional, `timeout_s`
+      1 to 600 like `plugin_defaults.call_timeout_s`). It cannot be confused with the mapping
+      form, whose single key is a tool ref (always with a dot). The suggested
+      `{ref: {params: {...}, timeout_s: N}}` was not used: it is ambiguous with a tool whose
+      parameters are named `params` or `timeout_s`. Without `timeout_s` the explicit form is
+      the same call as the mapping form and has the same pipeline digest; with one, the
+      canonical form keeps `{tool, params, timeout_s}` (a timeout changes how the call runs).
+      When omitted, `plugins.<name>.call_timeout_s`, then `plugin_defaults.call_timeout_s`
+      apply. The engine passes it to `ToolCaller.call(..., timeout_s=)`;
+    - **`secret_in_output` violation (answer 4).** The maintainer's answer "add the secrets
+      from the output" is read as: a secret value (or its base64, hex, percent or JSON encoding)
+      found in a tool's output or intents is **redacted** (`[REDACTED:<NAME>]`) and recorded
+      as a `secret_in_output` violation; the step does not fail. Redaction covers every
+      secret the instance resolved (`SecretResolver.resolved()`), in stderr, error messages,
+      outputs and intents. A replay leaves this kind out of the compared violations (it
+      describes the live process).
+
+    Rules of the host (`horae.plugins.host`), not part of a schema:
+    - `mcp>=2.3,<2.4` is a core dependency (answer 1). The host spawns the process itself
+      (answer 2; `stdio_client` copies host variables) and keeps the SDK's `ClientSession`,
+      which advertises no client capability and refuses sampling, roots and elicitation;
+    - the child environment is exactly `PATH` (fixed), `HOME` and `TMPDIR` (empty per-run
+      directories), `LANG=C.UTF-8`, `TZ` (the instance time zone) and the declared secrets
+      (answer 3), with the deny list of decision 28 (`env_unsafe`);
+    - one process per plugin per run, lazily started; one in flight per process; after a
+      timeout, crash or protocol failure the process group is killed and the plugin may be
+      started **once** more in the run, then `plugin_unavailable` (answer 6);
+    - intents travel in the result's `_meta["dev.horae/intents"]` (answer 5); the untrusted
+      input of a transform in the request's `_meta["dev.horae/input"]`, so the arguments are
+      the trusted parameters only. Data is `structuredContent`, else a single text block that
+      parses as JSON (answer 9);
+    - **parallel `collect` (answer 7).** The calls of a `collect` step run concurrently (at
+      most 8 in flight, started in declaration order); results, snapshots, stderr, violations
+      and intents are recorded in declaration order, so records and replays do not depend on
+      timing. Every source of the step is called and recorded, even when an earlier one's
+      proposals fail the step (sequentially, the later ones were not called). Transforms stay
+      sequential (each feeds the next); `act` / `notify` entries are never called;
+    - `/proc/<pid>/environ` (answer 10): Horae never adds a resolved secret to its own
+      environment, and secret files (decision 25, the default) are recommended over
+      `{env: VAR}` references, whose values a same-user plugin can read on Linux. The proper
+      fix is the M5 container isolation (#50, #51).
+
+    Security review of the implementation (provisional, pending maintainer review):
+    - **A. Sibling plugins.** Plugins run as the same user, so while two run at once one can
+      read the other's environment, hence its declared secrets (`/proc/<pid>/environ` on
+      Linux, `ps eww` on some systems). Accepted as a pre-M5 risk, mitigated by the
+      first-party-only rule of the "declared" tier, and narrowed: the engine releases each
+      plugin right after the last step of the plan that calls it (or as soon as the run stops
+      early), through an optional `release(plugin)` method of the `ToolCaller`
+      (`ReleasingToolCaller`); `PluginHost.release` stops its process, so a plugin is not
+      alive during later steps that do not use it. A released plugin called again starts
+      afresh without using its one restart; a failing `release` is ignored;
+    - **B. Complete redaction from the first call.** When the host opens it resolves every
+      secret declared by every locked plugin and every `secrets.refs` entry (one that cannot
+      be resolved is skipped; the plugin needing it fails with `secret_missing` later), so
+      redaction does not depend on which plugin started first (`SecretResolver.referenced()`
+      lists the refs);
+    - **C. More encodings.** For secrets of at least 8 bytes the redactor also matches the
+      lower- and upper-case hex, and misaligned base64 (both alphabets) of the value embedded
+      in a longer stream at byte offsets 1 and 2 (an HTTP Basic `user:<secret>` header): only
+      the characters that depend on the value alone, `ceil(8k/6)` to `floor((8k + 8n)/6)` for
+      offset `k` and `n` bytes, so up to 4 bits of the value can stay visible on each side;
+    - **D. Short secrets and keys.** Encoded and partial forms are used only for secrets of at
+      least 8 bytes. A shorter secret is matched by its raw value only, in every channel
+      (stderr, messages, string leaves), where it is bounded (not next to an ASCII letter or
+      digit: `token=abc123` and `<ref>: abc123` match, `xabc123y` does not), and as a whole
+      JSON string or number; an error message is redacted whole first (a secret may contain
+      or straddle `: `), then the body of the redacted `<ref>: <message>` is also matched
+      as a whole value.
+      The host logs a warning (name only) for each secret under 8 bytes it redacts, since its
+      encodings are not redacted. Object keys
+      are never rewritten: a key holding a secret fails the call with `output_invalid` and
+      nothing is stored. When the matches of two secrets overlap, only the leftmost one is
+      replaced (documented limit). A JSON number whose `json.dumps` is a secret becomes the
+      token string; the SDK's own log records (`mcp.*`, `client`, `server`) are scrubbed when
+      created: message redacted, arguments, traceback and stack dropped;
+    - **E. umask.** Every plugin process starts with umask `0o077`;
+    - **F. Stderr window.** The per-call stderr window keeps its quiet-window heuristic
+      (stderr and stdout are separate pipes, so nothing orders them); tests wait for a
+      sentinel line instead of relying on timing. What a process wrote before it died between
+      two calls goes with the next call; what it wrote after its last call is kept, redacted,
+      in `PluginHost.leftover_stderr`;
+    - **G. `runtime.command` pinning.** The lock pins version, commit and permissions, not the
+      manifest's `runtime.command` or the plugin's files; pinning them is M4 (#44, #46). A
+      relative command must resolve (symlinks included) inside the plugin's directory, and is
+      passed as an absolute path;
+    - the deny list (decision 28) also covers `GLIBC_TUNABLES`, `JAVA_TOOL_OPTIONS`,
+      `JDK_JAVA_OPTIONS`, `CLASSPATH`, `PERL5LIB`, `PERLLIB`, `RUBYLIB`, `SSLKEYLOGFILE`,
+      `OPENSSL_*`, `NODE_EXTRA_CA_CERTS`, `NODE_TLS_REJECT_UNAUTHORIZED`, `LOCPATH`,
+      `GCONV_PATH`, `TZDIR`, `LANGUAGE`, `SHELLOPTS`, `PS4`, `GODEBUG`, `MALLOC_*`, `UV_*`,
+      `PIP_*`, `NPM_CONFIG_*` and `VIRTUAL_ENV`;
+    - calls to one plugin are serialised, so N calls to it in one step can take N times the
+      call timeout; the run timeout (#19) bounds the whole. Group termination cannot reach a
+      descendant that left the group (`setsid`/`setpgid`), and the final `killpg` after the
+      leader is reaped has a (very unlikely) PID-reuse race; both are M5's (#50, #51).
