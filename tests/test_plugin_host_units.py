@@ -182,52 +182,32 @@ def test_misaligned_base64_hex_basic_auth_and_json_are_redacted() -> None:
     assert redactor.redact_bytes(embedded.encode()).count(token("S").encode()) == 2
 
 
-def test_short_secrets_match_their_bounded_raw_value_only() -> None:
-    short = "pin42"
-    assert len(short) < MIN_PARTIAL_BYTES
-    redactor = Redactor([Secret("PIN", short), Secret("NUM", "12345678901")])
-    assert redactor.short == ("PIN",)
-    pin = token("PIN")
-    # Inside text: matched when bounded (punctuation, spaces, the ends), not inside a word.
-    assert redactor.redact_text(f"token={short};") == (f"token={pin};", {"PIN"})
-    assert redactor.redact_text(f"probe.fail: {short}")[0] == f"probe.fail: {pin}"
-    assert redactor.redact_text(f"spin42 xpin42y pin42x {short}") == (
-        f"spin42 xpin42y pin42x {pin}",
-        {"PIN"},
-    )
-    assert (
-        redactor.redact_bytes(b"auth " + short.encode() + b"\n") == b"auth " + pin.encode() + b"\n"
-    )
-    assert redactor.redact_bytes(b"spin42s") == b"spin42s"
-    # Encodings of a short secret are not looked for (they would match everywhere).
-    encoded = base64.b64encode(short.encode()).decode()
-    assert redactor.redact_text(encoded) == (encoded, set())
-    value = {
-        "a": short,
-        "b": f"x{short}",
-        "c": f'{{"token": "{short}"}}',
-        "n": 12345678901,
-        "f": 1.5,
-        "t": True,
-    }
+def test_a_redactor_refuses_a_short_secret_and_matches_whole_numbers() -> None:
+    """Decision 43 H (superseding 35 D): no short-secret special case is left; a value under
+    `MIN_SECRET_BYTES` is a programming error (the resolver refuses it first)."""
+    assert MIN_PARTIAL_BYTES == 8
+    with pytest.raises(ValueError, match="secret PIN is shorter than 8 bytes") as info:
+        Redactor([Secret("PIN", "pin42")])
+    assert "pin42" not in str(info.value)
+    redactor = Redactor([Secret("NUM", "12345678901")])
+    value = {"n": 12345678901, "m": 123456789012, "f": 1.5, "t": True, "s": "x12345678901y"}
     data, found = redactor.redact_data(value)
     assert data == {
-        "a": pin,
-        "b": f"x{short}",
-        "c": f'{{"token": "{pin}"}}',
         "n": token("NUM"),
+        "m": 123456789012,
         "f": 1.5,
         "t": True,
+        "s": f"x{token('NUM')}y",
     }
-    assert found == {"PIN", "NUM"}
+    assert found == {"NUM"}
 
 
 def test_object_keys_are_never_rewritten() -> None:
-    redactor = Redactor([Secret("PIN", "pin42"), Secret("LONG", "a-long-secret-value")])
-    for key in ("pin42", "has a-long-secret-value inside"):
+    redactor = Redactor([Secret("PIN", "pin42pin"), Secret("LONG", "a-long-secret-value")])
+    for key in ("pin42pin", "has a-long-secret-value inside"):
         with pytest.raises(SecretInKey) as info:
             redactor.redact_data({"ok": [{key: 1}]})
-        assert "pin42" not in str(info.value)
+        assert "pin42pin" not in str(info.value)
         assert "a-long-secret-value" not in str(info.value)
     assert redactor.redact_data({"xpin42": 1}) == ({"xpin42": 1}, set())
 

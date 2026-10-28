@@ -41,9 +41,11 @@ from horae.cli_output import (
     EXIT_PROBLEMS,
     EXIT_REFUSED,
     CommandFailed,
+    echo,
     echo_json,
     io_failed,
     plural,
+    prime_secrets,
     run_command,
 )
 from horae.config import CONFIG_FILE, STORE_FILE, ProblemsError, read_yaml, validate
@@ -95,6 +97,7 @@ def _undo(instance: Path, run_id: str, vault: Path | None, force: bool) -> UndoR
         found = plural(len(exc.problems), "problem") + " found"
         message = "; ".join([*map(str, exc.problems), found])
         raise CommandFailed(EXIT_PROBLEMS, "config_invalid", message) from None
+    prime_secrets(instance, config)  # redaction of everything printed (#53)
     state_dir = instance / config.state_dir
     path = state_dir / STORE_FILE
     if not path.exists():  # never create the store just to look a run up
@@ -141,7 +144,7 @@ def _report(instance: Path, run_id: str, vault: Path | None, force: bool, json: 
     if json:
         echo_json(undo_to_dict(result))
     else:
-        typer.echo(render_undo_text(result), nl=False)
+        echo(render_undo_text(result), nl=False)
     return _code(result)
 
 

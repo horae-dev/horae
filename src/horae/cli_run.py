@@ -53,6 +53,7 @@ from horae.cli_output import (
     EXIT_USAGE,
     SCHEMA_VERSION,
     CommandFailed,
+    echo,
     echo_json,
     internal_message,
     io_failed,
@@ -265,14 +266,14 @@ def _emit(
         )
         return
     if record is not None:
-        typer.echo(_render(record, changes), nl=False)
+        echo(_render(record, changes), nl=False)
     if kind is None:
         return
     if record is not None and kind in _IN_RECORD:
         # The record's error is already printed above: the kind only, not the error twice.
-        typer.echo(f"horae run: {kind}", err=True)
+        echo(f"horae run: {kind}", err=True)
     else:
-        typer.echo(f"horae run: {safe(message or kind)}", err=True)
+        echo(f"horae run: {safe(message or kind)}", err=True)
 
 
 def _abandoned_during_apply(instance: Instance, run_id: str) -> str | None:

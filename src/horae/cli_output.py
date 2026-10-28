@@ -27,7 +27,12 @@ one JSON document on stdout, `schema_version: 1`, ASCII only, strict (no `NaN`),
 included: `{"schema_version": 1, "error": {"kind", "message"}}` (usage errors too, kind
 `usage`, also those of the `horae` group itself: `horae --json`, `horae nope --json`).
 Nothing printed is ever a secret value: an internal error shows its exception type only,
-never its message, traceback or locals.
+never its message, traceback or locals. Everything a command prints goes through `echo`,
+which redacts it with the process registry (`horae.secrets.redact.current()`, #53, schemas
+decision 43 I); a JSON document is redacted as data first (`to_json`), then as text. The
+commands that read the instance prime the registry with every secret it names
+(`prime_secrets`, `Instance.prime_redaction`), so a value is redacted even when no plugin
+host was opened.
 """
 
 from collections.abc import Callable
@@ -38,6 +43,11 @@ import typer
 from typer.core import TyperCommand, TyperGroup
 
 from horae.apply.render import dumps, safe
+from horae.config.loader import read_lock, redaction_names
+from horae.contracts.instance import InstanceConfig
+from horae.secrets import SecretResolver
+from horae.secrets.redact import current as current_redactor
+from horae.secrets.redact import prime
 
 if TYPE_CHECKING:
     # Typer vendors click privately; its `Context` base class is only needed for typing.
@@ -93,13 +103,32 @@ def plural(count: int, word: str, plurals: str | None = None) -> str:
     return f"{count} {word if count == 1 else plurals or word + 's'}"
 
 
+def prime_secrets(root: Path, config: InstanceConfig) -> None:
+    """Resolve, for redaction only, every secret the instance names, as
+    `Instance.redaction_names` does (`secrets.refs`, the model aliases' `secret` and, when
+    `horae.lock` exists and is valid, the secrets it grants its plugins), for a command that
+    reads `horae.yaml` alone (#53)."""
+    names = redaction_names(config, read_lock(root))
+    prime(SecretResolver(config.secrets.refs, root / config.secrets.dir), names)
+
+
+def echo(
+    message: str = "", *, err: bool = False, nl: bool = True, color: bool | None = None
+) -> None:
+    """`typer.echo`, redacted (every secret this process resolved becomes
+    `[REDACTED:<NAME>]`)."""
+    typer.echo(current_redactor().redact_text(message)[0], err=err, nl=nl, color=color)
+
+
 def to_json(value: Any) -> str:
-    """`value` as the JSON document of a command: indented, ASCII, strict."""
-    return dumps(value, indent=2, ensure_ascii=True)
+    """`value` as the JSON document of a command: indented, ASCII, strict; its strings and
+    keys redacted (`Redactor.scrub_data`)."""
+    scrubbed, _ = current_redactor().scrub_data(value)
+    return dumps(scrubbed, indent=2, ensure_ascii=True)
 
 
 def echo_json(value: Any) -> None:
-    typer.echo(to_json(value))
+    echo(to_json(value))
 
 
 def error_document(kind: str, message: str) -> dict[str, Any]:
@@ -111,7 +140,7 @@ def report_error(command: str, kind: str, message: str, json_output: bool) -> No
     if json_output:
         echo_json(error_document(kind, message))
     else:
-        typer.echo(f"horae {command}: {safe(message)}", err=True)
+        echo(f"horae {command}: {safe(message)}", err=True)
 
 
 def internal_message(exc: BaseException) -> str:
@@ -222,11 +251,13 @@ __all__ = [
     "CommandFailed",
     "JsonUsageCommand",
     "JsonUsageGroup",
+    "echo",
     "echo_json",
     "error_document",
     "internal_message",
     "io_failed",
     "plural",
+    "prime_secrets",
     "report_error",
     "run_command",
     "safe",

@@ -35,6 +35,11 @@ and every other step `skipped`, when:
   `transform` `transforms`, `act` `sinks`, `notify` `notifiers`, `llm` `skills`);
 - a parameter template is invalid (`template_error`), or a rendered parameter is not plain
   JSON data (`params_invalid`: e.g. `NaN`, a date object, nesting deeper than 64);
+- a template variable (`horae run --var`) or a rendered parameter holds the value (or an
+  encoding) of a secret this process resolved, in a string, an object key or as a number's
+  whole value (`pin: 12345678`) (`params_invalid`, naming the secret only, #53, schemas
+  decision 43 D): a secret is never a trusted parameter. The variable's value is redacted in
+  the record's `context`;
 - an `act` entry has no valid `mode`, or its binding parameters (or a `notify` entry's
   `link_prefix`) are invalid (`params_invalid`, see below);
 - the pipeline has more than `MAX_ITEMS` `collect` calls in all, or uses more than
@@ -242,6 +247,7 @@ from horae.engine.ports import (
 )
 from horae.engine.template import TemplateError, render, variables
 from horae.intents import MAX_BODY_DEPTH, IntentRejected, safe_excerpt, validate_intents
+from horae.secrets.redact import current as current_redactor
 
 DEFAULT_LLM_TIMEOUT_S = 120.0
 """Timeout of the LLM step (both attempts) when the pipeline sets no `timeout_s`."""
@@ -616,10 +622,17 @@ def _plan(
     planned: list[_Planned] = []
     used: set[str] = set()
     collect_calls = 0
+    redactor = current_redactor()
+    first = _kind_of(pipeline.steps[0])
+    for name, value in sorted(context.vars.items()):
+        held = redactor.names_in(value)
+        if held:
+            message = f"the variable {name} holds secret {', '.join(sorted(held))}"
+            error = StepError(kind="params_invalid", message=f"{message} (never a parameter)")
+            raise _PlanError(0, first, error)
     try:
         rendered_calls = {(c.step, c.call): c for c in planned_calls(pipeline, context)}
     except TemplateError as error:
-        first = _kind_of(pipeline.steps[0])
         raise _PlanError(0, first, StepError(kind="template_error", message=str(error))) from None
     for index, step in enumerate(pipeline.steps):
         kind = _kind_of(step)
@@ -668,6 +681,10 @@ def _plan(
             problem = _plain_problem(rendered)
             if problem is not None:
                 fail("params_invalid", f"{ref}: the parameters {problem[1]}")
+            held = redactor.find(rendered)  # strings, keys and whole numbers
+            if held:
+                names = ", ".join(sorted(held))
+                fail("params_invalid", f"{ref}: the parameters hold secret {names}")
             if kind in ("act", "notify"):
                 try:
                     types, binds = _entry_binding(kind, ref, rendered, plugin)
@@ -1144,7 +1161,8 @@ async def _llm_step(run: _Run, step: _Planned) -> _Outcome:
             usage = getattr(error, "usage", None)
             if isinstance(usage, Usage):
                 run.spend(usage)
-            return degraded(_kind(error.kind), safe_excerpt(error.message, 200))
+            message = current_redactor().redact_text(error.message)[0]
+            return degraded(_kind(error.kind), safe_excerpt(message, 200))
         except Exception as error:  # a backend bug must not crash the run
             return degraded("host_error", f"unexpected {type(error).__name__}")
         try:
@@ -1249,7 +1267,9 @@ async def execute(
     - `models` (when given), `lock_digest` and `config_digest` (`horae.config.Instance`) are
       recorded as given, for replays; an invalid value raises `ValueError` before anything
       runs. The canonical pipeline definition is recorded too (`pipeline_definition`), unless
-      it is larger than `MAX_PIPELINE_BYTES`.
+      it is larger than `MAX_PIPELINE_BYTES` or holds a resolved secret's value (#53: a
+      literal secret in a pipeline file; its parameters refuse the run at plan time, and the
+      definition is not copied into the store).
     - `dry_run` is recorded only: the engine applies nothing either way.
     - `on_step(index, record)` is awaited after each step record is final; its exceptions
       propagate. `clock` gives the wall-clock timestamps, `monotonic` the durations and the
@@ -1269,6 +1289,8 @@ async def execute(
         raise ValueError(f"more than {MAX_ITEMS} model aliases")
     canonical = canonical_pipeline(pipeline)
     definition = canonical if len(canonical_json(canonical)) <= MAX_PIPELINE_BYTES else None
+    if definition is not None and current_redactor().find(definition):
+        definition = None  # a pipeline file holding a secret is not copied into the record
     records: list[StepRecord] = []
     status: RunStatus = "ok"
     run_error: str | None = None
@@ -1302,13 +1324,16 @@ async def execute(
         if p.skill_plugin is not None and p.llm is not None:
             resolved.setdefault(p.skill_plugin.manifest.name, set()).add(p.llm.skill)
 
+    recorded_vars, _ = current_redactor().scrub_data(dict(context.vars))
+    recorded_context = context.model_copy(update={"vars": recorded_vars})
+
     def record(final: RunStatus, error: str | None, steps: list[StepRecord]) -> RunRecord:
         return RunRecord(
             schema_version=1,
             id=run_id,
             pipeline=pipeline.name,
             pipeline_digest=digest,
-            context=context,
+            context=recorded_context,
             lock_digest=lock_digest,
             config_digest=config_digest,
             models=recorded_models,
