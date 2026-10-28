@@ -64,7 +64,9 @@ backends disable their SDK's own retries.
   validator is mandatory before production use** (decision 38 G): structured outputs drop
   the constraints they do not support (`anthropic.transform_schema` moves them into
   descriptions), so only the validator enforces the full schema.
-- **#33 (budgets).** `max_tokens` is the attempt's remaining `tokens_out` (capped by the
+- **#33 (budgets).** `worst_case` is what the usage ledger reserves before `send`; the
+  runner's `DailyBudgets` caps the request's budget with the day's remaining allowance before
+  `render`. `max_tokens` is the attempt's remaining `tokens_out` (capped by the
   alias' `max_output_tokens`), lowered so that the input bound plus the output cannot exceed
   the remaining `usd` when the alias has a price.
 """
@@ -209,6 +211,8 @@ class RenderedRequest:
     """What is recorded as `LlmCall.request` (digests and sizes; see the module docstring)."""
     input_bound: int = 0
     """The upper bound of the input tokens used by the pre-flight budget check."""
+    max_tokens: int = 0
+    """The payload's `max_tokens`: the most output tokens the attempt can cost."""
     _body: bytes = field(default=b"", init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -416,7 +420,17 @@ class ModelBackends:
             timeout_s=request.timeout_s,
             summary=summary(completion, backend.name, canonical_json(payload)),
             input_bound=bound,
+            max_tokens=limit,
         )
+
+    def worst_case(self, rendered: RenderedRequest) -> Usage:
+        """The most `rendered` can cost (the usage ledger's reservation, decision 41): every
+        token of its input bound at the input price and every output token of its
+        `max_tokens`, the same bound `max_tokens` keeps within the attempt's `usd` (Horae asks
+        for no prompt caching, so no cache write is billed, and cache reads cost less)."""
+        spec = self.models.get(rendered.alias)
+        price = None if spec is None else spec.price
+        return cost(price, rendered.input_bound, rendered.max_tokens)
 
     async def send(self, rendered: RenderedRequest) -> LlmResponse:
         """Send `rendered` (exactly its frozen body) through its alias' provider backend."""

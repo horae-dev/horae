@@ -240,6 +240,38 @@ class RunSummary:
 
 
 @dataclass(frozen=True)
+class DaySpend:
+    """What the usage ledger records for one day: settled calls at their cost, calls in
+    flight (or whose process died) at their reservation."""
+
+    usd: float = 0.0
+    tokens_out: int = 0
+
+
+@dataclass(frozen=True)
+class UsageGroup:
+    """LLM calls of one day, pipeline, model alias, backend and model (`Store.usage_report`)."""
+
+    day: str
+    """The local day (`YYYY-MM-DD`, instance time zone)."""
+    pipeline: str
+    alias: str
+    backend: str | None
+    model: str | None
+    calls: int
+    tokens_in: int
+    tokens_out: int
+    cache_read_tokens: int
+    cache_write_tokens: int
+    usd: float
+    unpriced: int
+    """Calls of an alias without `price` (their `usd` is `0`)."""
+    estimated: int
+    """Calls counted at their reservation (an upper bound): still in flight, their process
+    died, or the provider reported no usage."""
+
+
+@dataclass(frozen=True)
 class JournalEntry:
     """One change, recorded before it is applied, with enough to undo it.
 
@@ -1405,3 +1437,169 @@ class Store:
         if row is None:
             return None
         return NotificationState(row[0], row[1], _dt(row[2]), _dt(row[3]), row[4])
+
+    # --- usage ledger (#33) ----------------------------------------------------------------
+
+    @_api
+    def day_spend(self, day: date, *, pipeline: str | None = None) -> DaySpend:
+        """The ledger's spend on local `day`, of every pipeline or of `pipeline` only.
+
+        Call it inside `transaction()` together with `reserve_usage`, so that no other
+        process reserves in between (the daily ceilings)."""
+        row = self._conn.execute(
+            "SELECT coalesce(sum(usd), 0), coalesce(sum(tokens_out), 0) FROM llm_usage "
+            "WHERE day = :day AND (:pipeline IS NULL OR pipeline = :pipeline)",
+            {"day": day.isoformat(), "pipeline": pipeline},
+        ).fetchone()
+        return DaySpend(usd=float(row[0]), tokens_out=int(row[1]))
+
+    @_api
+    def reserve_usage(
+        self,
+        run_id: str,
+        *,
+        step: int,
+        attempt: int,
+        alias: str,
+        at: datetime,
+        day: date,
+        usd: float,
+        tokens_out: int,
+        tokens_in: int = 0,
+        backend: str | None = None,
+        model: str | None = None,
+        priced: bool | None = None,
+    ) -> int:
+        """Record a call about to be made, at the most it can cost; return the row's id.
+
+        The run must be `running` (`RunNotRunning`, `UnknownRun`). `settle_usage` replaces
+        the reservation with what the call cost; `release_usage` drops it (no call made)."""
+        if type(step) is not int or step < 0 or type(attempt) is not int or attempt < 1:
+            raise ValueError("step must be an int >= 0 and attempt an int >= 1")
+        if not usd >= 0 or tokens_out < 0 or tokens_in < 0:
+            raise ValueError("a reservation is not negative")
+        with self.transaction():
+            self._require_running(run_id)
+            (pipeline,) = self._conn.execute(
+                "SELECT pipeline FROM runs WHERE id = ?", (run_id,)
+            ).fetchone()
+            cur = self._conn.execute(
+                "INSERT INTO llm_usage (run_id, pipeline, step, attempt, alias, backend, model, "
+                "state, tokens_in, tokens_out, usd, priced, at, day) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'reserved', ?, ?, ?, ?, ?, ?)",
+                (
+                    run_id,
+                    pipeline,
+                    step,
+                    attempt,
+                    alias,
+                    backend,
+                    model,
+                    tokens_in,
+                    tokens_out,
+                    usd,
+                    None if priced is None else int(priced),
+                    _ts(at),
+                    day.isoformat(),
+                ),
+            )
+            entry = cur.lastrowid
+        if entry is None:  # pragma: no cover - an INSERT always sets it
+            raise StoreError("the reservation has no id")
+        return entry
+
+    @_api
+    def settle_usage(
+        self,
+        entry_id: int,
+        usage: Usage | None,
+        *,
+        at: datetime,
+        backend: str | None = None,
+        model: str | None = None,
+    ) -> None:
+        """Replace a reservation with what the call cost; `usage=None` keeps the reserved
+        amounts, marked `estimated` (the provider reported nothing: a timeout, say).
+        Settling twice, or a row pruned with its run, is a no-op."""
+        stamp = _ts(at)
+        with self.transaction():
+            if usage is None:
+                self._conn.execute(
+                    "UPDATE llm_usage SET state = 'settled', estimated = 1, settled_at = ?, "
+                    "backend = coalesce(?, backend), model = coalesce(?, model) "
+                    "WHERE id = ? AND state = 'reserved'",
+                    (stamp, backend, model, entry_id),
+                )
+                return
+            self._conn.execute(
+                "UPDATE llm_usage SET state = 'settled', settled_at = ?, tokens_in = ?, "
+                "tokens_out = ?, cache_read_tokens = ?, cache_write_tokens = ?, usd = ?, "
+                "priced = coalesce(?, priced), backend = coalesce(?, backend), "
+                "model = coalesce(?, model) WHERE id = ? AND state = 'reserved'",
+                (
+                    stamp,
+                    usage.tokens_in,
+                    usage.tokens_out,
+                    usage.cache_read_tokens,
+                    usage.cache_write_tokens,
+                    usage.usd,
+                    None if usage.priced is None else int(usage.priced),
+                    backend,
+                    model,
+                    entry_id,
+                ),
+            )
+
+    @_api
+    def release_usage(self, entry_id: int) -> None:
+        """Drop a reservation whose call was not made (a no-op once it is settled)."""
+        with self.transaction():
+            self._conn.execute(
+                "DELETE FROM llm_usage WHERE id = ? AND state = 'reserved'", (entry_id,)
+            )
+
+    @_api
+    def usage_report(
+        self,
+        *,
+        since: date | None = None,
+        until: date | None = None,
+        pipeline: str | None = None,
+    ) -> list[UsageGroup]:
+        """The ledger grouped by local day, pipeline, alias, backend and model, oldest day
+        first; `since` and `until` are inclusive local days."""
+        rows = self._conn.execute(
+            "SELECT day, pipeline, alias, backend, model, count(*), sum(tokens_in), "
+            "sum(tokens_out), coalesce(sum(cache_read_tokens), 0), "
+            "coalesce(sum(cache_write_tokens), 0), sum(usd), "
+            "sum(CASE WHEN priced = 0 THEN 1 ELSE 0 END), "
+            "sum(CASE WHEN state = 'reserved' OR estimated = 1 THEN 1 ELSE 0 END) "
+            "FROM llm_usage WHERE (:since IS NULL OR day >= :since) "
+            "AND (:until IS NULL OR day <= :until) "
+            "AND (:pipeline IS NULL OR pipeline = :pipeline) "
+            "GROUP BY day, pipeline, alias, backend, model "
+            "ORDER BY day, pipeline, alias, backend, model",
+            {
+                "since": None if since is None else since.isoformat(),
+                "until": None if until is None else until.isoformat(),
+                "pipeline": pipeline,
+            },
+        ).fetchall()
+        return [
+            UsageGroup(
+                day=row[0],
+                pipeline=row[1],
+                alias=row[2],
+                backend=row[3],
+                model=row[4],
+                calls=int(row[5]),
+                tokens_in=int(row[6]),
+                tokens_out=int(row[7]),
+                cache_read_tokens=int(row[8]),
+                cache_write_tokens=int(row[9]),
+                usd=float(row[10]),
+                unpriced=int(row[11]),
+                estimated=int(row[12]),
+            )
+            for row in rows
+        ]

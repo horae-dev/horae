@@ -31,3 +31,8 @@ secrets:
     OPENROUTER_API_KEY: { env: OPENROUTER_KEY }
 scheduler: { mode: external }
 runs: { timeout_s: 1200 }
+# Daily LLM spend ceilings across runs, in the instance's time zone (decision 41).
+budgets:
+  daily: { usd: 2.0, tokens_out: 200000 }
+  pipelines:
+    daily-brief: { daily: { usd: 0.5 } }

@@ -1,0 +1,3 @@
+# A daily budget needs `usd`, `tokens_out` or both.
+budgets:
+  daily: {}

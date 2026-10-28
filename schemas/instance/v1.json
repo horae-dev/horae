@@ -2,6 +2,89 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/horae-dev/horae/main/schemas/instance/v1.json",
   "$defs": {
+    "BudgetsConfig": {
+      "additionalProperties": false,
+      "description": "Ceilings across runs (#33, schemas decision 41); each LLM step keeps its own `budget`.\n\nBefore every LLM call the remaining daily allowance (the ceiling minus what the usage\nledger records for the day, reservations of calls in flight included) caps the step's\nbudget; when nothing is left the call is refused (`budget_exceeded`) and the step is\n`degraded`.",
+      "properties": {
+        "daily": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DailyBudget"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "What every pipeline's LLM calls together may spend per day."
+        },
+        "pipelines": {
+          "description": "Per-pipeline ceilings, by pipeline name (both apply: the lower allowance wins).",
+          "maxProperties": 256,
+          "patternProperties": {
+            "^[a-z][a-z0-9-]*$": {
+              "$ref": "#/$defs/PipelineBudgets"
+            }
+          },
+          "propertyNames": {
+            "maxLength": 64
+          },
+          "title": "Pipelines",
+          "type": "object",
+          "additionalProperties": false
+        }
+      },
+      "title": "BudgetsConfig",
+      "type": "object"
+    },
+    "DailyBudget": {
+      "additionalProperties": false,
+      "anyOf": [
+        {
+          "required": [
+            "usd"
+          ]
+        },
+        {
+          "required": [
+            "tokens_out"
+          ]
+        }
+      ],
+      "description": "A ceiling on what LLM calls may spend in one day (schemas decision 41).\n\nThe day is the instance's `timezone` day. At least one of `usd` and `tokens_out` is\nrequired. `usd` bounds only the calls of priced model aliases (an alias without `price`\nrecords `usd: 0`); `tokens_out` bounds every call.",
+      "properties": {
+        "usd": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Maximum spend per day, in US dollars.",
+          "title": "Usd"
+        },
+        "tokens_out": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Maximum output tokens per day.",
+          "title": "Tokens Out"
+        }
+      },
+      "title": "DailyBudget",
+      "type": "object"
+    },
     "EnvSecretRef": {
       "additionalProperties": false,
       "description": "Read the secret from an environment variable.",
@@ -251,6 +334,21 @@
       "title": "ModelPrice",
       "type": "object"
     },
+    "PipelineBudgets": {
+      "additionalProperties": false,
+      "description": "The budgets of one pipeline, on top of the instance's.",
+      "properties": {
+        "daily": {
+          "$ref": "#/$defs/DailyBudget",
+          "description": "What this pipeline's LLM calls may spend per day."
+        }
+      },
+      "required": [
+        "daily"
+      ],
+      "title": "PipelineBudgets",
+      "type": "object"
+    },
     "PluginDefaults": {
       "additionalProperties": false,
       "description": "Timeouts for every plugin without its own setting (the #24 plugin host reads them).",
@@ -458,6 +556,10 @@
     "runs": {
       "$ref": "#/$defs/RunsConfig",
       "description": "Bounds of every pipeline run (the run timeout)."
+    },
+    "budgets": {
+      "$ref": "#/$defs/BudgetsConfig",
+      "description": "Daily LLM spend ceilings across runs (#33)."
     }
   },
   "title": "Horae instance configuration (horae.yaml)",

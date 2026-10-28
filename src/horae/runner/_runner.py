@@ -23,7 +23,9 @@
    finished step is persisted (`on_step` → `Store.record_step`), and a heartbeat
    (`Store.heartbeat`) is written every `heartbeat_s` seconds. Heartbeats are for
    observability (`horae runs`); the lock, not the heartbeat, decides whether a run is alive.
-5. **Apply** (#22, provisional): when the run is not a dry run, finished `ok`, `noop` or
+   The LLM backend is wrapped in `LedgerLlm` (`horae.runner._budget`, #33): the daily
+   budgets of `horae.yaml` and the usage ledger, one reserved then settled row per call.
+5.**Apply** (#22, provisional): when the run is not a dry run, finished `ok`, `noop` or
    `degraded` within its timeout, and `Ports.sinks` is set, its routed intents are planned
    (`horae.apply.plan_changes`, with the notifications already sent) and applied
    (`horae.apply.apply_changes`: journal first, then the sink, then mark applied) while the
@@ -118,6 +120,7 @@ from horae.engine import (
     make_context,
     pipeline_digest,
 )
+from horae.runner._budget import LedgerLlm
 from horae.runner._lock import PipelineLock, try_acquire_apply_lock
 from horae.store import (
     MAX_LIST_RUNS,
@@ -601,6 +604,23 @@ class Runner:
             raise RunLost(state.run_id)
         return result.record
 
+    def _ledger_llm(self, pipeline: Pipeline, run_id: str) -> LlmBackend | None:
+        """The run's LLM backend behind the daily budgets and the usage ledger (#33)."""
+        step = next((i for i, s in enumerate(pipeline.steps) if isinstance(s, LlmStep)), None)
+        if self.ports.llm is None or step is None:
+            return self.ports.llm
+        config = self.instance.config
+        return LedgerLlm(
+            self.ports.llm,
+            self.store,
+            run_id,
+            pipeline.name,
+            step,
+            config.budgets,
+            config.timezone,
+            self.clock,
+        )
+
     async def _drive(
         self,
         pipeline: Pipeline,
@@ -621,6 +641,7 @@ class Runner:
                 raise RunLost(run_id) from None
 
         models = {alias: spec.model for alias, spec in self.instance.config.models.items()}
+        llm = self._ledger_llm(pipeline, run_id)
         task = asyncio.create_task(
             execute(
                 pipeline,
@@ -629,7 +650,7 @@ class Runner:
                 started_at=started_at,
                 plugins=self.ports.plugins,
                 tools=self.ports.tools,
-                llm=self.ports.llm,
+                llm=llm,
                 dry_run=dry_run,
                 previous=previous,
                 models=models,

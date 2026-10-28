@@ -31,6 +31,7 @@ from horae.store._store import (
     MAX_LIST_RUNS,
     MAX_NESTING,
     CacheEntry,
+    DaySpend,
     JournalEntry,
     NotificationState,
     RunSummary,
@@ -38,6 +39,7 @@ from horae.store._store import (
     StoreRunStatus,
     TaskEntry,
     TaskStatus,
+    UsageGroup,
 )
 
 __all__ = [
@@ -48,6 +50,7 @@ __all__ = [
     "MAX_NESTING",
     "SCHEMA_VERSION",
     "CacheEntry",
+    "DaySpend",
     "InvalidRow",
     "JournalEntry",
     "JournalTooLarge",
@@ -71,6 +74,7 @@ __all__ = [
     "UnknownRun",
     "UnknownTask",
     "UnsupportedSQLite",
+    "UsageGroup",
     "load_migrations",
     "migrate",
 ]

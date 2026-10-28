@@ -26,6 +26,7 @@ from horae.contracts.types import (
     MAX_ITEMS,
     Contract,
     IanaTimezone,
+    PipelineName,
     PluginName,
     SchemaVersion1,
     SecretName,
@@ -300,6 +301,52 @@ class SchedulerConfig(Contract):
     (Coolify, systemd, cron) calls `horae run <pipeline>`."""
 
 
+class DailyBudget(Contract):
+    """A ceiling on what LLM calls may spend in one day (schemas decision 41).
+
+    The day is the instance's `timezone` day. At least one of `usd` and `tokens_out` is
+    required. `usd` bounds only the calls of priced model aliases (an alias without `price`
+    records `usd: 0`); `tokens_out` bounds every call."""
+
+    model_config = ConfigDict(
+        json_schema_extra={"anyOf": [{"required": ["usd"]}, {"required": ["tokens_out"]}]}
+    )
+
+    usd: Annotated[StrictFloat, Field(gt=0)] | None = None
+    """Maximum spend per day, in US dollars."""
+    tokens_out: Annotated[StrictInt, Field(ge=1)] | None = None
+    """Maximum output tokens per day."""
+
+    @model_validator(mode="after")
+    def _one_ceiling(self) -> Self:
+        if self.usd is None and self.tokens_out is None:
+            raise ValueError("a daily budget needs `usd`, `tokens_out` or both")
+        return self
+
+
+class PipelineBudgets(Contract):
+    """The budgets of one pipeline, on top of the instance's."""
+
+    daily: DailyBudget
+    """What this pipeline's LLM calls may spend per day."""
+
+
+class BudgetsConfig(Contract):
+    """Ceilings across runs (#33, schemas decision 41); each LLM step keeps its own `budget`.
+
+    Before every LLM call the remaining daily allowance (the ceiling minus what the usage
+    ledger records for the day, reservations of calls in flight included) caps the step's
+    budget; when nothing is left the call is refused (`budget_exceeded`) and the step is
+    `degraded`."""
+
+    daily: DailyBudget | None = None
+    """What every pipeline's LLM calls together may spend per day."""
+    pipelines: Annotated[dict[PipelineName, PipelineBudgets], Field(max_length=MAX_ITEMS)] = Field(
+        default_factory=dict
+    )
+    """Per-pipeline ceilings, by pipeline name (both apply: the lower allowance wins)."""
+
+
 class InstanceConfig(Contract):
     """An instance's `horae.yaml`."""
 
@@ -323,6 +370,8 @@ class InstanceConfig(Contract):
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
     runs: RunsConfig = Field(default_factory=RunsConfig)
     """Bounds of every pipeline run (the run timeout)."""
+    budgets: BudgetsConfig = Field(default_factory=BudgetsConfig)
+    """Daily LLM spend ceilings across runs (#33)."""
 
     def plugin_timeouts(self, plugin: str) -> PluginDefaults:
         """The effective timeouts of `plugin`: its own settings, else `plugin_defaults`."""

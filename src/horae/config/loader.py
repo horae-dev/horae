@@ -237,6 +237,16 @@ def _cross_check(state: _Loaded) -> None:
                     value=False,
                 )
             )
+    names = {pipeline.name for pipeline, _ in state.pipelines.values()}
+    for name in config.budgets.pipelines:
+        if name not in names:
+            state.problems.append(
+                config_doc.problem(
+                    ("budgets", "pipelines", name),
+                    f"budget for unknown pipeline {name!r}",
+                    value=False,
+                )
+            )
     for pipeline, doc in state.pipelines.values():
         zone = pipeline.trigger.timezone if pipeline.trigger else None
         if zone is not None and not _timezone_exists(zone):

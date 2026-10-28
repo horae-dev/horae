@@ -147,7 +147,7 @@ and later are new.
 |---|---|---|---|---|---|---|
 | T10 | I | A secret or personal data inside source output is sent to a cloud LLM | De-identification of declared fields before any cloud backend (#34); refuse a request that contains the value of any resolved secret (`SecretResolver.resolved()`) | #34 | D | planned #34 (secret check: see [§10](#10-story-updates-requested)) |
 | T11 | I, E | `claude-cli` exposes user configuration, tools or the OAuth token | Isolated empty config, env allowlist, built-in tools disabled, no user settings ([ADR 0005](adr/0005-claude-cli-backend-and-its-terms.md)); Horae never handles OAuth; re-verified per Claude Code release | #29 (fake binary) | D | planned #29 |
-| T12 | D | Runaway spend (loop, injection-inflated input) | One LLM step, `on_unchanged_input: skip` ([decision 15](../schemas/README.md#decisions)); budgets per step and per day with a ledger (#33); input-hash cache, the $0 path (#32); provider spend limits (#63) | `tests/test_contracts.py` (budget fields required); #32, #33 | D | planned #32, #33, #63 |
+| T12 | D | Runaway spend (loop, injection-inflated input) | One LLM step, `on_unchanged_input: skip` ([decision 15](../schemas/README.md#decisions)); budgets per step and per day with a usage ledger, the day's allowance reserved before each call so that concurrent runs cannot jointly exceed it ([decision 41](../schemas/README.md#decisions), #33); input-hash cache, the $0 path (#32); provider spend limits (#63) | `tests/test_contracts.py` (budget fields required); `tests/test_budgets.py` (step and daily ceilings, two processes); #32 | D | done #33; planned #32, #63 |
 
 ### B4: phone ↔ `/act`
 

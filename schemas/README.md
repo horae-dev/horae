@@ -1113,3 +1113,58 @@ loosened later without breaking a valid file.
       the LLM layer is reached. #27 also changes `open_ports` (`horae.runner._ports`), which
       this change touches too: the merge keeps both (the skill loader becomes the
       `PromptSource` of the `ModelBackends` built there).
+
+### Provisional decisions (#33, pending maintainer review)
+
+41. **Budgets per day and the usage ledger (#33).** (39 and 40 are taken by #27 and #30.)
+    A compatible v1 addition and the rules of `horae.runner._budget`, the store and `horae
+    usage`:
+    - **contract change** (optional): `horae.yaml` `budgets: {daily?, pipelines?}`, where
+      `daily` is `{usd?, tokens_out?}` (at least one; `usd > 0`, `tokens_out >= 1`) for every
+      pipeline together, and `pipelines.<name>.daily` the same for one pipeline (a name that
+      is not a pipeline of the instance is a loader problem). Both apply; the lower
+      allowance wins. The day is the instance's `timezone` day (not a trigger's). `usd`
+      bounds only priced aliases (an alias without `price` records `usd: 0`, decision 38 A);
+      `tokens_out` bounds every call. The step's own `budget` is unchanged and still bounds
+      both attempts together;
+    - **reservation**: before every LLM attempt, in one store transaction (`BEGIN
+      IMMEDIATE`, so the processes of other runs wait for it), the runner reads the day's
+      spend from the ledger (settled calls at their cost, unsettled ones at their
+      reservation), caps the attempt's budget with what is left of each ceiling (none left:
+      `LlmError("budget_exceeded")`, no request, the step `degraded`), renders the request
+      with that budget (`ModelBackends.render`, whose pre-flight of decision 38 B may refuse
+      it too) and reserves the most it can cost (`ModelBackends.worst_case`: the input bound
+      at the input price plus `max_tokens` at the output price, the bound `max_tokens`
+      already keeps within the budget; Horae requests no prompt caching, so no cache write is
+      billed). Another `LlmBackend` (a test fake) reserves the capped budget itself. Two runs
+      of different pipelines therefore never both spend the last of a ceiling. Not the apply
+      lock: an LLM call can take minutes and must not block other runs' applies;
+    - **settling, right after the call** (not with the step record: failed attempts cost
+      money too and have no `LlmCall`): the reported usage (also of a failed call,
+      `LlmError.usage`; zero for a backend's cached response); a refusal that reports no
+      usage and means the provider processed nothing (`budget_exceeded`,
+      `backend_unavailable`, `skill_unavailable`, `invalid_request`, `auth_failed`,
+      `rate_limited`, `overloaded`) releases the reservation; any other failure without
+      usage (a timeout, a lost connection, a cancellation) keeps the reservation as an
+      `estimated` cost. **Crash consistency**: a process that dies between reserving and
+      settling leaves its `reserved` row, which keeps counting for its day: a crash can
+      over-count, never under-count. A store failure while reserving refuses the call
+      (`host_error`); while settling it is logged (type only) and the reservation stays;
+    - **the ledger** is the `llm_usage` table (migration 4): per attempt `run_id`,
+      `pipeline`, `step`, `attempt`, `alias`, `backend`, `model`, `state` (`reserved` or
+      `settled`), tokens in and out, cache read and write tokens, `usd`, `priced`,
+      `estimated`, `at` (UTC) and `day` (local). Rows are deleted with their run
+      (`ON DELETE CASCADE`), so retention follows `prune_runs`;
+    - **`horae usage [--pipeline P] [--since DATE] [--until DATE] [--by day|pipeline|model]
+      [--json]`** groups the ledger by day and pipeline (or by day, pipeline, or backend and
+      model), oldest first, with a `TOTAL` row; dates are local days, inclusive. Cells of
+      calls of an unpriced alias are flagged `*` and those counted at a reservation `~`,
+      with a footnote each. The store is opened read-only (decision 31 E: a missing store
+      lists nothing, an older schema exits 1). Exit codes as decision 37: `0` listed, `1`
+      configuration or store problem, `2` usage error (a malformed date, `--since` after
+      `--until`, an unknown `--by`), `70` internal. `--json` prints `{schema_version: 1,
+      instance, by, pipeline, since, until, rows: [{<by keys>, calls, tokens_in, tokens_out,
+      cache_read_tokens, cache_write_tokens, usd, unpriced_calls, estimated_calls}], total}`;
+    - **follow-ups**: a `horae doctor` warning for a `usd` ceiling whose pipelines use an
+      unpriced alias; a monthly ceiling; provider-side spend limits (#63).
+
