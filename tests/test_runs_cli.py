@@ -193,7 +193,8 @@ def _files(root: Path) -> list[str]:
 
 def test_runs_opens_the_store_read_only(root: Path) -> None:
     db = root / "state" / STORE_FILE
-    assert _files(root) == [STORE_FILE]  # every writer closed: no -wal / -shm
+    lock = STORE_FILE + ".init.lock"  # left by the writers' first open (Store.open)
+    assert _files(root) == [STORE_FILE, lock]  # every writer closed: no -wal / -shm
     before = db.read_bytes()
     db.chmod(0o400)
     try:
@@ -202,7 +203,7 @@ def test_runs_opens_the_store_read_only(root: Path) -> None:
         assert len(json.loads(out)["runs"]) == 4
     finally:
         db.chmod(0o600)
-    assert _files(root) == [STORE_FILE]  # nothing created, no -wal / -shm
+    assert _files(root) == [STORE_FILE, lock]  # nothing created, no -wal / -shm
     assert db.read_bytes() == before
 
 

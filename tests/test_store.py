@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """The SQLite store: schema and migrations, connection settings, and the typed API."""
 
+import fcntl
 import hashlib
 import json
 import os
@@ -505,9 +506,17 @@ def test_wal_switch_backs_off_while_busy(db: Path, monkeypatch: pytest.MonkeyPat
 
     monkeypatch.setattr(_store, "time", clock)
     monkeypatch.setattr(_store, "_wal_attempt", flaky)
+    monkeypatch.setattr(_store, "_backoff", min)  # the jitter's upper bound
     with Store.open(db) as s:
         assert s.pragma("journal_mode") == "wal"
     assert clock.sleeps == [0.005, 0.01, 0.02]
+
+
+def test_backoff_has_full_jitter_bounded_by_the_time_left() -> None:
+    sleeps = [_store._backoff(0.1, 1.0) for _ in range(200)]
+    assert all(0 <= sleep <= 0.1 for sleep in sleeps)
+    assert len(set(sleeps)) > 1  # jittered, so concurrent openers spread out
+    assert _store._backoff(0.1, 0.0) == 0.0
 
 
 def test_wal_switch_waits_at_most_the_busy_timeout(
@@ -520,6 +529,7 @@ def test_wal_switch_waits_at_most_the_busy_timeout(
 
     monkeypatch.setattr(_store, "time", clock)
     monkeypatch.setattr(_store, "_wal_attempt", always_busy)
+    monkeypatch.setattr(_store, "_backoff", min)
     with pytest.raises(StoreBusy, match="WAL"):
         Store.open(db, busy_timeout_ms=50)
     assert clock.sleeps == pytest.approx([0.005, 0.01, 0.02, 0.015])
@@ -1251,25 +1261,96 @@ with Store.open(path) as s:
 """
 
 
-def test_concurrent_processes_begin_the_same_pipeline_once(db: Path) -> None:
-    db.parent.mkdir(parents=True)
+def _begin_concurrently(db: Path, count: int, start: Path | None = None) -> list[str]:
+    """Run `count` BEGINNER processes on `db` (each waiting for `start` to exist first, when
+    given); every child's stderr is printed (pytest shows it on failure)."""
+    script = BEGINNER
+    if start is not None:
+        wait = "import os, time\nwhile not os.path.exists(sys.argv[3]):\n    time.sleep(0.001)\n"
+        script = BEGINNER.replace("with Store.open", wait + "with Store.open", 1)
+    extra = [] if start is None else [str(start)]
     procs = [
         subprocess.Popen(  # noqa: S603 - fixed interpreter and script
-            [sys.executable, "-c", BEGINNER, str(db), f"p{n}"],
+            [sys.executable, "-c", script, str(db), f"p{n}", *extra],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
         )
-        for n in range(4)
+        for n in range(count)
     ]
+    if start is not None:
+        start.touch()
     outputs = [p.communicate(timeout=60) for p in procs]
-    assert [p.returncode for p in procs] == [0] * 4, outputs
+    for n, (_, err) in enumerate(outputs):
+        if err:
+            print(f"--- p{n} stderr ---\n{err}")
+    assert [p.returncode for p in procs] == [0] * count, outputs
     results = {f"p{n}": out.strip() for n, (out, _) in enumerate(outputs)}
     winners = [run_id for run_id, out in results.items() if out == "ok"]
     assert len(winners) == 1, results
-    assert sorted(results.values()) == sorted(["ok"] + [f"busy {winners[0]}"] * 3)
+    assert sorted(results.values()) == sorted(["ok"] + [f"busy {winners[0]}"] * (count - 1))
+    return winners
+
+
+def test_concurrent_processes_begin_the_same_pipeline_once(db: Path) -> None:
+    db.parent.mkdir(parents=True)
+    winners = _begin_concurrently(db, 4)
     with Store.open(db) as s:
         assert [r.id for r in s.list_runs()] == winners
+
+
+def test_concurrent_first_opens_under_stress(tmp_path: Path) -> None:
+    """8 processes released at once on a new database, 5 rounds: one initialises it at a
+    time (the init lock), exactly one begins the pipeline."""
+    for round_ in range(5):
+        db = tmp_path / f"round-{round_}" / "state" / "horae.db"
+        db.parent.mkdir(parents=True)
+        winners = _begin_concurrently(db, 8, start=tmp_path / f"go-{round_}")
+        with Store.open(db) as s:
+            assert [r.id for r in s.list_runs()] == winners
+        assert (db.parent / "horae.db.init.lock").exists()
+
+
+def test_first_open_waits_for_the_init_lock(db: Path) -> None:
+    db.parent.mkdir(parents=True)
+    lock = db.with_name(db.name + ".init.lock")
+    fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        with pytest.raises(StoreBusy, match="init lock"):
+            Store.open(db, busy_timeout_ms=50)
+        released = threading.Timer(0.2, os.close, args=(fd,))
+        released.start()
+        try:
+            Store.open(db, busy_timeout_ms=5000).close()  # waits, then initialises
+        finally:
+            released.join()
+        fd = -1
+    finally:
+        if fd != -1:
+            os.close(fd)
+    assert stat.S_IMODE(os.stat(lock).st_mode) == 0o600
+    os.unlink(lock)
+    Store.open(db, busy_timeout_ms=50).close()  # initialised: the fast path takes no lock
+    assert not lock.exists()
+
+
+def test_read_only_opens_never_create_the_init_lock(db: Path) -> None:
+    Store.open(db).close()
+    lock = db.with_name(db.name + ".init.lock")
+    os.unlink(lock)
+    with Store.open(db, read_only=True):
+        pass
+    assert not lock.exists()
+
+
+def test_the_init_lock_is_never_a_symlink(db: Path, tmp_path: Path) -> None:
+    db.parent.mkdir(parents=True)
+    target = tmp_path / "elsewhere"
+    os.symlink(target, db.with_name(db.name + ".init.lock"))
+    with pytest.raises(StoreError, match="init lock"):
+        Store.open(db)
+    assert not target.exists()
 
 
 def test_a_writer_waits_for_the_lock_instead_of_failing(db: Path) -> None:
