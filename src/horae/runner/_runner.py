@@ -24,8 +24,9 @@
    (`Store.heartbeat`) is written every `heartbeat_s` seconds. Heartbeats are for
    observability (`horae runs`); the lock, not the heartbeat, decides whether a run is alive.
    The LLM backend is wrapped in `LedgerLlm` (`horae.runner._budget`, #33): the daily
-   budgets of `horae.yaml` and the usage ledger, one reserved then settled row per call.
-5.**Apply** (#22, provisional): when the run is not a dry run, finished `ok`, `noop` or
+   budgets of `horae.yaml` and the usage ledger, one reserved then settled row per call;
+   a dry run is charged too (it calls the model; decision 41 E).
+5. **Apply** (#22, provisional): when the run is not a dry run, finished `ok`, `noop` or
    `degraded` within its timeout, and `Ports.sinks` is set, its routed intents are planned
    (`horae.apply.plan_changes`, with the notifications already sent) and applied
    (`horae.apply.apply_changes`: journal first, then the sink, then mark applied) while the

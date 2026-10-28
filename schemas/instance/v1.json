@@ -41,11 +41,21 @@
       "additionalProperties": false,
       "anyOf": [
         {
+          "properties": {
+            "usd": {
+              "type": "number"
+            }
+          },
           "required": [
             "usd"
           ]
         },
         {
+          "properties": {
+            "tokens_out": {
+              "type": "integer"
+            }
+          },
           "required": [
             "tokens_out"
           ]

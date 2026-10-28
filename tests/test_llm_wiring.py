@@ -324,6 +324,33 @@ def test_doctor_warns_about_a_cloud_alias_without_a_price(tmp_path: Path) -> Non
     assert "(1 warning)" in text.stdout
 
 
+def test_doctor_warns_about_a_usd_ceiling_over_an_unpriced_alias(tmp_path: Path) -> None:
+    # Decision 41 B: the dollars of an unpriced alias are unbounded by a usd ceiling.
+    root = _write(tmp_path / "instance", {"default": UNPRICED}, [LLM_STEP])
+    config = yaml.safe_load((root / "horae.yaml").read_text(encoding="utf-8"))
+    config["budgets"] = {
+        "daily": {"usd": 1.0},
+        "pipelines": {"brief": {"daily": {"usd": 0.5, "tokens_out": 1000}}},
+    }
+    (root / "horae.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
+    code, report = _doctor(root)
+    assert code == 0
+    messages = [p["message"] for p in report["problems"] if p["severity"] == "warning"]
+    assert [m for m in messages if "ceiling" in m] == [
+        "budgets.daily.usd: pipeline 'brief' uses model alias 'default', which has no price: "
+        "the usd ceiling does not bound its calls (only tokens_out does)",
+        "budgets.pipelines.brief.daily.usd: pipeline 'brief' uses model alias 'default', "
+        "which has no price: the usd ceiling does not bound its calls (only tokens_out does)",
+    ]
+    config["budgets"] = {"daily": {"tokens_out": 1000}}
+    (root / "horae.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
+    assert not any("ceiling" in p["message"] for p in _doctor(root)[1]["problems"])
+    config["models"] = {"default": ANTHROPIC}
+    config["budgets"] = {"daily": {"usd": 1.0}}
+    (root / "horae.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
+    assert _doctor(root)[1]["problems"] == []
+
+
 def test_doctor_does_not_warn_about_an_unused_or_local_alias(tmp_path: Path) -> None:
     models = {"default": ANTHROPIC, "spare": UNPRICED}  # `spare` is used by no pipeline
     root = _write(tmp_path / "instance", models, [LLM_STEP])

@@ -53,8 +53,12 @@ _KEYS: dict[GroupBy | None, tuple[str, ...]] = {
     None: ("day", "pipeline"),
     GroupBy.day: ("day",),
     GroupBy.pipeline: ("pipeline",),
-    GroupBy.model: ("backend", "model"),
+    GroupBy.model: ("backend", "model", "alias"),
 }
+"""The grouping keys of each `--by`. By model, a call that never reached a provider (no
+backend or model recorded) has `null` ones, and its alias tells it apart."""
+
+Key = tuple[str | None, ...]
 
 
 @dataclass
@@ -66,7 +70,9 @@ class _Total:
     cache_write_tokens: int = 0
     usd: float = 0.0
     unpriced: int = 0
+    in_flight: int = 0
     estimated: int = 0
+    over_reservation: int = 0
 
     def add(self, group: UsageGroup) -> None:
         self.calls += group.calls
@@ -76,7 +82,9 @@ class _Total:
         self.cache_write_tokens += group.cache_write_tokens
         self.usd += group.usd
         self.unpriced += group.unpriced
+        self.in_flight += group.in_flight
         self.estimated += group.estimated
+        self.over_reservation += group.over_reservation
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -87,31 +95,38 @@ class _Total:
             "cache_write_tokens": self.cache_write_tokens,
             "usd": round(self.usd, 9),
             "unpriced_calls": self.unpriced,
+            "in_flight_calls": self.in_flight,
             "estimated_calls": self.estimated,
+            "over_reservation_calls": self.over_reservation,
         }
 
 
-def _key(group: UsageGroup, fields: tuple[str, ...]) -> tuple[str, ...]:
-    values = {
+def _key(group: UsageGroup, fields: tuple[str, ...]) -> Key:
+    values: dict[str, str | None] = {
         "day": group.day,
         "pipeline": group.pipeline,
-        "backend": group.backend or "-",
-        "model": group.model or f"({group.alias})",
+        "backend": group.backend,
+        "model": group.model,
+        "alias": group.alias,
     }
     return tuple(values[name] for name in fields)
 
 
+def _order(item: tuple[Key, _Total]) -> tuple[tuple[bool, str], ...]:
+    return tuple((part is None, part or "") for part in item[0])
+
+
 def summarize(
     groups: Iterable[UsageGroup], by: GroupBy | None
-) -> tuple[tuple[str, ...], list[tuple[tuple[str, ...], _Total]], _Total]:
+) -> tuple[tuple[str, ...], list[tuple[Key, _Total]], _Total]:
     """`(key names, [(key, total)] in key order, grand total)`."""
     fields = _KEYS[by]
-    totals: dict[tuple[str, ...], _Total] = {}
+    totals: dict[Key, _Total] = {}
     grand = _Total()
     for group in groups:
         totals.setdefault(_key(group, fields), _Total()).add(group)
         grand.add(group)
-    return fields, sorted(totals.items()), grand
+    return fields, sorted(totals.items(), key=_order), grand
 
 
 def _config(instance: Path) -> InstanceConfig:
@@ -147,12 +162,23 @@ def _table(header: list[str], rows: list[list[str]]) -> list[str]:
     ]
 
 
+def _dollars(usd: float) -> str:
+    """`usd` for a table cell: four decimals, or `<$0.0001` for a smaller non-zero cost."""
+    if 0 < usd < 0.00005:
+        return "<$0.0001"
+    return f"${usd:.4f}"
+
+
 def _cells(total: _Total) -> list[str]:
-    usd = f"${total.usd:.4f}"
+    usd = _dollars(total.usd)
     if total.unpriced:
         usd += "*"
+    if total.in_flight:
+        usd += "+"
     if total.estimated:
         usd += "~"
+    if total.over_reservation:
+        usd += "!"
     return [
         str(total.calls),
         f"{total.tokens_in}/{total.tokens_out}",
@@ -193,7 +219,7 @@ def _report(
         typer.echo("no LLM usage")
         return EXIT_OK
     header = [*(name.upper() for name in fields), "CALLS", "TOKENS IN/OUT", "CACHE R/W", "USD"]
-    table = [[*(safe(part) for part in key), *_cells(total)] for key, total in rows]
+    table = [[*(safe(part or "-") for part in key), *_cells(total)] for key, total in rows]
     table.append(["TOTAL", *([""] * (len(fields) - 1)), *_cells(grand)])
     for line in _table(header, table):
         typer.echo(line)
@@ -202,10 +228,20 @@ def _report(
             f"* {plural(grand.unpriced, 'call')} of a model alias without `price`: "
             "their cost is not included"
         )
+    if grand.in_flight:
+        typer.echo(
+            f"+ {plural(grand.in_flight, 'call')} in flight (or whose run was not recovered "
+            "yet), counted at the most they can cost"
+        )
     if grand.estimated:
         typer.echo(
-            f"~ {plural(grand.estimated, 'call')} counted at the most they could cost "
-            "(in flight, interrupted, or no usage reported)"
+            f"~ {plural(grand.estimated, 'call')} settled at the most they could cost "
+            "(no usage reported, or the run was abandoned)"
+        )
+    if grand.over_reservation:
+        typer.echo(
+            f"! {plural(grand.over_reservation, 'call')} cost more than reserved "
+            "(the provider reported more than the bound)"
         )
     return EXIT_OK
 
@@ -254,9 +290,11 @@ def usage(
 ) -> None:
     """Show what LLM calls cost, per pipeline and day, with totals.
 
-    From the usage ledger: one row per LLM call, days in the instance's time zone. Calls of a
-    model alias without a price are flagged (*), and so are calls counted at the most they
-    could cost (~).
+    From the usage ledger: one row per LLM call, days in the instance's time zone (as when
+    each call was made). Flags: (*) calls of a model alias without a price, (+) calls in
+    flight, (~) calls settled at the most they could cost, (!) calls that cost more than
+    reserved. By model, a call that reached no provider has a null backend and model, and
+    its alias.
 
     Exit codes: 0 listed (possibly nothing), 1 configuration or store problem, 2 usage error,
     70 internal error. With --json: {schema_version, instance, by, pipeline, since, until,

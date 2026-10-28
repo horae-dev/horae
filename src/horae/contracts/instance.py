@@ -309,7 +309,12 @@ class DailyBudget(Contract):
     records `usd: 0`); `tokens_out` bounds every call."""
 
     model_config = ConfigDict(
-        json_schema_extra={"anyOf": [{"required": ["usd"]}, {"required": ["tokens_out"]}]}
+        json_schema_extra={
+            "anyOf": [
+                {"required": ["usd"], "properties": {"usd": {"type": "number"}}},
+                {"required": ["tokens_out"], "properties": {"tokens_out": {"type": "integer"}}},
+            ]
+        }
     )
 
     usd: Annotated[StrictFloat, Field(gt=0)] | None = None

@@ -1120,51 +1120,93 @@ loosened later without breaking a valid file.
     A compatible v1 addition and the rules of `horae.runner._budget`, the store and `horae
     usage`:
     - **contract change** (optional): `horae.yaml` `budgets: {daily?, pipelines?}`, where
-      `daily` is `{usd?, tokens_out?}` (at least one; `usd > 0`, `tokens_out >= 1`) for every
+      `daily` is `{usd?, tokens_out?}` (at least one, and not `null`: each `anyOf` branch of
+      the JSON Schema requires its property as a number; `usd > 0`, `tokens_out >= 1`) for every
       pipeline together, and `pipelines.<name>.daily` the same for one pipeline (a name that
       is not a pipeline of the instance is a loader problem). Both apply; the lower
       allowance wins. The day is the instance's `timezone` day (not a trigger's). `usd`
       bounds only priced aliases (an alias without `price` records `usd: 0`, decision 38 A);
       `tokens_out` bounds every call. The step's own `budget` is unchanged and still bounds
       both attempts together;
-    - **reservation**: before every LLM attempt, in one store transaction (`BEGIN
-      IMMEDIATE`, so the processes of other runs wait for it), the runner reads the day's
-      spend from the ledger (settled calls at their cost, unsettled ones at their
-      reservation), caps the attempt's budget with what is left of each ceiling (none left:
-      `LlmError("budget_exceeded")`, no request, the step `degraded`), renders the request
-      with that budget (`ModelBackends.render`, whose pre-flight of decision 38 B may refuse
-      it too) and reserves the most it can cost (`ModelBackends.worst_case`: the input bound
-      at the input price plus `max_tokens` at the output price, the bound `max_tokens`
-      already keeps within the budget; Horae requests no prompt caching, so no cache write is
-      billed). Another `LlmBackend` (a test fake) reserves the capped budget itself. Two runs
-      of different pipelines therefore never both spend the last of a ceiling. Not the apply
-      lock: an LLM call can take minutes and must not block other runs' applies;
+    - **reservation**: before every LLM attempt, the runner first prepares the request
+      outside any lock (`ModelBackends.prepare`: the alias, the skill's prompt from the
+      `PromptSource`, which may read files, the provider backend and the input bound); then,
+      in one store transaction (`BEGIN IMMEDIATE`, so the processes of other runs wait for
+      it), it reads the day's spend from the ledger (settled calls at their cost, unsettled
+      ones at their reservation), caps the attempt's budget with what is left of each
+      ceiling (see A for a refusal), renders the request with that budget
+      (`ModelBackends.render(capped, prepared)`: pure sizing and payload, no I/O; its
+      pre-flight of decision 38 B may refuse it too) and reserves the most it can cost
+      (`ModelBackends.worst_case`: the input bound at the input price, or at the cache write
+      price for a provider backend that `may_write_cache`, plus `max_tokens` at the output
+      price: the bound `max_tokens` already keeps within the budget). Another `LlmBackend` (a
+      test fake) reserves the capped budget itself. Two runs of different pipelines
+      therefore never both spend the last of a ceiling (`tests/test_budgets.py` has a
+      two-process test whose `day_spend` waits between the read and the reservation: it
+      fails with a deferred transaction). Not the apply lock: an LLM call can take minutes
+      and must not block other runs' applies;
     - **settling, right after the call** (not with the step record: failed attempts cost
       money too and have no `LlmCall`): the reported usage (also of a failed call,
-      `LlmError.usage`; zero for a backend's cached response); a refusal that reports no
+      `LlmError.usage`; zero for a backend's cached response; a cost above the reservation
+      is logged, amounts only, and the row marked `over_reservation`); a refusal that reports no
       usage and means the provider processed nothing (`budget_exceeded`,
       `backend_unavailable`, `skill_unavailable`, `invalid_request`, `auth_failed`,
       `rate_limited`, `overloaded`) releases the reservation; any other failure without
       usage (a timeout, a lost connection, a cancellation) keeps the reservation as an
       `estimated` cost. **Crash consistency**: a process that dies between reserving and
       settling leaves its `reserved` row, which keeps counting for its day: a crash can
-      over-count, never under-count. A store failure while reserving refuses the call
+      over-count, never under-count (until the run is abandoned or recovered, see D). A store failure while reserving refuses the call
       (`host_error`); while settling it is logged (type only) and the reservation stays;
     - **the ledger** is the `llm_usage` table (migration 4): per attempt `run_id`,
       `pipeline`, `step`, `attempt`, `alias`, `backend`, `model`, `state` (`reserved` or
       `settled`), tokens in and out, cache read and write tokens, `usd`, `priced`,
-      `estimated`, `at` (UTC) and `day` (local). Rows are deleted with their run
-      (`ON DELETE CASCADE`), so retention follows `prune_runs`;
+      `estimated`, `over_reservation`, `at` (UTC) and `day` (local). The ledger outlives its
+      runs (C);
     - **`horae usage [--pipeline P] [--since DATE] [--until DATE] [--by day|pipeline|model]
       [--json]`** groups the ledger by day and pipeline (or by day, pipeline, or backend and
       model), oldest first, with a `TOTAL` row; dates are local days, inclusive. Cells of
-      calls of an unpriced alias are flagged `*` and those counted at a reservation `~`,
-      with a footnote each. The store is opened read-only (decision 31 E: a missing store
+      calls of an unpriced alias are flagged `*`, calls in flight `+`, calls settled at
+      their reservation `~` and calls that cost more than reserved `!`, with a footnote
+      each; a cost under a ten-thousandth of a dollar shows as `<$0.0001`. `--by model`
+      groups by backend, model and alias: a call that reached no provider has a `null`
+      backend and model (`-` in the table). The store is opened read-only (decision 31 E: a missing store
       lists nothing, an older schema exits 1). Exit codes as decision 37: `0` listed, `1`
       configuration or store problem, `2` usage error (a malformed date, `--since` after
       `--until`, an unknown `--by`), `70` internal. `--json` prints `{schema_version: 1,
       instance, by, pipeline, since, until, rows: [{<by keys>, calls, tokens_in, tokens_out,
-      cache_read_tokens, cache_write_tokens, usd, unpriced_calls, estimated_calls}], total}`;
-    - **follow-ups**: a `horae doctor` warning for a `usd` ceiling whose pipelines use an
-      unpriced alias; a monthly ceiling; provider-side spend limits (#63).
+      cache_read_tokens, cache_write_tokens, usd, unpriced_calls, in_flight_calls,
+      estimated_calls, over_reservation_calls}], total}`;
+    - **(A) a minimum useful output**: a call is refused (`budget_exceeded`, no request,
+      nothing reserved) when what a daily ceiling leaves cannot buy
+      `MIN_OUTPUT_TOKENS = 256` output tokens, or fewer when the step's own budget buys
+      fewer (`min(256, what the step alone allows)`): an answer cut short is worse than
+      none. The refusal names the daily ceiling (`the instance daily budget leaves ...`),
+      also when the pre-flight of decision 38 B refuses only because of it; a step whose own
+      budget is too small is refused in the step's own words, as before;
+    - **(B) `horae doctor`** warns when a `usd` ceiling (`budgets.daily` or
+      `budgets.pipelines.<name>`) covers a pipeline whose `llm` alias has no `price`: its
+      dollars are then unbounded, only `tokens_out` bounds it;
+    - **(C) the ledger lives independently of runs**: `run_id` is nullable, `ON DELETE SET
+      NULL`, so `prune_runs` never changes a day's totals; the ledger's own retention is
+      `Store.prune_usage(older_than)` (settled rows of earlier local days; reserved rows are
+      kept);
+    - **(D) abandon and recovery**: `abandon_run` (the stale-run recovery calls it too, a
+      compare-and-set on the run's status) turns the run's `reserved` rows into `settled`
+      ones at their reservation, `estimated = 1`; `horae usage` tells calls in flight (`+`,
+      `in_flight_calls`) from settled estimates (`~`, `estimated_calls`);
+    - **(E) dry runs are charged**: they call the model. PLAN.md's "a dry run writes
+      nothing" is about user data (decision 32 D5): Horae's own state, the run record and
+      the usage ledger, is written;
+    - **(F) the day is stored at reservation time**: a later `timezone` change does not
+      rewrite history (past rows keep their day); local midnight and DST transitions follow
+      the instance's time zone (a 23- or 25-hour day is one day);
+    - **provider prompt caches**: a `ProviderBackend` declares `may_write_cache` (default
+      `False`; `anthropic` is `False`, since Horae sends no `cache_control`; `claude-cli`
+      #29 is expected to be `True`). For such a backend the input bound is priced at the
+      cache write price (`cache_write_per_mtok`, else twice the input price) in both
+      `max_tokens` and `worst_case`, so a settled call never exceeds its reservation; a
+      backend without it that reports cache writes beyond the bound is flagged
+      `over_reservation` (and logged);
+    - **follow-ups**: a monthly ceiling; provider-side spend limits (#63); calling
+      `prune_usage` from a retention setting.
 

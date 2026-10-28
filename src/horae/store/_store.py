@@ -248,6 +248,21 @@ class DaySpend:
     tokens_out: int = 0
 
 
+_USD_TOLERANCE = 1e-12
+"""Relative (and absolute, in dollars) slack when comparing a settled cost with its
+reservation: float sums of the same prices may differ in their last bits."""
+
+
+@dataclass(frozen=True)
+class Overrun:
+    """A call that cost more than its reservation (`Store.settle_usage`)."""
+
+    reserved_usd: float
+    usd: float
+    reserved_tokens_out: int
+    tokens_out: int
+
+
 @dataclass(frozen=True)
 class UsageGroup:
     """LLM calls of one day, pipeline, model alias, backend and model (`Store.usage_report`)."""
@@ -266,9 +281,14 @@ class UsageGroup:
     usd: float
     unpriced: int
     """Calls of an alias without `price` (their `usd` is `0`)."""
+    in_flight: int
+    """Calls still `reserved`, counted at their reservation (an upper bound): in flight, or
+    their process died and the run was not recovered yet."""
     estimated: int
-    """Calls counted at their reservation (an upper bound): still in flight, their process
-    died, or the provider reported no usage."""
+    """Settled calls counted at their reservation: the provider reported no usage, or their
+    run was abandoned (`abandon_run`)."""
+    over_reservation: int
+    """Settled calls that cost more than they reserved (logged when settled)."""
 
 
 @dataclass(frozen=True)
@@ -807,7 +827,9 @@ class Store:
     ) -> None:
         """Mark a running run whose process died as `failed`, without a run record.
 
-        This releases the store's pipeline guard. Its journal stays, for undo. It is a
+        This releases the store's pipeline guard. Its journal stays, for undo. Its usage
+        ledger rows still `reserved` (calls its process never settled) become `settled` at
+        their reservation, marked `estimated` (schemas decision 41 D). It is a
         compare-and-set: it changes run `run_id` only while it is still `running` (else
         `RunNotRunning` / `UnknownRun`) and, with `heartbeat_before`, only if its last
         heartbeat (or its start) is not later than that, i.e. the row has not changed since
@@ -824,6 +846,11 @@ class Store:
             if cur.rowcount != 1:
                 self._require_running(run_id)
                 raise RunNotStale(run_id)
+            self._conn.execute(
+                "UPDATE llm_usage SET state = 'settled', estimated = 1, settled_at = ? "
+                "WHERE run_id = ? AND state = 'reserved'",
+                (stamp, run_id),
+            )
 
     @_api
     def save_run(self, record: RunRecord) -> None:
@@ -1021,8 +1048,10 @@ class Store:
     def prune_runs(self, older_than: datetime) -> int:
         """Delete finished runs that finished before `older_than`; return how many.
 
-        Their steps and journal go with them (tasks and notifications keep their rows, without
-        the run), and journal contents no longer referenced are deleted."""
+        Their steps and journal go with them (tasks, notifications and usage ledger rows keep
+        their rows, without the run: a day's ledger totals never change; the ledger has its
+        own retention, `prune_usage`), and journal contents no longer referenced are
+        deleted."""
         with self.transaction():
             cur = self._conn.execute(
                 "DELETE FROM runs WHERE status <> 'running' AND finished_at < ?",
@@ -1445,7 +1474,8 @@ class Store:
         """The ledger's spend on local `day`, of every pipeline or of `pipeline` only.
 
         Call it inside `transaction()` together with `reserve_usage`, so that no other
-        process reserves in between (the daily ceilings)."""
+        process reserves in between (the daily ceilings). The `day` of a row is the one
+        stored when it was reserved."""
         row = self._conn.execute(
             "SELECT coalesce(sum(usd), 0), coalesce(sum(tokens_out), 0) FROM llm_usage "
             "WHERE day = :day AND (:pipeline IS NULL OR pipeline = :pipeline)",
@@ -1472,8 +1502,10 @@ class Store:
     ) -> int:
         """Record a call about to be made, at the most it can cost; return the row's id.
 
-        The run must be `running` (`RunNotRunning`, `UnknownRun`). `settle_usage` replaces
-        the reservation with what the call cost; `release_usage` drops it (no call made)."""
+        The run must be `running` (`RunNotRunning`, `UnknownRun`). `day` is stored as given
+        (the local day at reservation time; a later time zone change does not move it).
+        `settle_usage` replaces the reservation with what the call cost; `release_usage`
+        drops it (no call made)."""
         if type(step) is not int or step < 0 or type(attempt) is not int or attempt < 1:
             raise ValueError("step must be an int >= 0 and attempt an int >= 1")
         if not usd >= 0 or tokens_out < 0 or tokens_in < 0:
@@ -1517,10 +1549,13 @@ class Store:
         at: datetime,
         backend: str | None = None,
         model: str | None = None,
-    ) -> None:
+    ) -> Overrun | None:
         """Replace a reservation with what the call cost; `usage=None` keeps the reserved
         amounts, marked `estimated` (the provider reported nothing: a timeout, say).
-        Settling twice, or a row pruned with its run, is a no-op."""
+        Settling twice, or a row pruned by `prune_usage`, is a no-op.
+
+        Returns an `Overrun` when the call cost more (`usd` or `tokens_out`) than it
+        reserved; the row is then marked `over_reservation` (the caller logs it)."""
         stamp = _ts(at)
         with self.transaction():
             if usage is None:
@@ -1530,12 +1565,24 @@ class Store:
                     "WHERE id = ? AND state = 'reserved'",
                     (stamp, backend, model, entry_id),
                 )
-                return
+                return None
+            row = self._conn.execute(
+                "SELECT usd, tokens_out FROM llm_usage WHERE id = ? AND state = 'reserved'",
+                (entry_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            reserved_usd, reserved_tokens = float(row[0]), int(row[1])
+            over = (
+                usage.usd > reserved_usd * (1 + _USD_TOLERANCE) + _USD_TOLERANCE
+                or usage.tokens_out > reserved_tokens
+            )
             self._conn.execute(
                 "UPDATE llm_usage SET state = 'settled', settled_at = ?, tokens_in = ?, "
                 "tokens_out = ?, cache_read_tokens = ?, cache_write_tokens = ?, usd = ?, "
                 "priced = coalesce(?, priced), backend = coalesce(?, backend), "
-                "model = coalesce(?, model) WHERE id = ? AND state = 'reserved'",
+                "model = coalesce(?, model), over_reservation = ? "
+                "WHERE id = ? AND state = 'reserved'",
                 (
                     stamp,
                     usage.tokens_in,
@@ -1546,9 +1593,25 @@ class Store:
                     None if usage.priced is None else int(usage.priced),
                     backend,
                     model,
+                    int(over),
                     entry_id,
                 ),
             )
+        if not over:
+            return None
+        return Overrun(reserved_usd, usage.usd, reserved_tokens, usage.tokens_out)
+
+    @_api
+    def prune_usage(self, older_than: date) -> int:
+        """Delete the settled usage ledger rows of local days before `older_than`; return
+        how many. The ledger's own retention (decision 41 C): independent of `prune_runs`.
+        Rows still `reserved` are kept (they still count)."""
+        with self.transaction():
+            cur = self._conn.execute(
+                "DELETE FROM llm_usage WHERE state = 'settled' AND day < ?",
+                (older_than.isoformat(),),
+            )
+        return cur.rowcount
 
     @_api
     def release_usage(self, entry_id: int) -> None:
@@ -1573,7 +1636,8 @@ class Store:
             "sum(tokens_out), coalesce(sum(cache_read_tokens), 0), "
             "coalesce(sum(cache_write_tokens), 0), sum(usd), "
             "sum(CASE WHEN priced = 0 THEN 1 ELSE 0 END), "
-            "sum(CASE WHEN state = 'reserved' OR estimated = 1 THEN 1 ELSE 0 END) "
+            "sum(CASE WHEN state = 'reserved' THEN 1 ELSE 0 END), "
+            "sum(estimated), sum(over_reservation) "
             "FROM llm_usage WHERE (:since IS NULL OR day >= :since) "
             "AND (:until IS NULL OR day <= :until) "
             "AND (:pipeline IS NULL OR pipeline = :pipeline) "
@@ -1599,7 +1663,9 @@ class Store:
                 cache_write_tokens=int(row[9]),
                 usd=float(row[10]),
                 unpriced=int(row[11]),
-                estimated=int(row[12]),
+                in_flight=int(row[12]),
+                estimated=int(row[13]),
+                over_reservation=int(row[14]),
             )
             for row in rows
         ]

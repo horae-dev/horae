@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""A fake provider behind the real `ModelBackends`, and the child process of the daily
-ceiling concurrency test (#33).
+"""A fake provider behind the real `ModelBackends`, and the child processes of the daily
+ceiling concurrency tests (#33).
 
 Nothing here opens a socket or calls a model."""
 
@@ -18,7 +18,7 @@ import yaml
 from horae.contracts.instance import ModelAlias
 from horae.engine.ports import LlmBackendName, LlmError, LlmRequest
 from horae.llm import ModelBackends, Prompt
-from horae.llm.base import Completion, CompletionResult, cost
+from horae.llm.base import Completion, CompletionResult, ProviderBackend, cost
 from horae.secrets import SecretResolver
 from runner_fixtures import SKILL, Plugins
 
@@ -35,13 +35,17 @@ class Prompts:
 @dataclass
 class FakeProvider:
     """Answers `{"items": [...]}`, reporting `tokens_out` output tokens (default: all of
-    `max_tokens`) and 100 input tokens, priced with the alias' price."""
+    `max_tokens`), `tokens_in` input tokens and `cache_write` cache write tokens, priced
+    with the alias' price."""
 
     spec: ModelAlias
     script: list[Any] = field(default_factory=list)
     """Per call: `None` (answer), an `LlmError` to raise, or a list of schema errors to
     answer with an invalid output (the validator returns them)."""
     tokens_out: int | None = None
+    tokens_in: int = 100
+    cache_write: int | None = None
+    may_write_cache: bool = False
     sent: list[Mapping[str, Any]] = field(default_factory=list)
     sent_file: Path | None = None
     go_file: Path | None = None
@@ -66,7 +70,7 @@ class FakeProvider:
                 await asyncio.sleep(0.01)
         item = self.script.pop(0) if self.script else None
         out = payload["max_tokens"] if self.tokens_out is None else self.tokens_out
-        usage = cost(self.spec.price, 100, out)
+        usage = cost(self.spec.price, self.tokens_in, out, cache_write=self.cache_write)
         if isinstance(item, LlmError):
             raise item
         output: Any = {"items": ["Review PR 42"]}
@@ -90,7 +94,7 @@ def backends(
     every alias when given)."""
     made: list[FakeProvider] = []
 
-    def factory(alias: str, spec: ModelAlias, secrets: SecretResolver) -> FakeProvider:
+    def factory(alias: str, spec: ModelAlias, secrets: SecretResolver) -> ProviderBackend:
         fake = provider or FakeProvider(spec, **kwargs)
         made.append(fake)
         return fake
@@ -152,5 +156,59 @@ def child_main(argv: list[str]) -> int:
     return 0
 
 
+def _barrier(where: Path, name: str, wait_s: float) -> None:
+    """Mark `name` as past its read of the day's spend, then wait (up to `wait_s`) for the
+    other child to be past its own read too."""
+    (where / f"{name}.read").write_text("read", encoding="utf-8")
+    deadline = time.monotonic() + wait_s
+    while time.monotonic() < deadline and len(list(where.glob("*.read"))) < 2:
+        time.sleep(0.01)
+
+
+def reserve_main(argv: list[str]) -> int:
+    """`python tests/budget_fixtures.py reserve <db> <run> <pipeline> <dir>`: one call
+    through `LedgerLlm` (a fake backend, a daily `tokens_out` ceiling of 2000, a step budget
+    of 2000), with a slow `day_spend`: after reading the day's spend it waits for the other
+    child to have read it too (at most 1.5 s), so that, without the reservation's write
+    lock, both would reserve on the same stale spend. Waits for `<dir>/start` first. Prints
+    `ok` or the `LlmError` kind."""
+    from datetime import UTC, datetime
+
+    from horae.contracts.instance import BudgetsConfig
+    from horae.contracts.pipeline import Budget
+    from horae.engine.testing import FakeLlm, llm_response
+    from horae.runner._budget import LedgerLlm
+    from horae.store import DaySpend, Store
+
+    db, run, pipeline, where = Path(argv[0]), argv[1], argv[2], Path(argv[3])
+    read_spend = Store.day_spend
+
+    def slow_day_spend(self: Store, day: Any, *, pipeline: str | None = None) -> DaySpend:
+        spent = read_spend(self, day, pipeline=pipeline)
+        _barrier(where, run, 1.5)
+        return spent
+
+    Store.day_spend = slow_day_spend  # type: ignore[method-assign]
+    deadline = time.monotonic() + 30
+    while not (where / "start").exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    budgets = BudgetsConfig.model_validate({"daily": {"tokens_out": 2000}})
+    request = LlmRequest("pack/brief", "default", {}, Budget(usd=1.0, tokens_out=2000), 30.0, 1)
+    with Store.open(db) as store:
+        fake = FakeLlm([llm_response({}, tokens_out=2000)])
+        ledger = LedgerLlm(
+            fake, store, run, pipeline, 1, budgets, "Europe/Paris", lambda: datetime.now(UTC)
+        )
+        try:
+            asyncio.run(ledger.complete(request))
+        except LlmError as error:
+            print(error.kind)
+        else:
+            print("ok")
+    return 0
+
+
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["reserve"]:
+        sys.exit(reserve_main(sys.argv[2:]))
     sys.exit(child_main(sys.argv[1:]))

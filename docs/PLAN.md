@@ -56,7 +56,7 @@ _2026-10-24. Items still unverified are marked ⚠️._
 
 ### 2.2 Measurable guarantees (tested in CI)
 - A pipeline whose inputs didn't change **makes no LLM call**.
-- `horae run --dry-run` **writes nothing**: no vault change, no notification, no remote write.
+- `horae run --dry-run` **writes nothing**: no vault change, no notification, no remote write. (This is about user data: Horae's own state, its run record and usage ledger, is still written, and a dry run's LLM calls count against the daily budgets; schemas decisions 32 D5 and 41 E.)
 - An LLM output that fails its schema is **never applied**. After one retry the run is marked `degraded`.
 - A plugin calling an undeclared host, secret or path **fails** (from M5).
 - `horae undo <run-id>` restores every file the run touched.

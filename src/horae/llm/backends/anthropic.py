@@ -355,6 +355,11 @@ class AnthropicBackend:
     def name(self) -> LlmBackendName:
         return "anthropic"
 
+    @property
+    def may_write_cache(self) -> bool:
+        """`False`: the payload has no `cache_control`, so no cache write is billed."""
+        return False
+
     def _resolve_secret(self) -> None:
         if self._guard.secret is not None:
             return
