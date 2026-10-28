@@ -9,7 +9,15 @@ import ipaddress
 import re
 from typing import Annotated, Literal, Self
 
-from pydantic import AfterValidator, ConfigDict, Field, Strict, StringConstraints, model_validator
+from pydantic import (
+    AfterValidator,
+    ConfigDict,
+    Field,
+    Strict,
+    StrictInt,
+    StringConstraints,
+    model_validator,
+)
 
 from horae.contracts.types import (
     _PORT,
@@ -34,6 +42,13 @@ BACKENDS_NEEDING_BASE_URL: tuple[LlmBackend, ...] = ("openai-compatible", "ollam
 
 BACKENDS_NEEDING_SECRET: tuple[LlmBackend, ...] = ("anthropic",)
 """Backends that always authenticate with an API key, so `secret` is required."""
+
+BACKENDS_NEEDING_HTTPS: tuple[LlmBackend, ...] = ("anthropic",)
+"""Cloud backends whose `base_url`, when given, must be `https://` (the API key and the data
+must not cross the network in clear; schemas decision 38 C)."""
+
+MAX_OUTPUT_TOKENS = 1_000_000
+"""Largest `models.<alias>.max_output_tokens` accepted (a typo guard)."""
 
 ModelAliasName = Annotated[
     str, Strict(), StringConstraints(pattern=r"^[a-z][a-z0-9._-]*$", max_length=64)
@@ -123,8 +138,8 @@ class ModelPrice(Contract):
     """What a model's tokens cost, in US dollars per million tokens (schemas decision 38).
 
     Horae ships no price list: prices change and differ per account, so the instance states
-    the ones it pays. Cache prices are optional; cache tokens without one are priced as
-    input tokens."""
+    the ones it pays. Cache prices are optional: cache reads without one are priced as input
+    tokens, cache writes as twice the input price (conservative)."""
 
     input_per_mtok: PricePerMtok
     output_per_mtok: PricePerMtok
@@ -158,6 +173,15 @@ class ModelAlias(Contract):
                         "properties": {"secret": {"type": "string"}},
                     },
                 },
+                {
+                    "if": {
+                        "required": ["backend"],
+                        "properties": {"backend": {"enum": list(BACKENDS_NEEDING_HTTPS)}},
+                    },
+                    "then": {
+                        "properties": {"base_url": {"type": "string", "pattern": "^https://"}}
+                    },
+                },
             ]
         }
     )
@@ -173,7 +197,11 @@ class ModelAlias(Contract):
     for `anthropic`."""
     price: ModelPrice | None = None
     """What the model costs, for `Usage.usd` and the step's `usd` budget. Without it a call
-    is recorded with `usd: 0` and `priced: false`, and only `tokens_out` bounds the step."""
+    is recorded with `usd: 0` and `priced: false`, and only `tokens_out` bounds the step
+    (`horae doctor` warns about a cloud alias without one)."""
+    max_output_tokens: Annotated[StrictInt, Field(ge=1, le=MAX_OUTPUT_TOKENS)] | None = None
+    """A cap on `max_tokens` for every call of this alias, below the step's `tokens_out`
+    (e.g. the model's own output limit)."""
 
     @model_validator(mode="after")
     def _backend_requirements(self) -> Self:
@@ -181,6 +209,12 @@ class ModelAlias(Contract):
             raise ValueError(f"backend {self.backend!r} requires `base_url`")
         if self.backend in BACKENDS_NEEDING_SECRET and self.secret is None:
             raise ValueError(f"backend {self.backend!r} requires `secret`")
+        if (
+            self.backend in BACKENDS_NEEDING_HTTPS
+            and self.base_url is not None
+            and not self.base_url.startswith("https://")
+        ):
+            raise ValueError(f"backend {self.backend!r} requires an `https://` `base_url`")
         return self
 
 

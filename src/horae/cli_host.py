@@ -126,9 +126,16 @@ def _command_problems(registry: HostRegistry) -> list[Problem]:
     return problems
 
 
+CLOUD_BACKENDS = frozenset({"anthropic"})
+"""Backends billed per token, whose aliases `horae doctor` expects to have a `price`."""
+
+
 def _backend_problems(instance: Instance) -> list[Problem]:
-    """Each model alias used by an `llm` step whose backend this Horae does not implement
-    (`horae.llm.backends.FACTORIES`). Aliases no pipeline uses are not checked."""
+    """For each model alias used by an `llm` step: an error when its backend is not
+    implemented in this Horae (`horae.llm.backends.FACTORIES`), and a warning when it is a
+    cloud backend without a `price` (its calls are then recorded at `usd: 0` and the step's
+    `usd` budget does not bound them; schemas decision 38 A). Aliases no pipeline uses are
+    not checked."""
     used = sorted(
         {
             step.llm.model
@@ -140,7 +147,9 @@ def _backend_problems(instance: Instance) -> list[Problem]:
     problems: list[Problem] = []
     for alias in used:
         spec = instance.config.models.get(alias)
-        if spec is not None and spec.backend not in FACTORIES:
+        if spec is None:
+            continue
+        if spec.backend not in FACTORIES:
             available = ", ".join(sorted(FACTORIES))
             problems.append(
                 Problem(
@@ -151,15 +160,28 @@ def _backend_problems(instance: Instance) -> list[Problem]:
                     f"this version of Horae (available: {available})",
                 )
             )
+        elif spec.backend in CLOUD_BACKENDS and spec.price is None:
+            problems.append(
+                Problem(
+                    CONFIG_FILE,
+                    None,
+                    None,
+                    f"models.{alias}.price: model alias {alias!r} (backend {spec.backend!r}) "
+                    "has no price: its calls are recorded at usd 0 and the step's usd budget "
+                    "does not bound them (only tokens_out does)",
+                    severity="warning",
+                )
+            )
     return problems
 
 
 def instance_problems(instance: Instance) -> list[Problem]:
     """What `horae doctor` checks beyond the configuration (`check_instance`): the lock's
-    paths exist, the instance's own `vault/` is the one the lock writes to, and, when the
-    model alias an `llm` step uses has an available backend, and, when the
-    instance has a `plugins/` directory, the plugins are installed as the lock pins them
-    (`check_plugins`) and each command (its interpreter) exists and is executable."""
+    paths exist, the instance's own `vault/` is the one the lock writes to, each model alias
+    an `llm` step uses has an available backend (and, for a cloud backend, a `price`, else a
+    warning), and, when the instance has a `plugins/` directory, the plugins are installed
+    as the lock pins them (`check_plugins`) and each command (its interpreter) exists and is
+    executable."""
     problems = _path_problems(instance) + _backend_problems(instance)
     if plugins_dir(instance.root).is_dir():
         try:

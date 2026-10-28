@@ -87,6 +87,28 @@
               "secret"
             ]
           }
+        },
+        {
+          "if": {
+            "properties": {
+              "backend": {
+                "enum": [
+                  "anthropic"
+                ]
+              }
+            },
+            "required": [
+              "backend"
+            ]
+          },
+          "then": {
+            "properties": {
+              "base_url": {
+                "pattern": "^https://",
+                "type": "string"
+              }
+            }
+          }
         }
       ],
       "description": "What a model alias resolves to.",
@@ -152,7 +174,22 @@
             }
           ],
           "default": null,
-          "description": "What the model costs, for `Usage.usd` and the step's `usd` budget. Without it a call\nis recorded with `usd: 0` and `priced: false`, and only `tokens_out` bounds the step."
+          "description": "What the model costs, for `Usage.usd` and the step's `usd` budget. Without it a call\nis recorded with `usd: 0` and `priced: false`, and only `tokens_out` bounds the step\n(`horae doctor` warns about a cloud alias without one)."
+        },
+        "max_output_tokens": {
+          "anyOf": [
+            {
+              "maximum": 1000000,
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "A cap on `max_tokens` for every call of this alias, below the step's `tokens_out`\n(e.g. the model's own output limit).",
+          "title": "Max Output Tokens"
         }
       },
       "required": [
@@ -164,7 +201,7 @@
     },
     "ModelPrice": {
       "additionalProperties": false,
-      "description": "What a model's tokens cost, in US dollars per million tokens (schemas decision 38).\n\nHorae ships no price list: prices change and differ per account, so the instance states\nthe ones it pays. Cache prices are optional; cache tokens without one are priced as\ninput tokens.",
+      "description": "What a model's tokens cost, in US dollars per million tokens (schemas decision 38).\n\nHorae ships no price list: prices change and differ per account, so the instance states\nthe ones it pays. Cache prices are optional: cache reads without one are priced as input\ntokens, cache writes as twice the input price (conservative).",
       "properties": {
         "input_per_mtok": {
           "maximum": 10000.0,

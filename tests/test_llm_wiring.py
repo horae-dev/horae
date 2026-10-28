@@ -5,6 +5,7 @@ No network: the anthropic backend's transport is an `httpx2.MockTransport` (see
 `tests/test_llm_anthropic.py` for the recorded fixtures)."""
 
 import asyncio
+import hashlib
 import json
 import re
 from collections.abc import Iterator, Mapping
@@ -27,7 +28,7 @@ from horae.runner import Ports, Runner, open_ports, uses_llm
 from horae.secrets import SecretResolver
 from horae.store import Store
 from runner_fixtures import PIPELINES, Plugins, pipeline
-from test_llm_anthropic import DECLARED_VALUE, SCHEMA, SYSTEM, Recorder
+from test_llm_anthropic import DECLARED_VALUE, SCHEMA, SYSTEM, Recorder, fixture
 
 runner = CliRunner()
 ANTHROPIC = {
@@ -93,7 +94,10 @@ def test_a_run_records_usage_and_cost_per_call(inst: Instance, store: Store) -> 
     assert (call.usage.tokens_in, call.usage.tokens_out, call.usage.priced) == (1200, 45, True)
     assert call.usage.usd == pytest.approx((1200 * 3 + 45 * 15) / 1e6)
     assert record.cost.usd == pytest.approx(call.usage.usd)
-    assert call.request == recorder.body()
+    sent = recorder.requests[0].content
+    assert call.request["body_sha256"] == hashlib.sha256(sent).hexdigest()  # the exact body
+    assert call.request["max_tokens"] == recorder.body()["max_tokens"]
+    assert "Review PR 42" not in json.dumps(call.request)  # digests, not the payload
     assert call.response == {"items": ["Review PR 42"], "summary": "One review is waiting."}
     # the collected input reaches the model as data
     assert "Review PR 42" in recorder.body()["messages"][0]["content"][0]["text"]
@@ -114,6 +118,28 @@ def test_a_failed_call_costs_what_it_reported(inst: Instance, store: Store) -> N
     assert record.steps[1].error.kind == "output_invalid"
     assert record.cost.tokens_out == 2000
     assert record.cost.usd == pytest.approx((1200 * 3 + 2000 * 15) / 1e6)
+
+
+@pytest.mark.parametrize(
+    "text",
+    ['{"items": [], "n": 1e999}', '{"items": [], "items": []}', "[" * 100_000 + "]" * 100_000],
+    ids=["inf", "duplicate", "deep"],
+)
+def test_a_rejected_output_is_charged(inst: Instance, store: Store, text: str) -> None:
+    def answer(request: httpx2.Request) -> httpx2.Response:
+        _, body = fixture("success")
+        body["content"] = [{"type": "text", "text": text}]
+        return httpx2.Response(200, json=body)
+
+    plugins = Plugins()
+    llm = _llm(inst, Recorder(answer))
+    record = asyncio.run(Runner(inst, store, Ports(plugins, plugins, llm)).run("brief"))
+    asyncio.run(llm.aclose())
+    assert record.status == "degraded"
+    assert record.steps[1].error is not None
+    assert record.steps[1].error.kind == "output_invalid"
+    assert (record.cost.tokens_in, record.cost.tokens_out) == (1200, 45)
+    assert record.cost.usd == pytest.approx((1200 * 3 + 45 * 15) / 1e6)
 
 
 def test_uses_llm(inst: Instance, tmp_path: Path) -> None:
@@ -276,3 +302,42 @@ def test_doctor_reports_a_missing_alias_secret(tmp_path: Path) -> None:
     code, report = _doctor(root)
     assert code == 1
     assert any("ANTHROPIC_API_KEY" in p["message"] for p in report["problems"])
+
+
+UNPRICED = {key: value for key, value in ANTHROPIC.items() if key != "price"}
+
+
+def test_doctor_warns_about_a_cloud_alias_without_a_price(tmp_path: Path) -> None:
+    root = _write(tmp_path / "instance", {"default": UNPRICED}, [LLM_STEP])
+    code, report = _doctor(root)
+    assert code == 0  # a warning does not fail the check
+    assert report["ok"] is True
+    [warning] = report["problems"]
+    assert warning["severity"] == "warning"
+    assert warning["file"] == "horae.yaml"
+    assert warning["message"].startswith("models.default.price: model alias 'default'")
+    assert "has no price" in warning["message"]
+    assert "usd budget does not bound" in warning["message"]
+    text = runner.invoke(app, ["doctor", "-i", str(root)])
+    assert text.exit_code == 0
+    assert "horae.yaml: warning: models.default.price" in text.stdout
+    assert "(1 warning)" in text.stdout
+
+
+def test_doctor_does_not_warn_about_an_unused_or_local_alias(tmp_path: Path) -> None:
+    models = {"default": ANTHROPIC, "spare": UNPRICED}  # `spare` is used by no pipeline
+    root = _write(tmp_path / "instance", models, [LLM_STEP])
+    code, report = _doctor(root)
+    assert (code, report["problems"]) == (0, [])
+
+
+def test_doctor_warnings_do_not_hide_errors(tmp_path: Path) -> None:
+    root = _write(tmp_path / "instance", {"default": UNPRICED}, [LLM_STEP])
+    (root / "secrets" / "ANTHROPIC_API_KEY").unlink()
+    code, report = _doctor(root)
+    assert code == 1
+    assert report["ok"] is False
+    severities = sorted(p["severity"] for p in report["problems"])
+    assert severities == ["error", "warning"]
+    text = runner.invoke(app, ["doctor", "-i", str(root)])
+    assert "1 problem found" in text.stdout

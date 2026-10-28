@@ -78,7 +78,8 @@ class Problem:
     line: int | None
     column: int | None
     message: str
-    severity: Literal["error"] = field(default="error", compare=False)
+    severity: Literal["error", "warning"] = field(default="error", compare=False)
+    """`warning`: reported by `horae doctor` but not a problem (it does not fail the check)."""
 
     def __str__(self) -> str:
         where = self.file
@@ -86,6 +87,8 @@ class Problem:
             where += f":{self.line}"
             if self.column is not None:
                 where += f":{self.column}"
+        if self.severity == "warning":
+            return f"{where}: warning: {self.message}"
         return f"{where}: {self.message}"
 
     def sort_key(self) -> tuple[str, int, int, str]:

@@ -12,6 +12,8 @@ models:
     model: claude-haiku-4-5
     secret: ANTHROPIC_API_KEY
     price: { input_per_mtok: 1.5, output_per_mtok: 7.5, cache_read_per_mtok: 0.15 }
+    # Optional cap on `max_tokens` for every call of the alias, below the step's `tokens_out`.
+    max_output_tokens: 4096
   router:
     backend: openai-compatible
     model: mistral-small

@@ -4,6 +4,8 @@ backends (`horae.llm.backends`)."""
 
 from horae.llm.base import (
     ERROR_KINDS,
+    INPUT_TOKEN_MARGIN,
+    INTENTS_KEY,
     BackendFactory,
     Completion,
     CompletionResult,
@@ -15,11 +17,15 @@ from horae.llm.base import (
     RequestPrompts,
     Validator,
     cost,
+    input_bound,
     max_tokens,
+    split_intents,
 )
 
 __all__ = [
     "ERROR_KINDS",
+    "INPUT_TOKEN_MARGIN",
+    "INTENTS_KEY",
     "BackendFactory",
     "Completion",
     "CompletionResult",
@@ -31,5 +37,7 @@ __all__ = [
     "RequestPrompts",
     "Validator",
     "cost",
+    "input_bound",
     "max_tokens",
+    "split_intents",
 ]

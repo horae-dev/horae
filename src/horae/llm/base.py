@@ -5,9 +5,10 @@ Two layers:
 
 - **`ModelBackends`** is the engine's `LlmBackend` (`horae.engine.ports`). For one attempt
   (`LlmRequest`) it resolves the pipeline's model alias in `horae.yaml` (`models:` alias →
-  backend, model, `base_url`, `secret`, `price`), gets the skill's prompt and output schema
-  from a `PromptSource`, sizes `max_tokens` from the step budget, calls the alias' provider
-  backend, and returns an `LlmResponse` whose `usage` holds the tokens and their cost.
+  backend, model, `base_url`, `secret`, `price`, `max_output_tokens`), gets the skill's prompt
+  and output schema from a `PromptSource`, sizes `max_tokens` from the step budget, calls the
+  alias' provider backend, and returns an `LlmResponse` whose `usage` holds the tokens and
+  their cost.
 - **`ProviderBackend`** is one provider adapter (`horae.llm.backends`: `anthropic` today;
   `claude-cli` #29, `openai-compatible` / `ollama` #30). It gets a `Completion` (system prompt,
   untrusted input, output schema, `max_tokens`, timeout), makes **one** request with **no
@@ -16,7 +17,8 @@ Two layers:
 **Render, then send.** Both layers split an attempt in two (the #34 design note): `render`
 is pure (no I/O, no secret, no client) and builds the exact provider payload (model, system,
 messages, `max_tokens`, output schema), a `RenderedRequest` whose `body()` is its canonical
-JSON bytes; `send` makes the one network call with exactly that payload. The core can then
+JSON bytes, frozen when it is built; `send` makes the one network call with exactly those
+bytes, and refuses a request whose payload was changed after rendering. The core can then
 inspect what will leave the host before it does (e.g. a check that no resolved secret value
 is in a cloud request, T10, #34/#53). `complete` is `send(render(...))`.
 
@@ -25,9 +27,25 @@ through the instance's `SecretResolver` (decision 25), never from the ambient en
 Provider backends are built lazily, on the first attempt that uses their alias, so a run
 whose pipeline has no `llm` step (or whose alias is not used) never reads the key.
 
-**Cost** (decision 38). `price` is per model alias in `horae.yaml`; Horae ships no price
+**Cost** (decision 38 A). `price` is per model alias in `horae.yaml`; Horae ships no price
 list. Without one, `Usage.usd` is `0` and `Usage.priced` is `false`, and only the step's
-`tokens_out` budget bounds the call.
+`tokens_out` budget bounds the call (`horae doctor` warns about a cloud alias without one).
+
+**Pre-flight budget** (decision 38 B). `render` refuses an attempt with `budget_exceeded`,
+before any request, when it cannot afford one output token: the remaining `tokens_out` is
+below 1, or, with a price, the input alone may cost more than the remaining `usd`, or what is
+left after it buys no output token. The input cost is bounded without a `count_tokens` call:
+a token is at least one UTF-8 byte, so the canonical JSON size of the whole rendered payload
+(plus `INPUT_TOKEN_MARGIN` for what the provider adds) bounds the input tokens.
+
+**What is recorded** (decision 38 E). `LlmCall.request` is `RenderedRequest.summary`: the
+backend, model, `max_tokens`, and the SHA-256 and size of the skill prompt, the input, the
+output schema and the exact body; never the payload itself (the input is already in the run
+record's data, and a prompt can be long).
+
+**Intents** (decision 38 D). Raw intents live in a reserved top-level `intents` property of
+the skill's output object: when present it must be a list, and `ModelBackends` moves it into
+`LlmResponse.intents` (after validating the whole output), removing it from `output`.
 
 **Retries.** None here: the engine owns the single repair retry (`attempt` 2). Provider
 backends disable their SDK's own retries.
@@ -36,20 +54,26 @@ backends disable their SDK's own retries.
 
 - **#27 (skill format).** `RequestPrompts` reads the rendered prompt, the viewed input, the
   output schema and the skill version from the `LlmRequest` (`prompt`, `input`,
-  `output_schema`, `skill_version`) once #27 adds those fields. Until then a request without
-  them fails with kind `skill_unavailable`. Another `PromptSource` (a skill loader) can be
-  passed to `ModelBackends` instead.
+  `output_schema`, `skill_version`) with `getattr`, so it works before and after #27 adds
+  those fields. Until then a request without them fails with kind `skill_unavailable` (the
+  skill cannot be used yet; a skill that is present but malformed is #27's `skill_invalid`).
+  Another `PromptSource` (a skill loader) can be passed to `ModelBackends` instead.
 - **#31 (repair).** `ModelBackends(validate=...)` turns an output into its schema errors
   (`LlmResponse.schema_errors`, which drive the repair retry). Without a validator the
-  provider's structured output (constrained decoding to the schema) is the only check and
-  `schema_errors` is empty.
-- **#33 (budgets).** `max_tokens` is the attempt's remaining `tokens_out`, lowered so that
-  the output alone cannot exceed the remaining `usd` when the alias has a price.
+  provider's structured output is the only check and `schema_errors` is empty. **The
+  validator is mandatory before production use** (decision 38 G): structured outputs drop
+  the constraints they do not support (`anthropic.transform_schema` moves them into
+  descriptions), so only the validator enforces the full schema.
+- **#33 (budgets).** `max_tokens` is the attempt's remaining `tokens_out` (capped by the
+  alias' `max_output_tokens`), lowered so that the input bound plus the output cannot exceed
+  the remaining `usd` when the alias has a price.
 """
 
+import hashlib
+import json
 import math
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
 from horae.contracts.instance import ModelAlias, ModelPrice
@@ -60,6 +84,13 @@ from horae.secrets import SecretResolver
 
 MAX_ERROR_CHARS = 200
 """Longest provider detail kept in an `LlmError` message."""
+
+INPUT_TOKEN_MARGIN = 512
+"""Input tokens a provider may add to the rendered payload (message framing, the
+structured-output instructions), on top of its size in bytes, for the pre-flight bound."""
+
+INTENTS_KEY = "intents"
+"""The reserved top-level property of a skill's output that holds its raw intents."""
 
 
 @dataclass(frozen=True)
@@ -111,6 +142,7 @@ class Completion:
     model: str
     """The concrete model name (`models.<alias>.model`)."""
     system: str
+    """The skill's prompt (the provider backend adds Horae's own preamble before it)."""
     input: Any
     output_schema: Mapping[str, Any]
     max_tokens: int
@@ -144,7 +176,7 @@ class ProviderBackend(Protocol):
 
     async def send(self, payload: Mapping[str, Any], timeout_s: float) -> CompletionResult:
         """One request with exactly `payload`; raises `LlmError` with one of the kinds of
-        `ERROR_KINDS` and, when the provider reported it, the usage the failed request still
+        `ERROR_KINDS` and, whenever the provider answered, the usage the failed request still
         cost."""
         ...
 
@@ -155,7 +187,11 @@ class ProviderBackend(Protocol):
 
 @dataclass(frozen=True)
 class RenderedRequest:
-    """One attempt, rendered: everything `ModelBackends.send` needs, and nothing secret."""
+    """One attempt, rendered: everything `ModelBackends.send` needs, and nothing secret.
+
+    The payload's canonical JSON is frozen when the request is built: `body()` returns those
+    bytes, and `ModelBackends.send` refuses a request whose `payload` no longer matches them
+    (it was changed after it was inspected), then sends a fresh copy of the frozen body."""
 
     alias: str
     """The model alias of the pipeline."""
@@ -169,10 +205,47 @@ class RenderedRequest:
     payload: Mapping[str, Any]
     """The exact JSON body sent to the provider."""
     timeout_s: float
+    summary: Mapping[str, Any] = field(default_factory=dict)
+    """What is recorded as `LlmCall.request` (digests and sizes; see the module docstring)."""
+    input_bound: int = 0
+    """The upper bound of the input tokens used by the pre-flight budget check."""
+    _body: bytes = field(default=b"", init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "_body", canonical_json(self.payload))
 
     def body(self) -> bytes:
-        """`payload` as canonical JSON bytes (sorted keys, no whitespace, UTF-8)."""
-        return canonical_json(self.payload)
+        """`payload` as canonical JSON bytes (sorted keys, no whitespace, UTF-8), as it was
+        when the request was built."""
+        return self._body
+
+
+def _digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def summary(completion: Completion, backend: LlmBackendName, body: bytes) -> dict[str, Any]:
+    """`LlmCall.request` of an attempt: digests and sizes, never the payload (decision 38 E).
+
+    `system` is the skill's prompt, `input` and `schema` their canonical JSON, `body` the
+    exact bytes sent."""
+    system = completion.system.encode()
+    data = canonical_json(completion.input)
+    schema = canonical_json(dict(completion.output_schema))
+    return {
+        "backend": backend,
+        "model": completion.model,
+        "max_tokens": completion.max_tokens,
+        "body_sha256": _digest(body),
+        "body_bytes": len(body),
+        "system_sha256": _digest(system),
+        "system_bytes": len(system),
+        "input_sha256": _digest(data),
+        "input_bytes": len(data),
+        "schema_sha256": _digest(schema),
+        "schema_bytes": len(schema),
+        "repair_errors": len(completion.repair),
+    }
 
 
 ERROR_KINDS = (
@@ -203,14 +276,15 @@ def cost(
 ) -> Usage:
     """The `Usage` of a call: its tokens and, when the alias has a `price`, their cost.
 
-    Cache tokens without a cache price are priced as input tokens."""
+    Without a cache price, cache reads are priced as input tokens and cache writes at twice
+    the input price (at least what providers charge: conservative)."""
     if price is None:
         usd = 0.0
     else:
         read_price = price.input_per_mtok
         if price.cache_read_per_mtok is not None:
             read_price = price.cache_read_per_mtok
-        write_price = price.input_per_mtok
+        write_price = 2 * price.input_per_mtok
         if price.cache_write_per_mtok is not None:
             write_price = price.cache_write_per_mtok
         usd = (
@@ -229,14 +303,57 @@ def cost(
     )
 
 
-def max_tokens(request: LlmRequest, price: ModelPrice | None) -> int:
-    """The `max_tokens` of an attempt: its remaining `tokens_out`, lowered (with a price) so
-    that the output tokens alone stay within the remaining `usd`; at least 1."""
+def input_bound(payload: Mapping[str, Any]) -> int:
+    """An upper bound of the input tokens of `payload`: its canonical JSON size in bytes (a
+    token is at least one byte) plus `INPUT_TOKEN_MARGIN`."""
+    return len(canonical_json(payload)) + INPUT_TOKEN_MARGIN
+
+
+def max_tokens(
+    request: LlmRequest,
+    price: ModelPrice | None,
+    *,
+    input_tokens: int = 0,
+    cap: int | None = None,
+) -> int:
+    """The `max_tokens` of an attempt (decision 38 B): its remaining `tokens_out`, capped by
+    the alias' `max_output_tokens`, and, with a price, lowered so that `input_tokens` (an
+    upper bound of the input) plus the output stay within the remaining `usd`.
+
+    Raises `LlmError("budget_exceeded")` when not one output token is affordable, so that no
+    request is sent."""
     limit = request.budget.tokens_out
-    if price is not None and price.output_per_mtok > 0:
-        affordable = math.floor(request.budget.usd * 1_000_000 / price.output_per_mtok)
-        limit = min(limit, affordable)
-    return max(1, limit)
+    if cap is not None:
+        limit = min(limit, cap)
+    if limit < 1:
+        raise LlmError("budget_exceeded", "no output token is left in the step's tokens_out")
+    if price is not None:
+        left = request.budget.usd - input_tokens * price.input_per_mtok / 1_000_000
+        if left < 0:
+            raise LlmError(
+                "budget_exceeded",
+                f"the input (up to {input_tokens} tokens) may cost more than the step's "
+                "remaining usd",
+            )
+        if price.output_per_mtok > 0:
+            limit = min(limit, math.floor(left * 1_000_000 / price.output_per_mtok))
+        if limit < 1:
+            raise LlmError(
+                "budget_exceeded", "the step's remaining usd buys no output token after the input"
+            )
+    return limit
+
+
+def split_intents(output: Any, usage: Usage) -> tuple[Any, list[Any]]:
+    """`(output without its intents, raw intents)` (decision 38 D): the reserved top-level
+    `intents` of an output object, which must be a list when present."""
+    if not isinstance(output, dict) or INTENTS_KEY not in output:
+        return output, []
+    intents = output[INTENTS_KEY]
+    if not isinstance(intents, list):
+        raise LlmError("output_invalid", f"the output's `{INTENTS_KEY}` is not a list", usage=usage)
+    rest = {key: value for key, value in output.items() if key != INTENTS_KEY}
+    return rest, intents
 
 
 @dataclass
@@ -269,49 +386,65 @@ class ModelBackends:
 
     def render(self, request: LlmRequest) -> RenderedRequest:
         """The attempt `request`, rendered (pure: no I/O and no secret; see the module
-        docstring). Raises `LlmError` (unknown alias, unavailable backend or skill)."""
+        docstring). Raises `LlmError`: an unknown alias, an unavailable backend or skill, or
+        `budget_exceeded` when the attempt cannot afford one output token."""
         spec = self.models.get(request.model)
         if spec is None:
             raise LlmError("invalid_request", f"unknown model alias {request.model!r}")
         prompt = self.prompts.prompt(request)
         backend = self._backend(request.model, spec)
-        completion = Completion(
+        probe = Completion(
             model=spec.model,
             system=prompt.system,
             input=prompt.input,
             output_schema=prompt.output_schema,
-            max_tokens=max_tokens(request, spec.price),
+            max_tokens=1,
             timeout_s=request.timeout_s,
             repair=request.repair,
         )
+        bound = input_bound(backend.render(probe))
+        limit = max_tokens(request, spec.price, input_tokens=bound, cap=spec.max_output_tokens)
+        completion = replace(probe, max_tokens=limit)
+        payload = backend.render(completion)
         return RenderedRequest(
             alias=request.model,
             backend=backend.name,
             model=spec.model,
             skill_version=prompt.skill_version,
             output_schema=prompt.output_schema,
-            payload=backend.render(completion),
+            payload=payload,
             timeout_s=request.timeout_s,
+            summary=summary(completion, backend.name, canonical_json(payload)),
+            input_bound=bound,
         )
 
     async def send(self, rendered: RenderedRequest) -> LlmResponse:
-        """Send `rendered` (exactly its payload) through its alias' provider backend."""
+        """Send `rendered` (exactly its frozen body) through its alias' provider backend."""
         spec = self.models.get(rendered.alias)
         if spec is None:
             raise LlmError("invalid_request", f"unknown model alias {rendered.alias!r}")
+        body = rendered.body()
+        try:
+            unchanged = canonical_json(rendered.payload) == body
+        except (TypeError, ValueError):
+            unchanged = False
+        if not unchanged:
+            raise LlmError("invalid_request", "the payload was changed after it was rendered")
         backend = self._backend(rendered.alias, spec)
-        result = await backend.send(rendered.payload, rendered.timeout_s)
+        result = await backend.send(json.loads(body), rendered.timeout_s)
         errors: tuple[str, ...] = ()
         if self.validate is not None:
             errors = tuple(self.validate(result.output, rendered.output_schema))
+        output, intents = split_intents(result.output, result.usage)
         return LlmResponse(
-            output=result.output,
+            output=output,
             schema_errors=errors,
             usage=result.usage,
             backend=rendered.backend,
             model=rendered.model,
             skill_version=rendered.skill_version,
-            request=dict(rendered.payload),
+            request=dict(rendered.summary),
+            intents=intents,
         )
 
     async def complete(self, request: LlmRequest) -> LlmResponse:
@@ -327,6 +460,8 @@ class ModelBackends:
 
 __all__ = [
     "ERROR_KINDS",
+    "INPUT_TOKEN_MARGIN",
+    "INTENTS_KEY",
     "MAX_ERROR_CHARS",
     "BackendFactory",
     "Completion",
@@ -339,5 +474,8 @@ __all__ = [
     "RequestPrompts",
     "Validator",
     "cost",
+    "input_bound",
     "max_tokens",
+    "split_intents",
+    "summary",
 ]
