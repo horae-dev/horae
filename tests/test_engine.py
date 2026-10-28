@@ -658,6 +658,11 @@ def test_notification_links_need_a_trusted_prefix(
     if routed:
         assert record.status == "ok", record.error
         assert record.intents[0].applied_by == "sink.notify"
+    elif "\\" in (link or ""):
+        # A backslash reads as `/` in the input set: the guard refuses the link first.
+        assert record.status == "degraded"
+        assert _error_kind(record, 1) == "guard_violation"
+        assert record.intents == []
     else:
         assert record.status == "failed"
         assert _error_kind(record, 1) == "intent_unrouted"

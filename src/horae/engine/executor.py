@@ -119,8 +119,9 @@ commands, templates or further targets).
 
 **The action guard** (#35, `horae.engine.guard`, schemas decision 46). Every batch the `llm`
 step proposes (fresh or reused) is checked after validation and before routing: at most the
-skill's `intent_limits` of each type, no embed (Markdown image, Obsidian embed, HTML `<img>`,
-`<iframe>`, `<script>`…) and no `javascript:` / `data:` / `file:` link in its text, and every
+skill's `intent_limits` of each type, no Markdown image or Obsidian embed, no HTML tag outside
+a small inert allowlist and no HTML attribute, no `javascript:` / `data:` / `file:` /
+protocol-relative link in its text, and every
 URL in its text (and a `notify.push` `link`) an exact string of the viewed input. A refusal
 records a `guard` violation (a content-free detail) and **degrades the whole step**
 (`guard_violation`): nothing it proposed is routed, its output is not used, later steps are

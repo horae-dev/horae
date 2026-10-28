@@ -12,28 +12,40 @@ cache), after schema validation and before routing:
    `intents: {type: max}`, schemas decision 39 F).
 2. **Embeds are always refused**, even with a URL from the input: they fetch when the note
    renders, without a click. Markdown images `![…](…)`, reference images `![…][…]` and
-   Obsidian embeds `![[…]]` (any `![`), and the HTML tags of `EMBED_TAGS` (`<img`, `<iframe`,
-   `<script`, `<svg`, `<meta`…).
-3. **Refused schemes** (`REFUSED_SCHEMES`: `javascript:`, `vbscript:`, `data:`, `file:`)
-   followed by anything but whitespace, anywhere; inside an HTML tag also with whitespace or
-   control characters inside the scheme (`java&#9;script:`); a protocol-relative link (`//host`)
-   as a Markdown link destination, a link reference definition or an HTML attribute value.
-4. **Every URL must be in the input set**: an exact string extracted, the same way, from the
-   viewed input the model was shown (strings and object keys). A URL is any
-   `scheme://…`, `mailto:…` or `www.…` run, up to whitespace, `<`, `>` or a control
-   character; trailing punctuation (`.,;:!?)]}'"*_~` and backtick, at most 16 characters) may
-   be dropped on either side, so `[a](https://x/p)` matches `https://x/p.` in the input. A
-   `notify.push` `link` must be exactly such a URL (and is also routed only under a trusted
-   `link_prefix`, decision 30).
+   Obsidian embeds `![[…]]` (any `![`).
+3. **HTML: an allowlist, without attributes.** Any tag (`<name` or `</name`) whose name is
+   not in `INERT_TAGS` (`b`, `i`, `em`, `strong`, `code`, `p`, `li`, `h1`…) is refused, and an
+   allowed tag must carry nothing but an optional `/` before its `>`: no attribute at all
+   (so no `on*`, `style`, `background`, `poster`, `srcset`, `ping`, `href`, `url(` or
+   `@import`). `<scheme:…>` with no whitespace before its `>` is a Markdown autolink, checked
+   as a URL (4).
+4. **URLs.** Backslashes are read as `/` first (`https:/\\host`, `\\\\host`). A URL is a run
+   (up to whitespace, `<`, `>` or a control character) starting at
+   - `scheme:` followed by `/` (any scheme, `[a-z][a-z0-9+.-]*`), or a scheme of
+     `SPECIAL_SCHEMES` (`http`, `ftp`, `mailto`, `obsidian`, `javascript`…) followed by any
+     non-space character (`ftp:evil`);
+   - `//` at a token boundary (protocol-relative), followed by at least one character;
+   - `www.` at a word start.
 
-Every check runs on the text as written and on its HTML-entity-decoded forms (up to three
-passes: `&#x3c;img`, `&amp;lt;img`), ASCII case-insensitively. All scans are linear: `find`
-loops whose next search starts after the previous match, and regular expressions without
-nested quantifiers.
+   A URL whose scheme is in `REFUSED_SCHEMES` (`javascript`, `vbscript`, `data`, `file`,
+   `blob`) is refused, even when the input holds it. Every other URL must be **in the input
+   set**: an exact string extracted, the same way, from the viewed input the model was shown
+   (strings and object keys). Trailing punctuation (`.,;:!?)]}'"*_~` and backtick, at most 16
+   characters) may be dropped on either side, so `[a](https://x/p)` matches `https://x/p.` in
+   the input. A `notify.push` `link` must be exactly such a URL (and is also routed only under
+   a trusted `link_prefix`, decision 30).
+5. **Link contexts.** After `](` (a Markdown link destination), `]:` (a link reference
+   definition) and `<`, whitespace and control characters are dropped (`[x]( java\\tscript :…)`)
+   and a refused scheme, whatever follows its colon, or `//` is refused.
 
-A violation is reported as a short, **content-free** detail (`GuardViolation.detail`): the
-proposer, the intent type and position, the field and the kind of problem, from closed sets
-only, never the URL or the text.
+A refused scheme in prose (`data: three items`, colon then a space) is not a link in Markdown
+and passes. Every check runs on the text as written and on its HTML-entity-decoded forms (up
+to three passes: `&#x3c;img`, `&amp;lt;img`), ASCII case-insensitively. All scans are linear:
+`find` loops whose next search starts after the previous match (or a bounded window), and
+regular expressions without nested quantifiers.
+
+A violation is reported as a short, **content-free** detail: the proposer, the intent type and
+position, the field and the kind of problem, from closed sets only, never the URL or the text.
 """
 
 import html
@@ -63,49 +75,39 @@ TEXT_FIELDS: Mapping[IntentType, tuple[str, ...]] = {
 """The untrusted text fields of each intent type that the guard scans (`notify.push` `link`
 is checked as a whole URL; targets bound by routing are not text)."""
 
-EMBED_TAGS = frozenset(
-    {
-        "applet",
-        "audio",
-        "base",
-        "bgsound",
-        "embed",
-        "form",
-        "frame",
-        "frameset",
-        "iframe",
-        "image",
-        "img",
-        "input",
-        "link",
-        "math",
-        "meta",
-        "object",
-        "param",
-        "picture",
-        "portal",
-        "script",
-        "source",
-        "style",
-        "svg",
-        "track",
-        "video",
-    }
+INERT_TAGS = frozenset(
+    {"b", "i", "u", "s", "em", "strong", "code", "pre", "br", "hr", "p", "ul", "ol", "li"}
+    | {"blockquote", "h1", "h2", "h3", "h4", "h5", "h6", "kbd", "sup", "sub", "mark", "del"}
 )
-"""HTML tags refused in LLM text, whatever their attributes (they load or run something)."""
+"""The only HTML tags allowed in LLM text, and only without attributes."""
 
-REFUSED_SCHEMES = ("javascript:", "vbscript:", "data:", "file:")
+EMBED_TAGS = frozenset(
+    {"applet", "audio", "base", "bgsound", "embed", "form", "frame", "frameset", "iframe"}
+    | {"image", "img", "input", "link", "math", "meta", "object", "param", "picture"}
+    | {"portal", "script", "source", "style", "svg", "track", "video"}
+)
+"""Refused tags that a violation detail names (any other refused tag is not named: its name
+is the model's text)."""
+
+REFUSED_SCHEMES = frozenset({"javascript", "vbscript", "data", "file", "blob"})
 """URL schemes refused in LLM text, even when the input holds them."""
 
+SPECIAL_SCHEMES = REFUSED_SCHEMES | {"http", "https", "ftp", "ws", "wss", "obsidian", "mailto"}
+"""Schemes that start a URL whatever follows their colon (other schemes need a `/`)."""
+
 _LOWER = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
+_LETTERS = frozenset(string.ascii_lowercase)
 _SCHEME_CHARS = frozenset(string.ascii_lowercase + string.digits + "+.-")
 _WORD = frozenset(string.ascii_lowercase + string.digits + "-_.")
 _RUN = re.compile(r"[^\s<>\x00-\x1f\x7f]*")
 _TAG_NAME = re.compile(r"[a-z][a-z0-9-]{0,31}")
+_AUTOLINK = re.compile(r"[a-z][a-z0-9+.-]{0,31}:")
 _SPACE = re.compile(r"[\s\x00-\x1f\x7f]+")
 _TRAILING = frozenset(".,;:!?)]}'\"*_~`")
+_REFUSED_PREFIXES = tuple(f"{scheme}:" for scheme in sorted(REFUSED_SCHEMES))
+_CONTEXTS = ("](", "]:", "<")
+_WINDOW = 64
 _MAX_STRIP = 16
-_MAX_SCHEME = 32
 _DECODE_PASSES = 3
 
 
@@ -135,70 +137,100 @@ def _run_end(text: str, start: int) -> int:
     return start if match is None else match.end()  # pragma: no branch (`*` always matches)
 
 
-def urls(text: str) -> Iterator[str]:
-    """Every URL run of `text` (`scheme://…`, `mailto:…`, `www.…`), as written."""
-    low = text.translate(_LOWER)
-    found = low.find("://")
-    while found != -1:
-        start = found
-        while start > 0 and found - start < _MAX_SCHEME and low[start - 1] in _SCHEME_CHARS:
+def _scheme_urls(text: str, low: str) -> Iterator[str]:
+    """`scheme:/…` and `special:…` runs. A walk back from a colon stops at the previous colon
+    (not a scheme character), so the walks are disjoint."""
+    colon = low.find(":")
+    while colon != -1:
+        start = colon
+        while start > 0 and low[start - 1] in _SCHEME_CHARS:
             start -= 1
-        while start < found and low[start] not in string.ascii_lowercase:
+        while start < colon and low[start] not in _LETTERS:
             start += 1
-        end = _run_end(text, found + 3)
-        if start < found:
+        scheme = low[start:colon]
+        following = low[colon + 1 : colon + 2]
+        if scheme and (
+            following == "/"
+            or (scheme in SPECIAL_SCHEMES and following and not following.isspace())
+        ):
+            end = _run_end(text, colon + 1)
             yield text[start:end]
-        found = low.find("://", max(end, found + 3))
-    for marker in ("mailto:", "www."):
+            colon = low.find(":", max(end, colon + 1))
+        else:
+            colon = low.find(":", colon + 1)
+
+
+def urls(text: str) -> Iterator[str]:
+    """Every URL run of `text` (module docstring, 4), backslashes read as `/`."""
+    text = text.replace("\\", "/")
+    low = text.translate(_LOWER)
+    yield from _scheme_urls(text, low)
+    found = low.find("//")
+    while found != -1:
+        before = low[found - 1] if found else " "
+        if before in _SCHEME_CHARS or before in ":/":
+            found = low.find("//", found + 1)
+            continue
+        end = _run_end(text, found)
+        if end - found > 2:
+            yield text[found:end]
+        found = low.find("//", max(end, found + 2))
+    found = low.find("www.")
+    while found != -1:
+        end = _run_end(text, found)
+        if found == 0 or low[found - 1] not in _WORD:
+            yield text[found:end]
+        found = low.find("www.", max(end, found + 1))
+
+
+def _scheme_of(url: str) -> str | None:
+    colon = url.find(":")
+    head = url[:colon].translate(_LOWER) if colon > 0 else ""
+    return head if head and set(head) <= _SCHEME_CHARS else None
+
+
+def _context_problem(low: str) -> str | None:
+    """A refused scheme or `//` right after `](`, `]:` or `<`, whitespace dropped."""
+    for marker in _CONTEXTS:
         found = low.find(marker)
         while found != -1:
-            end = _run_end(text, found)
-            if found == 0 or low[found - 1] not in _WORD:
-                yield text[found:end]
-            found = low.find(marker, max(end, found + 1))
+            after = found + len(marker)
+            window = _SPACE.sub("", low[after : after + _WINDOW]).lstrip("<")
+            if window.startswith(_REFUSED_PREFIXES):
+                return "a script, data or file link"
+            if window.startswith("//"):
+                return "a protocol-relative link"
+            found = low.find(marker, after)
+    return None
 
 
-def _refused_scheme(low: str) -> bool:
-    """A refused scheme, at a word start and followed by a non-space character."""
-    for scheme in REFUSED_SCHEMES:
-        found = low.find(scheme)
-        while found != -1:
-            after = found + len(scheme)
-            boundary = found == 0 or low[found - 1] not in _SCHEME_CHARS
-            if boundary and after < len(low) and not low[after].isspace():
-                return True
-            found = low.find(scheme, after)
-    return False
-
-
-def _relative_destination(low: str) -> bool:
-    """`//host` as a Markdown link destination (`](//`) or link reference definition."""
-    for marker in ("](", "]:"):
-        found = low.find(marker)
-        while found != -1:
-            rest = low[found + 2 : found + 2 + _MAX_STRIP].lstrip(" \t\n<")
-            if rest.startswith("//"):
-                return True
-            found = low.find(marker, found + 2)
-    return False
+def _autolink(low: str, at: int) -> bool:
+    """`<scheme:…>` with nothing but URL characters up to its `>` (a Markdown autolink)."""
+    if _AUTOLINK.match(low, at) is None:
+        return False
+    end = _run_end(low, at)
+    return low[end : end + 1] == ">"
 
 
 def _tag_problem(low: str) -> str | None:
-    """An embed tag, or a refused scheme or protocol-relative link inside any tag."""
+    """A tag outside `INERT_TAGS`, or an allowed tag with an attribute. Each tag's body ends at
+    its `>` or the next `<`, so the scans are disjoint."""
     found = low.find("<")
     while found != -1:
         following = low.find("<", found + 1)
         stop = len(low) if following == -1 else following
-        name = _TAG_NAME.match(low, found + 1)
-        if name is not None:
-            if name.group() in EMBED_TAGS:
-                return f"an HTML <{name.group()}> embed"
+        at = found + 2 if low.startswith("</", found) else found + 1
+        name = _TAG_NAME.match(low, at)
+        if name is not None and not _autolink(low, at):
+            tag = name.group()
+            if tag not in INERT_TAGS:
+                if tag in EMBED_TAGS:
+                    return f"an HTML <{tag}> embed"
+                return "an HTML tag outside the allowlist"
             close = low.find(">", name.end(), stop)
             body = _SPACE.sub("", low[name.end() : stop if close == -1 else close])
-            if any(scheme in body for scheme in REFUSED_SCHEMES):
-                return "a script or data link in an HTML tag"
-            if any(marker in body for marker in ("=//", "='//", '="//')):
-                return "a protocol-relative link in an HTML tag"
+            if body not in ("", "/"):
+                return "an HTML attribute"
         found = following
     return None
 
@@ -243,21 +275,20 @@ def text_problem(text: str, known: Callable[[str], bool]) -> str | None:
     first, so an embed is reported as one even when its URL is also unknown."""
     views = list(_views(text))
     for view in views:
-        low = view.translate(_LOWER)
+        low = view.replace("\\", "/").translate(_LOWER)
         if "![" in low:
             return "an image or embed"
-        tag = _tag_problem(low)
-        if tag is not None:
-            return tag
-        if _refused_scheme(low):
-            return "a script, data or file link"
-        if _relative_destination(low):
-            return "a protocol-relative link"
+        problem = _tag_problem(low) or _context_problem(low)
+        if problem is not None:
+            return problem
+    unknown = False
     for view in views:
         for url in urls(view):
+            if _scheme_of(url) in REFUSED_SCHEMES:
+                return "a script, data or file link"
             if not any(known(variant) for variant in _variants(url)):
-                return "a link not in the input"
-    return None
+                unknown = True
+    return "a link not in the input" if unknown else None
 
 
 def _fields(intent: Intent) -> Iterator[tuple[str, str]]:
@@ -310,8 +341,10 @@ def guard_for(
 __all__ = [
     "EMBED_TAGS",
     "GUARD_ERROR",
+    "INERT_TAGS",
     "MAX_DETAIL",
     "REFUSED_SCHEMES",
+    "SPECIAL_SCHEMES",
     "TEXT_FIELDS",
     "check_intents",
     "guard_for",

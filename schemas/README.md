@@ -1720,21 +1720,34 @@ loosened later without breaking a valid file.
       skill does not declare stays `intent_rejected` (a permission breach, the run fails);
     - **(2) embeds are always refused**, even when the URL is in the input (they fetch when the
       note renders, without a click): any `![` (Markdown and reference images, Obsidian
-      `![[…]]` embeds), and the HTML tags `img image iframe frame frameset object embed video
-      audio source track picture link script style svg math meta base form input portal applet
-      bgsound param` whatever their attributes;
-    - **(3) refused schemes.** `javascript:`, `vbscript:`, `data:` and `file:` at a word start
-      and followed by a non-space character, anywhere in the text; inside any HTML tag also
-      with whitespace or control characters in the scheme; a protocol-relative `//host` as a
-      Markdown link destination, a link reference definition or an HTML attribute value;
-    - **(4) the input set** (answer 3). Every URL in the text (`scheme://…`, `mailto:…` and
-      `www.…` runs, up to whitespace, `<`, `>` or a control character) must be an **exact
-      string** extracted the same way from the **viewed** input (string values and object keys
-      of what the model was shown), case-sensitive, after dropping at most 16 trailing
-      punctuation characters (`.,;:!?)]}'"*_~` and backtick) on either side. So a known URL may
-      be copied, but never extended (`…?q=<data>`, `…/<data>`). A `notify.push` `link` must be
-      exactly such a URL **and** fall under the entry's `link_prefix` (decision 30). A
-      per-pipeline `strict_links` (only trusted parameters and `link_prefix`) is a follow-up;
+      `![[…]]` embeds);
+    - **(3) HTML: an allowlist without attributes.** A tag (`<name` or `</name`) is allowed only
+      if its name is one of `b i u s em strong code pre br hr p ul ol li blockquote h1`–`h6
+      kbd sup sub mark del`, and only with nothing but an optional `/` before its `>`: any
+      other tag (`img`, `iframe`, `svg`, `a`, `div`, `span`, `table`, custom elements…) and any
+      attribute (`on*`, `style`, `background`, `poster`, `srcset`, `ping`, `href`, so also
+      `url(` and `@import`) is refused. A denylist of embed tags was rejected in review: HTML
+      has too many fetching tags and attributes. `<scheme:…>` with no whitespace before its
+      `>` is a Markdown autolink and is checked as a URL;
+    - **(4) URLs.** Backslashes are read as `/` first (`https:/\host`, `\\host`). A URL is
+      a run (up to whitespace, `<`, `>` or a control character) starting at `scheme:` followed
+      by `/` (any `[a-z][a-z0-9+.-]*`, whatever precedes it), at a scheme of `http https ftp ws
+      wss obsidian mailto javascript vbscript data file blob` followed by any non-space
+      character (`ftp:host`), at `//` at a token boundary (protocol-relative, not after a
+      scheme character, `:` or `/`), or at `www.` at a word start. A URL with a **refused
+      scheme** (`javascript vbscript data file blob`) is always refused. Every other URL
+      (answer 3) must be an **exact string** extracted the same way from the **viewed** input
+      (string values and object keys of what the model was shown), case-sensitive, after
+      dropping at most 16 trailing punctuation characters (`.,;:!?)]}'"*_~` and backtick) on
+      either side. So a known URL may be copied, but never extended (`…?q=<data>`,
+      `…/<data>`). A `notify.push` `link` must be exactly such a URL **and** fall under the
+      entry's `link_prefix` (decision 30). A per-pipeline `strict_links` (only trusted
+      parameters and `link_prefix`) is a follow-up;
+    - **(5) link contexts.** Right after `](` (a link destination), `]:` (a reference
+      definition) and `<`, whitespace and control characters are dropped (also inside the
+      scheme: `[x]( java\tscript :…)`) and a refused scheme, whatever follows its colon, or
+      `//` is refused. A refused scheme in prose (`data: three items`: colon then a space) is
+      not a link in Markdown and passes;
     - **fields scanned**: `note.*` `content` and `heading`, `task.create` `title` and
       `fingerprint`, `notify.push` `title`, `body` and `link`, every string and object key of an
       `http.post` `body`. Targets bound by routing (`path`, `http.post` `url`) are not text;
@@ -1767,4 +1780,6 @@ loosened later without breaking a valid file.
       unchanged;
     - **known limits**: obfuscated URLs (`hxxps`, zero-width characters inside the scheme)
       are not links in Obsidian and pass; a URL the input brings may be copied (tenet 5 as
-      written); a brief citing a new URL from the model's own knowledge is refused.
+      written); a brief citing a new URL from the model's own knowledge is refused; being
+      conservative, a Windows path (`C:\x`), `a:/b` or `x<b and c` (a `<` and a letter, then
+      text) not in the input is refused too.

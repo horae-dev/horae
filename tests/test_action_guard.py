@@ -95,7 +95,68 @@ SCRIPTS = [
     "[ref]: //evil.example.net/c",
     "<a href=//evil.example.net/c>x</a>",
     "<a href = ' //evil.example.net/c'>x</a>",
+    # Markdown contexts: whitespace, controls and entities inside or around the scheme.
+    "[x]( javascript :alert(1))",
+    "[x](java\tscript:alert(1))",
+    "[x](java\nscript:alert(1))",
+    "[x](java&#x09;script:alert(1))",
+    "[x](&#106;avascript:alert(1))",
+    "[x](JAVA&Tab;SCRIPT&colon;alert(1))",
+    "[x](javascript:)",
+    "[x](data:)",
+    "[ref]:  vbscript :x",
+    "<javascript:alert(1)>",
+    "< data:text/html,x>",
+    "[x](blob:https://evil.example.net/1)",
+    "see javascript:alert(1)",
+    "ftp:evil.example.net",  # not refused, but unknown
+    # Backslashes are slashes; protocol-relative at a token boundary.
+    "[x](https:/\\evil.example.net/c)",
+    "[x](https:\\\\evil.example.net/c)",
+    "\\\\evil.example.net\\x",
+    "go /\\evil.example.net/x",
+    "[x](\\\\evil.example.net/c)",
+    "see //evil.example.net/c",
+    "[x](//evil.example.net&#x2f;c)",
 ]
+
+
+HTML = [
+    "<b onmouseover=alert(1)>x</b>",
+    "<b\nonmouseover=alert(1)>x</b>",
+    "<B STYLE=x>y</B>",
+    '<div style="background:url(//evil.example.net/c)">x</div>',
+    "<p style=\"background-image:url('https://docs.example.org/review/42')\">x</p>",
+    "<i>@import url(x)</i><x-style>",
+    "<a href=https://docs.example.org/review/42>x</a>",
+    "<a>x</a>",
+    "<span>x</span>",
+    "<table background=https://docs.example.org/review/42>",
+    "<body onload=x>",
+    "<details open ontoggle=x>",
+    "<marquee>x</marquee>",
+    "<x-widget>",
+    "<b:x onmouseover=alert(1)>",
+    "<p/onclick=x>",
+    "<p ping=x>",
+    "&lt;b onclick=x&gt;",
+    "&#60;span&#62;",
+    "</b onclick=x>",
+    "<li srcset=x>",
+]
+
+
+@pytest.mark.parametrize("text", HTML)
+def test_html_outside_the_inert_allowlist_or_with_attributes_is_refused(text: str) -> None:
+    problem = text_problem(text, _known(KNOWN))
+    assert problem is not None
+    assert problem.startswith("an HTML")
+
+
+def test_inert_tags_without_attributes_are_allowed() -> None:
+    text = "<b>bold</b> <i>it</i> <br> <br/> <p>para</p> <ul><li>one</li></ul> <h2>T</h2>"
+    assert text_problem(text, _known()) is None
+    assert text_problem("<code>x</code><pre>y</pre><kbd>k</kbd><sup>1</sup>", _known()) is None
 
 
 @pytest.mark.parametrize("text", SCRIPTS)
@@ -108,8 +169,17 @@ UNKNOWN = [
     f"see {EVIL}.",
     f"[report]({EVIL})",
     f"<{EVIL}>",
-    f'<a href="{EVIL}">x</a>',
     "HTTPS://EVIL.EXAMPLE.NET/c",
+    "ftp:evil.example.net",
+    "http:evil.example.net",
+    "wss:evil.example.net",
+    "gopher:/evil.example.net",
+    "x-custom:/evil",
+    "https:/\\evil.example.net/c",
+    "\\\\evil.example.net\\x",
+    "(//evil.example.net/c)",
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaahttps://evil.example.net/c",
+    "https&#x3a;&#x2f;&#x2f;evil.example.net/c",
     "obsidian://open?vault=Main&file=Secrets",
     "ftp://evil.example.net/x",
     "mailto:attacker@evil.example.net?body=private",
@@ -137,10 +207,11 @@ ALLOWED = [
     f"[the review]({KNOWN})",
     f"[the review](<{KNOWN}>)",
     f"<{KNOWN}>",
-    f'<a href="{KNOWN}">the review</a>',
+    KNOWN.replace("/", "\\"),  # backslashes read as slashes
+    f"<b>Review</b> {KNOWN}",
     f"(see {KNOWN})",
     "The data: three items. A file: none. JavaScript: not today.",
-    "metadata:x and 2 < 3 and a<b",
+    "metadata:x and 2 < 3 and 5 > 4, Note: ok, 10:30, a // b, and/or",
     "Wow! [not an image](#heading)",
     "[[Daily/2026-10-27]] is a plain wikilink",
     "a :// b",
@@ -253,6 +324,16 @@ def test_one_mib_of_hostile_text_is_scanned_in_linear_time() -> None:
         "https://" + "." * size,
         "https://" + "www." * (size // 4),
         "](" * (size // 2),
+        "]:" * (size // 2),
+        ":" * size,
+        "a" * size + ":",
+        "a:" * (size // 2),
+        "ftp:" * (size // 4),
+        "\\" * size,
+        " //" * (size // 3),
+        "<b " * (size // 3),
+        "<https:" * (size // 7),
+        "<b>" * (size // 3),
         "javascript" * (size // 10),
         (KNOWN + " ") * (size // 40),
     ]
