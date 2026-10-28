@@ -615,6 +615,53 @@ def test_a_schema_failure_is_recorded_pseudonymized(pack: Path, tmp_path: Path) 
     assert json.loads(provider.sent[1])["input"] == SENT
 
 
+def test_the_action_guard_sees_re_identified_intents(pack: Path, tmp_path: Path) -> None:
+    # Decision 46 after 47: a URL of the real input, pseudonymized on the way out, matches the
+    # guard's input set once put back; a pseudonym never reaches the guard's link rules.
+    data = {**DATA, "tasks": [{"title": "Notes at https://wiki.example.org/Alice/plan"}]}
+    sent_url = "https://wiki.example.org/[PERSON_3]/plan"
+    note = {"type": "note.create", "content": f"- [ ] [PERSON_3]: see [plan]({sent_url})\n"}
+    provider = Provider("anthropic", {**OUTPUT, "intents": [note]})
+    plugins = _plugins(data)
+    record = asyncio.run(
+        execute(
+            _pipeline(),
+            run_id="20261027T053000Z-brief-01",
+            context=CONTEXT,
+            started_at=START,
+            plugins=plugins,
+            tools=plugins,
+            llm=_backends(provider, CLOUD, tmp_path),
+            skills=DirectorySkills({"pack-daily-brief": pack}),
+            deid=_policy(),
+        )
+    )
+    assert record.status == "ok", (record.steps[2].error, record.violations)
+    assert "Alice" not in provider.sent[0].decode()
+    content = record.intents[0].intent.model_dump(mode="json")["content"]
+    assert content == "- [ ] Alice: see [plan](https://wiki.example.org/Alice/plan)\n"
+    # Another URL (not in the real input) is still refused by the guard.
+    other = {"type": "note.create", "content": "[x](https://evil.example.net/[PERSON_3])\n"}
+    provider = Provider("anthropic", {**OUTPUT, "intents": [other]})
+    plugins = _plugins(data)
+    refused = asyncio.run(
+        execute(
+            _pipeline(),
+            run_id="20261027T053000Z-brief-02",
+            context=CONTEXT,
+            started_at=START,
+            plugins=plugins,
+            tools=plugins,
+            llm=_backends(provider, CLOUD, tmp_path),
+            skills=DirectorySkills({"pack-daily-brief": pack}),
+            deid=_policy(),
+        )
+    )
+    error = refused.steps[2].error
+    assert error is not None
+    assert (refused.status, error.kind) == ("degraded", "guard_violation")
+
+
 def test_a_reused_output_is_re_identified(pack: Path, tmp_path: Path) -> None:
     provider = Provider("anthropic", _answer())
     llm = _backends(provider, CLOUD, tmp_path)

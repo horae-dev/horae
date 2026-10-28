@@ -460,12 +460,15 @@ def test_intent_limits_are_enforced_per_step(pack: Path) -> None:
     path = skill_dir(pack, SKILL) / "skill.yaml"
     path.write_text(path.read_text().replace("intents: [note.create]", "intents: {note.create: 1}"))
     record = _run(_plugins(), _llm([NOTE, NOTE]), _skills(pack))
-    assert record.status == "failed"
+    # The action guard (#35): the whole step is degraded, nothing is routed.
+    assert record.status == "degraded"
     error = record.steps[2].error
     assert error is not None
-    assert error.kind == "intent_rejected"
+    assert error.kind == "guard_violation"
     assert "2 note.create intents, the skill allows 1" in error.message
+    assert [v.kind for v in record.violations] == ["guard"]
     assert record.intents == []
+    assert record.steps[3].status == "skipped"
     # Within the limit: accepted. A reused output over the limit is a cache miss.
     ok = _run(_plugins(), _llm([NOTE]), _skills(pack))
     assert ok.status == "ok"
