@@ -1811,12 +1811,14 @@ loosened later without breaking a valid file.
       (nothing selected, `--all` with `--older-than`), 70 internal;
     - **(F) re-validated on read.** A cached output is checked against the skill's full output
       schema at every lookup, by the validator of the backend path: #31's
-      `horae.llm.validate.validate_output` once it is installed, until then
-      `horae.runner._cache.check_output` (the same size bound, `MAX_OUTPUT_BYTES`, and
-      `jsonschema`'s draft 2020-12 validator; `default_validator` switches by itself, so #31
-      needs no change here). An entry that fails, or that cannot be validated (fail closed),
-      is a miss and is deleted. So an entry written before a validator existed, or tampered
-      with in the store, is never reused unchecked;
+      `horae.llm.validate.validate_output` (`default_validator`; the interim synchronous
+      `check_output` is removed with #31, so no validation runs on the event loop), with its
+      killable worker, CPU and memory ceilings, at most `CACHE_VALIDATION_TIMEOUT_S` (10 s),
+      and the loader's fan-out cap on the schema (decision 44 C, G). An entry that fails, or
+      that cannot be validated (fail closed; `validator_unavailable` on a cache read is a
+      **miss**, never a degraded step: the model is then called), is a miss and is deleted.
+      So an entry written before a validator existed, or tampered with in the store, is
+      never reused unchecked;
     - **replay stays exact.** Replay never reads the store's cache: a run that reused an entry
       is replayed with that output as `previous` (`recorded_previous`, decision 33, which
       keeps `source_run`), so the replay takes the same path; a run that called the model is

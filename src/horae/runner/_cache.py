@@ -22,7 +22,9 @@ run that produced it, `created_at` when.
   setting: lowering it applies at once to every entry; raising it applies to entries written
   from then on, whose `expires_at` is later). It is then **re-validated** against the skill's
   full output schema (the output with its reserved `intents` put back) by the same validator
-  the backend path uses (`default_validator`): an entry that fails is a miss and is deleted. A
+  the backend path uses (`default_validator`: `horae.llm.validate.validate_output`, the
+  killable worker with its CPU and memory ceilings, #31): an entry that fails, or that the
+  validator cannot check (`validator_unavailable`), is a miss and is deleted. A
   hit names the alias' *current* backend and model and the producing run (`source_run`). A
   hit makes no backend call, so the usage ledger is not touched: a cached output costs
   nothing. A store error or a malformed entry is a miss (logged by type).
@@ -38,24 +40,21 @@ run that produced it, `created_at` when.
   first out); best effort. `horae cache purge` deletes on demand.
 """
 
-import importlib
 import inspect
-import json
 import logging
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, TypeGuard, get_args
-
-from jsonschema import Draft202012Validator
 
 from horae.contracts import RunRecord, Usage
 from horae.contracts.instance import CacheConfig, ModelAlias
 from horae.engine import PreviousLlm
 from horae.engine.canonical import sha256_hex
-from horae.engine.ports import LlmBackendName
+from horae.engine.ports import LlmBackendName, LlmError
 from horae.llm.backends._shared import LLM_KEY_VERSION
-from horae.skills import INTENTS_PROPERTY, MAX_OUTPUT_BYTES
+from horae.llm.base import Validator, production_validator
+from horae.skills import INTENTS_PROPERTY
 from horae.store import Store
 
 _log = logging.getLogger("horae.runner")
@@ -63,46 +62,19 @@ _log = logging.getLogger("horae.runner")
 _BACKENDS = frozenset(get_args(LlmBackendName))
 _STATUSES = frozenset({"ok", "noop"})
 """The run statuses whose LLM output may be cached (D2's rule, decision 30)."""
+CACHE_VALIDATION_TIMEOUT_S = 10.0
+"""The longest a cached output's re-validation may take (`VALIDATION_TIMEOUT_S`, #31)."""
 
-CacheValidator = Callable[[Any, Mapping[str, Any]], Sequence[str] | Awaitable[Sequence[str]]]
-"""`validate(output, schema)`: the errors of a full output (empty when valid), or an
-awaitable of them; the same shape as `horae.llm.base.Validator`."""
-
-MAX_CHECK_ERRORS = 20
-SIZE_ERROR = f"/: maxBytes: the output is larger than {MAX_OUTPUT_BYTES} bytes"
-NOT_JSON_ERROR = "/: json: the output is not plain JSON"
-
-
-def check_output(output: Any, schema: Mapping[str, Any]) -> tuple[str, ...]:
-    """The interim validator: `output`'s size (compact UTF-8 JSON at most `MAX_OUTPUT_BYTES`,
-    as the skill loader bounds it), then its draft 2020-12 errors against `schema` (path and
-    keyword only, never a value). Used until #31's `horae.llm.validate.validate_output`
-    exists, which `default_validator` then picks instead (decision 45 F)."""
-    try:
-        size = len(
-            json.dumps(output, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode()
-        )
-    except (TypeError, ValueError, RecursionError, UnicodeEncodeError):
-        return (NOT_JSON_ERROR,)
-    if size > MAX_OUTPUT_BYTES:
-        return (SIZE_ERROR,)
-    errors: list[str] = []
-    for error in Draft202012Validator(dict(schema)).iter_errors(output):
-        errors.append(f"{error.json_path}: {error.validator}")
-        if len(errors) >= MAX_CHECK_ERRORS:
-            break
-    return tuple(errors)
+CacheValidator = Validator
+"""`validate(output, schema, timeout_s=...)`: the errors of a full output (empty when valid),
+or an awaitable of them; raises when it cannot validate. `horae.llm.base.Validator`."""
 
 
 def default_validator() -> CacheValidator:
-    """The validator of the backend path: #31's `horae.llm.validate.validate_output` when it
-    is installed, else `check_output` (the shared hook #31 replaces)."""
-    try:
-        module = importlib.import_module("horae.llm.validate")
-    except ImportError:
-        return check_output
-    found = getattr(module, "validate_output", None)
-    return found if callable(found) else check_output
+    """The validator of the backend path, `horae.llm.validate.validate_output` (#31, the
+    default of `ModelBackends` too): the killable, memory-bounded worker, never a synchronous
+    validation on the event loop (decisions 44 and 45 F)."""
+    return production_validator()
 
 
 def full_output(output: Any, intents: list[Any], schema: Mapping[str, Any]) -> Any:
@@ -206,6 +178,7 @@ class StoreLlmCache:
         read: bool,
         models: Mapping[str, ModelAlias] | None = None,
         validate: CacheValidator | None = None,
+        validation_timeout_s: float = CACHE_VALIDATION_TIMEOUT_S,
     ) -> None:
         self.store = store
         self.config = config
@@ -215,6 +188,8 @@ class StoreLlmCache:
         self.models = dict(models or {})
         """`horae.yaml`'s model aliases: part of the stored key, and what a hit names."""
         self.validate = validate or default_validator()
+        self.validation_timeout_s = validation_timeout_s
+        """The longest a re-validation may take (the worker is killed past it: a miss)."""
 
     def stored_key(self, input_hash: str, model_alias: str | None) -> str:
         """The key an entry for the engine key `input_hash` is stored under (module docstring);
@@ -235,11 +210,15 @@ class StoreLlmCache:
             _log.warning("LLM cache delete failed (%s)", type(exc).__name__)
 
     async def _valid(self, entry: _Parsed, schema: Mapping[str, Any]) -> bool:
+        full = full_output(entry.output, entry.intents, schema)
         try:
-            found = self.validate(full_output(entry.output, entry.intents, schema), schema)
+            found = self.validate(full, schema, timeout_s=self.validation_timeout_s)
             if inspect.isawaitable(found):
                 found = await found
             return not tuple(found)
+        except LlmError as exc:  # `validator_unavailable`: a miss, never a degraded step
+            _log.warning("LLM cache entry could not be validated (%s)", exc.kind)
+            return False
         except Exception as exc:  # fail closed: an entry that cannot be validated is a miss
             _log.warning("LLM cache validation failed (%s)", type(exc).__name__)
             return False
@@ -313,11 +292,11 @@ class StoreLlmCache:
 
 
 __all__ = [
+    "CACHE_VALIDATION_TIMEOUT_S",
     "AcceptedEntry",
     "CacheValidator",
     "StoreLlmCache",
     "accepted_entry",
-    "check_output",
     "default_validator",
     "full_output",
 ]

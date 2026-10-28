@@ -842,11 +842,11 @@ def test_the_cache_validator_may_be_async_and_fails_closed(inst: Instance, store
 
     seen: list[Any] = []
 
-    async def strict(output: Any, schema: Any) -> list[str]:
+    async def strict(output: Any, schema: Any, *, timeout_s: float) -> list[str]:
         seen.append(output)
         return ["/: synthetic"]
 
-    def broken(output: Any, schema: Any) -> list[str]:
+    def broken(output: Any, schema: Any, *, timeout_s: float) -> list[str]:
         raise RuntimeError("synthetic")
 
     llm = CountingLlm(output=OUTPUT, intents=[NOTE])
@@ -860,41 +860,63 @@ def test_the_cache_validator_may_be_async_and_fails_closed(inst: Instance, store
     assert seen == [{**OUTPUT, "intents": [NOTE]}]
 
 
-def test_check_output_and_the_default_validator(monkeypatch: pytest.MonkeyPatch) -> None:
-    import importlib
-
+def test_the_cache_uses_the_backend_paths_validator(inst: Instance, store: Store) -> None:
+    from horae.llm.validate import validate_output
     from horae.runner import _cache as cache_module
-    from horae.skills import MAX_OUTPUT_BYTES
 
-    schema = {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]}
-    assert cache_module.check_output({"a": "x"}, schema) == ()
-    assert cache_module.check_output({"a": 1}, schema) == ("$.a: type",)
-    assert cache_module.check_output({}, schema) == ("$: required",)
-    assert cache_module.check_output({"a": "x" * MAX_OUTPUT_BYTES}, schema) == (
-        cache_module.SIZE_ERROR,
+    # #31's killable worker, never a synchronous validation on the event loop.
+    assert cache_module.default_validator() is validate_output
+    assert _cache(inst, store).validate is validate_output
+    assert not hasattr(cache_module, "check_output")
+
+
+def _cached_skill_entry(inst: Instance, store: Store) -> tuple[StoreLlmCache, str, Any]:
+    from test_engine_skills import NOTE, OUTPUT
+
+    cache = _cache(inst, store)
+    llm = CountingLlm(output=OUTPUT, intents=[NOTE])
+    first = _skill_run(cache, llm)
+    assert cache.remember(first)
+    return cache, cache.stored_key(first.input_hash or "", "default"), llm
+
+
+def test_a_cached_entry_the_validator_refuses_is_a_miss_and_deleted(
+    inst: Instance, store: Store
+) -> None:
+    # An entry over a constraint only the full schema has (`maxLength` of `summary`, which
+    # structured outputs drop): #31's validator refuses it, so it is never reused.
+    cache, stored, llm = _cached_skill_entry(inst, store)
+    entry = store.cache_get(stored, now=cache.clock())
+    assert entry is not None
+    long = {**entry.response["output"], "summary": "x" * 501}
+    store.cache_put(
+        stored,
+        skill=entry.skill,
+        skill_version=entry.skill_version,
+        model=entry.model,
+        response={**entry.response, "output": long},
+        usage=entry.usage,
+        at=entry.created_at,
+        expires_at=entry.expires_at,
     )
-    assert cache_module.check_output({"a": float("nan")}, schema) == (cache_module.NOT_JSON_ERROR,)
-    many = {"type": "array", "items": {"type": "string"}}
-    assert len(cache_module.check_output(list(range(50)), many)) == cache_module.MAX_CHECK_ERRORS
+    again = _skill_run(cache, llm)
+    assert (again.status, again.llm[0].cached, llm.calls) == ("ok", False, 2)
+    assert store.cache_get(stored, now=cache.clock()) is None
 
-    real = importlib.import_module
 
-    def missing(name: str) -> Any:
-        if name == "horae.llm.validate":
-            raise ImportError(name)
-        return real(name)
+def test_a_cache_read_the_validator_cannot_check_is_a_miss_not_a_degraded_step(
+    inst: Instance, store: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from horae.llm import validate as validate_module
 
-    monkeypatch.setattr(importlib, "import_module", missing)
-    assert cache_module.default_validator() is cache_module.check_output
-
-    async def validate_output(output: Any, schema: Any) -> tuple[str, ...]:
-        return ()
-
-    module = SimpleNamespace(validate_output=validate_output)
-    monkeypatch.setattr(importlib, "import_module", lambda name: module)
-    assert cache_module.default_validator() is validate_output  # #31's, once merged
-    monkeypatch.setattr(importlib, "import_module", lambda name: SimpleNamespace())
-    assert cache_module.default_validator() is cache_module.check_output
+    cache, stored, llm = _cached_skill_entry(inst, store)
+    worker = tmp_path / "worker.py"
+    worker.write_text("import sys\nsys.stdin.read()\nsys.exit(1)\n", encoding="utf-8")
+    monkeypatch.setattr(validate_module, "WORKER", worker)
+    again = _skill_run(cache, llm)  # the fake backend validates nothing itself
+    assert again.status == "ok", again.steps
+    assert (again.llm[0].cached, llm.calls) == (False, 2)
+    assert store.cache_get(stored, now=cache.clock()) is None
 
 
 def test_full_output_puts_the_intents_back() -> None:
