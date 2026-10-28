@@ -43,6 +43,7 @@ from horae.contracts.types import (
     Timestamp,
     Title,
 )
+from horae.engine.ports import PreviousLlm
 from horae.store._errors import (
     InvalidRow,
     JournalTooLarge,
@@ -639,6 +640,41 @@ class Store:
         if row is None or row[0] is None:
             return None
         return RunRecord.model_validate_json(row[0])
+
+    @_api
+    def last_accepted_llm(self, pipeline: str) -> PreviousLlm | None:
+        """The accepted LLM output of `pipeline`'s last run, for the unchanged-input path.
+
+        Only the most recent finished, non-dry-run run counts, and only if it is `ok` or
+        `noop`: after a `degraded`, `failed` or `undone` run (or with no run, or no accepted
+        LLM output in it) this is `None`, so the next run calls the LLM again. Read from the
+        stored run record: its `input_hash`, and the last schema-valid `LlmCall` of its `llm`
+        step if that step is `ok`."""
+        row = self._conn.execute(
+            "SELECT status, record FROM runs WHERE pipeline = ? AND dry_run = 0 "
+            "AND status != 'running' ORDER BY started_at DESC, id DESC LIMIT 1",
+            (pipeline,),
+        ).fetchone()
+        if row is None or row[0] not in ("ok", "noop") or row[1] is None:
+            return None
+        record = RunRecord.model_validate_json(row[1])
+        if record.input_hash is None:
+            return None
+        steps = [i for i, step in enumerate(record.steps) if step.kind == "llm"]
+        if not steps or record.steps[steps[0]].status != "ok":
+            return None
+        calls = [c for c in record.llm if c.step == steps[0] and c.schema_valid is not False]
+        if not calls:
+            return None
+        call = calls[-1]
+        return PreviousLlm(
+            input_hash=record.input_hash,
+            output=call.response,
+            intents=list(call.intents or []),
+            skill_version=call.skill_version,
+            model=call.model,
+            backend=call.backend,
+        )
 
     @staticmethod
     def _summary(row: tuple[Any, ...]) -> RunSummary:

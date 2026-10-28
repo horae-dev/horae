@@ -54,12 +54,25 @@ def test_render_substitutes_known_variables() -> None:
     assert render_string("Daily/{{date}}.assistant.md", names) == "Daily/2026-10-27.assistant.md"
     assert render_string("{{ date }}-{{x}}{{x}}", names) == "2026-10-27-11"
     assert render_string("no template", names) == "no template"
-    assert render_string("{{{date}}}", names) == "{2026-10-27}"  # single braces are literal
+    assert render_string("{a} {{date}} {b}", names) == "{a} 2026-10-27 {b}"  # apart: literal
 
 
 def test_render_walks_params_but_not_keys_or_scalars() -> None:
-    params: dict[str, Any] = {"{{date}}": [{"p": "{{date}}"}, 2, True, None], "n": 1.5}
-    assert render(params, {"date": "D"}) == {"{{date}}": [{"p": "D"}, 2, True, None], "n": 1.5}
+    params: dict[str, Any] = {"date": [{"p": "{{date}}"}, 2, True, None], "n": 1.5}
+    assert render(params, {"date": "D"}) == {"date": [{"p": "D"}, 2, True, None], "n": 1.5}
+
+
+@pytest.mark.parametrize("key", ["{{date}}", "a{{", "}}b"])
+def test_render_rejects_braces_in_keys(key: str) -> None:
+    with pytest.raises(TemplateError, match="parameter name"):
+        render({"outer": [{key: 1}]}, {"date": "D"})
+
+
+@pytest.mark.parametrize("name", ["now", "timezone"])
+def test_vars_cannot_shadow_now_or_timezone(name: str) -> None:
+    context = make_context(NOW, "UTC").model_copy(update={"vars": {name: "x"}})
+    with pytest.raises(TemplateError, match="built in"):
+        variables(context)
 
 
 @pytest.mark.parametrize(
@@ -72,6 +85,10 @@ def test_render_walks_params_but_not_keys_or_scalars() -> None:
         "{{date.year}}",
         "{{}}",
         "{{{{date}}}}",
+        "{{{date}}}",
+        "{{date}}}",
+        "{{{date}}",
+        "x{{{ date }}}y",
         "{{ __import__('os') }}",
     ],
 )
@@ -108,6 +125,17 @@ def test_digest_ignores_spelling_but_not_meaning() -> None:
     explicit = _pipeline({"name": "p", "steps": [{"llm": {**llm, "on_unchanged_input": "skip"}}]})
     assert pipeline_digest(implicit) == pipeline_digest(explicit)
 
+    scheduled = _pipeline(
+        {"name": "p", "trigger": {"cron": "30 5 * * *"}, "steps": [{"collect": ["a.b"]}]}
+    )
+    assert pipeline_digest(scheduled) == pipeline_digest(bare)  # digest = what runs
+
+    integral = _pipeline({"name": "p", "steps": [{"collect": [{"a.b": {"days": 2.0}}]}]})
+    negative_zero = _pipeline({"name": "p", "steps": [{"collect": [{"a.b": {"days": -0.0}}]}]})
+    zero = _pipeline({"name": "p", "steps": [{"collect": [{"a.b": {"days": 0.0}}]}]})
+    assert pipeline_digest(negative_zero) != pipeline_digest(zero)
+
     other = _pipeline({"name": "p", "steps": [{"collect": [{"a.b": {"days": 2}}]}]})
+    assert pipeline_digest(integral) != pipeline_digest(other)  # 2 and 2.0 differ
     assert pipeline_digest(other) != pipeline_digest(bare)
     assert len(pipeline_digest(bare)) == 64

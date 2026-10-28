@@ -172,6 +172,21 @@
         "response": {
           "title": "Response"
         },
+        "intents": {
+          "anyOf": [
+            {
+              "items": {},
+              "maxItems": 256,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The raw intents returned with `response`, as proposed (before the core fills a target\nfrom the act entry's parameters). Recorded for replays and for reuse on unchanged input;\nthe validated, routed intents are in `RunRecord.intents`.",
+          "title": "Intents"
+        },
         "usage": {
           "$ref": "#/$defs/Usage"
         }
@@ -385,7 +400,21 @@
     },
     "ProposedIntent": {
       "additionalProperties": false,
-      "description": "An intent proposed during the run, with where it came from.",
+      "dependentRequired": {
+        "applied_by": [
+          "applied_by_step",
+          "applied_by_call"
+        ],
+        "applied_by_call": [
+          "applied_by",
+          "applied_by_step"
+        ],
+        "applied_by_step": [
+          "applied_by",
+          "applied_by_call"
+        ]
+      },
+      "description": "An intent proposed during the run, with where it came from and which entry applies it.",
       "properties": {
         "step": {
           "description": "Index of the step that proposed it.",
@@ -434,6 +463,49 @@
             }
           ],
           "title": "Intent"
+        },
+        "applied_by": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "pattern": "^[a-z][a-z0-9-]*\\.[a-z][a-z0-9_]*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The sink or notifier that will apply the intent: the tool of the `act` or `notify`\nentry it was routed to. Set by the engine for every intent it records; an intent without\nit must not be applied.",
+          "title": "Applied By"
+        },
+        "applied_by_step": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Index of the `act` or `notify` step of that entry.",
+          "title": "Applied By Step"
+        },
+        "applied_by_call": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Index of that entry in its step's list of calls.",
+          "title": "Applied By Call"
         }
       },
       "required": [
@@ -913,7 +985,7 @@
         }
       ],
       "default": null,
-      "description": "Hash of the normalised LLM input, used for the unchanged-input skip.",
+      "description": "The LLM step's cache key (`horae.engine`), used for the unchanged-input skip. Set only\nwhen the LLM output was accepted, or reused unchanged from the previous run.",
       "title": "Input Hash"
     },
     "dry_run": {

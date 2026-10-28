@@ -6,67 +6,137 @@ the pipeline: every step, every call, every plugin resolved and every parameter 
 (`horae.engine.template`). It then walks that plan in order. Nothing a tool or the LLM
 returns is ever read as an instruction: a result that looks like steps, a "next step" or a
 template is plain data. The only deviation from "every step, in order" is the fixed policy
-below, which can stop the run early (the remaining steps are recorded as `skipped`); it can
-never add, repeat or reorder a step. Calls run one at a time, in declaration order.
+below, which can stop the run early (the remaining steps are recorded as `skipped`) or skip an
+`act` step; it can never add, repeat or reorder a step. Calls run one at a time, in
+declaration order.
+
+**Who proposes, who applies (ADR 0002).** `collect` sources, `transform` tools and the `llm`
+step **propose** intents. `act` and `notify` entries are never called here: each entry
+(`<sink>.<tool>: {params}`) names the sink or notifier that will **apply** the intents routed
+to it, later (#21/#22). `execute` therefore calls no tool that writes, dry run or not.
 
 **Planning** fails the run before any plugin is called, with the offending step `failed`
-and every other step `skipped`, when a tool or skill resolves to no plugin (`plugin_unknown`),
-the plugin does not list it under the `provides` entry of the step kind (`tool_not_provided`:
-`collect` uses `sources`, `transform` `transforms`, `act` `sinks`, `notify` `notifiers`, `llm`
-`skills`), a parameter template is invalid (`template_error`), or the pipeline has an `llm`
-step and no backend was given (`llm_unavailable`).
+and every other step `skipped`, when:
+
+- a tool or skill resolves to no plugin (`plugin_unknown`), or the plugin does not list it
+  under the `provides` entry of the step kind (`tool_not_provided`: `collect` uses `sources`,
+  `transform` `transforms`, `act` `sinks`, `notify` `notifiers`, `llm` `skills`);
+- a parameter template is invalid (`template_error`), or a rendered parameter is not plain
+  JSON data (`params_invalid`: e.g. `NaN`, a date object, nesting deeper than 64);
+- an `act` entry's binding parameters are invalid (`params_invalid`, see below);
+- the pipeline has more than `MAX_ITEMS` `collect` calls in all, or uses more than
+  `MAX_ITEMS` plugins (`plan_too_large`: the run record could not hold them);
+- the pipeline has an `llm` step and no backend was given (`llm_unavailable`).
 
 **Data between steps.** One JSON value flows through the run:
 
 - `collect` calls each source with `input=None`; its output is the list
   `[{"source": <ref>, "params": {...}, "data": <output>}, ...]` of the sources that succeeded,
   in declaration order, each also recorded as an `InputSnapshot` (a later `collect` step starts
-  a new list);
+  a new list). The step record's `output` lists the sources that failed,
+  `[{"source", "params", "error_kind"}]` (`None` when none did);
 - each `transform` receives the current value and its output replaces it (a fold);
 - `llm` receives the current value and its schema-valid output replaces it;
-- `act` and `notify` receive the current value and do not change it; they return intents.
+- `act` and `notify` do not change it.
 
 Every value is copied through JSON at each boundary, so a tool cannot change data it handed
-over or was handed, and a result that is not plain JSON fails the call (`output_invalid`).
+over or was handed. A result must be plain JSON data (objects with string keys, arrays,
+strings, integers, finite floats, booleans, `null`; no lone surrogate), nested at most
+`MAX_DEPTH` deep (`output_invalid`), and at most `MAX_OUTPUT_BYTES` as compact UTF-8 JSON
+(`output_too_large`).
 
-**Intents.** Only `act` and `notify` tools and the `llm` step may propose intents. Each call's
-proposals are checked with `horae.intents.validate_intents` against the proposing plugin's
-`permissions.intents` (`source` is the plugin name, or `skill:<skill>` for the LLM step, whose
-permissions are those of the plugin shipping the skill). A step's intents are kept only if the
-whole step is accepted, and the run-wide total is capped at `MAX_RUN_INTENTS`
-(`run_intents_exceeded`). A rejected `http.post` host is also recorded as an `egress_blocked`
-violation. Nothing is applied here: that is #21/#22, which must not apply a `failed` run.
+**Intents: validation and routing.** Each proposing call's batch is checked with
+`horae.intents.validate_intents` against the proposer's own `permissions.intents` (`source`
+is the plugin name, or `skill:<skill>` for the LLM step, whose permissions are those of the
+plugin shipping the skill). A rejected `http.post` host is also recorded as an
+`egress_blocked` violation. Then every intent is **routed** to exactly one `act` / `notify`
+entry of a later step, which is recorded in `ProposedIntent.applied_by` (the entry's tool),
+`applied_by_step` and `applied_by_call`. An entry takes an intent when:
+
+1. its plugin's `permissions.intents` lists the intent type (the sink must be allowed to apply
+   it), and the type is one the entry binds: `notify` entries bind `notify.push` only; `act`
+   entries bind the types of their `mode` (table below) or, without `mode`, every type except
+   `notify.push`;
+2. the intent's target matches the entry's **trusted** binding parameter exactly: a note
+   intent's `path` must equal the entry's `path`, an `http.post` `url` the entry's `url`. An
+   entry without that parameter takes no intent of that type. When the proposer **omits** the
+   target, the core fills it from the one entry that binds the type; if there is none or more
+   than one, the intent is unrouted or ambiguous.
+
+An intent that no entry takes fails the step (`intent_unrouted`), as does one that several
+entries take (`intent_ambiguous`): untrusted data can never pick a target outside the trusted
+parameters (PLAN.md §2.1 tenet 5). Other parameters of an entry (`topic`, `when`…) are trusted
+metadata for the sink, recorded with the entry in the `act` / `notify` step's `output`:
+`[{"call": <ref>, "params": {...}, "intents": [<indices into RunRecord.intents>]}]`.
+
+| `mode` | intent types | binding parameter |
+|---|---|---|
+| `create` | `note.create` | `path` (required) |
+| `append-section` | `note.append_section` | `path` (required) |
+| `replace-owned` | `note.replace_owned_block` | `path` (required) |
+| `tasks` | `task.create`, `task.update_status` | none |
+| `post` | `http.post` | `url` (required) |
+
+Any other `mode`, a `mode` whose types the sink may not apply, or a missing or invalid
+binding parameter is a plan error (`params_invalid`). A step's intents are kept only if the
+whole step is accepted, an intent enters `RunRecord.intents` only when the step of its entry
+runs, and the run-wide total is capped at `MAX_RUN_INTENTS` (`run_intents_exceeded`). Nothing
+is applied here: that is #21/#22, which must not apply a `failed` run.
+
+**The LLM step.** Its cache key, recorded as `RunRecord.input_hash` once the output is
+accepted, is the SHA-256 of the canonical JSON of `{skill, plugin: {name, version, commit},
+model, input}`, where `model` is the alias's target from `models` when the caller knows it, else
+the alias. When `previous` (the last accepted output, `PreviousLlm`) has the same key, no LLM
+call is made: its output and intents are reused (validated and routed again), recorded as an
+`LlmCall` with `cached=True` and zero usage, and the run continues. Without a usable `previous`
+the LLM is called. `timeout_s` (default `DEFAULT_LLM_TIMEOUT_S`) is one deadline for both
+attempts. The budget counts what every attempt cost, including the `usage` of a failed attempt
+(`LlmError.usage`); a backend's cached response costs nothing and counts towards neither the
+cost nor the budget.
 
 **Step policy** (step status, then the effect on the run; the run status is the worst of
 `failed` > `degraded` > `noop` > `ok`):
 
-| Step | Failure | Step | Run | Later steps |
+| Step | Situation | Step | Run | Later steps |
 |---|---|---|---|---|
-| any | intents rejected or over the run cap | failed | failed | skipped |
-| collect, transform | a tool proposes intents (`intent_not_allowed`) | failed | failed | skipped |
-| collect | some sources fail, at least one succeeds | degraded | degraded | run on partial data |
+| proposer | intents rejected, unrouted, ambiguous, over the cap | failed | failed | skipped |
+| collect | some sources fail, at least one succeeds | degraded | degraded | run (1) |
 | collect | every source fails | failed | failed | skipped |
 | transform | a transform fails | failed | failed | skipped |
-| llm | backend error, timeout, over budget, schema invalid twice | degraded | degraded | skipped |
-| llm | input hash unchanged (`on_unchanged_input: skip`) | skipped | noop | skipped (no LLM call) |
-| act | a sink call fails | failed | failed | skipped |
-| notify | a notifier fails | degraded | degraded | run (its intents dropped) |
+| llm | backend error, timeout, budget, invalid output, schema x2 | degraded | degraded | skipped |
+| llm | unchanged input, previous output reused | ok | ok or noop (2) | run |
+| act | after a degraded `collect` (`partial_input`) | skipped | (degraded) | run |
+| act, notify | otherwise | ok | ok | run |
 
-Rationale: a write is never made from partial or unvalidated data (`transform`, `llm`, `act`
-stop the run), reading is best effort (`collect` degrades, PLAN.md §2.2 "degraded"), and a
-notification is best effort once the writes are decided. Rejected intents are a permission or
-contract breach and always fail the run (ADR 0002).
+"Proposer" is any `collect`, `transform` or `llm` step. (1) On the partial data, except that
+every `act` step is skipped. (2) `noop` when the run records no intent at all.
+
+Rationale: a write is never made from partial or unvalidated data (a degraded `collect` skips
+every `act` step, whose intents are dropped, while `notify` still runs: telling the user about
+partial data is better than silence; `transform` and `llm` failures stop the run), reading is
+best effort (PLAN.md §2.2 "degraded"), and rejected or unroutable intents are a permission or
+contract breach and always fail the run (ADR 0002). The `noop` status means "nothing to do":
+the input was unchanged and nothing is left to apply.
+
+**Cancellation.** If the task running `execute` is cancelled, it raises `RunCancelled`, an
+`asyncio.CancelledError` that carries the partial, schema-valid `RunRecord` (the current step
+`failed` with kind `cancelled`, later steps `skipped`, run `failed`). `on_step` is called after
+each step record is final, in order, so a caller can also persist steps as they finish.
 """
 
 import asyncio
 import copy
 import datetime
 import json
-from collections.abc import Callable
+import math
+import time
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, NoReturn
 
-from horae.contracts.intents import Intent
+from pydantic import TypeAdapter, ValidationError
+
+from horae.contracts.intents import INTENT_TYPES, Intent, IntentType
 from horae.contracts.pipeline import (
     ActStep,
     Budget,
@@ -81,6 +151,7 @@ from horae.contracts.pipeline import (
 )
 from horae.contracts.run import (
     MAX_RUN_INTENTS,
+    ErrorKind,
     InputSnapshot,
     LlmCall,
     PluginVersion,
@@ -95,30 +166,64 @@ from horae.contracts.run import (
     Usage,
     Violation,
 )
+from horae.contracts.types import MAX_ITEMS, HttpsUrl, NotePath
 from horae.engine.canonical import pipeline_digest, sha256_hex
 from horae.engine.ports import (
     EngineCallError,
     LlmBackend,
     LlmError,
     LlmRequest,
+    LlmResponse,
     PluginRegistry,
+    PreviousLlm,
     ResolvedPlugin,
     ToolCaller,
-    ToolCallError,
     ToolResult,
     UnknownPlugin,
 )
 from horae.engine.template import TemplateError, render, variables
-from horae.intents import IntentRejected, safe_excerpt, validate_intents
+from horae.intents import MAX_BODY_DEPTH, IntentRejected, safe_excerpt, validate_intents
 
 DEFAULT_LLM_TIMEOUT_S = 120.0
-"""Timeout of one LLM attempt when the pipeline sets no `timeout_s`."""
+"""Timeout of the LLM step (both attempts) when the pipeline sets no `timeout_s`."""
 
 MAX_LLM_ATTEMPTS = 2
 """The first call and one repair retry (PLAN.md §3.4)."""
 
+MAX_DEPTH = MAX_BODY_DEPTH
+"""Deepest nesting of arrays and objects in a tool or LLM output, and in parameters."""
+
+MAX_OUTPUT_BYTES = 4 * 1024 * 1024
+"""Largest output of one call (compact UTF-8 JSON): 4 MiB."""
+
+ACT_MODES: dict[str, frozenset[IntentType]] = {
+    "create": frozenset({"note.create"}),
+    "append-section": frozenset({"note.append_section"}),
+    "replace-owned": frozenset({"note.replace_owned_block"}),
+    "tasks": frozenset({"task.create", "task.update_status"}),
+    "post": frozenset({"http.post"}),
+}
+"""The intent types an `act` entry's `mode` binds."""
+
+TARGET_FIELDS: dict[IntentType, str] = {
+    "note.create": "path",
+    "note.append_section": "path",
+    "note.replace_owned_block": "path",
+    "http.post": "url",
+}
+"""The intent field an `act` entry's parameter of the same name binds."""
+
+_NOTIFY_TYPES: frozenset[IntentType] = frozenset({"notify.push"})
+_ACT_TYPES: frozenset[IntentType] = frozenset(INTENT_TYPES) - _NOTIFY_TYPES
+_BINDING_TYPES: dict[str, TypeAdapter[str]] = {
+    "path": TypeAdapter(NotePath),
+    "url": TypeAdapter(HttpsUrl),
+}
+_ERROR_KIND: TypeAdapter[str] = TypeAdapter(ErrorKind)
+
 _MAX_MESSAGE = 4096
 _MAX_STDERR = 65536
+_STDERR_CUT = "\n[…]\n"
 _PROVIDES = {"collect": "sources", "transform": "transforms", "act": "sinks", "notify": "notifiers"}
 _EFFECT: dict[StepStatus, RunStatus] = {
     "ok": "ok",
@@ -127,6 +232,18 @@ _EFFECT: dict[StepStatus, RunStatus] = {
     "failed": "failed",
 }
 _RANK: dict[RunStatus, int] = {"ok": 0, "noop": 1, "degraded": 2, "failed": 3}
+_ZERO = Usage(tokens_in=0, tokens_out=0, usd=0.0)
+
+StepHook = Callable[[int, StepRecord], Awaitable[None]]
+"""`on_step(index, record)`: awaited after each step record is final."""
+
+
+class RunCancelled(asyncio.CancelledError):
+    """The run was cancelled; `record` is its partial run record (status `failed`)."""
+
+    def __init__(self, record: RunRecord) -> None:
+        super().__init__("the run was cancelled")
+        self.record = record
 
 
 def _utc_now() -> datetime.datetime:
@@ -138,16 +255,84 @@ def _cap(text: str, limit: int = _MAX_MESSAGE) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-def _json_copy(value: Any) -> Any:
-    """A deep copy of `value` through JSON; `ValueError` if it is not plain JSON data."""
+def _kind(kind: object) -> str:
+    """`kind` if it is a valid `ErrorKind`, else `host_error` (a misbehaving port)."""
     try:
-        return json.loads(json.dumps(value, allow_nan=False))
-    except (TypeError, ValueError, RecursionError) as error:
-        raise ValueError("not plain JSON data") from error
+        return _ERROR_KIND.validate_python(kind)
+    except ValidationError:
+        return "host_error"
 
 
-def _no_intents(raw: Any) -> bool:
-    return raw is None or (isinstance(raw, list | tuple) and len(raw) == 0)
+def _intent_list(raw: Any) -> Any:
+    """`None` and empty tuples mean "no intents"; a tuple is read as a list."""
+    if raw is None:
+        return []
+    if isinstance(raw, tuple):
+        return list(raw)
+    return raw
+
+
+# --- plain JSON data -------------------------------------------------------------------------
+
+
+class _DataError(Exception):
+    def __init__(self, kind: str, message: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.message = message
+
+
+_SCALARS = (str, int, bool, type(None))
+
+
+def _plain_problem(value: object) -> tuple[str, str] | None:
+    """Why `value` is not plain, bounded JSON data: `(kind, reason)`, or `None`.
+
+    Iterative (no recursion), so any nesting is safe to check. Each value takes at least one
+    byte, so more values than `MAX_OUTPUT_BYTES` is already too large."""
+    stack: list[tuple[object, int]] = [(value, 0)]
+    seen = 0
+    while stack:
+        item, depth = stack.pop()
+        seen += 1
+        if seen > MAX_OUTPUT_BYTES:
+            return "output_too_large", f"larger than {MAX_OUTPUT_BYTES} bytes"
+        kind = type(item)
+        if kind in _SCALARS:
+            continue
+        if kind is float:
+            if not math.isfinite(item):  # type: ignore[arg-type]
+                return "output_invalid", "contains a non-finite number"
+            continue
+        if kind is not dict and kind is not list:
+            return "output_invalid", f"contains a <{kind.__name__}>, not a JSON value"
+        if depth == MAX_DEPTH:
+            return "output_invalid", f"nested deeper than {MAX_DEPTH}"
+        if kind is dict:
+            mapping: dict[object, object] = item  # type: ignore[assignment]
+            if any(type(key) is not str for key in mapping):
+                return "output_invalid", "has an object key that is not a string"
+            stack.extend((child, depth + 1) for child in mapping.values())
+        else:
+            sequence: list[object] = item  # type: ignore[assignment]
+            stack.extend((child, depth + 1) for child in sequence)
+    return None
+
+
+def _json_copy(value: Any, what: str = "output") -> Any:
+    """A deep copy of `value` through JSON; `_DataError` if it is not plain, bounded data."""
+    problem = _plain_problem(value)
+    if problem is not None:
+        raise _DataError(problem[0], f"the {what} {problem[1]}")
+    try:
+        encoded = json.dumps(
+            value, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        ).encode("utf-8")
+    except (TypeError, ValueError, RecursionError) as error:  # lone surrogates, huge ints
+        raise _DataError("output_invalid", f"the {what} is not plain JSON data") from error
+    if len(encoded) > MAX_OUTPUT_BYTES:
+        raise _DataError("output_too_large", f"the {what} is larger than {MAX_OUTPUT_BYTES} bytes")
+    return json.loads(encoded)
 
 
 # --- plan ------------------------------------------------------------------------------------
@@ -161,10 +346,30 @@ class _Call:
 
 
 @dataclass(frozen=True)
+class _Entry:
+    """An `act` or `notify` entry: who applies which intents, bound to which targets."""
+
+    step: int
+    call: int
+    ref: str
+    params: dict[str, Any]
+    plugin: ResolvedPlugin
+    types: frozenset[IntentType]
+    binds: dict[str, str]
+
+    def takes(self, intent_type: str, target: str | None) -> bool:
+        if intent_type not in self.types:
+            return False
+        bound = TARGET_FIELDS.get(intent_type)
+        return bound is None or self.binds.get(bound) == target
+
+
+@dataclass(frozen=True)
 class _Planned:
     index: int
     kind: StepKind
     calls: tuple[_Call, ...] = ()
+    entries: tuple[_Entry, ...] = ()
     llm: LlmSpec | None = None
     skill_plugin: ResolvedPlugin | None = None
 
@@ -201,14 +406,53 @@ def _calls_of(step: Step) -> list[PluginCall]:
     return []  # pragma: no cover (the llm step calls no plugin tool)
 
 
+def _entry_binding(
+    kind: StepKind, ref: str, params: dict[str, Any], plugin: ResolvedPlugin
+) -> tuple[frozenset[IntentType], dict[str, str]]:
+    """The intent types and targets an `act` / `notify` entry binds; `ValueError` if its
+    binding parameters are invalid."""
+    allowed = frozenset(plugin.manifest.permissions.intents)
+    if kind == "notify":
+        return _NOTIFY_TYPES & allowed, {}
+    binds: dict[str, str] = {}
+    for name, adapter in _BINDING_TYPES.items():
+        if name in params:
+            try:
+                binds[name] = adapter.validate_python(params[name])
+            except ValidationError:
+                raise ValueError(f"{ref}: `{name}` is not a valid target") from None
+    mode = params.get("mode")
+    if mode is None:
+        types = _ACT_TYPES & allowed
+    else:
+        if not isinstance(mode, str) or mode not in ACT_MODES:
+            raise ValueError(f"{ref}: unknown `mode` (one of {', '.join(sorted(ACT_MODES))})")
+        types = ACT_MODES[mode]
+        if not types <= allowed:
+            raise ValueError(f"{ref}: plugin may not apply mode {mode} (permissions.intents)")
+        for intent_type in sorted(types):
+            target = TARGET_FIELDS.get(intent_type)
+            if target is not None and target not in binds:
+                raise ValueError(f"{ref}: mode {mode} needs a `{target}` parameter")
+    # A type with a target is bound only by an entry that names that target.
+    bound = frozenset(t for t in types if t not in TARGET_FIELDS or TARGET_FIELDS[t] in binds)
+    return bound, binds
+
+
 def _plan(
     pipeline: Pipeline,
     context: RunContext,
     plugins: PluginRegistry,
     has_llm: bool,
 ) -> tuple[_Planned, ...]:
-    names = variables(context)
     planned: list[_Planned] = []
+    used: set[str] = set()
+    collect_calls = 0
+    try:
+        names = variables(context)
+    except TemplateError as error:
+        first = _kind_of(pipeline.steps[0])
+        raise _PlanError(0, first, StepError(kind="template_error", message=str(error))) from None
     for index, step in enumerate(pipeline.steps):
         kind = _kind_of(step)
 
@@ -216,6 +460,11 @@ def _plan(
             error_kind: str, message: str, index: int = index, kind: StepKind = kind
         ) -> NoReturn:
             raise _PlanError(index, kind, StepError(kind=error_kind, message=_cap(message)))
+
+        def use(plugin: ResolvedPlugin) -> None:
+            used.add(plugin.manifest.name)
+            if len(used) > MAX_ITEMS:
+                fail("plan_too_large", f"the pipeline uses more than {MAX_ITEMS} plugins")
 
         if isinstance(step, LlmStep):
             if not has_llm:
@@ -226,27 +475,56 @@ def _plan(
                 fail("plugin_unknown", f"no installed plugin ships skill {step.llm.skill}")
             if step.llm.skill not in skill_plugin.manifest.provides.skills:
                 fail("tool_not_provided", f"{step.llm.skill} is not in the plugin's skills")
+            use(skill_plugin)
             planned.append(_Planned(index, kind, llm=step.llm, skill_plugin=skill_plugin))
             continue
         calls: list[_Call] = []
-        for call in _calls_of(step):
+        entries: list[_Entry] = []
+        for position, call in enumerate(_calls_of(step)):
             ref, params = (call, {}) if isinstance(call, str) else next(iter(call.items()))
+            if kind == "collect":
+                collect_calls += 1
+                if collect_calls > MAX_ITEMS:
+                    fail("plan_too_large", f"more than {MAX_ITEMS} collect calls in all")
             try:
                 plugin = plugins.plugin_for_tool(ref)
             except UnknownPlugin:
                 fail("plugin_unknown", f"no installed plugin provides {ref}")
             if ref not in getattr(plugin.manifest.provides, _PROVIDES[kind]):
                 fail("tool_not_provided", f"{ref} is not in the plugin's {_PROVIDES[kind]}")
+            use(plugin)
             try:
                 rendered = render(copy.deepcopy(params), names)
             except TemplateError as error:
                 fail("template_error", f"{ref}: {error}")
-            calls.append(_Call(ref, rendered, plugin))
-        planned.append(_Planned(index, kind, calls=tuple(calls)))
+            problem = _plain_problem(rendered)
+            if problem is not None:
+                fail("params_invalid", f"{ref}: the parameters {problem[1]}")
+            if kind in ("act", "notify"):
+                try:
+                    types, binds = _entry_binding(kind, ref, rendered, plugin)
+                except ValueError as error:
+                    fail("params_invalid", str(error))
+                entries.append(_Entry(index, position, ref, rendered, plugin, types, binds))
+            else:
+                calls.append(_Call(ref, rendered, plugin))
+        planned.append(_Planned(index, kind, calls=tuple(calls), entries=tuple(entries)))
     return tuple(planned)
 
 
 # --- execution -------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _Failure:
+    kind: str
+    message: str
+
+
+@dataclass(frozen=True)
+class _Result:
+    data: Any
+    intents: Any
 
 
 @dataclass
@@ -256,46 +534,69 @@ class _Outcome:
     output: Any = None
     intents: list[ProposedIntent] = field(default_factory=list)
     stop: bool = False
-    noop: bool = False
 
 
 @dataclass
 class _Run:
     tools: ToolCaller
     llm: LlmBackend | None
-    previous_input_hash: str | None
+    previous: PreviousLlm | None
+    models: Mapping[str, str]
+    entries: tuple[_Entry, ...]
+    monotonic: Callable[[], float]
     data: Any = None
     inputs: list[InputSnapshot] = field(default_factory=list)
     llm_calls: list[LlmCall] = field(default_factory=list)
     intents: list[ProposedIntent] = field(default_factory=list)
+    pending: dict[int, list[ProposedIntent]] = field(default_factory=dict)
     violations: list[Violation] = field(default_factory=list)
-    stderr: list[str] = field(default_factory=list)
+    stderr: list[tuple[str, str]] = field(default_factory=list)
     input_hash: str | None = None
-    cost: Usage = field(default_factory=lambda: Usage(tokens_in=0, tokens_out=0, usd=0.0))
+    partial: bool = False
+    reused: bool = False
+    cost: Usage = field(default_factory=lambda: _ZERO)
 
-    async def call(self, call: _Call, data: Any) -> ToolResult | EngineCallError:
-        """One tool call; errors are returned, never raised."""
+    def spend(self, usage: Usage) -> None:
+        self.cost = Usage(
+            tokens_in=self.cost.tokens_in + usage.tokens_in,
+            tokens_out=self.cost.tokens_out + usage.tokens_out,
+            usd=self.cost.usd + usage.usd,
+        )
+
+    async def call(self, call: _Call, data: Any) -> _Result | _Failure:
+        """One tool call; failures are returned, never raised."""
         try:
             result = await self.tools.call(call.ref, copy.deepcopy(call.params), _json_copy(data))
-        except ToolCallError as error:
-            self._stderr(call.ref, error.stderr)
-            return error
+        except EngineCallError as error:
+            self._stderr(call, getattr(error, "stderr", None))
+            return _Failure(_kind(error.kind), _describe(call.ref, error.kind, error.message))
         except Exception as error:  # a host bug must not crash the run
-            return ToolCallError("host_error", f"unexpected {type(error).__name__}")
-        self._stderr(call.ref, result.stderr)
+            return _Failure("host_error", f"{call.ref}: unexpected {type(error).__name__}")
         try:
-            return ToolResult(_json_copy(result.data), result.intents, result.stderr)
-        except ValueError:
-            return ToolCallError("output_invalid", "the tool output is not plain JSON data")
+            if not isinstance(result, ToolResult):
+                raise _DataError("output_invalid", "the host returned no ToolResult")
+            self._stderr(call, result.stderr)
+            output = _json_copy(result.data, "tool output")
+            intents = _json_copy(_intent_list(result.intents), "tool's intents")
+        except _DataError as error:
+            return _Failure(error.kind, f"{call.ref}: {error.kind}: {error.message}")
+        return _Result(output, intents)
 
-    def _stderr(self, ref: str, stderr: str | None) -> None:
-        if stderr:
-            self.stderr.append(f"--- {ref} ---\n{stderr}")
+    def _stderr(self, call: _Call, stderr: object) -> None:
+        if isinstance(stderr, str) and stderr:
+            self.stderr.append((call.plugin.manifest.name, stderr))
 
-    def accept(
+    def propose(
         self, raw: Any, plugin: ResolvedPlugin, source: str, index: int, by: str, pending: int
     ) -> tuple[list[ProposedIntent], StepError | None]:
-        """Validate one call's proposals; `pending` intents of this step are already kept."""
+        """Validate and route one call's proposals; `pending` intents of this step are kept."""
+        raw = _intent_list(raw)
+        entries = [entry for entry in self.entries if entry.step > index]
+        unroutable: list[tuple[str, int, str]] = []
+        if isinstance(raw, list):
+            raw = [self._fill(payload, i, entries, unroutable) for i, payload in enumerate(raw)]
+        if unroutable:
+            return [], _route_error(source, unroutable)
         try:
             typed: tuple[Intent, ...] = validate_intents(
                 raw, permissions=plugin.manifest.permissions, source=source
@@ -306,117 +607,259 @@ class _Run:
                     detail = _cap(f"{source}: {rejection.describe()}")
                     self.violations.append(Violation(kind="egress_blocked", detail=detail))
             return [], rejected.step_error()
-        if len(self.intents) + pending + len(typed) > MAX_RUN_INTENTS:
+        kept = len(self.intents) + sum(len(p) for p in self.pending.values()) + pending
+        if kept + len(typed) > MAX_RUN_INTENTS:
             message = f"more than {MAX_RUN_INTENTS} intents in the run"
             return [], StepError(kind="run_intents_exceeded", message=message)
-        return [ProposedIntent(step=index, proposed_by=by, intent=i) for i in typed], None
+        routed: list[ProposedIntent] = []
+        for position, intent in enumerate(typed):
+            target_field = TARGET_FIELDS.get(intent.type)
+            target = None if target_field is None else getattr(intent, target_field)
+            takers = [entry for entry in entries if entry.takes(intent.type, target)]
+            if len(takers) != 1:
+                code = "intent_unrouted" if not takers else "intent_ambiguous"
+                unroutable.append((code, position, intent.type))
+                continue
+            entry = takers[0]
+            routed.append(
+                ProposedIntent(
+                    step=index,
+                    proposed_by=by,
+                    intent=intent,
+                    applied_by=entry.ref,
+                    applied_by_step=entry.step,
+                    applied_by_call=entry.call,
+                )
+            )
+        if unroutable:
+            return [], _route_error(source, unroutable)
+        return routed, None
+
+    @staticmethod
+    def _fill(
+        payload: Any, position: int, entries: list[_Entry], unroutable: list[tuple[str, int, str]]
+    ) -> Any:
+        """`payload` with its omitted target filled from the one entry that binds its type."""
+        if not isinstance(payload, dict):
+            return payload
+        intent_type = payload.get("type")
+        if not isinstance(intent_type, str) or intent_type not in TARGET_FIELDS:
+            return payload
+        name = TARGET_FIELDS[intent_type]
+        if payload.get(name) is not None:
+            return payload
+        takers = [entry for entry in entries if intent_type in entry.types]
+        if len(takers) != 1:
+            code = "intent_unrouted" if not takers else "intent_ambiguous"
+            unroutable.append((code, position, intent_type))
+            return payload
+        return {**payload, name: takers[0].binds[name]}
 
 
-def _describe(ref: str, error: EngineCallError) -> str:
-    return f"{ref}: {error.kind}: {safe_excerpt(error.message, 200)}"
+def _route_error(source: str, unroutable: list[tuple[str, int, str]]) -> StepError:
+    """Only closed-set values (codes, positions, intent types) are echoed."""
+    lines = [f"{source!r} proposed {len(unroutable)} intent(s) no single entry can apply"]
+    lines += [f"#{position} {intent_type} {code}" for code, position, intent_type in unroutable]
+    return StepError(kind=unroutable[0][0], message=_cap("\n".join(lines)))
+
+
+def _describe(ref: str, kind: object, message: object) -> str:
+    return f"{ref}: {_kind(kind)}: {safe_excerpt(message, 200)}"
+
+
+def _cut(text: str, room: int) -> str:
+    """`text` cut to `room` characters, keeping its head and (mostly) its tail."""
+    if len(text) <= room:
+        return text
+    if room <= len(_STDERR_CUT):
+        return text[:room]
+    keep = room - len(_STDERR_CUT)
+    head = keep // 4
+    return text[:head] + _STDERR_CUT + text[len(text) - (keep - head) :]
+
+
+def _join_stderr(parts: list[tuple[str, str]]) -> str | None:
+    """Each call's stderr gets an equal share of the 64 KiB cap, head and tail kept."""
+    if not parts:
+        return None
+    share = _MAX_STDERR // len(parts)
+    chunks = []
+    for plugin, text in parts:
+        prefix = f"--- {plugin} ---\n"
+        chunks.append(prefix + _cut(text, max(0, share - len(prefix) - 1)))
+    return _cap("\n".join(chunks), _MAX_STDERR)
 
 
 async def _collect(run: _Run, step: _Planned) -> _Outcome:
     collected: list[dict[str, Any]] = []
-    failures: list[str] = []
+    snapshots: list[InputSnapshot] = []
+    kept: list[ProposedIntent] = []
+    failed: list[dict[str, Any]] = []
+    messages: list[str] = []
     for call in step.calls:
         result = await run.call(call, None)
-        if isinstance(result, EngineCallError):
-            failures.append(_describe(call.ref, result))
+        if isinstance(result, _Failure):
+            failed.append({"source": call.ref, "params": call.params, "error_kind": result.kind})
+            messages.append(result.message)
             continue
-        if not _no_intents(result.intents):
-            message = f"{call.ref}: a collect tool may not propose intents"
-            return _Outcome("failed", StepError(kind="intent_not_allowed", message=message))
+        name = call.plugin.manifest.name
+        accepted, rejected = run.propose(
+            result.intents, call.plugin, name, step.index, call.ref, len(kept)
+        )
+        if rejected is not None:
+            return _Outcome("failed", rejected, output=failed or None)
+        kept.extend(accepted)
         collected.append({"source": call.ref, "params": call.params, "data": result.data})
-        run.inputs.append(
+        snapshots.append(
             InputSnapshot(step=step.index, source=call.ref, params=call.params, data=result.data)
         )
     run.data = collected
-    if not failures:
-        return _Outcome("ok")
-    error = StepError(kind="source_failed", message=_cap("\n".join(failures)))
+    run.inputs.extend(snapshots)
+    if not failed:
+        return _Outcome("ok", intents=kept)
+    error = StepError(kind="source_failed", message=_cap("\n".join(messages)))
     if not collected:
-        return _Outcome("failed", error)
-    return _Outcome("degraded", error)
+        return _Outcome("failed", error, output=failed)
+    run.partial = True
+    return _Outcome("degraded", error, output=failed, intents=kept)
 
 
 async def _transform(run: _Run, step: _Planned) -> _Outcome:
-    for call in step.calls:
-        result = await run.call(call, run.data)
-        if isinstance(result, EngineCallError):
-            return _Outcome(
-                "failed", StepError(kind=result.kind, message=_describe(call.ref, result))
-            )
-        if not _no_intents(result.intents):
-            message = f"{call.ref}: a transform may not propose intents"
-            return _Outcome("failed", StepError(kind="intent_not_allowed", message=message))
-        run.data = result.data
-    return _Outcome("ok", output=run.data)
-
-
-async def _sinks(run: _Run, step: _Planned) -> _Outcome:
-    """`act` (any failure fails the step) and `notify` (a failed notifier degrades it)."""
     kept: list[ProposedIntent] = []
-    outputs: list[dict[str, Any]] = []
-    failures: list[str] = []
     for call in step.calls:
         result = await run.call(call, run.data)
-        if isinstance(result, EngineCallError):
-            if step.kind == "act":
-                failed = StepError(kind=result.kind, message=_describe(call.ref, result))
-                return _Outcome("failed", failed)
-            failures.append(_describe(call.ref, result))
-            continue
+        if isinstance(result, _Failure):
+            return _Outcome("failed", StepError(kind=result.kind, message=_cap(result.message)))
         name = call.plugin.manifest.name
-        accepted, rejected = run.accept(
+        accepted, rejected = run.propose(
             result.intents, call.plugin, name, step.index, call.ref, len(kept)
         )
         if rejected is not None:
             return _Outcome("failed", rejected)
         kept.extend(accepted)
-        outputs.append({"call": call.ref, "data": result.data})
-    if failures:
-        error = StepError(kind="notifier_failed", message=_cap("\n".join(failures)))
-        return _Outcome("degraded", error, outputs, kept)
-    return _Outcome("ok", output=outputs, intents=kept)
+        run.data = result.data
+    return _Outcome("ok", output=run.data, intents=kept)
+
+
+async def _apply_step(run: _Run, step: _Planned) -> _Outcome:
+    """`act` / `notify`: no call; record the intents routed to each entry."""
+    routed = run.pending.pop(step.index, [])
+    if step.kind == "act" and run.partial:
+        message = (
+            f"a collect step degraded: not writing from partial data "
+            f"({len(routed)} intent(s) dropped)"
+        )
+        return _Outcome("skipped", StepError(kind="partial_input", message=message))
+    base = len(run.intents)
+    run.intents.extend(routed)
+    output = [
+        {
+            "call": entry.ref,
+            "params": entry.params,
+            "intents": [
+                base + i for i, intent in enumerate(routed) if intent.applied_by_call == entry.call
+            ],
+        }
+        for entry in step.entries
+    ]
+    return _Outcome("ok", output=output)
+
+
+def _cache_key(run: _Run, spec: LlmSpec, plugin: ResolvedPlugin) -> str:
+    return sha256_hex(
+        {
+            "skill": spec.skill,
+            "plugin": {
+                "name": plugin.manifest.name,
+                "version": plugin.manifest.version,
+                "commit": plugin.commit,
+            },
+            "model": run.models.get(spec.model, spec.model),
+            "input": run.data,
+        }
+    )
+
+
+def _reuse(
+    run: _Run, step: _Planned, spec: LlmSpec, plugin: ResolvedPlugin, key: str
+) -> _Outcome | None:
+    """The previous accepted output, reused; `None` if it cannot be (then the LLM is called)."""
+    previous = run.previous
+    if previous is None or previous.input_hash != key:
+        return None
+    try:
+        output = _json_copy(previous.output, "previous LLM output")
+        raw = _json_copy(_intent_list(previous.intents), "previous LLM intents")
+        call = LlmCall(
+            step=step.index,
+            skill=spec.skill,
+            skill_version=previous.skill_version,
+            backend=previous.backend,
+            model=previous.model,
+            cached=True,
+            schema_valid=True,
+            request={"skill": spec.skill, "model": spec.model, "reused_input_hash": key},
+            response=output,
+            intents=raw,
+            usage=_ZERO,
+        )
+    except (_DataError, ValidationError):
+        return None
+    run.llm_calls.append(call)
+    accepted, rejected = run.propose(raw, plugin, f"skill:{spec.skill}", step.index, spec.skill, 0)
+    if rejected is not None:
+        return _Outcome("failed", rejected, stop=True)
+    run.data, run.input_hash, run.reused = output, key, True
+    return _Outcome("ok", output=output, intents=accepted)
 
 
 async def _llm_step(run: _Run, step: _Planned) -> _Outcome:
     spec, plugin, backend = step.llm, step.skill_plugin, run.llm
     if spec is None or plugin is None or backend is None:  # pragma: no cover (planned)
         raise RuntimeError("an llm step is planned with its spec, plugin and backend")
-    run.input_hash = sha256_hex({"skill": spec.skill, "model": spec.model, "input": run.data})
-    if run.previous_input_hash is not None and run.previous_input_hash == run.input_hash:
-        return _Outcome("skipped", stop=True, noop=True)
+    key = _cache_key(run, spec, plugin)
+    reused = _reuse(run, step, spec, plugin, key)
+    if reused is not None:
+        return reused
 
     def degraded(kind: str, message: str) -> _Outcome:
         return _Outcome("degraded", StepError(kind=kind, message=_cap(message)), stop=True)
 
     timeout = spec.timeout_s or DEFAULT_LLM_TIMEOUT_S
+    deadline = run.monotonic() + timeout
     spent_usd, spent_tokens = 0.0, 0
     repair: tuple[str, ...] = ()
     for attempt in range(1, MAX_LLM_ATTEMPTS + 1):
         if spent_usd >= spec.budget.usd or spent_tokens >= spec.budget.tokens_out:
             return degraded("budget_exceeded", "no budget left for the repair retry")
+        remaining = deadline - run.monotonic()
+        if remaining <= 0:
+            return degraded("timeout", f"the LLM step took longer than {timeout} s")
         budget = Budget(
             usd=spec.budget.usd - spent_usd, tokens_out=spec.budget.tokens_out - spent_tokens
         )
         request = LlmRequest(
-            spec.skill, spec.model, _json_copy(run.data), budget, timeout, attempt, repair
+            spec.skill, spec.model, _json_copy(run.data), budget, remaining, attempt, repair
         )
         try:
-            async with asyncio.timeout(timeout):
+            async with asyncio.timeout(remaining):
                 response = await backend.complete(request)
         except TimeoutError:
-            return degraded("timeout", f"the LLM did not answer within {timeout} s")
+            return degraded("timeout", f"the LLM step took longer than {timeout} s")
         except LlmError as error:
-            return degraded(error.kind, safe_excerpt(error.message, 200))
+            usage = getattr(error, "usage", None)
+            if isinstance(usage, Usage):
+                run.spend(usage)
+            return degraded(_kind(error.kind), safe_excerpt(error.message, 200))
         except Exception as error:  # a backend bug must not crash the run
             return degraded("host_error", f"unexpected {type(error).__name__}")
         try:
-            output = _json_copy(response.output)
+            if not isinstance(response, LlmResponse):
+                raise _DataError("output_invalid", "the LLM backend returned no LlmResponse")
+            output = _json_copy(response.output, "LLM output")
+            raw = _json_copy(_intent_list(response.intents), "LLM intents")
             recorded = (
-                _json_copy(response.request)
+                _json_copy(response.request, "LLM request")
                 if response.request is not None
                 else {
                     "skill": spec.skill,
@@ -426,18 +869,11 @@ async def _llm_step(run: _Run, step: _Planned) -> _Outcome:
                     "repair": list(repair),
                 }
             )
-        except ValueError:
-            return degraded("output_invalid", "the LLM output is not plain JSON data")
-        usage = response.usage
-        run.cost = Usage(
-            tokens_in=run.cost.tokens_in + usage.tokens_in,
-            tokens_out=run.cost.tokens_out + usage.tokens_out,
-            usd=run.cost.usd + usage.usd,
-        )
-        spent_usd += usage.usd
-        spent_tokens += usage.tokens_out
-        run.llm_calls.append(
-            LlmCall(
+            if not isinstance(response.usage, Usage):
+                raise _DataError("output_invalid", "the LLM usage is not a Usage")
+            usage = _ZERO if response.cached is True else response.usage
+            errors = tuple(str(error) for error in response.schema_errors)
+            llm_call = LlmCall(
                 step=step.index,
                 skill=spec.skill,
                 skill_version=response.skill_version,
@@ -445,24 +881,30 @@ async def _llm_step(run: _Run, step: _Planned) -> _Outcome:
                 model=response.model,
                 cached=response.cached,
                 attempt=attempt,
-                schema_valid=not response.schema_errors,
+                schema_valid=not errors,
                 request=recorded,
                 response=output,
+                intents=raw,
                 usage=usage,
             )
-        )
+        except _DataError as error:
+            return degraded(error.kind, error.message)
+        except (ValidationError, TypeError, ValueError):
+            return degraded("output_invalid", "the LLM response does not fit the run record")
+        run.spend(usage)
+        spent_usd += usage.usd
+        spent_tokens += usage.tokens_out
+        run.llm_calls.append(llm_call)
         if spent_usd > spec.budget.usd or spent_tokens > spec.budget.tokens_out:
             return degraded("budget_exceeded", "the LLM step spent more than its budget")
-        if not response.schema_errors:
+        if not errors:
             source = f"skill:{spec.skill}"
-            accepted, rejected = run.accept(
-                response.intents, plugin, source, step.index, spec.skill, 0
-            )
+            accepted, rejected = run.propose(raw, plugin, source, step.index, spec.skill, 0)
             if rejected is not None:
                 return _Outcome("failed", rejected, stop=True)
-            run.data = output
+            run.data, run.input_hash = output, key
             return _Outcome("ok", output=output, intents=accepted)
-        repair = tuple(response.schema_errors)
+        repair = errors
     return degraded(
         "schema_invalid", f"the output failed its schema after {MAX_LLM_ATTEMPTS} attempts"
     )
@@ -472,8 +914,8 @@ _STEPS = {
     "collect": _collect,
     "transform": _transform,
     "llm": _llm_step,
-    "act": _sinks,
-    "notify": _sinks,
+    "act": _apply_step,
+    "notify": _apply_step,
 }
 
 
@@ -482,22 +924,35 @@ async def execute(
     *,
     run_id: str,
     context: RunContext,
+    started_at: datetime.datetime,
     plugins: PluginRegistry,
     tools: ToolCaller,
     llm: LlmBackend | None = None,
     dry_run: bool = False,
-    previous_input_hash: str | None = None,
+    previous: PreviousLlm | None = None,
+    models: Mapping[str, str] | None = None,
+    on_step: StepHook | None = None,
     clock: Callable[[], datetime.datetime] = _utc_now,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> RunRecord:
-    """Run `pipeline` once and return its record; never raises for a step failure.
+    """Run `pipeline` once and return its record; never raises for a step or port failure.
 
-    `context` is the template context (`horae.engine.make_context`). `previous_input_hash` is
-    the last run's `input_hash` (from the store, #19), for the unchanged-input skip. `dry_run`
-    is recorded only: the engine applies nothing either way. Persistence, locking and the run
-    timeout are #19's."""
-    started_at = clock()
+    - `context`: the template context (`horae.engine.make_context`, with the instance's time
+      zone).
+    - `started_at`: the run's start, the value given to `Store.begin_run` (the record keeps it).
+    - `tools` is called for `collect` and `transform` only; `act` / `notify` entries are
+      routed to, never called (ADR 0002).
+    - `previous`: the last accepted LLM output (`Store.last_accepted_llm`), for the
+      unchanged-input path. `models`: model alias to concrete model (`horae.yaml`), part of
+      the LLM cache key.
+    - `dry_run` is recorded only: the engine applies nothing either way.
+    - `on_step(index, record)` is awaited after each step record is final; its exceptions
+      propagate. `clock` gives the wall-clock timestamps, `monotonic` the durations and the
+      LLM deadline.
+
+    Raises `RunCancelled` (an `asyncio.CancelledError`) with the partial record if cancelled.
+    Persistence, locking and the run timeout are the caller's (#19)."""
     digest = pipeline_digest(pipeline)
-    run = _Run(tools=tools, llm=llm, previous_input_hash=previous_input_hash)
     records: list[StepRecord] = []
     status: RunStatus = "ok"
     run_error: str | None = None
@@ -511,63 +966,107 @@ async def execute(
                 records.append(StepRecord(kind=error.kind, status="failed", error=error.error))
             else:
                 records.append(StepRecord(kind=_kind_of(declared), status="skipped"))
-    used = {s.plugin.manifest.name: s.plugin for p in plan for s in p.calls}
+    run = _Run(
+        tools=tools,
+        llm=llm,
+        previous=previous,
+        models=dict(models or {}),
+        entries=tuple(entry for p in plan for entry in p.entries),
+        monotonic=monotonic,
+    )
+    used = {c.plugin.manifest.name: c.plugin for p in plan for c in p.calls}
+    used.update({e.plugin.manifest.name: e.plugin for e in run.entries})
     used.update({p.skill_plugin.manifest.name: p.skill_plugin for p in plan if p.skill_plugin})
 
-    stopped = False
-    for step in plan:
-        if stopped:
-            records.append(StepRecord(kind=step.kind, status="skipped"))
-            continue
-        step_start = clock()
-        run.stderr = []
-        outcome = await _STEPS[step.kind](run, step)
-        step_end = clock()
-        stderr = _cap("\n".join(run.stderr), _MAX_STDERR) if run.stderr else None
-        records.append(
-            StepRecord(
-                kind=step.kind,
-                status=outcome.status,
-                output=outcome.output,
-                error=outcome.error,
-                started_at=step_start,
-                finished_at=step_end,
-                stderr=stderr,
-                duration_ms=max(0, int((step_end - step_start).total_seconds() * 1000)),
-            )
+    def record(final: RunStatus, error: str | None, steps: list[StepRecord]) -> RunRecord:
+        return RunRecord(
+            schema_version=1,
+            id=run_id,
+            pipeline=pipeline.name,
+            pipeline_digest=digest,
+            context=context,
+            input_hash=run.input_hash,
+            dry_run=dry_run,
+            started_at=started_at,
+            finished_at=max(clock(), started_at),
+            status=final,
+            plugins={
+                name: PluginVersion(version=p.manifest.version, commit=p.commit)
+                for name, p in used.items()
+            },
+            inputs=run.inputs,
+            steps=steps,
+            llm=run.llm_calls,
+            intents=run.intents,
+            changes=[],
+            violations=run.violations,
+            cost=run.cost,
+            error=_cap(error) if error else None,
         )
-        run.intents.extend(outcome.intents)
-        step_status = "noop" if outcome.noop else _EFFECT[outcome.status]
-        if _RANK[step_status] > _RANK[status]:
-            status = step_status
-        if outcome.error is not None and run_error is None and outcome.status != "ok":
-            run_error = f"step {step.index} ({step.kind}): {outcome.error.message}"
-        stopped = outcome.stop or outcome.status == "failed"
 
-    return RunRecord(
-        schema_version=1,
-        id=run_id,
-        pipeline=pipeline.name,
-        pipeline_digest=digest,
-        context=context,
-        input_hash=run.input_hash,
-        dry_run=dry_run,
-        started_at=started_at,
-        finished_at=max(clock(), started_at),
-        status=status,
-        plugins={
-            name: PluginVersion(version=p.manifest.version, commit=p.commit)
-            for name, p in used.items()
-        },
-        inputs=run.inputs,
-        steps=records,
-        llm=run.llm_calls,
-        intents=run.intents,
-        changes=[],
-        violations=run.violations,
-        cost=run.cost,
-        error=_cap(run_error) if run_error else None,
-    )
+    in_step = False
+    try:
+        if on_step is not None:
+            for index, step_record in enumerate(records):
+                await on_step(index, step_record)
+        stopped = False
+        for step in plan:
+            if stopped:
+                step_record = StepRecord(kind=step.kind, status="skipped")
+            else:
+                step_start = max(clock(), started_at)
+                begin = monotonic()
+                run.stderr = []
+                in_step = True
+                outcome = await _STEPS[step.kind](run, step)
+                in_step = False
+                elapsed = max(0.0, monotonic() - begin)
+                step_record = StepRecord(
+                    kind=step.kind,
+                    status=outcome.status,
+                    output=outcome.output,
+                    error=outcome.error,
+                    started_at=step_start,
+                    finished_at=max(clock(), step_start),
+                    stderr=_join_stderr(run.stderr),
+                    duration_ms=int(elapsed * 1000),
+                )
+                if outcome.status != "failed":
+                    for intent in outcome.intents:
+                        run.pending.setdefault(intent.applied_by_step or 0, []).append(intent)
+                effect = _EFFECT[outcome.status]
+                if _RANK[effect] > _RANK[status]:
+                    status = effect
+                if outcome.error is not None and run_error is None and outcome.status != "ok":
+                    run_error = f"step {step.index} ({step.kind}): {outcome.error.message}"
+                stopped = outcome.stop or outcome.status == "failed"
+            records.append(step_record)
+            if on_step is not None:
+                await on_step(step.index, step_record)
+    except asyncio.CancelledError as cancelled:
+        partial = list(records)
+        for index in range(len(partial), len(pipeline.steps)):
+            kind = _kind_of(pipeline.steps[index])
+            if index == len(records) and in_step:
+                why = StepError(kind="cancelled", message="the run was cancelled")
+                partial.append(StepRecord(kind=kind, status="failed", error=why))
+            else:
+                partial.append(StepRecord(kind=kind, status="skipped"))
+        raise RunCancelled(record("failed", "the run was cancelled", partial)) from cancelled
+
+    if status == "ok" and run.reused and not run.intents:
+        status = "noop"
+    return record(status, run_error, records)
 
 
-__all__ = ["DEFAULT_LLM_TIMEOUT_S", "MAX_LLM_ATTEMPTS", "execute"]
+__all__ = [
+    "ACT_MODES",
+    "DEFAULT_LLM_TIMEOUT_S",
+    "MAX_DEPTH",
+    "MAX_LLM_ATTEMPTS",
+    "MAX_OUTPUT_BYTES",
+    "TARGET_FIELDS",
+    "RunCancelled",
+    "StepHook",
+    "execute",
+]

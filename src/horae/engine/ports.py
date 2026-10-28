@@ -12,9 +12,23 @@ Calls are still awaited one at a time, in declaration order; parallel `collect` 
 without changing these protocols. Plugin resolution (`PluginRegistry`) is plain data lookup,
 hence synchronous.
 
+**Which tools are called.** `ToolCaller` is used for `collect` sources and `transform` tools
+only. `act` sinks and `notify` notifiers are never called while a pipeline executes: they apply
+the routed intents afterwards (#21/#22, ADR 0002), so a dry run calls nothing that writes.
+
 **Trusted vs untrusted.** A call gets `params` (rendered from the pipeline definition and the run
 context only: trusted) and `input` (the data from earlier steps: untrusted, to be treated as
 data). Results are data too: nothing a tool or the LLM returns can add, skip or reorder steps.
+
+**Redaction is the host's job.** `ToolCallError.message`, `ToolCallError.stderr`,
+`ToolResult.stderr` and `LlmError.message` are recorded in the run record as given (only
+truncated and stripped of control characters), so the host must redact secret values from them
+before raising or returning.
+
+**Misbehaving ports never crash a run.** An error kind that is not a valid `ErrorKind` is
+recorded as `host_error`; a result of the wrong type, or output that is not plain, bounded JSON
+data, fails the call (`output_invalid` / `output_too_large`); any other exception is recorded as
+`host_error` without its message.
 """
 
 from dataclasses import dataclass, field
@@ -42,7 +56,21 @@ class ToolCallError(EngineCallError):
 
 
 class LlmError(EngineCallError):
-    """The LLM call failed (backend error, timeout…)."""
+    """The LLM call failed (backend error, timeout…).
+
+    `usage` is what the failed attempt still cost (e.g. tokens billed before the error); the
+    engine adds it to the run's cost and to the step's budget."""
+
+    def __init__(
+        self,
+        kind: ErrorKind,
+        message: str,
+        *,
+        stderr: str | None = None,
+        usage: Usage | None = None,
+    ) -> None:
+        super().__init__(kind, message, stderr=stderr)
+        self.usage = usage
 
 
 class UnknownPlugin(LookupError):
@@ -77,8 +105,9 @@ class ToolResult:
     data: Any = None
     """The tool's output: plain JSON data."""
     intents: Any = field(default_factory=list)
-    """Raw intents the tool proposes (a list), validated by the engine. Only `act` and `notify`
-    tools may propose intents."""
+    """Raw intents the tool proposes (a list; `None` or an empty tuple mean none), validated
+    against the tool's plugin permissions and routed to an `act` / `notify` entry by the
+    engine (sources and transforms propose; ADR 0002)."""
     stderr: str | None = None
     """The plugin's (already redacted) standard error for this call."""
 
@@ -104,6 +133,7 @@ class LlmRequest:
     budget: Budget
     """What this attempt may still spend (the step budget minus earlier attempts)."""
     timeout_s: float
+    """What is left of the step's single deadline (`timeout_s` covers both attempts)."""
     attempt: int
     """1, or 2 for the repair retry."""
     repair: tuple[str, ...] = ()
@@ -125,9 +155,28 @@ class LlmResponse:
     request: Any = None
     """The request as sent, recorded for replays."""
     cached: bool = False
+    """The response came from the backend's cache: its usage counts towards neither the cost
+    nor the budget."""
     intents: Any = field(default_factory=list)
     """Raw intents in the output, validated by the engine against the skill plugin's
-    permissions (source `skill:<name>`)."""
+    permissions (source `skill:<name>`) and routed to an `act` / `notify` entry."""
+
+
+@dataclass(frozen=True)
+class PreviousLlm:
+    """The last accepted LLM output of a pipeline, for the unchanged-input path.
+
+    Built by the caller from the last finished, non-dry-run run when it is `ok` or `noop`
+    (`horae.store.Store.last_accepted_llm`). When its `input_hash` equals this run's cache key,
+    the engine makes no LLM call and reuses `output` and `intents`."""
+
+    input_hash: str
+    output: Any
+    intents: Any
+    """The raw intents proposed with `output` (validated and routed again)."""
+    skill_version: str
+    model: str
+    backend: LlmBackendName
 
 
 class LlmBackend(Protocol):

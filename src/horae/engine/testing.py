@@ -2,9 +2,10 @@
 """In-memory implementations of the engine's ports, for tests and examples.
 
 `FixturePlugins` is a `PluginRegistry` and a `ToolCaller`: register plugin manifests and a
-Python handler per tool, and it records every call in order (`calls`). `FakeLlm` is an
-`LlmBackend` that answers from a script of responses. Nothing here starts a process, opens a
-socket or calls a model.
+Python handler per `collect` / `transform` tool, and it records every call in order (`calls`).
+Sinks and notifiers need no handler: the engine never calls them (they apply intents later).
+`FakeLlm` is an `LlmBackend` that answers from a script of responses. Nothing here starts a
+process, opens a socket or calls a model.
 """
 
 import copy
@@ -46,13 +47,17 @@ class FixturePlugins:
     calls: list[RecordedCall] = field(default_factory=list)
 
     def add(
-        self, manifest: PluginManifest | dict[str, Any], handlers: dict[str, Handler] | None = None
+        self,
+        manifest: PluginManifest | dict[str, Any],
+        handlers: dict[str, Handler] | None = None,
+        *,
+        commit: str | None = None,
     ) -> PluginManifest:
         """Register a plugin (a manifest or its parsed `plugin.yaml`) and its tool handlers.
         Namespaces resolve to plugins by the namespace of the tools and skills they provide."""
         if not isinstance(manifest, PluginManifest):
             manifest = PluginManifest.model_validate(manifest)
-        resolved = ResolvedPlugin(manifest)
+        resolved = ResolvedPlugin(manifest, commit)
         provides = manifest.provides
         for ref in [*provides.sources, *provides.transforms, *provides.sinks, *provides.notifiers]:
             self.plugins[ref.split(".", 1)[0]] = resolved
@@ -91,6 +96,7 @@ def llm_response(
     tokens_out: int = 10,
     usd: float = 0.001,
     intents: Any = None,
+    cached: bool = False,
 ) -> LlmResponse:
     """A synthetic `LlmResponse` (backend `anthropic`, model `fixture-model`)."""
     return LlmResponse(
@@ -101,6 +107,7 @@ def llm_response(
         model="fixture-model",
         skill_version="1",
         intents=[] if intents is None else intents,
+        cached=cached,
     )
 
 

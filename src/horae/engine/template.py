@@ -13,12 +13,16 @@ Rules:
   caller's extra variables). Step outputs are never variables: data read from outside cannot
   become a parameter of a later call (PLAN.md §2.1 tenet 5).
 - **Unknown variables are an error** (`TemplateError`), as is any other `{{` or `}}` in a
-  string (an unterminated or malformed placeholder). Literal double braces cannot be written
-  in v1.
+  string (an unterminated or malformed placeholder), and a single `{` or `}` touching a
+  placeholder (`{{{date}}}`, `{{date}}}`), which other template engines would read
+  differently. Literal double braces cannot be written in v1.
+- **`now` and `timezone` are always the context's own:** a `vars` entry with either name is
+  an error.
 - **Single pass.** Substituted values are not scanned again, so a variable whose value
   contains `{{x}}` inserts that text literally.
 - Only string values are rendered, at any depth of the parameters (mappings and lists);
-  mapping keys and non-string scalars are kept as they are.
+  non-string scalars are kept as they are. Mapping keys are never rendered, and a key that
+  contains `{{` or `}}` is an error (it would look like a template that silently is not one).
 
 All parameters of a pipeline are rendered once, before the first step runs, so a template
 error fails the run before any plugin is called.
@@ -64,7 +68,12 @@ def make_context(
 
 
 def variables(context: RunContext) -> dict[str, str]:
-    """The template namespace of `context`: `now`, `timezone` and `vars`."""
+    """The template namespace of `context`: `now`, `timezone` and `vars`.
+
+    Raises `TemplateError` if `vars` tries to set `now` or `timezone`."""
+    shadowed = sorted({"now", "timezone"} & set(context.vars))
+    if shadowed:
+        raise TemplateError(f"variables {shadowed} are built in and cannot be set")
     return {
         "now": context.now.isoformat().replace("+00:00", "Z"),
         "timezone": context.timezone,
@@ -78,6 +87,10 @@ def render_string(text: str, names: Mapping[str, str]) -> str:
     position = 0
     for match in PLACEHOLDER.finditer(text):
         parts.append(_literal(text[position : match.start()]))
+        before = text[match.start() - 1] if match.start() > 0 else ""
+        after = text[match.end()] if match.end() < len(text) else ""
+        if before == "{" or after == "}":
+            raise TemplateError("a single brace touches a template placeholder")
         name = match.group(1)
         if name not in names:
             raise TemplateError(f"unknown template variable {name!r}")
@@ -98,6 +111,9 @@ def render(value: Any, names: Mapping[str, str]) -> Any:
     if isinstance(value, str):
         return render_string(value, names)
     if isinstance(value, dict):
+        for key in value:
+            if isinstance(key, str) and ("{{" in key or "}}" in key):
+                raise TemplateError("a parameter name may not contain `{{` or `}}`")
         return {key: render(item, names) for key, item in value.items()}
     if isinstance(value, list):
         return [render(item, names) for item in value]

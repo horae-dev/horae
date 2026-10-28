@@ -105,7 +105,9 @@ Contracts constrain shape, not meaning. The runtime still has to:
 JSON Schema cannot express these; the models enforce them and the tests pin the difference:
 
 - `run-record`: `changes[].intent` is an index into `intents`; `finished_at` is not before
-  `started_at` (run and step records).
+  `started_at` (run and step records); `intents[].applied_by`, `applied_by_step` and
+  `applied_by_call` are all set or all absent (the JSON Schema's `dependentRequired` checks
+  presence, the model also rejects an explicit `null` next to a value).
 - `plugin-manifest`: the host of an `mcp-http` `runtime.url` is listed in `permissions.network`.
 - Hosts (`permissions.network`, every `https` URL): a label starting with `xn--` must be a valid
   IDNA A-label. It must round-trip through Python's `idna` codec (IDNA2003, so no runtime
@@ -273,3 +275,15 @@ loosened later without breaking a valid file.
     wrong place. Messages never show a regular expression, and a union (a pipeline step, a
     secret reference) gives a single problem, e.g. `unknown step kind 'colect' (expected one
     of: collect, transform, llm, act, notify)`.
+30. **Intent routing in the run record (#17, maintainer decision D1).** Following ADR 0002,
+    sources, transforms and the LLM step propose intents; `act` / `notify` entries are never
+    called during a run, they name the sink or notifier that applies the intents later
+    (#21/#22). Each recorded intent says which entry: `intents[].applied_by` (the entry's
+    `<namespace>.<tool>`), `applied_by_step` (its step) and `applied_by_call` (its index in the
+    step). The three are optional in v1 (a compatible addition) but go together, and the
+    engine sets them on every intent it records; an applier must refuse an intent without
+    them. `llm[].intents` records the raw intents returned with the response, before the core
+    fills a target from the entry's parameters, for replays and for reuse on unchanged input
+    (D2). `input_hash` is the LLM step's cache key (`horae.engine`), set only when the LLM output
+    was accepted or reused. The routing and binding rules (`mode`, `path`, `url`) are the
+    engine's, documented in `horae.engine.executor`.

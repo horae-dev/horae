@@ -1,21 +1,30 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Pipeline execution (#17): the daily brief end to end, step policy and fixed control flow."""
+"""Pipeline execution (#17): the daily brief end to end, intent routing, step policy and fixed
+control flow."""
 
 import asyncio
 import datetime
 import itertools
 import json
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
 import yaml
+from jsonschema import Draft202012Validator, FormatChecker
+from pydantic import ValidationError
 
-from horae.contracts import MAX_RUN_INTENTS, Pipeline, RunRecord
+from horae.contracts import MAX_RUN_INTENTS, Pipeline, RunRecord, StepRecord
+from horae.contracts.run import ProposedIntent
 from horae.engine import (
+    MAX_DEPTH,
+    MAX_OUTPUT_BYTES,
     LlmError,
     LlmRequest,
     LlmResponse,
+    PreviousLlm,
+    RunCancelled,
     ToolCallError,
     ToolResult,
     execute,
@@ -23,23 +32,39 @@ from horae.engine import (
     pipeline_digest,
 )
 from horae.engine.testing import FakeLlm, FixturePlugins, llm_response
+from horae.store import Store
 
-EXAMPLES = Path(__file__).parent.parent / "schemas" / "examples" / "pipeline" / "valid"
+ROOT = Path(__file__).parent.parent
+EXAMPLES = ROOT / "schemas" / "examples" / "pipeline" / "valid"
+RUN_RECORD_SCHEMA = json.loads((ROOT / "schemas" / "run-record" / "v1.json").read_text())
 START = datetime.datetime(2026, 10, 27, 5, 30, tzinfo=datetime.UTC)
 CONTEXT = make_context(START, "Europe/Paris")
 BRIEF = {"items": ["Review PR 42", "Dentist at 10:00"]}
+NOTE_PATH = "Daily/2026-10-27.assistant.md"
 NOTE = {
     "type": "note.replace_owned_block",
-    "path": "Daily/2026-10-27.assistant.md",
     "block": "horae-brief",
     "content": "- [ ] Review PR 42\n",
 }
 PUSH = {"type": "notify.push", "body": "2 items today"}
+SKILL = "daily-brief/rank-and-word"
 
 
-def _clock() -> Any:
+def _clock() -> Callable[[], datetime.datetime]:
     ticks = itertools.count()
     return lambda: START + datetime.timedelta(milliseconds=250 * next(ticks))
+
+
+class _Monotonic:
+    """A monotonic clock the tests move by hand (and by 0.25 s per read)."""
+
+    def __init__(self, step: float = 0.25) -> None:
+        self.now = 1000.0
+        self.step = step
+
+    def __call__(self) -> float:
+        self.now += self.step
+        return self.now
 
 
 def _manifest(name: str, intents: tuple[str, ...] = (), **provides: list[str]) -> dict[str, Any]:
@@ -53,15 +78,9 @@ def _manifest(name: str, intents: tuple[str, ...] = (), **provides: list[str]) -
 
 
 def _daily_brief_plugins() -> FixturePlugins:
-    """Synthetic fixture plugins for every tool of the PLAN.md §3.2 daily brief."""
+    """Synthetic fixture plugins for every tool of the PLAN.md §3.2 daily brief. The sink and
+    the notifier have no handler: the engine must never call them."""
     plugins = FixturePlugins()
-
-    def write_note(params: dict[str, Any], data: Any) -> ToolResult:
-        assert params == {"path": "Daily/2026-10-27.assistant.md", "mode": "replace-owned"}
-        content = "".join(f"- [ ] {item}\n" for item in data["items"])
-        intent = {**NOTE, "path": params["path"], "content": content}
-        return ToolResult(data={"written": params["path"]}, intents=[intent])
-
     plugins.add(
         _manifest("github", sources=["github.review_requests"]),
         {"github.review_requests": lambda p, i: [{"title": "Fix the parser", "number": 42}]},
@@ -84,7 +103,7 @@ def _daily_brief_plugins() -> FixturePlugins:
             sources=["obsidian.open_tasks"],
             sinks=["obsidian.write_note"],
         ),
-        {"obsidian.open_tasks": lambda p, i: [], "obsidian.write_note": write_note},
+        {"obsidian.open_tasks": lambda p, i: []},
     )
     plugins.add(
         _manifest("tasks", transforms=["tasks.normalize", "tasks.dedupe_fingerprint"]),
@@ -93,11 +112,11 @@ def _daily_brief_plugins() -> FixturePlugins:
             "tasks.dedupe_fingerprint": lambda p, i: {**i, "deduped": True},
         },
     )
-    plugins.add(_manifest("pack-daily-brief", skills=["daily-brief/rank-and-word"]))
     plugins.add(
-        _manifest("ntfy", ("notify.push",), notifiers=["ntfy.digest"]),
-        {"ntfy.digest": lambda p, i: ToolResult(data=None, intents=[PUSH])},
+        _manifest("pack-daily-brief", ("note.replace_owned_block", "notify.push"), skills=[SKILL]),
+        commit="a" * 40,
     )
+    plugins.add(_manifest("ntfy", ("notify.push",), notifiers=["ntfy.digest"]))
     return plugins
 
 
@@ -105,27 +124,42 @@ def _daily_brief() -> Pipeline:
     return Pipeline.model_validate(yaml.safe_load((EXAMPLES / "daily-brief.yaml").read_text()))
 
 
+def _brief_llm(*more: LlmResponse | LlmError, intents: Any = None) -> FakeLlm:
+    proposed = [NOTE, PUSH] if intents is None else intents
+    return FakeLlm([llm_response(BRIEF, intents=proposed), *more])
+
+
+def _check(record: RunRecord) -> RunRecord:
+    """Every produced record is valid against the JSON Schema and the model, on the wire."""
+    data = json.loads(record.model_dump_json())
+    validator = Draft202012Validator(RUN_RECORD_SCHEMA, format_checker=FormatChecker())
+    errors = [error.message for error in validator.iter_errors(data)]
+    assert errors == []
+    RunRecord.model_validate_json(record.model_dump_json())
+    return record
+
+
 def _run(
     pipeline: Pipeline,
     plugins: FixturePlugins,
-    llm: FakeLlm | None = None,
+    llm: Any = None,
     **kwargs: Any,
 ) -> RunRecord:
+    kwargs.setdefault("clock", _clock())
+    kwargs.setdefault("monotonic", _Monotonic())
     record = asyncio.run(
         execute(
             pipeline,
             run_id="20261027T053000Z-test-01",
             context=CONTEXT,
+            started_at=START,
             plugins=plugins,
             tools=plugins,
             llm=llm,
-            clock=_clock(),
             **kwargs,
         )
     )
-    # The record is a valid RunRecord on the wire too.
-    RunRecord.model_validate_json(record.model_dump_json())
-    return record
+    return _check(record)
 
 
 def _pipeline(*steps: dict[str, Any]) -> Pipeline:
@@ -136,20 +170,28 @@ def _statuses(record: RunRecord) -> list[str]:
     return [step.status for step in record.steps]
 
 
+def _error_kind(record: RunRecord, index: int) -> str:
+    error = record.steps[index].error
+    assert error is not None
+    return error.kind
+
+
 # --- acceptance: the daily brief parses and executes with fixture plugins --------------------
 
 
 def test_daily_brief_end_to_end() -> None:
     plugins = _daily_brief_plugins()
-    llm = FakeLlm([llm_response(BRIEF)])
+    llm = _brief_llm()
     record = _run(_daily_brief(), plugins, llm)
 
     assert record.status == "ok", record.error
     assert record.pipeline == "daily-brief"
     assert record.pipeline_digest == pipeline_digest(_daily_brief())
+    assert record.started_at == START
     assert record.context.vars == {"date": "2026-10-27"}
     assert _statuses(record) == ["ok"] * 5
     assert [s.kind for s in record.steps] == ["collect", "transform", "llm", "act", "notify"]
+    # Sources and transforms are called; the sink and the notifier are not.
     assert plugins.refs == [
         "github.review_requests",
         "calendar.events",
@@ -158,10 +200,7 @@ def test_daily_brief_end_to_end() -> None:
         "tasks.normalize",
         "tasks.dedupe_fingerprint",
         "calendar.prep_tasks",
-        "obsidian.write_note",
-        "ntfy.digest",
     ]
-    # Sources get no input; transforms fold; the llm sees the transform output.
     assert all(call.input is None for call in plugins.calls[:4])
     assert [snap.source for snap in record.inputs] == plugins.refs[:4]
     assert record.inputs[1].params == {"days": 2}
@@ -170,15 +209,33 @@ def test_daily_brief_end_to_end() -> None:
     assert llm.requests[0].input == expected_input
     assert llm.requests[0].budget.usd == 0.05
     assert llm.requests[0].budget.tokens_out == 2000
-    # act and notify receive the llm output; `{{date}}` was rendered from the context.
-    assert plugins.calls[7].input == BRIEF
-    assert plugins.calls[8].input == BRIEF
-    assert [(i.step, i.proposed_by, i.intent.type) for i in record.intents] == [
-        (3, "obsidian.write_note", "note.replace_owned_block"),
-        (4, "ntfy.digest", "notify.push"),
+    # The LLM proposed the note without a path: the core filled it from the act entry.
+    routed = [
+        (i.step, i.proposed_by, i.intent.type, i.applied_by, i.applied_by_step, i.applied_by_call)
+        for i in record.intents
+    ]
+    assert routed == [
+        (2, SKILL, "note.replace_owned_block", "obsidian.write_note", 3, 0),
+        (2, SKILL, "notify.push", "ntfy.digest", 4, 0),
+    ]
+    assert record.intents[0].intent.model_dump()["path"] == NOTE_PATH
+    assert record.steps[3].output == [
+        {
+            "call": "obsidian.write_note",
+            "params": {"path": NOTE_PATH, "mode": "replace-owned"},
+            "intents": [0],
+        }
+    ]
+    assert record.steps[4].output == [
+        {
+            "call": "ntfy.digest",
+            "params": {"when": "07:30", "only_if": "due_today_or_overdue"},
+            "intents": [1],
+        }
     ]
     assert record.llm[0].attempt == 1
     assert record.llm[0].schema_valid is True
+    assert record.llm[0].intents == [NOTE, PUSH]  # raw, as proposed
     assert record.cost.usd == pytest.approx(0.001)
     assert record.input_hash is not None
     assert set(record.plugins) == {
@@ -190,23 +247,49 @@ def test_daily_brief_end_to_end() -> None:
         "pack-daily-brief",
         "ntfy",
     }
+    assert record.plugins["pack-daily-brief"].commit == "a" * 40
     assert record.changes == []  # applying intents is #21/#22
     assert record.steps[0].duration_ms == 250
 
 
-@pytest.mark.parametrize("name", ["external-trigger.yaml", "remind.yaml", "with-timezone.yaml"])
-def test_other_examples_run(name: str) -> None:
+@pytest.mark.parametrize(
+    ("name", "notifier"),
+    [
+        ("external-trigger.yaml", "ntfy.digest"),
+        ("remind.yaml", "ntfy.reminders"),
+        ("with-timezone.yaml", "ntfy.reminders"),
+    ],
+)
+def test_other_examples_run(name: str, notifier: str) -> None:
     plugins = FixturePlugins()
     plugins.add(
-        _manifest("obsidian", sources=["obsidian.open_tasks"]),
-        {"obsidian.open_tasks": lambda p, i: []},
+        _manifest("obsidian", ("notify.push",), sources=["obsidian.open_tasks"]),
+        {"obsidian.open_tasks": lambda p, i: ToolResult(data=[], intents=[PUSH])},
     )
     plugins.add(
         _manifest("ntfy", ("notify.push",), notifiers=["ntfy.digest", "ntfy.reminders"]),
-        {"ntfy.digest": lambda p, i: [], "ntfy.reminders": lambda p, i: []},
     )
     pipeline = Pipeline.model_validate(yaml.safe_load((EXAMPLES / name).read_text()))
-    assert _run(pipeline, plugins).status == "ok"
+    record = _run(pipeline, plugins)
+    assert record.status == "ok", record.error
+    assert [i.applied_by for i in record.intents] == [notifier]
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_execute_calls_no_act_or_notify_tool(dry_run: bool) -> None:
+    """Sinks and notifiers only apply intents later: `execute` never calls them, so a dry run
+    calls nothing that writes."""
+    plugins = _daily_brief_plugins()
+
+    def forbidden(params: dict[str, Any], data: Any) -> Any:
+        raise AssertionError("an act or notify tool was called")
+
+    plugins.handlers["obsidian.write_note"] = forbidden
+    plugins.handlers["ntfy.digest"] = forbidden
+    record = _run(_daily_brief(), plugins, _brief_llm(), dry_run=dry_run)
+    assert record.status == "ok"
+    assert record.dry_run is dry_run
+    assert not {"obsidian.write_note", "ntfy.digest"} & set(plugins.refs)
 
 
 # --- acceptance: no step can change control flow at run time ---------------------------------
@@ -232,48 +315,52 @@ def _flow_plugins(log: list[str]) -> FixturePlugins:
         return handler
 
     plugins.add(
-        _manifest("src", sources=["src.read"], transforms=["src.shape"]),
+        _manifest("src", ("notify.push",), sources=["src.read"], transforms=["src.shape"]),
         {"src.read": tool("src.read", HOSTILE), "src.shape": tool("src.shape", HOSTILE)},
     )
     plugins.add(
-        _manifest("sink", ("notify.push",), sinks=["sink.write"], notifiers=["sink.notify"]),
-        {
-            "sink.write": tool("sink.write", ToolResult(data=HOSTILE, intents=[PUSH])),
-            "sink.notify": tool("sink.notify", HOSTILE),
-        },
+        _manifest(
+            "sink",
+            ("note.create", "notify.push"),
+            sinks=["sink.write"],
+            notifiers=["sink.notify"],
+        ),
     )
-    plugins.add(_manifest("evil", ("http.post",), sinks=["evil.exfiltrate"]), {})
-    plugins.add(_manifest("skills", skills=["skills/rank"]))
+    plugins.add(_manifest("evil", ("http.post",), sinks=["evil.exfiltrate"]))
+    plugins.add(_manifest("skills", ("note.create", "notify.push"), skills=["skills/rank"]))
     return plugins
 
 
+LLM = {"skill": "skills/rank", "model": "default", "budget": {"usd": 1, "tokens_out": 99}}
 FLOW: tuple[dict[str, Any], ...] = (
     {"collect": ["src.read"]},
     {"transform": ["src.shape"]},
-    {"llm": {"skill": "skills/rank", "model": "default", "budget": {"usd": 1, "tokens_out": 99}}},
-    {"act": [{"sink.write": {"day": "{{date}}"}}]},
+    {"llm": LLM},
+    {"act": [{"sink.write": {"path": "Notes/{{date}}.md", "mode": "create", "day": "{{date}}"}}]},
     {"notify": ["sink.notify"]},
 )
+CREATE = {"type": "note.create", "path": "Notes/2026-10-27.md", "content": "hi"}
 
 
 def test_step_like_results_are_plain_data() -> None:
     """Results shaped like steps, gotos, intents or templates never change what runs."""
     log: list[str] = []
     plugins = _flow_plugins(log)
-    llm = FakeLlm([llm_response(HOSTILE)])
+    llm = FakeLlm([llm_response(HOSTILE, intents=[CREATE])])
     record = _run(_pipeline(*FLOW), plugins, llm)
 
     assert record.status == "ok", record.error
-    assert log == ["src.read", "src.shape", "sink.write", "sink.notify"]
+    assert log == ["src.read", "src.shape"]
     assert "evil.exfiltrate" not in plugins.refs
     # Data is passed on verbatim: the template in the data is not rendered.
     assert plugins.calls[1].input[0]["data"]["path"] == "{{date}}"
-    assert plugins.calls[2].input == HOSTILE
+    assert llm.requests[0].input == HOSTILE
     # Params come from the definition and the context only.
-    assert plugins.calls[2].params == {"day": "2026-10-27"}
-    # `intents` inside data proposes nothing; only the declared ToolResult.intents count.
-    assert [i.intent.type for i in record.intents] == ["notify.push"]
-    assert record.steps[3].output == [{"call": "sink.write", "data": HOSTILE}]
+    assert record.steps[3].output[0]["params"]["day"] == "2026-10-27"
+    # `intents` inside data proposes nothing; only the declared intents count.
+    assert [(i.intent.type, i.applied_by) for i in record.intents] == [
+        ("note.create", "sink.write")
+    ]
 
 
 def test_mutating_inputs_or_the_pipeline_changes_nothing() -> None:
@@ -292,54 +379,210 @@ def test_mutating_inputs_or_the_pipeline_changes_nothing() -> None:
     plugins.handlers["src.shape"] = tamper
     record = _run(pipeline, plugins, FakeLlm([llm_response(BRIEF)]))
     assert record.status == "ok"
-    assert log == ["src.read", "src.shape", "sink.write", "sink.notify"]
+    assert log == ["src.read", "src.shape"]
     assert len(record.steps) == 5
     assert record.inputs[0].data == HOSTILE
 
 
-@pytest.mark.parametrize("ref", ["src.read", "src.shape"])
-def test_collect_and_transform_cannot_propose_intents(ref: str) -> None:
+@pytest.mark.parametrize(("ref", "step"), [("src.read", 0), ("src.shape", 1)])
+def test_sources_and_transforms_propose_intents(ref: str, step: int) -> None:
     plugins = _flow_plugins([])
     plugins.handlers[ref] = lambda p, i: ToolResult(data={}, intents=[PUSH])
     record = _run(_pipeline(*FLOW), plugins, FakeLlm([llm_response(BRIEF)]))
+    assert record.status == "ok", record.error
+    assert [(i.step, i.proposed_by, i.applied_by) for i in record.intents] == [
+        (step, ref, "sink.notify")
+    ]
+
+    # Validated against the proposer's own permissions.
+    plugins.add(_manifest("src", sources=["src.read"], transforms=["src.shape"]))
+    record = _run(_pipeline(*FLOW), plugins, FakeLlm([llm_response(BRIEF)]))
     assert record.status == "failed"
-    failed = next(s for s in record.steps if s.status == "failed")
-    assert failed.error is not None
-    assert failed.error.kind == "intent_not_allowed"
+    assert _error_kind(record, step) == "intent_rejected"
+    assert "intent_undeclared" in (record.steps[step].error.message or "")  # type: ignore[union-attr]
     assert record.intents == []
-    assert "sink.write" not in plugins.refs
+
+
+@pytest.mark.parametrize("empty", [None, (), []])
+def test_no_intents_in_any_spelling(empty: Any) -> None:
+    plugins = _flow_plugins([])
+    plugins.handlers["src.read"] = lambda p, i: ToolResult(data={}, intents=empty)
+    record = _run(_pipeline(*FLOW), plugins, FakeLlm([llm_response(BRIEF, intents=empty)]))
+    assert record.status == "ok", record.error
+    assert record.intents == []
+
+
+# --- intent routing and binding --------------------------------------------------------------
+
+
+def _route(intents: list[Any], *act: Any, notify: Any = None) -> RunRecord:
+    plugins = _flow_plugins([])
+    plugins.add(_manifest("other", ("note.create", "notify.push"), sinks=["other.write"]))
+    steps: list[dict[str, Any]] = [{"collect": ["src.read"]}, {"llm": LLM}]
+    if act:
+        steps.append({"act": list(act)})
+    steps.append({"notify": notify or ["sink.notify"]})
+    return _run(_pipeline(*steps), plugins, FakeLlm([llm_response(BRIEF, intents=intents)]))
+
+
+def test_explicit_target_must_match_the_binding() -> None:
+    entry = {"sink.write": {"path": "Notes/{{date}}.md", "mode": "create"}}
+    assert _route([CREATE], entry).status == "ok"
+
+    other_path = {**CREATE, "path": "Secrets/stolen.md"}
+    record = _route([other_path], entry)
+    assert record.status == "failed"
+    assert _error_kind(record, 1) == "intent_unrouted"
+    assert record.steps[1].error is not None
+    assert "stolen" not in record.steps[1].error.message  # the target is not echoed
+    assert record.intents == []
+
+
+def test_omitted_target_is_filled_only_from_one_entry() -> None:
+    first = {"sink.write": {"path": "Notes/{{date}}.md", "mode": "create"}}
+    second = {"other.write": {"path": "Notes/other.md", "mode": "create"}}
+    no_path = {"type": "note.create", "content": "hi"}
+    record = _route([no_path], first)
+    assert record.intents[0].intent.model_dump()["path"] == "Notes/2026-10-27.md"
+
+    record = _route([no_path], first, second)
+    assert record.status == "failed"
+    assert _error_kind(record, 1) == "intent_ambiguous"
+
+    # Naming the target picks the entry.
+    record = _route([{**no_path, "path": "Notes/other.md"}], first, second)
+    assert record.status == "ok"
+    assert [(i.applied_by, i.applied_by_call) for i in record.intents] == [("other.write", 1)]
+
+    # Two entries bound to the same target are ambiguous.
+    record = _route([CREATE], first, {"other.write": first["sink.write"]})
+    assert _error_kind(record, 1) == "intent_ambiguous"
+
+
+def test_sink_must_be_allowed_to_apply_the_type() -> None:
+    plugins = _flow_plugins([])
+    plugins.add(_manifest("weak", ("note.append_section",), sinks=["weak.write"]))
+    steps: list[dict[str, Any]] = [
+        {"collect": ["src.read"]},
+        {"llm": LLM},
+        {"act": [{"weak.write": {"path": "Notes/2026-10-27.md"}}]},
+    ]
+    record = _run(_pipeline(*steps), plugins, FakeLlm([llm_response(BRIEF, intents=[CREATE])]))
+    assert record.status == "failed"
+    assert _error_kind(record, 1) == "intent_unrouted"
+
+
+def test_an_entry_without_a_target_takes_no_targeted_intent() -> None:
+    record = _route([CREATE], "sink.write")
+    assert _error_kind(record, 1) == "intent_unrouted"
+
+
+def test_only_later_entries_take_intents() -> None:
+    plugins = _flow_plugins([])
+    plugins.handlers["src.read"] = lambda p, i: ToolResult(data={}, intents=[PUSH])
+    steps = [{"notify": ["sink.notify"]}, {"collect": ["src.read"]}]
+    record = _run(_pipeline(*steps), plugins)
+    assert record.status == "failed"
+    assert _error_kind(record, 1) == "intent_unrouted"
+
+
+def test_http_post_binds_the_url() -> None:
+    plugins = _flow_plugins([])
+    plugins.add(_manifest("skills", ("http.post",), skills=["skills/rank"]))
+    post = {"type": "http.post", "url": "https://hooks.example.org/x", "body": {"a": 1}}
+    steps: list[dict[str, Any]] = [
+        {"collect": ["src.read"]},
+        {"llm": LLM},
+        {"act": [{"evil.exfiltrate": {"mode": "post", "url": "https://hooks.example.org/x"}}]},
+    ]
+    record = _run(_pipeline(*steps), plugins, FakeLlm([llm_response(BRIEF, intents=[post])]))
+    assert record.status == "ok", record.error
+    other = {**post, "url": "https://hooks.example.org/y"}
+    record = _run(_pipeline(*steps), plugins, FakeLlm([llm_response(BRIEF, intents=[other])]))
+    assert _error_kind(record, 1) == "intent_unrouted"
+
+
+def test_two_notifiers_for_the_same_type_are_ambiguous() -> None:
+    plugins = _flow_plugins([])
+    plugins.add(_manifest("ntfy", ("notify.push",), notifiers=["ntfy.digest"]))
+    plugins.add(_manifest("mail", notifiers=["mail.digest"]))  # may apply nothing
+    plugins.handlers["src.read"] = lambda p, i: ToolResult(data={}, intents=[PUSH])
+    both = _pipeline({"collect": ["src.read"]}, {"notify": ["sink.notify", "ntfy.digest"]})
+    record = _run(both, plugins)
+    assert record.status == "failed"
+    assert _error_kind(record, 0) == "intent_ambiguous"
+
+    one = _pipeline(
+        {"collect": ["src.read"]},
+        {"notify": [{"mail.digest": {"topic": "x"}}, {"ntfy.digest": {"topic": "brief"}}]},
+    )
+    record = _run(one, plugins)
+    assert record.status == "ok", record.error
+    assert [(i.applied_by, i.applied_by_call) for i in record.intents] == [("ntfy.digest", 1)]
+    assert record.steps[1].output == [
+        {"call": "mail.digest", "params": {"topic": "x"}, "intents": []},
+        {"call": "ntfy.digest", "params": {"topic": "brief"}, "intents": [0]},
+    ]
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"mode": "overwrite", "path": "Notes/a.md"},
+        {"mode": 3, "path": "Notes/a.md"},
+        {"mode": "replace-owned"},
+        {"mode": "append-section", "path": "Notes/a.md"},  # sink may not append
+        {"mode": "create", "path": "../escape.md"},
+        {"mode": "create", "path": 7},
+        {"mode": "post", "url": "http://hooks.example.org/"},
+    ],
+)
+def test_invalid_act_bindings_are_plan_errors(params: dict[str, Any]) -> None:
+    plugins = _flow_plugins([])
+    plugins.add(_manifest("sink", ("note.create", "http.post"), sinks=["sink.write"]))
+    record = _run(_pipeline({"act": [{"sink.write": params}]}), plugins)
+    assert record.status == "failed"
+    assert _error_kind(record, 0) == "params_invalid"
+    assert plugins.calls == []
 
 
 # --- step policy -----------------------------------------------------------------------------
 
 
-def _fail(kind: str = "timeout", message: str = "boom") -> Any:
+def _fail(kind: str = "timeout", message: str = "boom", stderr: str = "trace\n") -> Any:
     def handler(params: dict[str, Any], data: Any) -> Any:
-        raise ToolCallError(kind, message, stderr="trace\n")
+        raise ToolCallError(kind, message, stderr=stderr)
 
     return handler
 
 
-def test_collect_partial_failure_degrades_and_continues() -> None:
+def test_collect_partial_failure_skips_act_but_notifies() -> None:
     plugins = _daily_brief_plugins()
     plugins.handlers["calendar.events"] = _fail("plugin_crashed", "exit 3\x1b[2J")
-    record = _run(_daily_brief(), plugins, FakeLlm([llm_response(BRIEF)]))
+    record = _run(_daily_brief(), plugins, _brief_llm())
     assert record.status == "degraded"
-    assert _statuses(record) == ["degraded", "ok", "ok", "ok", "ok"]
+    assert _statuses(record) == ["degraded", "ok", "ok", "skipped", "ok"]
     error = record.steps[0].error
     assert error is not None
     assert error.kind == "source_failed"
     assert "calendar.events: plugin_crashed" in error.message
     assert "\x1b" not in error.message
-    assert record.steps[0].stderr == "--- calendar.events ---\ntrace\n"
+    assert record.steps[0].output == [
+        {"source": "calendar.events", "params": {"days": 2}, "error_kind": "plugin_crashed"}
+    ]
+    assert record.steps[0].stderr == "--- calendar ---\ntrace\n"
     assert [s.source for s in record.inputs] == [
         "github.review_requests",
         "coach.brief",
         "obsidian.open_tasks",
     ]
-    assert len(record.intents) == 2
+    # The note is not written from partial data; the notification still goes out.
+    assert _error_kind(record, 3) == "partial_input"
+    assert [i.intent.type for i in record.intents] == ["notify.push"]
+    assert record.steps[4].output[0]["intents"] == [0]
     assert record.error is not None
     assert record.error.startswith("step 0 (collect)")
+    assert record.input_hash is not None  # the LLM output itself was accepted
 
 
 def test_collect_total_failure_fails_the_run() -> None:
@@ -348,6 +591,7 @@ def test_collect_total_failure_fails_the_run() -> None:
     record = _run(_pipeline(*FLOW), plugins, FakeLlm())
     assert record.status == "failed"
     assert _statuses(record) == ["failed", "skipped", "skipped", "skipped", "skipped"]
+    assert record.steps[0].output == [{"source": "src.read", "params": {}, "error_kind": "timeout"}]
     assert plugins.refs == ["src.read"]
 
 
@@ -357,82 +601,139 @@ def test_transform_failure_fails_the_run() -> None:
     record = _run(_pipeline(*FLOW), plugins, FakeLlm())
     assert record.status == "failed"
     assert _statuses(record) == ["ok", "failed", "skipped", "skipped", "skipped"]
-    assert record.steps[1].error is not None
-    assert record.steps[1].error.kind == "tool_error"
+    assert _error_kind(record, 1) == "tool_error"
+    assert record.input_hash is None
 
 
-def test_unexpected_host_exception_and_non_json_output_are_contained() -> None:
+class _NotAResult:
+    data: Any = None
+
+
+@pytest.mark.parametrize(
+    ("handler", "kind"),
+    [
+        (lambda p, i: (_ for _ in ()).throw(RuntimeError("secret detail")), "host_error"),
+        (_fail("NOT A KIND!", "x"), "host_error"),
+        (lambda p, i: {"bad": {1, 2}}, "output_invalid"),
+        (lambda p, i: {1: "int key"}, "output_invalid"),
+        (lambda p, i: {"nan": float("nan")}, "output_invalid"),
+        (lambda p, i: {"text": "lone \ud800 surrogate"}, "output_invalid"),
+        (lambda p, i: ToolResult(data={}, intents=[{1, 2}]), "output_invalid"),
+    ],
+)
+def test_misbehaving_tools_are_contained(handler: Any, kind: str) -> None:
     plugins = _flow_plugins([])
-
-    def crash(params: dict[str, Any], data: Any) -> Any:
-        raise RuntimeError("secret detail")
-
-    plugins.handlers["src.shape"] = crash
+    plugins.handlers["src.shape"] = handler
     record = _run(_pipeline(*FLOW), plugins, FakeLlm())
-    assert record.steps[1].error is not None
-    assert record.steps[1].error.kind == "host_error"
-    assert "secret detail" not in record.steps[1].error.message
-
-    plugins.handlers["src.shape"] = lambda p, i: {"bad": {1, 2}}
-    record = _run(_pipeline(*FLOW), plugins, FakeLlm())
-    assert record.steps[1].error is not None
-    assert record.steps[1].error.kind == "output_invalid"
-
-
-def test_act_failure_fails_and_drops_the_step_intents() -> None:
-    plugins = _flow_plugins([])
-    plugins.add(
-        _manifest("second", ("notify.push",), sinks=["second.write"]), {"second.write": _fail()}
-    )
-    steps: list[dict[str, Any]] = list(FLOW)
-    steps[3] = {"act": ["sink.write", "second.write"]}
-    record = _run(_pipeline(*steps), plugins, FakeLlm([llm_response(BRIEF)]))
     assert record.status == "failed"
-    assert _statuses(record) == ["ok", "ok", "ok", "failed", "skipped"]
-    assert record.intents == []
+    assert _error_kind(record, 1) == kind
+    assert "secret detail" not in (record.steps[1].error.message or "")  # type: ignore[union-attr]
 
 
-def test_notify_failure_degrades_and_keeps_earlier_intents() -> None:
-    plugins = _daily_brief_plugins()
-    plugins.handlers["ntfy.digest"] = _fail("timeout")
-    record = _run(_daily_brief(), plugins, FakeLlm([llm_response(BRIEF)]))
-    assert record.status == "degraded"
-    assert _statuses(record) == ["ok", "ok", "ok", "ok", "degraded"]
-    assert [i.intent.type for i in record.intents] == ["note.replace_owned_block"]
-    assert record.steps[4].error is not None
-    assert record.steps[4].error.kind == "notifier_failed"
+def test_a_host_returning_no_tool_result_is_contained() -> None:
+    plugins = _flow_plugins([])
+
+    class Host(FixturePlugins):
+        async def call(self, ref: str, params: dict[str, Any], input: Any) -> ToolResult:
+            return _NotAResult()  # type: ignore[return-value]
+
+    host = Host(plugins=plugins.plugins)
+    record = _check(
+        asyncio.run(
+            execute(
+                _pipeline(*FLOW),
+                run_id="r",
+                context=CONTEXT,
+                started_at=START,
+                plugins=host,
+                tools=host,
+                llm=FakeLlm(),
+            )
+        )
+    )
+    assert _error_kind(record, 0) == "source_failed"
+    assert record.steps[0].output == [
+        {"source": "src.read", "params": {}, "error_kind": "output_invalid"}
+    ]
+
+
+def _nested(depth: int) -> Any:
+    value: Any = "leaf"
+    for _ in range(depth):
+        value = [value]
+    return value
+
+
+def test_output_depth_and_size_bounds(tmp_path: Path) -> None:
+    plugins = _flow_plugins([])
+    plugins.handlers["src.read"] = lambda p, i: _nested(MAX_DEPTH + 1)
+    record = _run(_pipeline(*FLOW), plugins, FakeLlm())
+    assert _error_kind(record, 0) == "source_failed"
+    assert record.steps[0].output[0]["error_kind"] == "output_invalid"
+
+    plugins.handlers["src.read"] = lambda p, i: "x" * MAX_OUTPUT_BYTES
+    record = _run(_pipeline(*FLOW), plugins, FakeLlm())
+    assert record.steps[0].output[0]["error_kind"] == "output_too_large"
+
+    # The deepest accepted output survives the store.
+    plugins.handlers["src.read"] = lambda p, i: _nested(MAX_DEPTH)
+    record = _run(_pipeline({"collect": ["src.read"]}), plugins)
+    assert record.status == "ok"
+    with Store.open(tmp_path / "state.db") as store:
+        store.begin_run(record.id, record.pipeline, START)
+        store.save_run(record)
+        assert store.get_run(record.id) == record
 
 
 def test_rejected_intents_fail_the_run_and_record_egress() -> None:
     plugins = _daily_brief_plugins()
     post = {"type": "http.post", "url": "https://evil.example.org/x", "body": {}}
-    plugins.handlers["ntfy.digest"] = lambda p, i: ToolResult(intents=[PUSH, post])
-    record = _run(_daily_brief(), plugins, FakeLlm([llm_response(BRIEF)]))
+    record = _run(_daily_brief(), plugins, _brief_llm(intents=[PUSH, post]))
     assert record.status == "failed"
-    assert record.steps[4].error is not None
-    assert record.steps[4].error.kind == "intent_rejected"
-    assert [i.intent.type for i in record.intents] == ["note.replace_owned_block"]
+    assert _error_kind(record, 2) == "intent_rejected"
+    assert record.intents == []
+    assert record.input_hash is None
 
-    plugins.add(_manifest("ntfy", ("http.post",), notifiers=["ntfy.digest"]))
-    record = _run(_daily_brief(), plugins, FakeLlm([llm_response(BRIEF)]))
+    plugins.add(_manifest("pack-daily-brief", ("http.post",), skills=[SKILL]))
+    record = _run(_daily_brief(), plugins, _brief_llm(intents=[post]))
     assert record.status == "failed"
     assert [v.kind for v in record.violations] == ["egress_blocked"]
 
 
 def test_run_wide_intent_cap() -> None:
     plugins = _flow_plugins([])
-    plugins.add(
-        _manifest("sink", ("notify.push",), sinks=["sink.write"], notifiers=["sink.notify"]),
-        {
-            "sink.write": lambda p, i: ToolResult(intents=[PUSH] * MAX_RUN_INTENTS),
-            "sink.notify": lambda p, i: ToolResult(intents=[PUSH]),
-        },
-    )
+    plugins.handlers["src.read"] = lambda p, i: ToolResult(intents=[PUSH] * MAX_RUN_INTENTS)
+    plugins.handlers["src.shape"] = lambda p, i: ToolResult(intents=[PUSH])
     record = _run(_pipeline(*FLOW), plugins, FakeLlm([llm_response(BRIEF)]))
     assert record.status == "failed"
-    assert record.steps[4].error is not None
-    assert record.steps[4].error.kind == "run_intents_exceeded"
-    assert len(record.intents) == MAX_RUN_INTENTS
+    assert _error_kind(record, 1) == "run_intents_exceeded"
+    assert record.intents == []  # the notify step that would record them never ran
+
+
+def test_stderr_is_shared_between_calls_head_and_tail() -> None:
+    plugins = _daily_brief_plugins()
+    huge = "HEAD" + "x" * 100_000 + "TAIL"
+    for ref in ("github.review_requests", "calendar.events"):
+        plugins.handlers[ref] = _fail("tool_error", "x", stderr=huge)
+    record = _run(_daily_brief(), plugins, _brief_llm())
+    stderr = record.steps[0].stderr
+    assert stderr is not None
+    assert len(stderr) <= 65536
+    assert stderr.startswith("--- github ---\nHEAD")
+    assert "TAIL\n--- calendar ---\nHEAD" in stderr
+    assert stderr.endswith("TAIL")
+
+
+def test_timestamps_never_go_backwards() -> None:
+    plugins = _flow_plugins([])
+    ticks = itertools.count()
+
+    def backwards() -> datetime.datetime:
+        return START - datetime.timedelta(seconds=next(ticks))
+
+    record = _run(_pipeline(*FLOW), plugins, FakeLlm([llm_response(BRIEF)]), clock=backwards)
+    assert record.finished_at == START
+    assert all(s.finished_at is None or s.started_at <= s.finished_at for s in record.steps)  # type: ignore[operator]
 
 
 # --- the llm step ----------------------------------------------------------------------------
@@ -440,20 +741,19 @@ def test_run_wide_intent_cap() -> None:
 
 def test_llm_schema_failure_retries_once_then_degrades() -> None:
     plugins = _flow_plugins([])
-    bad = llm_response({"oops": 1}, schema_errors=["items: missing"])
+    bad = llm_response({"oops": 1}, schema_errors=["items: missing"], intents=[CREATE])
     llm = FakeLlm([bad, llm_response({"still": "bad"}, schema_errors=["items: missing"])])
     record = _run(_pipeline(*FLOW), plugins, llm)
     assert record.status == "degraded"
     assert _statuses(record) == ["ok", "ok", "degraded", "skipped", "skipped"]
-    assert record.steps[2].error is not None
-    assert record.steps[2].error.kind == "schema_invalid"
+    assert _error_kind(record, 2) == "schema_invalid"
     assert [r.attempt for r in llm.requests] == [1, 2]
     assert llm.requests[1].repair == ("items: missing",)
     assert llm.requests[1].input == llm.requests[0].input
     assert llm.requests[1].budget.usd == pytest.approx(0.999)
     assert [c.schema_valid for c in record.llm] == [False, False]
     assert record.intents == []  # invalid output is never applied
-    assert "sink.write" not in plugins.refs
+    assert record.input_hash is None
 
 
 def test_llm_repair_succeeds() -> None:
@@ -462,7 +762,7 @@ def test_llm_repair_succeeds() -> None:
     record = _run(_pipeline(*FLOW), plugins, llm)
     assert record.status == "ok"
     assert [c.attempt for c in record.llm] == [1, 2]
-    assert plugins.calls[2].input == BRIEF
+    assert record.steps[2].output == BRIEF
     assert record.cost.tokens_out == 20
 
 
@@ -470,17 +770,69 @@ def test_llm_repair_succeeds() -> None:
     ("script", "kind"),
     [
         ([LlmError("backend_unavailable", "503")], "backend_unavailable"),
+        ([LlmError("Not A Kind", "503")], "host_error"),
         ([llm_response(BRIEF, tokens_out=100)], "budget_exceeded"),
         ([llm_response({}, schema_errors=["x"], usd=1.0)], "budget_exceeded"),
         ([llm_response({"x": float("inf")})], "output_invalid"),
+        ([llm_response({"x": "lone \udfff"})], "output_invalid"),
+        ([llm_response(_nested(MAX_DEPTH + 1))], "output_invalid"),
+        ([llm_response("x" * (MAX_OUTPUT_BYTES + 1))], "output_too_large"),
     ],
 )
 def test_llm_failures_degrade(script: list[LlmResponse | LlmError], kind: str) -> None:
     record = _run(_pipeline(*FLOW), _flow_plugins([]), FakeLlm(script))
     assert record.status == "degraded"
-    assert record.steps[2].error is not None
-    assert record.steps[2].error.kind == kind
+    assert _error_kind(record, 2) == kind
     assert _statuses(record)[3:] == ["skipped", "skipped"]
+    assert record.input_hash is None
+
+
+def test_failed_attempt_usage_counts_towards_cost_and_budget() -> None:
+    plugins = _flow_plugins([])
+    usage = llm_response(None, tokens_out=40, usd=0.4).usage
+    llm = FakeLlm([LlmError("backend_error", "cut off", usage=usage)])
+    record = _run(_pipeline(*FLOW), plugins, llm)
+    assert record.status == "degraded"
+    assert record.cost.usd == pytest.approx(0.4)
+    assert record.cost.tokens_out == 40
+
+
+def test_cached_responses_cost_nothing() -> None:
+    plugins = _flow_plugins([])
+    cached = llm_response(BRIEF, tokens_out=500, usd=5.0, cached=True)  # over budget if counted
+    record = _run(_pipeline(*FLOW), plugins, FakeLlm([cached]))
+    assert record.status == "ok", record.error
+    assert record.llm[0].cached is True
+    assert record.cost.usd == 0.0
+    assert record.llm[0].usage.tokens_out == 0
+
+
+def test_one_deadline_covers_both_attempts() -> None:
+    clock = _Monotonic(step=0.0)
+    seen: list[float] = []
+
+    class Slowish:
+        async def complete(self, request: LlmRequest) -> LlmResponse:
+            seen.append(request.timeout_s)
+            clock.now += 0.75
+            return llm_response({}, schema_errors=["x"])
+
+    steps: list[dict[str, Any]] = list(FLOW)
+    steps[2] = {"llm": {**LLM, "timeout_s": 1.0}}
+    record = _run(_pipeline(*steps), _flow_plugins([]), Slowish(), monotonic=clock)
+    assert seen == [pytest.approx(1.0), pytest.approx(0.25)]
+    assert record.status == "degraded"
+
+    clock.now, seen[:] = 0.0, []
+
+    class TooSlow(Slowish):
+        async def complete(self, request: LlmRequest) -> LlmResponse:
+            clock.now += 1.5
+            return llm_response({}, schema_errors=["x"])
+
+    record = _run(_pipeline(*steps), _flow_plugins([]), TooSlow(), monotonic=clock)
+    assert _error_kind(record, 2) == "timeout"
+    assert len(record.llm) == 1  # no second attempt after the deadline
 
 
 class _SlowLlm:
@@ -494,28 +846,37 @@ class _BuggyLlm:
         raise KeyError("bug")
 
 
-def test_llm_timeout_and_backend_bug_degrade() -> None:
+class _WrongTypeLlm:
+    async def complete(self, request: LlmRequest) -> LlmResponse:
+        return {"output": 1}  # type: ignore[return-value]
+
+
+class _BadModelLlm:
+    async def complete(self, request: LlmRequest) -> LlmResponse:
+        response = llm_response(BRIEF)
+        return LlmResponse(**{**response.__dict__, "model": "has spaces in it"})
+
+
+@pytest.mark.parametrize(
+    ("backend", "kind"),
+    [
+        (_SlowLlm(), "timeout"),
+        (_BuggyLlm(), "host_error"),
+        (_WrongTypeLlm(), "output_invalid"),
+        (_BadModelLlm(), "output_invalid"),
+    ],
+)
+def test_misbehaving_backends_degrade(backend: Any, kind: str) -> None:
     steps: list[dict[str, Any]] = list(FLOW)
-    steps[2] = {"llm": {**FLOW[2]["llm"], "timeout_s": 0.01}}
-    plugins = _flow_plugins([])
-    for backend, kind in ((_SlowLlm(), "timeout"), (_BuggyLlm(), "host_error")):
-        record = asyncio.run(
-            execute(
-                _pipeline(*steps),
-                run_id="r",
-                context=CONTEXT,
-                plugins=plugins,
-                tools=plugins,
-                llm=backend,
-            )
-        )
-        assert record.status == "degraded"
-        assert record.steps[2].error is not None
-        assert record.steps[2].error.kind == kind
+    steps[2] = {"llm": {**LLM, "timeout_s": 0.01}}
+    record = _run(_pipeline(*steps), _flow_plugins([]), backend, monotonic=_Monotonic(0.0))
+    assert record.status == "degraded"
+    assert _error_kind(record, 2) == kind
 
 
 def test_llm_intents_are_validated_against_the_skill_plugin() -> None:
     plugins = _flow_plugins([])
+    plugins.add(_manifest("skills", skills=["skills/rank"]))
     record = _run(_pipeline(*FLOW), plugins, FakeLlm([llm_response(BRIEF, intents=[PUSH])]))
     assert record.status == "failed"  # `skills` declares no intents
     assert record.steps[2].error is not None
@@ -527,15 +888,160 @@ def test_llm_intents_are_validated_against_the_skill_plugin() -> None:
     assert record.intents[0].proposed_by == "skills/rank"
 
 
-def test_unchanged_llm_input_is_a_noop_without_a_call() -> None:
-    plugins = _flow_plugins([])
-    first = _run(_pipeline(*FLOW), plugins, FakeLlm([llm_response(BRIEF)]))
+# --- unchanged input (D2) --------------------------------------------------------------------
+
+
+def _previous(record: RunRecord) -> PreviousLlm:
+    assert record.input_hash is not None
+    call = record.llm[-1]
+    return PreviousLlm(
+        input_hash=record.input_hash,
+        output=call.response,
+        intents=call.intents,
+        skill_version=call.skill_version,
+        model=call.model,
+        backend=call.backend,
+    )
+
+
+def test_unchanged_input_reuses_the_previous_output_and_routes_again() -> None:
+    plugins = _daily_brief_plugins()
+    first = _run(_daily_brief(), plugins, _brief_llm())
     llm = FakeLlm()
-    second = _run(_pipeline(*FLOW), plugins, llm, previous_input_hash=first.input_hash)
-    assert second.status == "noop"
+    second = _run(_daily_brief(), plugins, llm, previous=_previous(first))
     assert llm.requests == []
-    assert _statuses(second) == ["ok", "ok", "skipped", "skipped", "skipped"]
+    assert second.status == "ok"
+    assert _statuses(second) == ["ok"] * 5
     assert second.input_hash == first.input_hash
+    assert second.llm[0].cached is True
+    assert second.llm[0].usage.usd == 0.0
+    assert second.cost.usd == 0.0
+    assert second.steps[2].output == BRIEF
+    assert [i.intent for i in second.intents] == [i.intent for i in first.intents]
+    # The reused run can be reused again.
+    third = _run(_daily_brief(), plugins, FakeLlm(), previous=_previous(second))
+    assert third.status == "ok"
+
+
+def test_unchanged_input_with_nothing_to_apply_is_a_noop() -> None:
+    plugins = _daily_brief_plugins()
+    first = _run(_daily_brief(), plugins, _brief_llm(intents=[]))
+    assert first.status == "ok"
+    second = _run(_daily_brief(), plugins, FakeLlm(), previous=_previous(first))
+    assert second.status == "noop"
+    assert _statuses(second) == ["ok"] * 5
+
+
+def test_changed_source_data_calls_the_llm() -> None:
+    plugins = _daily_brief_plugins()
+    plugins.handlers["tasks.normalize"] = lambda p, i: {"data": [s["data"] for s in i]}
+    previous = _previous(_run(_daily_brief(), plugins, _brief_llm()))
+    plugins.handlers["obsidian.open_tasks"] = lambda p, i: [{"done": "Buy milk"}]
+    llm = _brief_llm()
+    record = _run(_daily_brief(), plugins, llm, previous=previous)
+    assert len(llm.requests) == 1
+    assert record.input_hash != previous.input_hash
+
+
+@pytest.mark.parametrize("change", ["version", "commit", "model_target", "model_alias", "skill"])
+def test_cache_key_covers_skill_plugin_and_model(change: str) -> None:
+    plugins = _daily_brief_plugins()
+    models = {"default": "model-a", "other": "model-a"}
+    previous = _previous(_run(_daily_brief(), plugins, _brief_llm(), models=models))
+    pipeline = _daily_brief()
+    pack = _manifest("pack-daily-brief", ("note.replace_owned_block", "notify.push"))
+    if change == "version":
+        plugins.add({**pack, "version": "0.2.0", "provides": {"skills": [SKILL]}}, commit="a" * 40)
+    elif change == "commit":
+        plugins.add({**pack, "provides": {"skills": [SKILL]}}, commit="b" * 40)
+    elif change == "model_target":
+        models = {"default": "model-b"}
+    elif change == "model_alias":
+        models = {"default": "model-a"}  # `other` is unknown: the alias itself is hashed
+        llm_step = pipeline.steps[2]
+        llm_step.llm.model = "other-unknown"  # type: ignore[union-attr]
+    else:
+        plugins.add({**pack, "provides": {"skills": [SKILL, "daily-brief/other"]}}, commit="a" * 40)
+        pipeline.steps[2].llm.skill = "daily-brief/other"  # type: ignore[union-attr]
+    llm = _brief_llm()
+    record = _run(pipeline, plugins, llm, previous=previous, models=models)
+    assert len(llm.requests) == 1, change
+    assert record.input_hash != previous.input_hash
+
+
+def test_same_model_target_keeps_the_key() -> None:
+    plugins = _daily_brief_plugins()
+    previous = _previous(_run(_daily_brief(), plugins, _brief_llm(), models={"default": "m"}))
+    llm = FakeLlm()
+    _run(_daily_brief(), plugins, llm, previous=previous, models={"default": "m"})
+    assert llm.requests == []
+
+
+def test_unusable_previous_output_calls_the_llm() -> None:
+    plugins = _daily_brief_plugins()
+    first = _run(_daily_brief(), plugins, _brief_llm())
+    previous = _previous(first)
+    broken = PreviousLlm(**{**previous.__dict__, "output": {"x": float("nan")}})
+    llm = _brief_llm()
+    record = _run(_daily_brief(), plugins, llm, previous=broken)
+    assert len(llm.requests) == 1
+    assert record.llm[0].cached is False
+
+
+def _store_run(
+    store: Store, run_id: str, *, llm: FakeLlm, dry_run: bool = False, **kwargs: Any
+) -> RunRecord:
+    """One real run through the store, as #19 will do it."""
+    started = START + datetime.timedelta(minutes=len(store.list_runs()))
+    store.begin_run(run_id, "daily-brief", started, dry_run=dry_run)
+    record = _check(
+        asyncio.run(
+            execute(
+                _daily_brief(),
+                run_id=run_id,
+                context=CONTEXT,
+                started_at=started,
+                plugins=kwargs.get("plugins") or _daily_brief_plugins(),
+                tools=kwargs.get("plugins") or _daily_brief_plugins(),
+                llm=llm,
+                dry_run=dry_run,
+                previous=store.last_accepted_llm("daily-brief"),
+            )
+        )
+    )
+    if "status" in kwargs:  # e.g. the apply step (#21/#22) failed
+        record = record.model_copy(update={"status": kwargs["status"]})
+    store.save_run(record)
+    return record
+
+
+def test_store_previous_output_is_reused(tmp_path: Path) -> None:
+    with Store.open(tmp_path / "state.db") as store:
+        assert store.last_accepted_llm("daily-brief") is None
+        first = _store_run(store, "r1", llm=_brief_llm())
+        assert store.get_run("r1") == first
+        llm = FakeLlm()
+        second = _store_run(store, "r2", llm=llm)
+        assert llm.requests == []
+        assert second.llm[0].cached is True
+
+
+@pytest.mark.parametrize("case", ["degraded", "dry", "failed"])
+def test_store_reruns_after_an_unaccepted_run(tmp_path: Path, case: str) -> None:
+    with Store.open(tmp_path / "state.db") as store:
+        if case == "degraded":
+            plugins = _daily_brief_plugins()
+            plugins.handlers["coach.brief"] = _fail()
+            first = _store_run(store, "r1", llm=_brief_llm(), plugins=plugins)
+            assert first.status == "degraded"
+        elif case == "dry":
+            _store_run(store, "r1", llm=_brief_llm(), dry_run=True)
+        else:
+            _store_run(store, "r1", llm=_brief_llm(), status="failed")
+        assert store.last_accepted_llm("daily-brief") is None
+        llm = _brief_llm()
+        _store_run(store, "r2", llm=llm)
+        assert len(llm.requests) == 1
 
 
 # --- planning --------------------------------------------------------------------------------
@@ -547,13 +1053,14 @@ def test_unchanged_llm_input_is_a_noop_without_a_call() -> None:
         ([{"collect": ["nobody.read"]}], "plugin_unknown", 0),
         ([{"collect": ["src.read"]}, {"act": ["src.shape"]}], "tool_not_provided", 1),
         ([{"act": [{"sink.write": {"p": "{{nope}}"}}]}], "template_error", 0),
-        ([{"collect": ["src.read"]}, FLOW[2]], "llm_unavailable", 1),
-        (
-            [{"llm": {**FLOW[2]["llm"], "skill": "nobody/rank"}}],
-            "plugin_unknown",
-            0,
-        ),
-        ([{"llm": {**FLOW[2]["llm"], "skill": "skills/other"}}], "tool_not_provided", 0),
+        ([{"collect": [{"src.read": {"{{date}}": 1}}]}], "template_error", 0),
+        ([{"collect": [{"src.read": {"x": float("nan")}}]}], "params_invalid", 0),
+        ([{"collect": [{"src.read": {"x": [float("inf")]}}]}], "params_invalid", 0),
+        ([{"collect": [{"src.read": {"x": START}}]}], "params_invalid", 0),
+        ([{"collect": ["src.read"]}, {"llm": LLM}], "llm_unavailable", 1),
+        ([{"llm": {**LLM, "skill": "nobody/rank"}}], "plugin_unknown", 0),
+        ([{"llm": {**LLM, "skill": "skills/other"}}], "tool_not_provided", 0),
+        ([{"collect": ["src.read"] * 200}, {"collect": ["src.read"] * 57}], "plan_too_large", 1),
     ],
 )
 def test_planning_errors_fail_before_any_call(
@@ -564,17 +1071,117 @@ def test_planning_errors_fail_before_any_call(
     record = _run(_pipeline(*steps), plugins, FakeLlm() if has_llm else None)
     assert record.status == "failed"
     assert plugins.calls == []
-    error = record.steps[index].error
-    assert error is not None
-    assert error.kind == kind
+    assert _error_kind(record, index) == kind
     assert [s.status for i, s in enumerate(record.steps) if i != index] == ["skipped"] * (
         len(steps) - 1
     )
 
 
-def test_dry_run_is_recorded() -> None:
+def test_too_many_plugins_is_a_plan_error() -> None:
+    plugins = FixturePlugins()
+    for n in range(257):
+        plugins.add(_manifest(f"p{n}", sources=[f"p{n}.read"]), {f"p{n}.read": lambda p, i: 1})
+    record = _run(
+        _pipeline(
+            {"collect": [f"p{n}.read" for n in range(200)]},
+            {"collect": [f"p{n}.read" for n in range(200, 257)]},
+        ),
+        plugins,
+    )
+    assert _error_kind(record, 1) == "plan_too_large"
+    assert plugins.calls == []
+
+
+def test_context_vars_cannot_override_now_or_timezone() -> None:
+    context = CONTEXT.model_copy(update={"vars": {"date": "2026-10-27", "now": "never"}})
     plugins = _flow_plugins([])
-    record = _run(_pipeline(*FLOW), plugins, FakeLlm([llm_response(BRIEF)]), dry_run=True)
-    assert record.dry_run is True
-    assert record.changes == []
-    assert json.loads(record.model_dump_json())["dry_run"] is True
+    record = _check(
+        asyncio.run(
+            execute(
+                _pipeline({"collect": ["src.read"]}),
+                run_id="r",
+                context=context,
+                started_at=START,
+                plugins=plugins,
+                tools=plugins,
+            )
+        )
+    )
+    assert _error_kind(record, 0) == "template_error"
+
+
+# --- hooks, cancellation, the store ----------------------------------------------------------
+
+
+def test_on_step_sees_every_step_in_order(tmp_path: Path) -> None:
+    plugins = _daily_brief_plugins()
+    seen: list[tuple[int, str]] = []
+    with Store.open(tmp_path / "state.db") as store:
+        store.begin_run("r1", "daily-brief", START)
+
+        async def hook(index: int, step: StepRecord) -> None:
+            seen.append((index, step.kind))
+            store.record_step("r1", index, step)
+
+        record = _run(_daily_brief(), plugins, _brief_llm(), on_step=hook)
+        assert seen == [(i, s.kind) for i, s in enumerate(record.steps)]
+        assert store.steps("r1") == record.steps
+        store.save_run(record.model_copy(update={"id": "r1"}))
+        assert store.get_run("r1") is not None
+
+
+def test_cancellation_carries_the_partial_record() -> None:
+    plugins = _daily_brief_plugins()
+    started = asyncio.Event()
+
+    async def scenario() -> RunRecord:
+        class Blocking:
+            async def complete(self, request: LlmRequest) -> LlmResponse:
+                started.set()
+                await asyncio.sleep(60)
+                raise AssertionError("unreachable")
+
+        task = asyncio.create_task(
+            execute(
+                _daily_brief(),
+                run_id="r",
+                context=CONTEXT,
+                started_at=START,
+                plugins=plugins,
+                tools=plugins,
+                llm=Blocking(),
+            )
+        )
+        await started.wait()
+        task.cancel()
+        with pytest.raises(RunCancelled) as raised:
+            await task
+        assert isinstance(raised.value, asyncio.CancelledError)
+        return raised.value.record
+
+    record = _check(asyncio.run(scenario()))
+    assert record.status == "failed"
+    assert _statuses(record) == ["ok", "ok", "failed", "skipped", "skipped"]
+    assert _error_kind(record, 2) == "cancelled"
+
+
+def test_store_needs_an_accepted_llm_step(tmp_path: Path) -> None:
+    plugins = _flow_plugins([])
+    with_llm = _pipeline({"collect": ["src.read"]}, {"llm": LLM})
+    no_llm = _run(_pipeline({"collect": ["src.read"]}), plugins)
+    invalid = llm_response({}, schema_errors=["x"])
+    degraded = _run(with_llm, plugins, FakeLlm([invalid, invalid]))
+    ok = _run(with_llm, plugins, FakeLlm([llm_response(BRIEF)]))
+    forged = degraded.model_copy(update={"status": "ok", "input_hash": "0" * 64})
+    elsewhere = ok.model_copy(update={"llm": [ok.llm[0].model_copy(update={"step": 5})]})
+    for n, record in enumerate([no_llm, forged, elsewhere]):
+        with Store.open(tmp_path / f"state-{n}.db") as store:
+            store.save_run(record)
+            assert store.last_accepted_llm("test") is None
+
+
+def test_route_fields_go_together() -> None:
+    with pytest.raises(ValidationError, match="go together"):
+        ProposedIntent.model_validate(
+            {"step": 0, "proposed_by": "a.b", "intent": PUSH, "applied_by": "c.d"}
+        )
