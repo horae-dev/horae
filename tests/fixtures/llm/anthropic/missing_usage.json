@@ -1,0 +1,17 @@
+{
+  "status": 200,
+  "body": {
+    "id": "msg_01SyntheticFixture000000",
+    "type": "message",
+    "role": "assistant",
+    "model": "claude-fixture-1",
+    "content": [
+      {
+        "type": "text",
+        "text": "{\"items\": [\"Review PR 42\"], \"summary\": \"One review is waiting.\"}"
+      }
+    ],
+    "stop_reason": "end_turn",
+    "stop_sequence": null
+  }
+}

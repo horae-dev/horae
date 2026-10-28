@@ -1113,3 +1113,70 @@ loosened later without breaking a valid file.
       the LLM layer is reached. #27 also changes `open_ports` (`horae.runner._ports`), which
       this change touches too: the merge keeps both (the skill loader becomes the
       `PromptSource` of the `ModelBackends` built there).
+
+### Provisional decisions (#30, pending maintainer review)
+
+40. **The `openai-compatible` and `ollama` backends (#30).** One compatible v1 addition and
+    the rules of `horae.llm.backends.openai_compatible` and `horae.llm.backends.ollama`, which
+    keep every rule of decision 38 (render/send, the key only from the declared secret,
+    rebuilt headers, the explicit network path, quiet loggers, strict JSON, the pre-flight
+    budget, clean error chains, the summary recorded as `LlmCall.request`, reserved
+    `intents`) and share its code (`horae.llm.backends._shared`):
+    - **contract change** (optional): `models.<alias>.structured_output`, `json_schema`
+      (the default when unset), `json_object` or `none`, accepted for `backend:
+      openai-compatible` only (the model and the JSON Schema both refuse it on another
+      backend). It is the fallback for a server that lacks JSON Schema structured output;
+    - **A. no SDK**: both talk to their API with a direct `httpx2` client (one JSON `POST`).
+      The `openai` SDK would add a dependency and what the `anthropic` backend has to
+      neutralise (`OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_ORG_ID` /
+      `OPENAI_PROJECT_ID`, its own retries, platform headers and debug logging); the
+      `ollama` client reads `OLLAMA_HOST`. Nothing here reads the environment. The posted
+      bytes are the canonical JSON of the rendered payload, so they equal
+      `RenderedRequest.body()` byte for byte;
+    - **B. what `base_url` means**: for `openai-compatible` it is the API root **with** its
+      version prefix, as the OpenAI SDKs take it (`https://openrouter.ai/api/v1`,
+      `https://api.mistral.ai/v1`, `http://vllm:8000/v1`), and the only request is `POST
+      <base_url>/chat/completions`; for `ollama` it is the server root (`http://ollama:11434`)
+      and the only request is `POST <base_url>/api/chat`. A request to any other origin,
+      path or query is refused (`host_error`). `http://` follows decision 24 (loopback,
+      private and single-label hosts only);
+    - **C. the key is optional**: `secret` is optional for both; when declared it is sent as
+      `Authorization: Bearer <key>` (for `ollama`, to a proxy in front of it), else no
+      `Authorization` header is sent. The headers are exactly `host`, `accept`,
+      `content-type`, `content-length`, `user-agent: horae` and that one;
+    - **D. `openai-compatible` request**: `model`, `max_tokens`, `stream: false` and two
+      messages (`system`: the preamble, then the skill's prompt; `user`: the tagged input and
+      schema errors of decision 38). `json_schema` sends `response_format: {type:
+      json_schema, json_schema: {name: horae_output, schema, strict: false}}`: `strict:
+      false` because OpenAI's strict mode refuses schemas that do not mark every property
+      required or that use keywords it lacks (`maxLength`, `pattern`), and the #31 validator
+      checks the full schema anyway (decision 38 G). `json_object` sends `{type:
+      json_object}` and `none` no `response_format`; both append the schema to the system
+      prompt. `max_tokens` (not `max_completion_tokens`) because the compatible servers
+      take it;
+    - **E. `openai-compatible` response**: exactly one choice, `finish_reason: stop`, and
+      `message.content` one JSON value. `length` / `model_length` (truncation), a non-empty
+      `message.refusal` or `content_filter` (refusal), `tool_calls` / `function_call` and any
+      other finish reason are `output_invalid` with the usage. Usage is `prompt_tokens` /
+      `completion_tokens`; a reported `prompt_tokens_details.cached_tokens` (at most
+      `prompt_tokens`) becomes `cache_read_tokens` and is taken out of `tokens_in`. An error
+      status carries the API's error `type` when it is a short identifier;
+    - **F. `ollama` request and response**: `model`, `stream: false`, `format` (the output
+      schema: Ollama's structured outputs, Ollama 0.5 or later), `options.num_predict` (the
+      `max_tokens`) and the same two messages. `done` must be `true`; `done_reason: length` is
+      a truncation, tool calls and any reason but `stop` (or none, as older servers send) are
+      `output_invalid`. Usage is `prompt_eval_count` / `eval_count`; Ollama may omit
+      `prompt_eval_count` for a cached prompt, and a missing count is charged conservatively
+      (decision 38). Ollama's `error` text is never shown: the message has the status only
+      (a missing model is HTTP 404, `invalid_request`);
+    - **G. cost and `horae doctor`**: without a `price` a call costs `usd: 0` (`priced:
+      false`), as for every backend. `horae doctor` treats `ollama` as local (no price
+      warning) and `openai-compatible` as cloud (the warning of decision 38 A, which never
+      fails the check), even when its `base_url` is a local vLLM: the backend name is the
+      only signal kept simple here. The #34 design note proposes an explicit `local:` flag
+      per alias; when it lands it replaces this rule;
+    - **H. shared conformance suite**: `tests/test_llm_backends_shared.py` runs the same
+      tests over `anthropic`, `openai-compatible` and `ollama` with recorded synthetic
+      responses (`tests/fixtures/llm/<backend>/`: success, truncation, refusal where the API
+      has one, tool call, 401, 429, 5xx, malformed JSON, missing usage); a new backend joins
+      it by adding a `Kind` in `tests/llm_backend_kinds.py`.

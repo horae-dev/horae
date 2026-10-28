@@ -341,3 +341,36 @@ def test_doctor_warnings_do_not_hide_errors(tmp_path: Path) -> None:
     assert severities == ["error", "warning"]
     text = runner.invoke(app, ["doctor", "-i", str(root)])
     assert "1 problem found" in text.stdout
+
+
+# --- openai-compatible and ollama (#30, decision 40) ----------------------------------------
+
+OLLAMA = {"backend": "ollama", "model": "llama3", "base_url": "http://ollama:11434"}
+OPENAI = {
+    "backend": "openai-compatible",
+    "model": "mistral-small",
+    "base_url": "https://llm-gateway.internal.test/v1",
+}
+
+
+def test_doctor_accepts_an_unpriced_ollama_alias(tmp_path: Path) -> None:
+    root = _write(tmp_path / "instance", {"default": OLLAMA}, [LLM_STEP])
+    code, report = _doctor(root)
+    assert (code, report["problems"]) == (0, [])  # local: no price warning
+
+
+def test_doctor_warns_about_an_unpriced_openai_compatible_alias(tmp_path: Path) -> None:
+    root = _write(tmp_path / "instance", {"default": OPENAI}, [LLM_STEP])
+    code, report = _doctor(root)
+    assert code == 0
+    [warning] = report["problems"]
+    assert warning["severity"] == "warning"
+    assert "backend 'openai-compatible'" in warning["message"]
+
+
+def test_doctor_reports_a_missing_openai_compatible_secret(tmp_path: Path) -> None:
+    spec = {**OPENAI, "secret": "LLM_API_KEY", "price": ANTHROPIC["price"]}
+    root = _write(tmp_path / "instance", {"default": spec}, [LLM_STEP])
+    code, report = _doctor(root)
+    assert code == 1
+    assert any("LLM_API_KEY" in p["message"] for p in report["problems"])

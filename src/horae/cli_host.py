@@ -126,8 +126,10 @@ def _command_problems(registry: HostRegistry) -> list[Problem]:
     return problems
 
 
-CLOUD_BACKENDS = frozenset({"anthropic"})
-"""Backends billed per token, whose aliases `horae doctor` expects to have a `price`."""
+CLOUD_BACKENDS = frozenset({"anthropic", "openai-compatible"})
+"""Backends billed per token, whose aliases `horae doctor` expects to have a `price`. `ollama`
+is local (no warning); an `openai-compatible` alias is treated as cloud even when it points
+at a local server (a warning, which does not fail the check; schemas decision 40)."""
 
 
 def _backend_problems(instance: Instance) -> list[Problem]:

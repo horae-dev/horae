@@ -47,6 +47,15 @@ BACKENDS_NEEDING_HTTPS: tuple[LlmBackend, ...] = ("anthropic",)
 """Cloud backends whose `base_url`, when given, must be `https://` (the API key and the data
 must not cross the network in clear; schemas decision 38 C)."""
 
+StructuredOutput = Literal["json_schema", "json_object", "none"]
+"""How an `openai-compatible` alias constrains the output (schemas decision 40):
+`json_schema` (the default) sends `response_format: {type: json_schema, ...}`, `json_object`
+sends `{type: json_object}` for a server without JSON Schema support, `none` sends no
+`response_format`; with the last two the schema is given in the system prompt."""
+
+BACKENDS_WITH_STRUCTURED_OUTPUT: tuple[LlmBackend, ...] = ("openai-compatible",)
+"""Backends whose alias may set `structured_output`."""
+
 MAX_OUTPUT_TOKENS = 1_000_000
 """Largest `models.<alias>.max_output_tokens` accepted (a typo guard)."""
 
@@ -176,6 +185,15 @@ class ModelAlias(Contract):
                 {
                     "if": {
                         "required": ["backend"],
+                        "properties": {
+                            "backend": {"not": {"enum": list(BACKENDS_WITH_STRUCTURED_OUTPUT)}}
+                        },
+                    },
+                    "then": {"not": {"required": ["structured_output"]}},
+                },
+                {
+                    "if": {
+                        "required": ["backend"],
                         "properties": {"backend": {"enum": list(BACKENDS_NEEDING_HTTPS)}},
                     },
                     "then": {
@@ -191,10 +209,15 @@ class ModelAlias(Contract):
     model: Token
     """The concrete model name for that backend."""
     base_url: BackendUrl | None = None
-    """Endpoint; required for `openai-compatible` and `ollama`. See `BackendUrl`."""
+    """Endpoint; required for `openai-compatible` and `ollama`. See `BackendUrl`. For
+    `openai-compatible` it is the API root **with** its version prefix, as the OpenAI SDKs
+    take it (`https://api.mistral.ai/v1`, `https://openrouter.ai/api/v1`,
+    `http://vllm:8000/v1`): requests go to `<base_url>/chat/completions`. For `ollama` it is
+    the server root (`http://ollama:11434`): requests go to `<base_url>/api/chat`."""
     secret: SecretName | None = None
     """The secret holding the backend's API key or token, e.g. `ANTHROPIC_API_KEY`; required
-    for `anthropic`."""
+    for `anthropic`, optional for `openai-compatible` and `ollama` (sent as `Authorization:
+    Bearer`; a local server usually needs none)."""
     price: ModelPrice | None = None
     """What the model costs, for `Usage.usd` and the step's `usd` budget. Without it a call
     is recorded with `usd: 0` and `priced: false`, and only `tokens_out` bounds the step
@@ -202,6 +225,10 @@ class ModelAlias(Contract):
     max_output_tokens: Annotated[StrictInt, Field(ge=1, le=MAX_OUTPUT_TOKENS)] | None = None
     """A cap on `max_tokens` for every call of this alias, below the step's `tokens_out`
     (e.g. the model's own output limit)."""
+    structured_output: StructuredOutput | None = None
+    """`openai-compatible` only: how the output is constrained (`json_schema` when unset, or
+    `json_object` / `none` for a server that lacks JSON Schema support). See
+    `StructuredOutput`."""
 
     @model_validator(mode="after")
     def _backend_requirements(self) -> Self:
@@ -215,6 +242,11 @@ class ModelAlias(Contract):
             and not self.base_url.startswith("https://")
         ):
             raise ValueError(f"backend {self.backend!r} requires an `https://` `base_url`")
+        if (
+            self.structured_output is not None
+            and self.backend not in BACKENDS_WITH_STRUCTURED_OUTPUT
+        ):
+            raise ValueError(f"backend {self.backend!r} takes no `structured_output`")
         return self
 
 

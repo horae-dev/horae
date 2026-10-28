@@ -1,0 +1,6 @@
+{
+  "status": 404,
+  "body": {
+    "error": "Synthetic: model 'fixture-model-1' not found"
+  }
+}

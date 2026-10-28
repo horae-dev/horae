@@ -719,7 +719,7 @@ def test_a_backend_without_a_factory_is_unavailable(secrets: SecretResolver) -> 
 
 
 def test_the_builtin_factories() -> None:
-    assert set(FACTORIES) == {"anthropic"}
+    assert set(FACTORIES) == {"anthropic", "openai-compatible", "ollama"}
 
 
 def test_request_prompts_need_the_skill_fields(secrets: SecretResolver) -> None:

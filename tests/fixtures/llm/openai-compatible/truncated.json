@@ -1,0 +1,25 @@
+{
+  "status": 200,
+  "body": {
+    "id": "chatcmpl-synthetic0001",
+    "object": "chat.completion",
+    "created": 1767225600,
+    "model": "fixture-model-1",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "{\"items\": [\"Review PR",
+          "refusal": null
+        },
+        "finish_reason": "length"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 1200,
+      "completion_tokens": 2000,
+      "total_tokens": 3200
+    }
+  }
+}
