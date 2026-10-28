@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Command-line entry point for Horae."""
 
+import asyncio
 import json
 import re
 from datetime import UTC, datetime, timedelta
@@ -11,6 +12,8 @@ from typing import Annotated, Any
 import typer
 
 from horae import __version__
+from horae.apply import JSON_SCHEMA_VERSION, LocalSink, StaticSinks, plan_changes, to_json
+from horae.apply.render import render_text, safe
 from horae.config import CONFIG_FILE, STORE_FILE, ProblemsError, check_instance, read_yaml, validate
 from horae.contracts import InstanceConfig
 from horae.runner import lock_is_free
@@ -54,6 +57,10 @@ def _plural(count: int, word: str, plural: str | None = None) -> str:
 EXIT_OK = 0
 EXIT_PROBLEMS = 1
 EXIT_USAGE = 2
+EXIT_UNKNOWN_RUN = 3
+"""`horae diff`: the run is unknown, still running, or refused (failed, undone, applied)."""
+EXIT_PLANNED_WITH_PROBLEMS = 4
+"""`horae diff`: the run is planned, but some intents cannot be applied."""
 EXIT_INTERNAL = 70
 """`EX_SOFTWARE` (sysexits.h): an unexpected internal error."""
 
@@ -301,5 +308,103 @@ def runs(
         name = type(exc).__name__
         del exc
         typer.echo(f"horae runs: internal error ({name}); please report it", err=True)
+        code = EXIT_INTERNAL
+    raise typer.Exit(code)
+
+
+class _DiffFailed(Exception):
+    def __init__(self, code: int, kind: str, message: str) -> None:
+        super().__init__(kind)
+        self.code, self.kind, self.message = code, kind, message
+
+
+def _diff_error(kind: str, message: str, json_output: bool) -> None:
+    """Report a `horae diff` error: a JSON error object on stdout, or text on stderr."""
+    if json_output:
+        error = {"schema_version": JSON_SCHEMA_VERSION, "error": {"kind": kind, "message": message}}
+        typer.echo(json.dumps(error, indent=2, ensure_ascii=True))
+    else:
+        typer.echo(f"horae diff: {safe(message)}", err=True)
+
+
+def _diff(instance: Path, run_id: str, vault: Path | None, json_output: bool, color: bool) -> int:
+    try:
+        config = validate(read_yaml(instance / CONFIG_FILE), InstanceConfig)
+    except ProblemsError as exc:
+        found = _plural(len(exc.problems), "problem") + " found"
+        raise _DiffFailed(
+            EXIT_PROBLEMS, "config_invalid", "; ".join([*map(str, exc.problems), found])
+        ) from None
+    path = instance / config.state_dir / STORE_FILE
+    if not path.exists():  # never create the store just to read it
+        raise _DiffFailed(EXIT_UNKNOWN_RUN, "unknown_run", f"unknown run {run_id!r} (no store)")
+    sinks = StaticSinks(default=LocalSink(vault))
+    try:
+        # Read-only: no migration, no WAL switch, no new file (schemas decision 32, D5).
+        with Store.open(path, read_only=True) as store:
+            record = store.get_run(run_id)
+            if record is None:
+                raise _DiffFailed(
+                    EXIT_UNKNOWN_RUN, "unknown_run", f"unknown or unfinished run {run_id!r}"
+                )
+
+            def notified(key: str) -> bool:
+                return store.get_notification(key) is not None
+
+            changes = asyncio.run(plan_changes(record, sinks, notified=notified))
+    except (StoreError, OSError) as exc:
+        raise _DiffFailed(EXIT_PROBLEMS, "store_error", f"{path}: {exc}") from None
+    if json_output:
+        typer.echo(to_json(changes))
+    else:
+        typer.echo(render_text(changes, color=color), nl=False, color=color or None)
+    if changes.refused is not None:
+        return EXIT_UNKNOWN_RUN
+    return EXIT_PLANNED_WITH_PROBLEMS if changes.problems else EXIT_OK
+
+
+@app.command()
+def diff(
+    run_id: Annotated[str, typer.Argument(help="The run to show.")],
+    instance: Annotated[
+        Path,
+        typer.Option(
+            "--instance",
+            "-i",
+            envvar="HORAE_INSTANCE",
+            help="Instance directory (holds horae.yaml).",
+            file_okay=False,
+        ),
+    ] = Path(),
+    vault: Annotated[
+        Path | None,
+        typer.Option(
+            "--vault",
+            help="Vault directory to read notes from (read only; provisional until #24).",
+            file_okay=False,
+            exists=True,
+        ),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print the diff as JSON.")] = False,
+    color: Annotated[bool, typer.Option("--color", help="Colour the text diff.")] = False,
+) -> None:
+    """Show what applying a stored run would change, without applying anything.
+
+    Notes are read from --vault with the built-in read-only local sink until plugin sinks are
+    available (#24). A failed, undone or already applied run is refused.
+
+    Exit codes: 0 planned, 1 configuration or store problem, 2 usage error, 3 unknown or
+    refused run, 4 planned but some intents cannot be applied, 70 internal error. With
+    --json, errors are a JSON object on stdout ({schema_version, error: {kind, message}})."""
+    try:
+        code = _diff(instance, run_id, vault, json_output, color)
+    except _DiffFailed as failed:
+        _diff_error(failed.kind, failed.message, json_output)
+        code = failed.code
+    except Exception as exc:
+        # Never print the exception, its traceback or its locals: a frame may hold a secret.
+        name = type(exc).__name__
+        del exc
+        _diff_error("internal", f"internal error ({name}); please report it", json_output)
         code = EXIT_INTERNAL
     raise typer.Exit(code)
