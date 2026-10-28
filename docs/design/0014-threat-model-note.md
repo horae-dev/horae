@@ -1,7 +1,10 @@
 # Design note: threat model (`docs/security.md`)
 
+> **Superseded by [docs/security.md](../security.md).** Kept as the record of the proposal; the
+> maintainer's answers to its questions are on [PR #84](https://github.com/horae-dev/horae/pull/84).
+
 - **Issue:** [#14](https://github.com/horae-dev/horae/issues/14) (Human-led, M0)
-- **Status:** Draft for maintainer review. `docs/security.md` is written after feedback.
+- **Status:** Superseded by [docs/security.md](../security.md).
 - **Sources:** [PLAN.md](../PLAN.md) §2, §3.3–3.5, §4, §7, §9, §10;
   [ADRs 0001–0006](../adr/README.md); [schemas decisions](../../schemas/README.md#decisions).
 
