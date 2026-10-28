@@ -25,7 +25,7 @@ tool-less function inside one step.
 
 1. **Control flow is declared, never decided by an LLM.** A pipeline is a YAML document with a
    trigger (optional in the v1 contract, [schemas decision
-   13](../../schemas/README.md#decisions-provisional-maintainer-to-confirm); PLAN says "a trigger,
+   13](../../schemas/README.md#decisions); PLAN says "a trigger,
    then steps") and an ordered list of steps
    ([§3.1](../PLAN.md#31-concepts), [§3.2](../PLAN.md#32-a-pipeline-example-the-morning-note)).
    Step kinds are `collect`, `transform`, `llm`, `act` and `notify`, run in order. Each non-`llm`
@@ -71,7 +71,7 @@ The run record ([`schemas/run-record/v1.json`](../../schemas/run-record/v1.json)
 
 - PLAN.md says one LLM step "by default"; the v1 contract enforces at most one. A later opt-out
   would be an explicit key ([schemas decision
-  14](../../schemas/README.md#decisions-provisional-maintainer-to-confirm)).
+  14](../../schemas/README.md#decisions)).
 - The per-day budget and the usage ledger ([§3.4](../PLAN.md#34-llm-step-and-backends)) are not in
   the pipeline contract; they belong to instance configuration, which has no schema yet.
 - The canonical form of the pipeline for `pipeline_digest` (e.g. RFC 8785) is for the engine to fix.

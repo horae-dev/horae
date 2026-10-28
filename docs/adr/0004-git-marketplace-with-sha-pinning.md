@@ -70,7 +70,7 @@ plugins and permission lists so that a lockfile diff shows only real changes. Ru
 - The lockfile syntax is not given in PLAN.md (the example is YAML); the schema validates the
   parsed document and adds `repo`, which PLAN's list (name, version, SHA, approved permissions)
   does not mention ([schemas decision
-  20](../../schemas/README.md#decisions-provisional-maintainer-to-confirm)).
+  20](../../schemas/README.md#decisions)).
 - Signed tags (gitsign or sigstore) and a "tests pass on horae X.Y" badge are "later" in §4.
 
 ## Alternatives considered

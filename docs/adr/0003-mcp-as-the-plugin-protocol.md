@@ -65,7 +65,7 @@ generated from [`src/horae/contracts/plugin.py`](../../src/horae/contracts/plugi
 
 - The v1 contract accepts only `https` for `mcp-http`, including internal Docker or Coolify service
   names (decision 6 in the [schemas
-  README](../../schemas/README.md#decisions-provisional-maintainer-to-confirm)).
+  README](../../schemas/README.md#decisions)).
   Existing services joined over a Docker network ([§7](../PLAN.md#7-reference-deployment-coolify))
   therefore need TLS; whether that is practical is unverified. Container-name stability across
   Coolify redeploys is a ⚠️ spike in §7.

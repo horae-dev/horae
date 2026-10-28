@@ -126,10 +126,10 @@ failing examples for every schema. Each valid example passes the JSON Schema, `v
 `examples/plugin-manifest/valid/github.yaml` are the PLAN.md §3.2 and §3.3 examples, verbatim (a
 test checks this). All other examples are synthetic.
 
-## Decisions (provisional, maintainer to confirm)
+## Decisions
 
-PLAN.md leaves these open. Each takes the most conservative option; loosening it later is a
-compatible change.
+Confirmed by the maintainer on 2026-10-28. PLAN.md left these open; each takes the most
+conservative option, so loosening one later is a compatible change.
 
 1. **Intent names.** §2.1 says `create_task`, `append_note`, `notify`; §3.3 lists the closed set
    `note.create`, `note.append_section`, `note.replace_owned_block`, `task.create`,
