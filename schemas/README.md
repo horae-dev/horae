@@ -1208,8 +1208,9 @@ loosened later without breaking a valid file.
       **`jsonschema` as a runtime dependency** (it was a dev dependency; #31 needs it to
       validate outputs);
     - **(F) intents.** `intents` is a list of types or a mapping `type: max` (1 to 256, #35):
-      at most `max` intents of that type per `llm` step, more is `intent_rejected` (fresh
-      outputs; a reused one over the limit is a cache miss). Omitted or empty: the skill
+      at most `max` intents of that type per `llm` step; more is a `guard` violation that
+      degrades the step (decision 46; it was `intent_rejected` before #35); a reused output
+      over the limit is a cache miss. Omitted or empty: the skill
       proposes none. They must be within the plugin's approved `permissions.intents` (load
       error otherwise). The engine checks the LLM's intents against the plugin's permissions
       **narrowed to the skill's**, on fresh and reused outputs alike, and a
@@ -1825,3 +1826,155 @@ loosened later without breaking a valid file.
       replayed from its tape;
     - **follow-ups**: a per-skill `ttl_s`; LRU instead of first in, first out if hit rates
       show it matters.
+
+### Decisions (#35, design note and maintainer answers on #99)
+
+46. **The action guard on LLM proposals (#35).** Numbering: 44 is #31's (PR #108), 45 #32's.
+    No contract change: the run record's `violations[].kind` already has `guard`, and the
+    step's `error.kind` is the free-form `ErrorKind` `guard_violation`. `horae.engine.guard`
+    runs on every batch of intents the `llm` step proposes (fresh, `previous` or a cache hit),
+    after schema validation and the permission check, **before routing**:
+    - **(1) per-type limits.** A skill's `intents: {type: max}` (decision 39 F) caps the intents
+      of each type per step; more is a guard violation (it was `intent_rejected`). A type the
+      skill does not declare stays `intent_rejected` (a permission breach, the run fails);
+    - **(0) structurally conservative** (security review): rather than chasing each
+      obfuscation, the guard refuses whole classes of text the parsers it guards against could
+      read differently: control and format characters, any non-trivial tag-like token, any
+      link destination with whitespace or a backslash (rules 0a, 0b, 3, 5);
+    - **(0b) Markdown escapes.** A renderer drops `\` before ASCII punctuation, so the text
+      it renders differs from the text as written (`[x](java\script:…)`, `<https\://…>`).
+      Every check also runs on a view with those escapes removed (after each entity-decoding
+      pass), and the text is refused if **any** view fails. A backslash is refused outright
+      inside a link destination, a reference definition and a tag-like token or autolink;
+    - **(0a) no control or format character.** Any Cc character but `\n` (tab and carriage
+      return included), any Cf character (zero-width, joiners, bidi controls, BOM, soft
+      hyphen) and U+2028 / U+2029 refuse the text before any other scan, also when an entity
+      decodes to one (`h&#9;ttps:`). Note text already refused lone CR and U+2028 / U+2029
+      (`content_line_break`); this extends it to all guarded text. A ZWJ emoji sequence is
+      refused too (known cost);
+    - **(2) embeds are always refused**, even when the URL is in the input (they fetch when the
+      note renders, without a click): any `![` (Markdown and reference images, Obsidian
+      `![[…]]` embeds);
+    - **(3) tag-like tokens: an allowlist, exact form.** Every `<` followed by a letter, `/`,
+      `!` or `?` starts a tag-like token, up to its `>`. It is allowed only as exactly
+      `<name>`, `</name>` or `<name/>` with a name of `b i u s em strong code pre br hr p ul ol
+      li blockquote h1`–`h6 kbd sup sub mark del` (no attribute, no `:`, no space), or as an
+      autolink: content up to `>` that `urls` reads as one URL with a `scheme://` or a
+      special scheme, and no whitespace, quote or `=` (the URL then goes through (4)).
+      Everything else is refused: other tags (`img`, `iframe`, `svg`, `a`, `div`, `span`,
+      custom elements…), any attribute (`on*`, `style`, `background`, `poster`, `srcset`,
+      `ping`, `href`, so also `url(` and `@import`), `<name:…>` forms, comments, doctype,
+      processing instructions and an unclosed `<b`. A denylist of embed tags, then an
+      autolink exemption, were rejected in review;
+    - **(4) URLs.** Backslashes are read as `/` first (`https:/\host`, `\\host`). A URL is
+      a run (up to whitespace, `<`, `>` or a control character) starting at `scheme:` followed
+      by `/` (any `[a-z][a-z0-9+.-]*`, whatever precedes it), at a scheme of `http https ftp ws
+      wss obsidian mailto javascript vbscript data file blob` followed by any non-space
+      character (`ftp:host`), at `//` at a token boundary (protocol-relative, not after a
+      scheme character, `:` or `/`), or at `www.` at a word start. A URL with a **refused
+      scheme** (`javascript vbscript data file blob`) is always refused. Every other URL
+      (answer 3) must be an **exact string** extracted the same way from the **viewed** input
+      (string values and object keys of what the model was shown), case-sensitive, after
+      dropping at most 16 trailing punctuation characters (`.,;:!?)]}'"*_~` and backtick) on
+      either side. So a known URL may be copied, but never extended (`…?q=<data>`,
+      `…/<data>`). A `notify.push` `link` must be exactly such a URL **and** fall under the
+      entry's `link_prefix` (decision 30). A per-pipeline `strict_links` (only trusted
+      parameters and `link_prefix`) is a follow-up;
+    - **(5) link destinations.** After `](` (up to the next `)`, or the line end when there
+      is none) and after a line's leading `[label]:` (not a `[^footnote]:`; up to the line
+      end; container prefixes skipped, (H2)), leading spaces skipped: a destination holding
+      **any whitespace or backslash** (so also a title,
+      `[x]( javascript :…)` or a line break) or starting with a refused scheme (also inside
+      `<…>`) is refused; its URLs go through (4). A refused scheme in prose (`data: three
+      items`: colon then a space) is not a link in Markdown and passes;
+    - **fields scanned**: `note.*` `content` and `heading`, `task.create` `title` and
+      `fingerprint`, `notify.push` `title`, `body` and `link`, every string and object key of an
+      `http.post` `body`. Targets bound by routing (`path`, `http.post` `url`) are not text;
+    - **robust parsing, bounded work.** Every check runs on the text as written and on its
+      HTML-entity-decoded forms (up to three passes: `&#x3c;img`, `&amp;lt;img`) and their
+      Markdown-unescaped forms (0b), ASCII
+      case-insensitively. Scans are linear (`find` loops that resume after each match, regular
+      expressions without nested quantifiers, pointers to the next `)`, line end or whitespace
+      reused while ahead); a test scans 1 MiB of hostile text per field, and a seeded fuzz
+      (case flips, decimal and hex entities, Markdown escapes, controls and format characters inserted into
+      embeds, script links and unknown URLs) never passes;
+    - **(answer 4) the whole step degrades.** A violation records one `Violation(kind="guard")`
+      and the step `degraded` with `error.kind` `guard_violation`: none of its intents is
+      routed (also the valid ones), its output is not used, later steps are `skipped`, the
+      run is `degraded`, and no `input_hash` is recorded (so the runner never caches it). The
+      LLM call is recorded with its raw intents (replay and audit);
+    - **(answer 6) content-free detail.** `Violation.detail` (= the step error's message, at
+      most 512 characters) names only closed-set values: the proposer (`skill:<name>`), the
+      intent type and position, the field and the kind of problem, e.g. ``skill:daily-brief/
+      rank proposed note.create #2 with an image or embed in `content` ``, never the URL, its
+      host or the text. The same line is logged at `warning` (`horae.engine`);
+    - **reuse (decision 45).** On a reuse, a guard violation is a **cache miss**: nothing of
+      the entry is recorded (no violation) and the model is called. For a cache hit the engine
+      awaits the cache's `discard(key, model_alias=...)` (a port member, (H4)); `StoreLlmCache.discard`
+      deletes the entry (logged, store errors swallowed), so a poisoned entry is not looked up
+      again. A refused `previous` (replay) is only a miss;
+    - **(answer 5) scope.** LLM proposals only; `collect` and `transform` intents are not
+      guarded in v1 (first-party plugins in the D tier, T04); hostile plugins are #52's;
+    - **fencing** (design note C). The backends already fence the input: it is sent as JSON
+      inside `<input>` tags with every `<` written `<` (`horae.llm.backends._shared.
+      escaped`), and repair errors likewise inside `<schema_errors>`, so data can never close
+      the fence (`tests/test_llm_backends_shared.py`). A per-call nonce adds nothing to that
+      and would make requests non-deterministic, so none is added and `LLM_KEY_VERSION` is
+      unchanged;
+    - **known limits**: obfuscated URLs that are not links in Obsidian (`hxxps://`) pass;
+      zero-width and other format characters are refused (0a); a URL the input brings may be copied (tenet 5 as
+      written); a brief citing a new URL from the model's own knowledge is refused; being
+      conservative, a Windows path (`C:\x`), `a:/b`, `x<b and c` (an unclosed tag-like
+      token), a Markdown link title and a ZWJ emoji not in the input are refused too.
+    - **hardening round (provisional, pending maintainer review).** Conservative: v1
+      protects the **Obsidian rendering surface**, not only CommonMark. In text bound for a
+      note or a notification (every guarded field but `http.post` `body`), on every view:
+      - **(H1a) active code fences.** A fence of three or more backticks or tildes, after any
+        leading spaces (more than CommonMark's three too), blockquote `>` or list prefix,
+        whose info string starts (case-insensitively, after spaces or `{`) with `dataview`,
+        `dataviewjs`, `templater`, `mermaid`, `js`, `javascript`, `html`, `button` or `query`
+        (`ACTIVE_FENCES`): Obsidian or a common plugin runs, queries or draws these instead of
+        showing code. Other fences (`python`, none) pass;
+      - **(H1b) Templater and inline queries.** `<%` and `%>` anywhere (Templater, inline
+        script), `` `= `` and `` `$= `` (Dataview inline queries, their default prefixes);
+      - **(H1c) frontmatter.** In a note intent's `content` (all three `note.*` types), a
+        first non-blank line of three or more `-` (a frontmatter block can set `cssclasses`,
+        aliases and plugin properties). This complements decision 32's note conventions
+        (`content_has_marker`, `content_line_break`); a thematic break later in the text
+        passes;
+      - **(H1d) Mermaid `click`.** `click <id> href`, `click <id> call` or `click <id>` then a
+        quote, at a line's content start or after a `;`, anywhere (also outside a fence,
+        although (H1a) already refuses a `mermaid` fence). A callback without a quote
+        (`click A cb`) is not matched: it needs a Mermaid block, which (H1a) refuses;
+      - **(H1e) wikilinks.** A `[[…]]` (up to `]]` or the line end, alias included) holding
+        `://` or a refused scheme (`javascript:` …) is refused; plain internal wikilinks
+        (`[[Daily/2026-10-27|today]]`) pass. Embeds `![[…]]` stay refused by (2);
+      - **(H1f) `obsidian:` URIs** must be in the input set like any URL (4); a miss is
+        reported as its own kind (`an obsidian URI not in the input`), and the case-sensitive
+        match means `OBSIDIAN://…` is refused unless written so in the input;
+      - **(H2) container prefixes before link definitions.** Before a `[label]:`, any spaces
+        and tabs, blockquote `>` and list markers (`-`, `*`, `+`, `1.`, `1)`, followed by a
+        space, a tab or the line end) are skipped, repeatedly (`> - [r]: javascript:x`). A
+        footnote definition `[^x]:` is not a link definition but gets **no exemption**: its
+        text goes through the URL, embed and tag checks like any other text (an unknown URL
+        in a footnote is refused);
+      - **(H3) entity decoding fails closed.** When a fourth `html.unescape` would still
+        change the text after the three allowed passes, the text is refused (`too many levels
+        of HTML entities`): the guard never checks a text whose rendering it has not seen.
+        Text with four or more nested `&amp;` levels is refused (known cost);
+      - **(H4) `discard` is part of the `LlmCache` port.** `LlmCache.discard(key, *,
+        model_alias)` is now a Protocol member, so mypy rejects a cache without it;
+        `horae.engine.NoDiscardCache` is an abstract base whose `discard` is a documented
+        no-op (a refused hit then stays a miss each lookup, never routed). The engine awaits
+        it directly (exceptions still ignored). A refused `previous` (replay, decision 33;
+        the D2 reuse of decision 30) is not a cache entry: it is only a miss and is left as
+        is;
+      - **(H5) logging and source.** Details and the `warning` line stay content-free. The
+        guard's `source` must be `skill:` followed by the pipeline configuration's `SkillRef`
+        (`<namespace>/<skill>`, pattern-checked, at most 128 characters); anything else is a
+        `ValueError` (a programming error, never input or model text);
+      - **(H6) ADR 0002** keeps its accepted text; what #17 and #35 added after acceptance is
+        a dated amendment at its end;
+      - **bounded work**: the new scans are line loops and `find` loops that resume after each
+        match (wikilinks reuse the next `]]` and line end), plus one regular expression
+        without nested quantifiers (`click`); a test scans 1 MiB per hostile shape.

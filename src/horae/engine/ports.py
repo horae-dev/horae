@@ -32,6 +32,7 @@ data, fails the call (`output_invalid` / `output_too_large`); any other exceptio
 `host_error` without its message.
 """
 
+from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
@@ -259,13 +260,38 @@ class LlmCache(Protocol):
     outputs, expiry and purging are the caller's (`horae.runner`). `lookup` may read and
     clean local storage (the SQLite store) and validate the entry against `output_schema`
     (an invalid entry is a miss), but must not call a model or the network. An exception is
-    a cache miss."""
+    a cache miss. `discard` is part of the port (#35, schemas decision 46), so mypy checks
+    that every cache has it: the engine awaits it when the action guard refuses a hit's
+    intents, and its exceptions are ignored. A cache that cannot delete entries subclasses
+    `NoDiscardCache` (a documented no-op) or defines its own no-op. A refused `previous`
+    (replay, decision 33) is not a cache entry and is never discarded."""
 
     async def lookup(
         self, key: str, *, model_alias: str, output_schema: Mapping[str, Any] | None
     ) -> PreviousLlm | None:
         """The live, valid entry for `key` (its `input_hash` is `key`), or `None`."""
         ...
+
+    async def discard(self, key: str, *, model_alias: str) -> None:
+        """Delete the entry for `key` (the action guard refused its intents on reuse), so a
+        poisoned entry is not looked up again."""
+        ...
+
+
+class NoDiscardCache(ABC):
+    """A base for an `LlmCache` that cannot delete entries: `discard` is a no-op, so a refused
+    hit stays a miss each time it is looked up (the guard refuses it again; nothing of it is
+    ever routed). Subclasses implement `lookup`."""
+
+    @abstractmethod
+    async def lookup(
+        self, key: str, *, model_alias: str, output_schema: Mapping[str, Any] | None
+    ) -> PreviousLlm | None:
+        """The live, valid entry for `key`, or `None` (`LlmCache.lookup`)."""
+
+    async def discard(self, key: str, *, model_alias: str) -> None:
+        """A no-op: this cache cannot delete entries."""
+        del key, model_alias
 
 
 class SkillUnavailable(Exception):

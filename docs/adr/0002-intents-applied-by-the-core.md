@@ -83,11 +83,6 @@ notification links, one-line titles, size limits); the runtime still checks mean
   provenance so that untrusted data cannot pick a URL or recipient is left to the M2 guards
   ([#35, Untrusted-content tagging and action
   guard](https://github.com/horae-dev/horae/issues/35)).
-  Until then, the engine's routing ([schemas decision 30](../../schemas/README.md#decisions))
-  binds every target to a trusted pipeline parameter: a note `path` or `http.post` `url` to the
-  entry's, a notification `link` to the entry's `link_prefix`, and a task status change to a
-  fingerprint the run collected. Titles and bodies stay untrusted text that appliers treat as
-  data.
 
 ## Alternatives considered
 
@@ -107,3 +102,22 @@ notification links, one-line titles, size limits); the runtime still checks mean
   [`schemas/run-record/v1.json`](../../schemas/run-record/v1.json)
 - [`schemas/README.md`](../../schemas/README.md#decisions)
   (decisions 1, 2, 4–7, 12, 21)
+
+## Amendments
+
+The accepted text above is unchanged; these dated additions record what later work settled.
+
+### Amendment (2026-10-28, #17)
+
+On the open question of untrusted-content tagging: until the M2 guards, the engine's routing
+([schemas decision 30](../../schemas/README.md#decisions)) binds every target to a trusted
+pipeline parameter: a note `path` or `http.post` `url` to the entry's, a notification `link` to
+the entry's `link_prefix`, and a task status change to a fingerprint the run collected. Titles
+and bodies stay untrusted text that appliers treat as data.
+
+### Amendment (2026-10-28, #35)
+
+#35 adds no per-value tags: the action guard ([schemas decision
+46](../../schemas/README.md#decisions)) checks the LLM's text instead, so every URL in it is an
+exact string of the viewed input, no embed or script link is ever proposed, and a skill's
+per-type limits hold; a violation degrades the whole step. Plugin proposals are left to #52.
