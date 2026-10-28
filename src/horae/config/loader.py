@@ -45,7 +45,7 @@ class ResolvedModel:
     secret: Secret | None
 
 
-def secret_names(config: InstanceConfig, lock: Lockfile | None) -> tuple[str, ...]:
+def redaction_names(config: InstanceConfig, lock: Lockfile | None) -> tuple[str, ...]:
     """Every secret an instance names, sorted: `secrets.refs`, the secrets `horae.lock`
     grants its plugins and the model aliases' `secret` (for redaction, #53)."""
     names = set(config.secrets.refs)
@@ -109,17 +109,17 @@ class Instance:
         only for the secrets that have an explicit `{env: VAR}` reference."""
         return SecretResolver(self.config.secrets.refs, self.secrets_dir, environ)
 
-    def secret_names(self) -> tuple[str, ...]:
-        """Every secret the instance names (`secret_names(config, lock)`)."""
-        return secret_names(self.config, self.lock)
+    def redaction_names(self) -> tuple[str, ...]:
+        """Every secret the instance names (`redaction_names(config, lock)`)."""
+        return redaction_names(self.config, self.lock)
 
     def prime_redaction(self) -> None:
-        """Resolve every secret the instance names (`secret_names`), for redaction only, so
+        """Resolve every secret the instance names (`redaction_names`), for redaction only, so
         that the process registry (`horae.secrets.redact`) knows them before anything is
         run, stored, logged or printed (#53, schemas decision 43 A). A secret that cannot
         be resolved is skipped: what needs it fails later with its own error. The values
         are never sent anywhere; only redaction uses them."""
-        redact.prime(self.secret_resolver(), self.secret_names())
+        redact.prime(self.secret_resolver(), self.redaction_names())
 
     def plugin_timeouts(self, plugin: str) -> PluginDefaults:
         """The effective startup and call timeouts of `plugin` (for the plugin host)."""

@@ -1376,7 +1376,7 @@ loosened later without breaking a valid file.
       instance names (`secrets.refs`, the secrets `horae.lock` grants, the model aliases'
       `secret`), skipping one that cannot be resolved; `Runner.run` and the CLI commands that
       read the instance call it first; those that read `horae.yaml` alone (`runs`, `diff`,
-      `usage`, `undo`) prime the same names (`horae.config.loader.secret_names(config,
+      `usage`, `undo`) prime the same names (`horae.config.loader.redaction_names(config,
       lock)`, shared with the instance), reading `horae.lock` best effort (an absent or
       invalid lock adds nothing). A provider backend still resolves its own key lazily,
       through its own resolver. A JSON number whose `json.dumps` is a secret's value is a

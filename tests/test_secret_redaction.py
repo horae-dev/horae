@@ -1171,7 +1171,7 @@ def test_a_plugin_secret_is_redacted_by_every_command_that_reads_the_store(
     tmp_path: Path,
 ) -> None:
     root = _instance_with_a_plugin_secret(tmp_path)
-    assert load_instance(root).secret_names() == ("PLUGIN_TOKEN",)
+    assert load_instance(root).redaction_names() == ("PLUGIN_TOKEN",)
     # A record written by a process that did not know the secret (no gate could catch it).
     with Store.open(root / "state" / "horae.db") as store:
         store.begin_run("r1", "feed", AT)
