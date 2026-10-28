@@ -1882,7 +1882,8 @@ loosened later without breaking a valid file.
       parameters and `link_prefix`) is a follow-up;
     - **(5) link destinations.** After `](` (up to the next `)`, or the line end when there
       is none) and after a line's leading `[label]:` (not a `[^footnote]:`; up to the line
-      end), leading spaces skipped: a destination holding **any whitespace or backslash** (so also a title,
+      end; container prefixes skipped, (H2)), leading spaces skipped: a destination holding
+      **any whitespace or backslash** (so also a title,
       `[x]( javascript :…)` or a line break) or starting with a refused scheme (also inside
       `<…>`) is refused; its URLs go through (4). A refused scheme in prose (`data: three
       items`: colon then a space) is not a link in Markdown and passes;
@@ -1909,7 +1910,7 @@ loosened later without breaking a valid file.
       host or the text. The same line is logged at `warning` (`horae.engine`);
     - **reuse (decision 45).** On a reuse, a guard violation is a **cache miss**: nothing of
       the entry is recorded (no violation) and the model is called. For a cache hit the engine
-      awaits the cache's optional `discard(key, model_alias=...)`; `StoreLlmCache.discard`
+      awaits the cache's `discard(key, model_alias=...)` (a port member, (H4)); `StoreLlmCache.discard`
       deletes the entry (logged, store errors swallowed), so a poisoned entry is not looked up
       again. A refused `previous` (replay) is only a miss;
     - **(answer 5) scope.** LLM proposals only; `collect` and `transform` intents are not
@@ -1925,3 +1926,55 @@ loosened later without breaking a valid file.
       written); a brief citing a new URL from the model's own knowledge is refused; being
       conservative, a Windows path (`C:\x`), `a:/b`, `x<b and c` (an unclosed tag-like
       token), a Markdown link title and a ZWJ emoji not in the input are refused too.
+    - **hardening round (provisional, pending maintainer review).** Conservative: v1
+      protects the **Obsidian rendering surface**, not only CommonMark. In text bound for a
+      note or a notification (every guarded field but `http.post` `body`), on every view:
+      - **(H1a) active code fences.** A fence of three or more backticks or tildes, after any
+        leading spaces (more than CommonMark's three too), blockquote `>` or list prefix,
+        whose info string starts (case-insensitively, after spaces or `{`) with `dataview`,
+        `dataviewjs`, `templater`, `mermaid`, `js`, `javascript`, `html`, `button` or `query`
+        (`ACTIVE_FENCES`): Obsidian or a common plugin runs, queries or draws these instead of
+        showing code. Other fences (`python`, none) pass;
+      - **(H1b) Templater and inline queries.** `<%` and `%>` anywhere (Templater, inline
+        script), `` `= `` and `` `$= `` (Dataview inline queries, their default prefixes);
+      - **(H1c) frontmatter.** In a note intent's `content` (all three `note.*` types), a
+        first non-blank line of three or more `-` (a frontmatter block can set `cssclasses`,
+        aliases and plugin properties). This complements decision 32's note conventions
+        (`content_has_marker`, `content_line_break`); a thematic break later in the text
+        passes;
+      - **(H1d) Mermaid `click`.** `click <id> href`, `click <id> call` or `click <id>` then a
+        quote, at a line's content start or after a `;`, anywhere (also outside a fence,
+        although (H1a) already refuses a `mermaid` fence). A callback without a quote
+        (`click A cb`) is not matched: it needs a Mermaid block, which (H1a) refuses;
+      - **(H1e) wikilinks.** A `[[…]]` (up to `]]` or the line end, alias included) holding
+        `://` or a refused scheme (`javascript:` …) is refused; plain internal wikilinks
+        (`[[Daily/2026-10-27|today]]`) pass. Embeds `![[…]]` stay refused by (2);
+      - **(H1f) `obsidian:` URIs** must be in the input set like any URL (4); a miss is
+        reported as its own kind (`an obsidian URI not in the input`), and the case-sensitive
+        match means `OBSIDIAN://…` is refused unless written so in the input;
+      - **(H2) container prefixes before link definitions.** Before a `[label]:`, any spaces
+        and tabs, blockquote `>` and list markers (`-`, `*`, `+`, `1.`, `1)`, followed by a
+        space, a tab or the line end) are skipped, repeatedly (`> - [r]: javascript:x`). A
+        footnote definition `[^x]:` is not a link definition but gets **no exemption**: its
+        text goes through the URL, embed and tag checks like any other text (an unknown URL
+        in a footnote is refused);
+      - **(H3) entity decoding fails closed.** When a fourth `html.unescape` would still
+        change the text after the three allowed passes, the text is refused (`too many levels
+        of HTML entities`): the guard never checks a text whose rendering it has not seen.
+        Text with four or more nested `&amp;` levels is refused (known cost);
+      - **(H4) `discard` is part of the `LlmCache` port.** `LlmCache.discard(key, *,
+        model_alias)` is now a Protocol member, so mypy rejects a cache without it;
+        `horae.engine.NoDiscardCache` is an abstract base whose `discard` is a documented
+        no-op (a refused hit then stays a miss each lookup, never routed). The engine awaits
+        it directly (exceptions still ignored). A refused `previous` (replay, decision 33;
+        the D2 reuse of decision 30) is not a cache entry: it is only a miss and is left as
+        is;
+      - **(H5) logging and source.** Details and the `warning` line stay content-free. The
+        guard's `source` must be `skill:` followed by the pipeline configuration's `SkillRef`
+        (`<namespace>/<skill>`, pattern-checked, at most 128 characters); anything else is a
+        `ValueError` (a programming error, never input or model text);
+      - **(H6) ADR 0002** keeps its accepted text; what #17 and #35 added after acceptance is
+        a dated amendment at its end;
+      - **bounded work**: the new scans are line loops and `find` loops that resume after each
+        match (wikilinks reuse the next `]]` and line end), plus one regular expression
+        without nested quantifiers (`click`); a test scans 1 MiB per hostile shape.

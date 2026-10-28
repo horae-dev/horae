@@ -24,9 +24,11 @@ cache), after schema validation and before routing:
    special scheme, and no whitespace, quote or `=` (that URL then goes through 6). Anything
    else (other tags, attributes, comments, an unclosed `<b`) is refused.
 5. **Link destinations.** After `](` (up to the next `)`, or the line end when there is
-   none) and after a line's leading `[label]:` (not a `[^footnote]:`, up to the line end),
-   leading spaces skipped: a destination holding whitespace or a backslash, or starting with
-   a refused scheme (also inside `<…>`), is refused. A backslash in a tag-like token or an
+   none) and after a line's leading `[label]:` (not a `[^footnote]:`, whose text gets every
+   other check; up to the line end), leading spaces skipped, and before a label also
+   blockquote `>` and list prefixes (`-`, `*`, `+`, `1.`, `1)`): a destination holding
+   whitespace or a backslash, or starting with a refused scheme (also inside `<…>`), is
+   refused. A backslash in a tag-like token or an
    autolink (4) is refused too.
 6. **URLs.** Backslashes are read as `/` first (`https:/\\host`, `\\\\host`). A URL is a run
    (up to whitespace, `<`, `>` or a control character) starting at
@@ -44,9 +46,20 @@ cache), after schema validation and before routing:
    the input. A `notify.push` `link` must be exactly such a URL (and is also routed only under
    a trusted `link_prefix`, decision 30).
 
+7. **The Obsidian rendering surface** (text bound for a note or a notification: every field
+   but `http.post`'s `body`). Refused: a code fence (backticks or tildes, behind any spaces,
+   `>` or list prefix) whose info string starts with a word of `ACTIVE_FENCES` (`dataview`,
+   `dataviewjs`, `templater`, `mermaid`, `js`, `javascript`, `html`, `button`, `query`);
+   Templater and inline script markers `<%` and `%>`; Dataview inline queries `` `= `` and
+   `` `$= ``; a Mermaid `click <id> href|call|"…"` at a line's start or after a `;`; a
+   wikilink `[[…]]` holding `://` or a refused scheme (internal wikilinks pass); an
+   `obsidian:` URI not in the input set; and, in a note intent's `content`, a frontmatter
+   block (a first non-blank line of three or more `-`).
+
 A refused scheme in prose (`data: three items`, colon then a space) is not a link in Markdown
 and passes. Every check runs on the text as written and on its HTML-entity-decoded forms (up
-to three passes: `&#x3c;img`, `&amp;lt;img`) and on the Markdown-unescaped form of each (a
+to three passes: `&#x3c;img`, `&amp;lt;img`; a text that a fourth pass would still change is
+refused, failing closed) and on the Markdown-unescaped form of each (a
 backslash before ASCII punctuation dropped, as a renderer does), ASCII case-insensitively; the
 text is refused if any view fails. All scans are linear:
 `find` loops whose next search starts after the previous match, pointers to the next `)`,
@@ -55,6 +68,8 @@ regular expressions without nested quantifiers.
 
 A violation is reported as a short, **content-free** detail: the proposer, the intent type and
 position, the field and the kind of problem, from closed sets only, never the URL or the text.
+The proposer is `skill:` and the pipeline's validated `SkillRef`; any other `source` is a
+`ValueError`.
 """
 
 import html
@@ -65,6 +80,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from typing import Any
 
 from horae.contracts.intents import Intent, IntentType, NotifyPush
+from horae.contracts.types import PLUGIN_NAME
 
 GUARD_ERROR = "guard_violation"
 """The `StepError.kind` of a step whose proposals the guard refused (the run record's
@@ -105,6 +121,13 @@ REFUSED_SCHEMES = frozenset({"javascript", "vbscript", "data", "file", "blob"})
 SPECIAL_SCHEMES = REFUSED_SCHEMES | {"http", "https", "ftp", "ws", "wss", "obsidian", "mailto"}
 """Schemes that start a URL whatever follows their colon (other schemes need a `/`)."""
 
+ACTIVE_FENCES = frozenset(
+    {"dataview", "dataviewjs", "templater", "mermaid", "js", "javascript", "html", "button"}
+    | {"query"}
+)
+"""Code fence info words refused in text bound for a note or a notification: Obsidian or a
+common plugin runs, queries or draws them instead of showing code (decision 46)."""
+
 _LOWER = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
 _LETTERS = frozenset(string.ascii_lowercase)
 _SCHEME_CHARS = frozenset(string.ascii_lowercase + string.digits + "+.-")
@@ -116,14 +139,19 @@ _WHITESPACE = re.compile(r"[\s\\]")
 _MD_ESCAPE = re.compile(r"\\([!-/:-@\[-`{-~])")
 _TRAILING = frozenset(".,;:!?)]}'\"*_~`")
 _REFUSED_PREFIXES = tuple(f"{scheme}:" for scheme in sorted(REFUSED_SCHEMES))
+_INFO_WORD = re.compile(r"[a-z0-9_-]*")
+_CLICK = re.compile(r"[ \t]*click[ \t]+[^\s;\"'`]+[ \t]+(?:href\b|call\b|[\"'`])")
+_SOURCE = re.compile(rf"skill:{PLUGIN_NAME}/[a-z][a-z0-9_-]*")
 _MAX_STRIP = 16
 _DECODE_PASSES = 3
 
 
 def _views(text: str) -> Iterator[str]:
-    """`text` and its HTML-entity-decoded forms until nothing changes (bounded passes), each
-    followed by its Markdown-unescaped form (`\\` + ASCII punctuation read as the
-    punctuation) when that differs: a check refuses the text if any view fails it."""
+    """`text` and its HTML-entity-decoded forms until nothing changes (at most
+    `_DECODE_PASSES` decodings), each followed by its Markdown-unescaped form (`\\` + ASCII
+    punctuation read as the punctuation) when that differs: a check refuses the text if any
+    view fails it. What a further decoding would give is not a view: `_entities_exhausted`
+    refuses such a text (fail closed)."""
     for _ in range(_DECODE_PASSES + 1):
         yield text
         unescaped = _MD_ESCAPE.sub(r"\1", text) if "\\" in text else text
@@ -133,6 +161,17 @@ def _views(text: str) -> Iterator[str]:
         if decoded == text:
             return
         text = decoded
+
+
+def _entities_exhausted(text: str) -> bool:
+    """Decoding `text` `_DECODE_PASSES` times still leaves entities that change it: the guard
+    cannot tell what renders, so it refuses (fails closed)."""
+    for _ in range(_DECODE_PASSES + 1):
+        decoded = html.unescape(text) if "&" in text else text
+        if decoded == text:
+            return False
+        text = decoded
+    return True
 
 
 def _variants(url: str) -> Iterator[str]:
@@ -213,7 +252,9 @@ def _control_problem(text: str) -> bool:
 def _destination_problem(low: str) -> str | None:
     """A Markdown link destination that holds whitespace or starts with a refused scheme:
     after `](`, up to the next `)` (or the line end when there is none), and after a line's
-    leading `[label]:` (not a `[^footnote]:`), up to the line end; leading spaces are skipped.
+    leading `[label]:` (not a `[^footnote]:`, which is scanned as text), up to the line end;
+    leading spaces are skipped, and before a label so are blockquote and list prefixes
+    (`_content_start`).
     The next `)`, line end and whitespace are found once per position (amortised linear)."""
     close = newline = space = -1
     found = low.find("](")
@@ -234,7 +275,7 @@ def _destination_problem(low: str) -> str | None:
             return problem
         found = low.find("](", start)
     for line in low.split("\n"):
-        label = line.lstrip(" ")
+        label = line[_content_start(line) :] if line else line
         if label.startswith("[") and not label.startswith("[^") and "]:" in label:
             rest = label[label.index("]:") + 2 :].lstrip(" ")
             match = _WHITESPACE.search(rest)
@@ -301,6 +342,112 @@ def _tag_problem(low: str) -> str | None:
     return None
 
 
+def _content_start(line: str) -> int:
+    """Where a line's content starts once its container prefixes are skipped: spaces and tabs
+    (any number: more than CommonMark's three is refused too, being conservative), blockquote
+    `>` and list markers (`-`, `*`, `+`, `1.`, `1)` followed by a space, a tab or the line
+    end), repeatedly. Each character is looked at once or twice (a marker's digits, at most
+    nine, once more)."""
+    at, size = 0, len(line)
+    while True:
+        while at < size and line[at] in " \t":
+            at += 1
+        if at == size:
+            return at
+        if line[at] == ">":
+            at += 1
+            continue
+        digits = at
+        while digits < size and digits - at < 9 and line[digits] in string.digits:
+            digits += 1
+        if digits > at:  # an ordered list marker: digits then `.` or `)`
+            marker = digits if digits < size and line[digits] in ".)" else -1
+        else:
+            marker = at if line[at] in "-*+" else -1
+        if marker != -1 and (marker + 1 == size or line[marker + 1] in " \t"):
+            at = marker + 1
+            continue
+        return at
+
+
+def _fence_problem(line: str, start: int) -> str | None:
+    """A code fence (three or more backticks or tildes) whose info string starts with a word of
+    `ACTIVE_FENCES` (Dataview, Templater, Mermaid, scripts, HTML, buttons, queries)."""
+    fence = line[start : start + 3]
+    if fence not in ("```", "~~~"):
+        return None
+    end = start + 3
+    while end < len(line) and line[end] == fence[0]:
+        end += 1
+    while end < len(line) and line[end] in " \t{":
+        end += 1
+    word = _INFO_WORD.match(line, end)
+    if word is not None and word.group() in ACTIVE_FENCES:
+        return "an active code block (Dataview, Templater, Mermaid, script or query)"
+    return None
+
+
+def _wikilink_problem(low: str) -> str | None:
+    """A wikilink `[[…]]` (up to its `]]` or the line end) holding `://` or a refused scheme:
+    plain internal wikilinks pass. Each search resumes after the previous wikilink's end, so the
+    scans are disjoint."""
+    close = newline = -1
+    found = low.find("[[")
+    while found != -1:
+        start = found + 2
+        if close < start:
+            close = _find(low, "]]", start)
+        if newline < start:
+            newline = _find(low, "\n", start)
+        end = min(close, newline)
+        inner = low[start:end]
+        if "://" in inner or any(prefix in inner for prefix in _REFUSED_PREFIXES):
+            return "a wikilink to a URL or a script, data or file link"
+        found = low.find("[[", max(end, start))
+    return None
+
+
+def _obsidian_problem(low: str, *, note_content: bool) -> str | None:
+    """What Obsidian (and its common plugins) would run or read rather than render as text, in
+    a text bound for a note or a notification (decision 46, hardening): Templater and inline
+    script markers, Dataview inline queries, active code fences, Mermaid `click` directives,
+    wikilinks to URLs and, in a note's content, a frontmatter block."""
+    if "<%" in low or "%>" in low:
+        return "a Templater or inline script marker"
+    if "`=" in low or "`$=" in low:
+        return "a Dataview inline query"
+    if note_content:
+        first = low.lstrip(" \t\n")
+        line = first[: _find(first, "\n", 0)].rstrip(" \t")
+        if len(line) >= 3 and not line.strip("-"):
+            return "a frontmatter block"
+    problem = _wikilink_problem(low)
+    if problem is not None:
+        return problem
+    for line in low.split("\n"):
+        if not line:
+            continue
+        start = _content_start(line)
+        problem = _fence_problem(line, start)
+        if problem is not None:
+            return problem
+        if "click" in line and _clicks(line, start):
+            return "a Mermaid click directive"
+    return None
+
+
+def _clicks(line: str, start: int) -> bool:
+    """A Mermaid `click <id> href|call|"…"` at the line's content start or after a `;`."""
+    if _CLICK.match(line, start) is not None:
+        return True
+    semicolon = line.find(";", start)
+    while semicolon != -1:
+        if _CLICK.match(line, semicolon + 1) is not None:
+            return True
+        semicolon = line.find(";", semicolon + 1)
+    return False
+
+
 class _Known:
     """The input set: every URL variant extracted from the viewed input, built on first use."""
 
@@ -334,12 +481,24 @@ def _strings(value: Any) -> Iterator[str]:
             stack.extend(item)
 
 
-def text_problem(text: str, known: Callable[[str], bool]) -> str | None:
+def text_problem(
+    text: str,
+    known: Callable[[str], bool],
+    *,
+    obsidian: bool = True,
+    note_content: bool = False,
+) -> str | None:
     """What the guard refuses in one untrusted text (a closed-set description), or `None`.
 
-    `known(url)` says whether a URL is in the input set. Control and format characters are
-    refused first, then markup on every view, so an embed is reported as one even when its
-    URL is also unknown."""
+    `known(url)` says whether a URL is in the input set. `obsidian`: the text is bound for a
+    note or a notification, so Obsidian's active constructs are refused too
+    (`_obsidian_problem`); `note_content`: it is a note intent's `content`, which must not
+    open with a frontmatter block. A text whose entities are not exhausted after the allowed
+    decoding passes is refused (fail closed). Control and format characters are refused
+    first, then markup on every view, so an embed is reported as one even when its URL is
+    also unknown."""
+    if _entities_exhausted(text):
+        return "too many levels of HTML entities"
     views = list(_views(text))
     if any(_control_problem(view) for view in views):
         return "a control or format character"
@@ -348,14 +507,19 @@ def text_problem(text: str, known: Callable[[str], bool]) -> str | None:
         if "![" in low:
             return "an image or embed"
         problem = _tag_problem(low) or _destination_problem(low)
+        if problem is None and obsidian:
+            problem = _obsidian_problem(low, note_content=note_content)
         if problem is not None:
             return problem
     unknown = False
     for view in views:
         for url in urls(view):
-            if _scheme_of(url) in REFUSED_SCHEMES:
+            scheme = _scheme_of(url)
+            if scheme in REFUSED_SCHEMES:
                 return "a script, data or file link"
             if not any(known(variant) for variant in _variants(url)):
+                if scheme == "obsidian":
+                    return "an obsidian URI not in the input"
                 unknown = True
     return "a link not in the input" if unknown else None
 
@@ -376,7 +540,11 @@ def check_intents(
 ) -> str | None:
     """`None` when the guard accepts every intent of the batch; else the content-free detail
     of the first violation. `shown` is what the model was shown (the viewed input), `source`
-    the proposer (`skill:<name>`), `limits` the most intents of each type."""
+    the proposer: `skill:` and the pipeline's `SkillRef` (`<namespace>/<skill>`, a validated
+    configuration value, never model or input text), else `ValueError`, so a detail and its
+    log line stay content-free. `limits` is the most intents of each type."""
+    if len(source) > 134 or _SOURCE.fullmatch(source) is None:
+        raise ValueError("the guard's source must be `skill:<namespace>/<skill>`")
     for intent_type, most in sorted((limits or {}).items()):
         count = sum(1 for intent in intents if intent.type == intent_type)
         if count > most:
@@ -388,8 +556,10 @@ def check_intents(
         where = f"{source} proposed {intent.type} #{position}"
         if isinstance(intent, NotifyPush) and intent.link is not None and not known(intent.link):
             return _detail(f"{where} with a link not in the input in `link`")
+        obsidian = intent.type != "http.post"
         for name, text in _fields(intent):
-            problem = text_problem(text, known)
+            note_content = name == "content" and intent.type.startswith("note.")
+            problem = text_problem(text, known, obsidian=obsidian, note_content=note_content)
             if problem is not None:
                 return _detail(f"{where} with {problem} in `{name}`")
     return None
@@ -408,6 +578,7 @@ def guard_for(
 
 
 __all__ = [
+    "ACTIVE_FENCES",
     "EMBED_TAGS",
     "GUARD_ERROR",
     "INERT_TAGS",

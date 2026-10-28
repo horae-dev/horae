@@ -198,7 +198,8 @@ UNKNOWN = [
 
 @pytest.mark.parametrize("text", UNKNOWN)
 def test_urls_must_be_in_the_input(text: str) -> None:
-    assert text_problem(text, _known(KNOWN)) == "a link not in the input"
+    expected = "an obsidian URI" if text.startswith("obsidian:") else "a link"
+    assert text_problem(text, _known(KNOWN)) == f"{expected} not in the input"
 
 
 ALLOWED = [
@@ -508,6 +509,183 @@ def test_one_mib_of_hostile_text_is_scanned_in_linear_time() -> None:
         intent = _intents({"type": "note.create", "path": "a.md", "content": content})
         began = time.perf_counter()
         check_intents(intent, shown=shown, source=SOURCE)
+        assert time.perf_counter() - began < 5.0, text[:16]
+
+
+# --- hardening round: the Obsidian rendering surface (decision 46, provisional) ------------------
+
+OBSIDIAN_REFUSED = [
+    # (a) active code fences, any fence, case, up to (and beyond) 3 leading spaces, in containers.
+    ("```dataview\nLIST\n```", "an active code block"),
+    ("~~~DataviewJS\ndv.el('p', 'x')\n~~~", "an active code block"),
+    ("   ```templater\nx\n```", "an active code block"),
+    ("````mermaid\ngraph TD\n````", "an active code block"),
+    ("``` js\nx\n```", "an active code block"),
+    ("```javascript\nx\n```", "an active code block"),
+    ("```html\nx\n```", "an active code block"),
+    ("```button\nname x\n```", "an active code block"),
+    ("```query\ntag:#x\n```", "an active code block"),
+    ("> ```dataview\n> LIST\n> ```", "an active code block"),
+    ("- ```dataview\n  LIST\n  ```", "an active code block"),
+    # (b) Templater and inline script markers, Dataview inline queries.
+    ("Today <% tp.date.now() %>", "a Templater or inline script marker"),
+    ("trailing %> only", "a Templater or inline script marker"),
+    ("&lt;% tp.file.title %&gt;", "a Templater or inline script marker"),
+    ("Count: `= this.file.name`", "a Dataview inline query"),
+    ("Count: `$= dv.current()`", "a Dataview inline query"),
+    # (d) Mermaid click directives, anywhere (also outside a fence, after `;`).
+    ('click nodeA href "https://example.org"', "a Mermaid click directive"),
+    ("graph TD; A-->B; click A call alert()", "a Mermaid click directive"),
+    ('> CLICK n1 "https://example.org"', "a Mermaid click directive"),
+    # (e) wikilinks to URLs or refused schemes.
+    ("[[https://evil.example.net/c]]", "a wikilink to a URL"),
+    ("[[Note|javascript:alert(1)]]", "a wikilink to a URL"),
+    ("[[data:text/html,x]]", "a wikilink to a URL"),
+]
+
+
+@pytest.mark.parametrize(("text", "problem"), OBSIDIAN_REFUSED)
+def test_obsidian_active_constructs_are_refused(text: str, problem: str) -> None:
+    found = text_problem(text, _known("https://example.org", "https://evil.example.net/c"))
+    assert found is not None
+    assert found.startswith(problem), found
+
+
+OBSIDIAN_ALLOWED = [
+    "```python\nprint(1)\n```",
+    "~~~\nplain\n~~~",
+    "``dataview`` is two backticks, not a fence",
+    "Use `code` inline and 50% of it",
+    "See [[Daily/2026-10-27]] and [[Projects/Horae|Horae]]",
+    "Click the button to start",
+    "click here then go",
+    "a = b; click",
+]
+
+
+@pytest.mark.parametrize("text", OBSIDIAN_ALLOWED)
+def test_plain_obsidian_text_is_allowed(text: str) -> None:
+    assert text_problem(text, _known()) is None
+
+
+def test_the_obsidian_rules_apply_to_notes_and_notifications_only() -> None:
+    fence = "```dataview\nLIST\n```"
+    assert text_problem(fence, _known(), obsidian=False) is None
+    post = {"type": "http.post", "url": "https://api.example.org/x", "body": {"q": fence}}
+    assert check_intents(_intents(post), shown=None, source=SOURCE) is None
+    push = {"type": "notify.push", "body": "<% tp.date.now() %>"}
+    detail = check_intents(_intents(push), shown=None, source=SOURCE)
+    assert detail == (
+        f"{SOURCE} proposed notify.push #0 with a Templater or inline script marker in `body`"
+    )
+
+
+def test_a_frontmatter_block_is_refused_in_note_content_only() -> None:
+    front = "---\ntags: [x]\ncssclasses: wide\n---\nBody"
+    assert text_problem(front, _known(), note_content=True) == "a frontmatter block"
+    assert text_problem("\n  ---- \nx", _known(), note_content=True) == "a frontmatter block"
+    assert text_problem("Body\n\n---\n\nMore", _known(), note_content=True) is None
+    assert text_problem(front, _known()) is None  # a heading or a notification: not a note top
+    for raw in (
+        {"type": "note.create", "path": "a.md", "content": front},
+        {"type": "note.append_section", "path": "a.md", "heading": "h", "content": front},
+        {"type": "note.replace_owned_block", "path": "a.md", "block": "b", "content": front},
+    ):
+        detail = check_intents(_intents(raw), shown=None, source=SOURCE)
+        assert detail is not None
+        assert detail.endswith("with a frontmatter block in `content`")
+
+
+def test_obsidian_uris_must_be_exactly_in_the_input() -> None:
+    uri = "obsidian://open?vault=Main&file=Today"
+    assert text_problem(f"Open {uri}", _known(uri)) is None
+    assert text_problem(f"[open]({uri})", _known(uri)) is None
+    assert text_problem(f"Open {uri}2", _known(uri)) == "an obsidian URI not in the input"
+    assert text_problem("OBSIDIAN://open?vault=Main", _known(uri)) == (
+        "an obsidian URI not in the input"
+    )
+    assert text_problem("obsidian:open?vault=Main", _known(uri)) == (
+        "an obsidian URI not in the input"
+    )
+
+
+PREFIXED_DEFINITIONS = [
+    "> [ref]: javascript:alert(1)",
+    "> > [ref]: a b",
+    "- [ref]: data:text/html,x",
+    "* [ref]: a b",
+    "+ [ref]: a\\b",
+    "1. [ref]: vbscript:x",
+    "12) [ref]: a b",
+    "   > - [ref]: file:///etc/passwd",
+]
+
+
+@pytest.mark.parametrize("text", PREFIXED_DEFINITIONS)
+def test_blockquote_and_list_prefixed_link_definitions_are_checked(text: str) -> None:
+    problem = text_problem(text, _known())
+    assert problem is not None
+    assert problem.startswith(("whitespace", "a script")), problem
+
+
+def test_footnotes_get_no_exemption_from_the_url_checks() -> None:
+    assert text_problem("[^1]: see https://evil.example.net/c", _known(KNOWN)) == (
+        "a link not in the input"
+    )
+    assert text_problem(f"[^1]: see {KNOWN}", _known(KNOWN)) is None
+    assert text_problem(f"[^1]: ![x]({KNOWN})", _known(KNOWN)) == "an image or embed"
+    assert text_problem("> [^1]: <iframe>", _known()) is not None
+
+
+def test_entity_decoding_fails_closed() -> None:
+    triple = f"&amp;amp;lt;img src={KNOWN}&gt;"  # `<` encoded three times: still decoded
+    assert text_problem(triple, _known(KNOWN)) == "an HTML <img> embed"
+    quadruple = f"&amp;amp;amp;lt;img src={KNOWN}&gt;"  # one level past the passes
+    assert text_problem(quadruple, _known(KNOWN)) == "too many levels of HTML entities"
+    assert text_problem("&amp;amp;amp;amp; plain", _known()) == "too many levels of HTML entities"
+    assert text_problem("Tom &amp; Jerry &amp;amp; co", _known()) is None
+
+
+def test_the_source_must_be_a_skill_reference() -> None:
+    note = _intents({"type": "note.create", "path": "a.md", "content": "x"})
+    assert check_intents(note, shown=None, source="skill:daily-brief/rank") is None
+    for bad in ("skill:", "plugin:x/y", "skill:x/y z", f"skill:x/{EVIL}", "skill:X/y"):
+        with pytest.raises(ValueError, match="source"):
+            check_intents(note, shown=None, source=bad)
+
+
+def test_one_mib_for_the_obsidian_scans_in_linear_time() -> None:
+    size = 1 << 20
+    worst = [
+        "[[" * (size // 2),
+        "[[a\n" * (size // 4),
+        "[[" + "a" * size,
+        "]]" * (size // 2),
+        "```" * (size // 3),
+        "```\n" * (size // 4),
+        "~" * size,
+        "`" * size,
+        "> " * (size // 2),
+        "- " * (size // 2),
+        "1. " * (size // 3),
+        "1" * size,
+        " " * size + "```dataview",
+        "\n" * size,
+        "> [r]: x\n" * (size // 9),
+        "click a " * (size // 8),
+        ";click a" * (size // 8),
+        "click " + "a" * size,
+        "-" * size,
+        "<" * (size // 2) + "%",
+        "&amp;" * (size // 5),
+        "&amp;amp;amp;amp;" * (size // 17),
+        "obsidian:" * (size // 9),
+    ]
+    for text in worst:
+        content = text[:size]
+        intent = _intents({"type": "note.create", "path": "a.md", "content": content})
+        began = time.perf_counter()
+        check_intents(intent, shown=None, source=SOURCE)
         assert time.perf_counter() - began < 5.0, text[:16]
 
 

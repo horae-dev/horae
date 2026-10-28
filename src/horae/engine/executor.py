@@ -1278,11 +1278,11 @@ def _reuse_marker(spec: LlmSpec, key: str, source_run: str | None) -> dict[str, 
 
 
 async def _discard(cache: LlmCache | None, key: str, model_alias: str) -> None:
-    """Delete a cached entry, when the cache can (`discard`, optional); never raises."""
-    discard = getattr(cache, "discard", None)
-    if callable(discard):
+    """Delete a cached entry (`LlmCache.discard`, part of the port: a cache that cannot delete
+    has a no-op); never raises."""
+    if cache is not None:
         with contextlib.suppress(Exception):  # a broken cache never fails the run
-            await discard(key, model_alias=model_alias)
+            await cache.discard(key, model_alias=model_alias)
 
 
 def _shown(step: _Planned, viewed: Any, source: str) -> dict[str, Any]:
