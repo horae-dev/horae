@@ -119,7 +119,6 @@ def test_doctor_never_prints_secret_values(
     outputs += [caplog.text, *capsys.readouterr()]
     assert "BROKEN_KEY" in outputs[0]
     assert "CLAUDE_CODE_OAUTH_TOKEN" in outputs[0]
-    assert "secret ANTHROPIC_API_KEY resolved from file" in caplog.text
     for text in outputs:
         assert anthropic_key not in text
         assert github_token not in text

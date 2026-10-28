@@ -188,15 +188,13 @@ def test_open_failure_after_stat(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
         _resolver(tmp_path, {}).resolve("API_KEY")
 
 
-def test_resolution_logs_names_never_values(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
+def test_resolution_logs_nothing(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     (tmp_path / "FILE_KEY").write_text(VALUE + "-file", encoding="utf-8")
     resolver = _resolver(tmp_path, {"ENV_KEY": VALUE + "-env"})
-    with caplog.at_level(logging.DEBUG, logger="horae"):
+    with caplog.at_level(logging.DEBUG):
         resolver.resolve("ENV_KEY")
         resolver.resolve("FILE_KEY")
-    assert "secret ENV_KEY resolved from environment variable ENV_KEY" in caplog.text
-    assert "secret FILE_KEY resolved from file" in caplog.text
+        with pytest.raises(SecretError):
+            resolver.resolve("MISSING")
     assert VALUE not in caplog.text
-    assert all(VALUE not in str(r.args) for r in caplog.records)
+    assert caplog.records == []

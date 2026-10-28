@@ -6,11 +6,11 @@ A secret is resolved from an environment variable or from a file in the secrets 
 `Secret`, whose `repr`, `str`, `format` and pydantic serialization are redacted, and which
 refuses to be pickled. Code that needs the value calls `Secret.reveal()` at the last moment.
 
-Error messages and logs name the secret and where it was looked for, never its value.
+Error messages name the secret and where it was looked for, never its value. Resolution
+logs nothing.
 """
 
 import hmac
-import logging
 import os
 import stat
 from collections.abc import Mapping
@@ -27,8 +27,6 @@ REDACTED = "[REDACTED]"
 
 MAX_SECRET_BYTES = 64 * 1024
 """Largest secret file read, in bytes."""
-
-log = logging.getLogger(__name__)
 
 
 class Secret:
@@ -162,7 +160,6 @@ class SecretResolver:
         if variable not in self._environ:
             return None
         secret = _clean(name, self._environ[variable], f"environment variable {variable}")
-        log.debug("secret %s resolved from environment variable %s", name, variable)
         return secret
 
     def _from_file(self, name: str, path: Path) -> Secret | None:
@@ -187,7 +184,6 @@ class SecretResolver:
             secret = _clean(name, data.decode("utf-8"), f"file {path}")
         except UnicodeDecodeError:
             raise SecretError(name, f"file {path} is not valid UTF-8") from None
-        log.debug("secret %s resolved from file %s", name, path)
         return secret
 
 
