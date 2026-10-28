@@ -311,3 +311,29 @@ loosened later without breaking a valid file.
     must treat as data. Reusing an unchanged input re-proposes identical intents, `notify.push`
     included, so appliers (#21/#22) must deduplicate notifications (e.g. by `input_hash` and
     intent); reused intents that no longer route are a cache miss and the LLM is called.
+
+### Provisional decisions (#19, pending maintainer review)
+
+31. **Run lifecycle (#19).** `horae.yaml` takes an optional `runs.timeout_s` (default 900, 1 to
+    86400 seconds), the run timeout: past it the runner (`horae.runner`) cancels the run and
+    saves the partial record `failed`, with the interrupted step `failed` with error kind
+    `timeout` (kind `cancelled` when the caller cancelled instead) and later steps `skipped`.
+    Per-call limits stay where they are: `plugin_defaults.call_timeout_s` for tool calls (the
+    #24 host) and the pipeline's `llm.timeout_s` for the LLM step (the engine). Other rules of
+    the runner, which are not part of a schema:
+    - run ids are `<UTC start, %Y%m%dT%H%M%S%fZ>-<pipeline>-<6 hex>`, so they sort by start
+      time and match `RunId`;
+    - a run is locked per pipeline by the store (`PipelineBusy`); the runner reports
+      `PipelineLocked`, naming the run that holds the lock, its start, pid and host;
+    - a running run writes a heartbeat every 10 s; before each run, running runs are
+      abandoned (`failed`, no record, journal kept) when their heartbeat is older than 120 s,
+      or when they were started on this host by a pid that no longer exists;
+    - a crash (any other exception) abandons the run with `run crashed (<ExceptionType>)`,
+      never the exception's message;
+    - the template time zone is the pipeline trigger's `timezone` when set, else
+      `horae.yaml` `timezone`;
+    - the store is `<state_dir>/horae.db`. `horae runs` lists runs (`--pipeline`,
+      `--status`, `--limit`, `--json`) with the exit codes of decision 27; `--json` prints
+      `{"schema_version": 1, "instance", "runs": [{id, pipeline, status, dry_run, abandoned,
+      started_at, finished_at, duration_s, cost: {usd, tokens_in, tokens_out}, error}]}`.
+      It never creates the store.

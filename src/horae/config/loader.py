@@ -20,6 +20,8 @@ from horae.secrets import Secret, SecretError, SecretResolver
 CONFIG_FILE = "horae.yaml"
 LOCK_FILE = "horae.lock"
 PIPELINES_DIR = "pipelines"
+STORE_FILE = "horae.db"
+"""The SQLite store's file name, inside the state directory (ADR 0006)."""
 PIPELINE_SUFFIXES = (".yaml", ".yml")
 
 
@@ -56,6 +58,11 @@ class Instance:
     @property
     def state_dir(self) -> Path:
         return self.root / self.config.state_dir
+
+    @property
+    def store_path(self) -> Path:
+        """The SQLite store (`<state_dir>/horae.db`)."""
+        return self.state_dir / STORE_FILE
 
     @property
     def secrets_dir(self) -> Path:

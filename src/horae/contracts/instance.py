@@ -218,6 +218,23 @@ class PluginSettings(Contract):
     """Seconds one tool call may take. When omitted, `plugin_defaults` applies."""
 
 
+MIN_RUN_TIMEOUT_S = 1.0
+MAX_RUN_TIMEOUT_S = 86400.0
+DEFAULT_RUN_TIMEOUT_S = 900.0
+
+RunTimeout = Annotated[StrictFloat, Field(ge=MIN_RUN_TIMEOUT_S, le=MAX_RUN_TIMEOUT_S)]
+"""A run timeout in seconds, 1 to 86400 (one day)."""
+
+
+class RunsConfig(Contract):
+    """Bounds of one pipeline run (#19)."""
+
+    timeout_s: RunTimeout = DEFAULT_RUN_TIMEOUT_S
+    """Seconds a whole run may take. Past it the run is cancelled: the current step is
+    `failed` with kind `timeout`, later steps are `skipped` and the run is `failed`. Per-call
+    limits are separate: `plugin_defaults.call_timeout_s` and the LLM step's `timeout_s`."""
+
+
 class SchedulerConfig(Contract):
     """How pipelines with a `trigger` are started."""
 
@@ -247,6 +264,8 @@ class InstanceConfig(Contract):
     """Per-plugin settings, by plugin name."""
     secrets: SecretsConfig = Field(default_factory=SecretsConfig)
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
+    runs: RunsConfig = Field(default_factory=RunsConfig)
+    """Bounds of every pipeline run (the run timeout)."""
 
     def plugin_timeouts(self, plugin: str) -> PluginDefaults:
         """The effective timeouts of `plugin`: its own settings, else `plugin_defaults`."""
