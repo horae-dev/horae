@@ -25,6 +25,7 @@ import shutil
 import socket
 import sqlite3
 import subprocess
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -193,6 +194,9 @@ def arm(
         connect = never("_socket.socket.connect")
         connect_ex = never("_socket.socket.connect_ex")
 
+    # A module first imported while the guard is armed must not write its bytecode cache
+    # (`__pycache__` in site-packages: the interpreter's, not the dry run's).
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
     monkeypatch.setattr(builtins, "open", guarded_open)
     monkeypatch.setattr(io, "open", guarded_open)
     monkeypatch.setattr(os, "open", guarded_os_open)
