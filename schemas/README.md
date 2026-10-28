@@ -194,11 +194,13 @@ conservative option, so loosening one later is a compatible change.
     syntax; the schema validates the parsed document (the example is YAML) and adds the git
     `repo` (https only). Permission lists are written sorted.
 21. **Run record.** v1 requires `pipeline_digest` (SHA-256, hex, of the canonical pipeline
-    definition; the canonical form, e.g. RFC 8785 JSON, is for the engine to fix) and `context`
+    definition; the canonical form is fixed by the engine, see `horae.engine.canonical`) and `context`
     (`now`, IANA `timezone`, rendered template `vars`). Optional: `lock_digest`, `config_digest`,
     `input_hash`, per-step `error` / timings / capped `stderr`, LLM `attempt` and `schema_valid`,
     and `violations` (`egress_blocked`, `guard`, `undeclared_secret`, `undeclared_path`). Statuses:
     run `ok`, `noop`, `degraded`, `failed`, `undone`; step `ok`, `skipped`, `degraded`, `failed`.
     A dry run has no `changes`. Untrusted-content tagging is not part of v1.
+    `intents[].proposed_by` is the proposing tool (`<namespace>.<tool>`) or, for intents of the
+    `llm` step, the skill (`<namespace>/<skill>`) (added with #17, a compatible loosening).
 22. **`$id` host.** `raw.githubusercontent.com/horae-dev/horae/main/schemas/…`, which this project
     controls and which serves the files once merged. A custom domain can come later as `v<N+1>`.

@@ -394,10 +394,20 @@
           "type": "integer"
         },
         "proposed_by": {
-          "maxLength": 128,
-          "pattern": "^[a-z][a-z0-9-]*\\.[a-z][a-z0-9_]*$",
-          "title": "Proposed By",
-          "type": "string"
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "pattern": "^[a-z][a-z0-9-]*\\.[a-z][a-z0-9_]*$",
+              "type": "string"
+            },
+            {
+              "maxLength": 128,
+              "pattern": "^[a-z][a-z0-9-]*/[a-z][a-z0-9_-]*$",
+              "type": "string"
+            }
+          ],
+          "description": "The tool (`<namespace>.<tool>`) or, for the `llm` step, the skill (`<namespace>/<skill>`)\nthat proposed it.",
+          "title": "Proposed By"
         },
         "intent": {
           "oneOf": [

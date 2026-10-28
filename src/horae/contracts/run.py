@@ -157,7 +157,9 @@ class ProposedIntent(Contract):
 
     step: StepIndex
     """Index of the step that proposed it."""
-    proposed_by: PluginRef
+    proposed_by: PluginRef | SkillRef
+    """The tool (`<namespace>.<tool>`) or, for the `llm` step, the skill (`<namespace>/<skill>`)
+    that proposed it."""
     intent: Intent
 
 
