@@ -54,24 +54,26 @@ process resolved, the alias' key included once its backend resolved it) before i
 error with no `__cause__` / `__context__`), and the response's output, intents, schema
 errors and request summary. A secret found there is logged (`horae.llm`, names only). A
 skill's prompt or output schema holding a secret (in a string, an object key or as a
-number's whole value) is refused by `prepare` with `params_invalid`, naming the secret only,
-before anything is rendered, reserved or sent (a secret is never a trusted parameter). This
-check runs when the `llm` step prepares its request, **not at plan time**: until #27's skill
-loader gives the engine the prompt before the run starts, the steps before the `llm` step have
-already run when it refuses (the run then fails at that step, nothing is sent to the model);
-with the loader the check moves to the engine's `_plan`, before any step runs.
+number's whole value) is refused with `params_invalid`, naming the secret only (a secret is
+never a trusted parameter): by the engine's `_plan`, which loads the skill through its
+`SkillSource` before any step runs (schemas decision 43 D), and again by `prepare`, as a
+backstop, before anything is rendered, reserved or sent (an engine given no `SkillSource`,
+a `PromptSource` other than the skill loader).
 
 **Retries.** None here: the engine owns the single repair retry (`attempt` 2). Provider
 backends disable their SDK's own retries.
 
 **Integration points.**
 
-- **#27 (skill format).** `RequestPrompts` reads the rendered prompt, the viewed input, the
+- **#27 (skill format).** `RequestPrompts` reads the skill's prompt, the viewed input, the
   output schema and the skill version from the `LlmRequest` (`prompt`, `input`,
-  `output_schema`, `skill_version`) with `getattr`, so it works before and after #27 adds
-  those fields. Until then a request without them fails with kind `skill_unavailable` (the
-  skill cannot be used yet; a skill that is present but malformed is #27's `skill_invalid`).
-  Another `PromptSource` (a skill loader) can be passed to `ModelBackends` instead.
+  `output_schema`, `skill_version`, set by the engine from the loaded skill). A request
+  without a prompt or schema (an engine given no `SkillSource`) fails with kind
+  `skill_unavailable`: a real backend never sends the whole input without a skill (a skill
+  that is present but malformed fails earlier, `skill_invalid`). A skill that declares
+  intents must declare the reserved `intents` array in its output schema (#27,
+  `horae.skills.INTENTS_PROPERTY`, the same name as `INTENTS_KEY`). Another `PromptSource`
+  can be passed to `ModelBackends` instead.
 - **#31 (repair).** `ModelBackends(validate=...)` turns an output into its schema errors
   (`LlmResponse.schema_errors`, which drive the repair retry). Without a validator the
   provider's structured output is the only check and `schema_errors` is empty. **The
@@ -144,10 +146,8 @@ class RequestPrompts:
     """Reads the prompt from the request itself (the #27 fields of `LlmRequest`)."""
 
     def prompt(self, request: LlmRequest) -> Prompt:
-        system = getattr(request, "prompt", None)
-        schema = getattr(request, "output_schema", None)
-        version = getattr(request, "skill_version", None)
-        if not isinstance(system, str) or not isinstance(schema, Mapping):
+        system, schema, version = request.prompt, request.output_schema, request.skill_version
+        if system is None or schema is None:
             raise LlmError(
                 "skill_unavailable",
                 f"skill {request.skill} has no loaded prompt and output schema",
@@ -156,7 +156,7 @@ class RequestPrompts:
             system=system,
             input=request.input,
             output_schema=schema,
-            skill_version=version if isinstance(version, str) and version else "0",
+            skill_version=version or "0",
         )
 
 

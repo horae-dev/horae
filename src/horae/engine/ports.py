@@ -32,9 +32,11 @@ data, fails the call (`output_invalid` / `output_too_large`); any other exceptio
 `host_error` without its message.
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
+from horae.contracts.intents import IntentType
 from horae.contracts.pipeline import Budget
 from horae.contracts.plugin import PluginManifest
 from horae.contracts.run import ErrorKind, Usage, Violation
@@ -162,6 +164,15 @@ class LlmRequest:
     """1, or 2 for the repair retry."""
     repair: tuple[str, ...] = ()
     """For the retry: the previous attempt's schema validation errors, and nothing else."""
+    prompt: str | None = None
+    """The skill's prompt (trusted, sent verbatim). `None` only when the engine was given no
+    `SkillSource` (tests with fakes); a real backend (#28) must refuse such a request."""
+    output_schema: Mapping[str, Any] | None = None
+    """The skill's output JSON Schema (draft 2020-12, bounded; a fresh copy per request)."""
+    skill_version: str | None = None
+    """The loaded skill's version."""
+    skill_digest: str | None = None
+    """SHA-256 of the skill's content (`LoadedSkill.digest`)."""
 
 
 @dataclass(frozen=True)
@@ -208,6 +219,76 @@ class PreviousLlm:
     skill_version: str
     model: str
     backend: LlmBackendName
+
+
+class SkillUnavailable(Exception):
+    """A skill could not be loaded: missing or invalid files (`horae.skills.SkillError`).
+
+    The message names the skill and the problem (file names, never file content); the engine
+    records it as a `skill_invalid` plan error."""
+
+
+class LoadedSkill(Protocol):
+    """A validated skill (`horae.skills.Skill`): what the engine needs from it."""
+
+    @property
+    def name(self) -> str:
+        """`<namespace>/<skill>`."""
+        ...
+
+    @property
+    def version(self) -> str:
+        """The skill's semver version (`LlmCall.skill_version`)."""
+        ...
+
+    @property
+    def digest(self) -> str:
+        """SHA-256 of the skill's prompt, output schema, input view and intents."""
+        ...
+
+    @property
+    def prompt(self) -> str: ...
+
+    @property
+    def output_schema(self) -> Mapping[str, Any]:
+        """The output JSON Schema (a fresh copy on each access)."""
+        ...
+
+    @property
+    def intents(self) -> tuple[IntentType, ...]:
+        """The intents the skill may propose (within the plugin's permissions)."""
+        ...
+
+    @property
+    def intent_limits(self) -> Mapping[str, int]:
+        """The most intents of a type the skill may propose per step (types not listed: no
+        limit beyond the run's)."""
+        ...
+
+    @property
+    def output_bound(self) -> int:
+        """The output schema's size bound, in UTF-8 bytes of compact JSON."""
+        ...
+
+    @property
+    def view_paths(self) -> tuple[str, ...]:
+        """The input view paths (`SkillManifest.input_view`), sorted."""
+        ...
+
+    def view(self, data: Any) -> Any:
+        """The step input restricted to the skill's input view (plain JSON, deterministic)."""
+        ...
+
+
+class SkillSource(Protocol):
+    """Loads the skill a plugin ships (`horae.skills.DirectorySkills`).
+
+    Like `PluginRegistry`, it reads local files only. The engine loads the skill of the `llm`
+    step while planning, before any plugin is called."""
+
+    def load_skill(self, skill: str, plugin: ResolvedPlugin) -> LoadedSkill:
+        """The validated skill `skill` of `plugin`; raises `SkillUnavailable`."""
+        ...
 
 
 class LlmBackend(Protocol):

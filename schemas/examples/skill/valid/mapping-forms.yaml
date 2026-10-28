@@ -1,0 +1,12 @@
+# The mapping forms: input view paths with options (#34 field classes) and a maximum per
+# intent type (#35). Synthetic.
+name: daily-brief/rank-and-word
+version: 1.1.0
+description: Rank today's tasks and word the morning note.
+input_view:
+  tasks[].title: { class: free_text }
+  tasks[].fingerprint:
+  events[].attendees[]: { class: person }
+intents:
+  note.create: 1
+  task.update_status: 20

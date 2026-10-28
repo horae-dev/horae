@@ -21,10 +21,12 @@ from horae.cli_output import EXIT_PROBLEMS, CommandFailed, plural
 from horae.config import CONFIG_FILE, Instance, InstanceError, Problem, ProblemsError, load_instance
 from horae.contracts.pipeline import LlmStep
 from horae.contracts.plugin import StdioRuntime
+from horae.engine import UnknownPlugin
 from horae.llm.backends import FACTORIES
 from horae.plugins.host import HostRegistry, PluginCallError, RegistryError
 from horae.plugins.host.host import resolve_command
 from horae.runner import LivePorts, open_ports
+from horae.skills import SKILLS_DIR, SkillError, load_skill
 
 PLUGINS_DIR = "plugins"
 LOCK_FILE = "horae.lock"
@@ -236,14 +238,41 @@ def _budget_problems(instance: Instance) -> list[Problem]:
     return problems
 
 
+def _skill_problems(instance: Instance, registry: HostRegistry) -> list[Problem]:
+    """Each skill an `llm` step of a pipeline uses that does not load (`SkillError`), as the
+    engine would load it (with the plugin's locked `permissions.intents`)."""
+    used = sorted(
+        {
+            step.llm.skill
+            for pipeline in instance.pipelines.values()
+            for step in pipeline.steps
+            if isinstance(step, LlmStep)
+        }
+    )
+    problems: list[Problem] = []
+    for skill in used:
+        try:
+            plugin = registry.installed(registry.plugin_for_skill(skill).manifest.name)
+        except UnknownPlugin:
+            continue  # reported by the configuration checks
+        where = f"{PLUGINS_DIR}/{plugin.manifest.name}/{SKILLS_DIR}/{skill}/"
+        if plugin.root is None:  # pragma: no cover (from_directory sets every root)
+            continue
+        try:
+            load_skill(plugin.root, skill, allowed_intents=plugin.manifest.permissions.intents)
+        except SkillError as error:
+            problems.append(Problem(where, None, None, f"skill_invalid: {error.problem}"))
+    return problems
+
+
 def instance_problems(instance: Instance) -> list[Problem]:
     """What `horae doctor` checks beyond the configuration (`check_instance`): the lock's
     paths exist, the instance's own `vault/` is the one the lock writes to, each model alias
     an `llm` step uses has an available backend (and, for a cloud backend, a `price`, else a
     warning; a warning too for a `usd` daily ceiling over such an unpriced alias), and,
-    when the instance has a `plugins/` directory, the plugins are installed
-    as the lock pins them (`check_plugins`) and each command (its interpreter) exists and is
-    executable."""
+    when the instance has a `plugins/` directory, the plugins are installed as the lock
+    pins them (`check_plugins`), each command (its interpreter) exists and is executable,
+    and every skill an `llm` step uses loads (`horae.skills.load_skill`)."""
     problems = _path_problems(instance) + _backend_problems(instance) + _budget_problems(instance)
     if plugins_dir(instance.root).is_dir():
         try:
@@ -252,6 +281,7 @@ def instance_problems(instance: Instance) -> list[Problem]:
             problems.append(Problem(f"{PLUGINS_DIR}/", None, None, failed.message))
         else:
             problems.extend(_command_problems(registry))
+            problems.extend(_skill_problems(instance, registry))
     return problems
 
 

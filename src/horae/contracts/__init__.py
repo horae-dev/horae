@@ -77,6 +77,7 @@ from horae.contracts.run import (
     Usage,
     Violation,
 )
+from horae.contracts.skill import SkillFile, SkillManifest, ViewPath
 from horae.contracts.types import (
     AbsolutePath,
     BlockId,
@@ -166,6 +167,8 @@ __all__ = [
     "SecretsConfig",
     "SemVer",
     "Sha256Hex",
+    "SkillFile",
+    "SkillManifest",
     "SkillRef",
     "SpdxExpression",
     "StdioRuntime",
@@ -180,6 +183,7 @@ __all__ = [
     "Trigger",
     "Usage",
     "VersionSpecifier",
+    "ViewPath",
     "Violation",
     "intent_adapter",
     "url_host",

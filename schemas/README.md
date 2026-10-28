@@ -13,6 +13,7 @@ All schemas use JSON Schema **draft 2020-12**. `$id` values below are relative t
 | Lockfile | [`lockfile/v1.json`](lockfile/v1.json) | `lockfile/v1.json` | `horae.lock` (§4) |
 | Run record | [`run-record/v1.json`](run-record/v1.json) | `run-record/v1.json` | one run (§3.1, §2.1.6) |
 | Instance configuration | [`instance/v1.json`](instance/v1.json) | `instance/v1.json` | `horae.yaml` (§3.1, §3.4, §7) |
+| Skill | [`skill/v1.json`](skill/v1.json) | `skill/v1.json` | `skills/<namespace>/<skill>/skill.yaml` of a plugin (§2.1, §3.4) |
 
 ## Source of truth
 
@@ -110,6 +111,8 @@ JSON Schema cannot express these; the models enforce them and the tests pin the 
   `applied_by_call` are all set or all absent (the JSON Schema's `dependentRequired` checks
   presence, the model also rejects an explicit `null` next to a value); `pipeline_definition`
   is a valid pipeline named `pipeline`, at most 64 KiB as compact JSON (decision 33).
+- `skill`: two `input_view` paths may not overlap (one a prefix of the other) or disagree on
+  whether a value is an object or an array (decision 39).
 - `plugin-manifest`: the host of an `mcp-http` `runtime.url` is listed in `permissions.network`;
   no tool in `provides` is a sink operation of the plugin's own sink or notifier namespaces
   (`<ns>.read`, `<ns>.apply`, `<ns>.restore`, `<ns>.parent_exists`, `<ns>.identity`,
@@ -1110,13 +1113,135 @@ loosened later without breaking a valid file.
       37) when an alias is configured. `horae doctor` reports a model alias used by an `llm`
       step whose backend is not available (`models.<alias>.backend`), besides its secret;
     - **integration points (#27)**: the prompt, viewed input, output schema and skill version
-      come from the `LlmRequest` (`RequestPrompts` reads the fields #27 adds with `getattr`,
-      so it works before and after #27). Until then the step stops with `skill_unavailable`
-      before any request; `skill_unavailable` means "no usable prompt for this skill here",
-      and #27's `skill_invalid` (a skill that is present but malformed) is reported before
-      the LLM layer is reached. #27 also changes `open_ports` (`horae.runner._ports`), which
-      this change touches too: the merge keeps both (the skill loader becomes the
-      `PromptSource` of the `ModelBackends` built there).
+      come from the `LlmRequest` (`RequestPrompts` reads the fields #27 added: `prompt`,
+      `output_schema`, `skill_version`). A request without a prompt or schema (an engine
+      given no `SkillSource`) stops with `skill_unavailable` before any request;
+      `skill_unavailable` means "no usable prompt for this skill here", and #27's
+      `skill_invalid` (a skill that is present but malformed) is reported while planning,
+      before the LLM layer is reached. `open_ports` (`horae.runner._ports`) builds both the
+      owned `ModelBackends` and the `DirectorySkills` source (`Ports.skills`, decision 39);
+      the reserved `intents` property is the one #27's schema check requires of a skill
+      that declares intents (`horae.skills.INTENTS_PROPERTY` is `INTENTS_KEY`).
+
+### Provisional decisions (#27, pending maintainer review)
+
+39. **Skill format and loader (#27).** A new contract, `schemas/skill/v1.json`
+    (`horae.contracts.skill.SkillManifest`), the loader `horae.skills`, and one optional
+    run-record field, `llm[].skill_digest` (a compatible addition). Numbered 39 because #28
+    (decision 38) merges first. Choices to verify:
+    - **(A) layout.** A skill `<namespace>/<skill>` is the folder
+      `skills/<namespace>/<skill>/` of the plugin that lists it in `provides.skills`
+      (`HostRegistry.plugin_for_skill`, then the plugin's installed directory). The namespace
+      is a folder level so one plugin can ship skills of two namespaces without a clash. The
+      folder holds `skill.yaml`, the prompt (`prompt.md` by default) and the output schema
+      (`output.schema.json` by default); other files are ignored;
+    - **(B) `skill.yaml` and race-safe reads**: `name` (must equal the skill ref), `version`
+      (semver), `description` (one line), `input_view` (1 to 256 paths), optional `prompt` and
+      `output_schema` file names, optional `intents`. File names are **one path segment**
+      (`^[A-Za-z0-9_][A-Za-z0-9_.-]*$`), so `../`, absolute paths and hidden files cannot be
+      written. The loader opens the plugin root and walks `skills`, the namespace and the
+      skill one component at a time relative to the previous descriptor (`dir_fd`), each
+      `O_DIRECTORY | O_NOFOLLOW`, then opens each file relative to the skill folder with
+      `O_NOFOLLOW | O_NONBLOCK` and checks it with `fstat`: a regular file with exactly one
+      hard link. **Every symbolic link inside the skill tree is refused** (a symlinked skill
+      folder, namespace or `skills` folder too, and a link between two files of the folder),
+      and so is a hard link to a file elsewhere. Swapping a component for a link between a
+      check and the read cannot redirect the read. Sizes: `skill.yaml`, prompt and schema at
+      most 64 KiB each. Every problem, including a non-finite number, a lone surrogate, a
+      `$ref` chain or a recursion too deep, is a `SkillError` (`skill_invalid`);
+    - **(C) input view: dotted paths with `[]`**, not JSON Pointer: `tasks[].title`,
+      `[].data` (a `collect` output is an array at the root), `matrix[][].v`. JSON Pointer
+      names one location (`/tasks/0/title`) and has no "every element", and its `~0`/`~1`
+      escapes are hard to review in YAML. Names are `[A-Za-z_][A-Za-z0-9_-]*`: a key with
+      another character cannot be selected in v1; the bracket-quoted form (`["a.b"]`) is
+      reserved for it. A path selects the whole value it ends on; overlapping or
+      shape-contradicting paths are refused. `input_view` is a list of paths **or a mapping
+      `path: {options}`** (for #34's field classes, `events[].attendees[]: {class: person}`):
+      options are free-form but bounded (at most 16 per path, names like the paths', values
+      booleans, finite numbers, one-line strings or lists of at most 64 of them); `class`,
+      when given, is one of `person`, `email`, `phone`, `place`, `amount`, `free_text`. v1 does
+      not act on options; they join the skill's digest only when present, so a mapping without
+      options has the list form's digest. **Applying** the view (`InputView.apply`) keeps
+      exactly the declared keys that are present, maps `[]` over arrays (keeping order,
+      dropping elements of the wrong shape) and re-encodes the result with `sort_keys`, so
+      object keys are sorted at every depth (inside selected whole values too) and nothing
+      is shared with the input; a value of the wrong shape selects nothing (the root: `null`,
+      see G). Missing fields are not an error: the input is untrusted data;
+    - **(D) prompt: no template syntax in v1.** The prompt is sent verbatim; `{{` and `}}` are
+      refused so a later syntax (e.g. `{{date}}` from the run context, never from the input)
+      is a compatible addition. It must be non-empty UTF-8 without a character of the Unicode
+      categories `Cc`, `Cf`, `Co`, `Cs`, `Cn`, `Zl`, `Zp` (but tab and newline: no CR, so the
+      digest does not depend on line endings), which covers the bidirectional controls,
+      zero-width characters, U+00AD, U+180E, the tag characters U+E0000 to U+E007F and U+2028 /
+      U+2029, nor another invisible character (the variation selectors U+FE00 to U+FE0F and
+      U+E0100 to U+E01EF, the combining grapheme joiner, the Hangul fillers). The input is
+      never interpolated into the prompt: it travels separately, as data (tenet 5);
+    - **(E) output schema: draft 2020-12, self-contained, regex-free and bounded**
+      (`horae.skills.check_output_schema`): the metaschema, an optional `$schema` that must
+      be 2020-12, a root `"type": "object"`, only local `$ref`s (at most 32 chained, no cycle,
+      no `%`: the validator percent-decodes pointers; resolved with `referencing`, as the
+      validator resolves them), every `$defs` / `definitions` entry bounded even when
+      unreferenced, and no `$id`, `$anchor`, `$dynamic*`, `$recursive*` or `$vocabulary`; **no `pattern`,
+      `patternProperties`, `propertyNames` or `"format": "regex"`** (a plugin author's regex
+      is a ReDoS risk; #31 must still validate outputs in a worker it can kill on a timeout);
+      every subschema a value meets has a `type`, `enum`, `const`, `$ref` or combinator; a
+      `string` needs `maxLength`, an `array` `maxItems` (and `items` past its `prefixItems`),
+      an `object` `additionalProperties: false` (as the backends' strict structured-output
+      modes require), an `integer` or `number` a finite lower and upper bound. The **size
+      bound** is in **UTF-8 bytes** of the compact JSON (`separators=(",", ":")`,
+      `ensure_ascii=False`) and is a sound worst case: a string counts `6 * maxLength + 2`
+      (every code point escaped as `\uXXXX`), a number the digits of its larger extreme (an
+      `integer` two more, for `3.0`; a `number` or an extreme of 10^15 or more at least 25, the
+      longest float `repr`), `enum` / `const` their longest serialisation (`1` may be `1.0`);
+      `anyOf` / `oneOf` take the largest branch, `allOf` the smallest **bounded** branch
+      (unconstrained branches are skipped; refused only if none is bounded), and a keyword
+      that does not bound is skipped when another one does. #31 re-serialises the validated
+      output in that form, so the bound holds for what it stores. A property test
+      (`hypothesis`, a new dev dependency) checks it on random bounded schemas. The bound
+      must be at most `MAX_OUTPUT_BYTES` (256 KiB); the file nests at most 64 levels and is
+      strict JSON (no duplicate keys, no `NaN`, no number overflowing to infinity). This adds
+      **`jsonschema` as a runtime dependency** (it was a dev dependency; #31 needs it to
+      validate outputs);
+    - **(F) intents.** `intents` is a list of types or a mapping `type: max` (1 to 256, #35):
+      at most `max` intents of that type per `llm` step, more is `intent_rejected` (fresh
+      outputs; a reused one over the limit is a cache miss). Omitted or empty: the skill
+      proposes none. They must be within the plugin's approved `permissions.intents` (load
+      error otherwise). The engine checks the LLM's intents against the plugin's permissions
+      **narrowed to the skill's**, on fresh and reused outputs alike, and a
+      `task.update_status` fingerprint must appear in the **viewed** input (what the model was
+      shown), not merely in the data collected. **The reserved output property** (#28): the
+      LLM proposes intents in a top-level `intents` property of its output, which the backends
+      extract; a skill that declares intents must declare `properties.intents` as a bounded
+      `"type": "array"` in its output schema, and a skill that declares none may not;
+    - **(G) the engine** (`execute(..., skills=SkillSource)`, `Ports.skills`, built by
+      `open_ports` as `DirectorySkills` over `<instance>/plugins`): the skill is loaded while
+      planning, **before** the backend is checked, so an invalid skill fails the run before
+      any plugin is called (`skill_invalid` on the `llm` step, even without a backend; a port
+      bug is `host_error`), and `horae doctor` loads every skill an `llm` step uses (a
+      `SkillError` is a problem). `LoadedSkill` exposes `name`, `version`, `digest`, `prompt`,
+      `output_schema` (a fresh deep copy on each access: the skill keeps canonical bytes),
+      `intents`, `intent_limits`, `output_bound`, `view_paths` and `view(data)`. `LlmRequest`
+      gains `prompt`, `output_schema` (a fresh copy per attempt), `skill_version` and
+      `skill_digest`, and its `input` is the **viewed** input, so a backend (#28) only sends
+      it. A viewed input of `null` (the input does not have the view's shape) degrades the
+      step **without calling the LLM** (`input_invalid`). `LlmCall.skill_version` is the
+      loaded skill's version (not the backend's), `LlmCall.skill_digest` its digest, and
+      `LlmCall.input_hash` the hash of the viewed input. Without a skill source (fakes, older
+      callers) nothing changes; whether a real backend must refuse a request without a prompt
+      is a question for the maintainer;
+    - **(H) cache key.** With a skill, the key (`RunRecord.input_hash`) is the SHA-256 of
+      `{skill, plugin: {name, version, commit}, model, input: <viewed input>, skill_version,
+      skill_digest}`, where `skill_digest` is the SHA-256 of the canonical JSON of `{name,
+      version, prompt, output_schema, input_view, intents}` (plus `view_options` and
+      `intent_limits` when the manifest has any; not `description`). A new version, an edited
+      prompt, schema, view or intents is a cache miss; a change to an undeclared input field
+      is not (the model would see the same thing). Skills are loaded once per run
+      (`DirectorySkills` caches them), so a run sees one version of the files;
+    - **(I) replay.** `replay(..., skills=)` passes the source to the engine; `horae replay`
+      reads skills from `<instance>/plugins` when it exists (local files only, like
+      `LockRegistry`). A skill edited since the run replays as different, by design; when
+      both records carry `llm[].skill_digest`, the report adds the note "skill <name> changed
+      since the run" and an `llm.<skill>.skill_digest` summary field.
 
 ### Provisional decisions (#30, pending maintainer review)
 
@@ -1423,11 +1548,13 @@ loosened later without breaking a valid file.
       before any call, `params_invalid` naming the secret only, when a template variable
       (`horae run --var`) or a rendered parameter holds the value (or a known encoding) of a
       resolved secret, in a string, an object key or as a number's whole value; the variable
-      is redacted in the record's `context`. A skill's prompt or output schema holding one is
-      refused by `ModelBackends.prepare` (`params_invalid`, before rendering, reserving or
-      sending). That check is **not** at plan time yet: #27's skill loader is not on `main`,
-      so the engine does not have the prompt before the run; the steps before the `llm` step
-      have run when it refuses. With the loader the check moves to `_plan`.
+      is redacted in the record's `context`. A skill's prompt or output schema holding one
+      (in a string, an object key or as a number's whole value) is refused at plan time too:
+      `_plan` loads the skill through the engine's `SkillSource` (#27, decision 39) and fails
+      the run with `params_invalid` (`<skill>: the prompt or output schema holds secret
+      <NAME>`) before any step runs. `ModelBackends.prepare` keeps the same check as a
+      backstop (an engine given no `SkillSource`, a `PromptSource` that reads other files),
+      before rendering, reserving or sending.
       `params_invalid` releases a ledger reservation;
     - **E. logs, warnings, uncaught exceptions (provisional).** `horae.secrets.logs.install()`
       (the CLI entry point, `Runner.run`, an opening `PluginHost`; idempotent) wraps the log

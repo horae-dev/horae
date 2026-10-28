@@ -14,6 +14,8 @@ dependencies = [
     "pyyaml>=6",
     "typer>=0.27",
     "tzdata>=2026.5",
+    "jsonschema>=4.23",
+    "referencing>=0.35",
 ]
 
 [project.scripts]
@@ -44,6 +46,7 @@ dev = [
     "regex>=2024.11",
     "types-regex>=2024.11",
     "ruff>=0.17",
+    "hypothesis>=6.100",
 ]
 
 [tool.uv]

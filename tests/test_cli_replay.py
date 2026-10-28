@@ -6,6 +6,7 @@ import asyncio
 import datetime
 import json
 import re
+import shutil
 import socket
 import sqlite3
 import subprocess
@@ -20,8 +21,16 @@ from horae import cli
 from horae.cli import app
 from horae.config import STORE_FILE, load_instance
 from horae.contracts import RunRecord
-from horae.engine import LlmBackend, PreviousLlm, ToolResult, execute, make_context
+from horae.engine import (
+    LlmBackend,
+    PreviousLlm,
+    SkillSource,
+    ToolResult,
+    execute,
+    make_context,
+)
 from horae.engine.testing import FakeLlm, FixturePlugins, llm_response
+from horae.skills import DirectorySkills
 from horae.store import Store
 
 runner = CliRunner()
@@ -159,6 +168,7 @@ def _run(
     plugins: FixturePlugins,
     llm: LlmBackend | None,
     previous: PreviousLlm | None = None,
+    skills: SkillSource | None = None,
 ) -> RunRecord:
     """Run `name` as the runner does (models and digests of the instance) and save it."""
     loaded = load_instance(root)
@@ -172,6 +182,7 @@ def _run(
             tools=plugins,
             llm=llm,
             previous=previous,
+            skills=skills,
             models={alias: spec.model for alias, spec in loaded.config.models.items()},
             lock_digest=loaded.lock_digest(),
             config_digest=loaded.config_digest(),
@@ -398,6 +409,60 @@ def test_plan_daily_brief_replays_with_plugins_not_named_after_their_namespace(
     assert record.status == "ok", record.error
     code, out = _invoke(record.id, "-i", str(root))
     assert code == 0, out
+
+
+def _write_skill(instance: Path) -> Path:
+    """The `skills/rank` skill, installed where `horae replay` reads it."""
+    folder = instance / "plugins" / "skills" / "skills" / "skills" / "rank"
+    folder.mkdir(parents=True)
+    (folder / "skill.yaml").write_text(
+        "name: skills/rank\nversion: 1.0.0\ndescription: Rank.\n"
+        "input_view: [shaped]\nintents: [note.create]\n",
+        encoding="utf-8",
+    )
+    (folder / "prompt.md").write_text("Rank the shaped data.\n", encoding="utf-8")
+    note = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "type": {"const": "note.create"},
+            "content": {"type": "string", "maxLength": 99},
+        },
+    }
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "ok": {"type": "boolean"},
+            "intents": {"type": "array", "maxItems": 2, "items": note},
+        },
+    }
+    (folder / "output.schema.json").write_text(json.dumps(schema), encoding="utf-8")
+    return folder
+
+
+def test_replay_reads_the_skills_of_the_installed_plugins(tmp_path: Path) -> None:
+    root = tmp_path / "instance"
+    _write_instance(root, FLOW, PERMISSIONS)
+    folder = _write_skill(root)
+    skills = DirectorySkills({name: root / "plugins" / name for name in PERMISSIONS})
+    llm = FakeLlm([llm_response({"ok": True}, intents=[CREATE])])
+    record = _run(root, "flow", RUN, _flow_plugins(), llm, skills=skills)
+    assert record.status == "ok", record.error
+    assert record.llm[0].skill_digest is not None
+    assert record.llm[0].skill_version == "1.0.0"
+    code, out = _invoke(RUN, "-i", str(root))
+    assert code == 0, out
+    # An edited prompt: the same viewed input, another skill digest.
+    (folder / "prompt.md").write_text("Rank it differently.\n", encoding="utf-8")
+    code, report = _json(RUN, "-i", str(root))
+    assert code == 4, report
+    assert any(n.startswith("skill skills/rank changed since the run") for n in report["notes"])
+    assert "llm.skills/rank.skill_digest" in {d["field"] for d in report["summary"]}
+    # Without installed plugins the skill is not loaded: what the model saw differs.
+    shutil.rmtree(root / "plugins")
+    code, report = _json(RUN, "-i", str(root))
+    assert code != 0, report
 
 
 def test_internal_error_prints_only_the_type(

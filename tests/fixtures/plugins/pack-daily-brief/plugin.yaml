@@ -1,0 +1,10 @@
+# A skill-only pipeline pack (#27). Synthetic: no runtime, no network, no paths. It ships
+# the minimal `daily-brief/rank-and-word` skill used by the skill loader and engine tests.
+name: pack-daily-brief
+version: 0.1.0
+horae: ">=0"
+description: Test pack shipping the rank-and-word skill.
+provides:
+  skills: [daily-brief/rank-and-word]
+permissions:
+  intents: [note.create]

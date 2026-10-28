@@ -1,0 +1,3 @@
+name: daily-brief/rank-and-word
+version: 1.0.0
+input_view: [tasks]
