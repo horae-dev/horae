@@ -426,7 +426,11 @@ class Runner:
         try:
             self._recover(name)
             llm_cache = StoreLlmCache(
-                self.store, self.instance.config.cache, self.clock, read=cache
+                self.store,
+                self.instance.config.cache,
+                self.clock,
+                read=cache,
+                models=self.instance.config.models,
             )
             if not dry_run:
                 llm_cache.purge()

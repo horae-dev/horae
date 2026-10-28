@@ -85,6 +85,18 @@ def _run(
     return asyncio.run(runner.run("brief", **kwargs))
 
 
+def _cache(inst: Instance, store: Store, **kwargs: Any) -> StoreLlmCache:
+    return StoreLlmCache(
+        store, inst.config.cache, Clock(), read=True, models=inst.config.models, **kwargs
+    )
+
+
+def _entry(inst: Instance, store: Store, input_hash: str | None, now: datetime) -> Any:
+    """The entry the runner stored for the engine key `input_hash` (alias `default`)."""
+    assert input_hash is not None
+    return store.cache_get(_cache(inst, store).stored_key(input_hash, "default"), now=now)
+
+
 def _with(inst: Instance, **config: Any) -> Instance:
     data = {**inst.config.model_dump(mode="json", exclude_none=True), **config}
     return Instance(
@@ -103,8 +115,7 @@ def test_unchanged_input_makes_no_llm_call(inst: Instance, store: Store) -> None
     first = _run(inst, store, llm)
     assert first.status == "ok"
     assert llm.calls == 1
-    assert first.input_hash is not None
-    entry = store.cache_get(first.input_hash, now=T0 + timedelta(minutes=1))
+    entry = _entry(inst, store, first.input_hash, T0 + timedelta(minutes=1))
     assert entry is not None
     assert entry.skill == "pack/brief"
     assert entry.model == "fixture-model"
@@ -232,9 +243,9 @@ def test_runs_purge_expired_and_surplus_entries(inst: Instance, store: Store) ->
     now = T0 + timedelta(minutes=1)
     kept = [n for n in range(5) if store.cache_get(f"{n:064x}", now=now) is not None]
     assert kept == [0, 1]  # purged before the run, which then added its own
-    assert store.cache_get(record.input_hash, now=now) is not None
+    assert _entry(inst, store, record.input_hash, now) is not None
     assert store.cache_trim(1) == 2
-    assert store.cache_get(record.input_hash, now=now) is not None
+    assert _entry(inst, store, record.input_hash, now) is not None
     with pytest.raises(ValueError, match="max_entries"):
         store.cache_trim(-1)
 
@@ -255,8 +266,7 @@ def test_a_dry_run_reads_the_cache_but_never_writes_it(inst: Instance, store: St
     llm = CountingLlm()
     dry = _run(inst, store, llm, dry_run=True)
     assert llm.calls == 1
-    assert dry.input_hash is not None
-    assert store.cache_get(dry.input_hash, now=T0) is None
+    assert _entry(inst, store, dry.input_hash, T0) is None
     _run(inst, store, llm)
     assert llm.calls == 2
     dry = _run(inst, store, llm, dry_run=True)
@@ -269,8 +279,7 @@ def test_a_response_holding_a_secret_is_not_cached(inst: Instance, store: Store)
     redact.remember(Secret("CACHE_TOKEN", value))
     llm = CountingLlm(output={"items": [f"token {value}"]})
     first = _run(inst, store, llm)
-    assert first.input_hash is not None
-    assert store.cache_get(first.input_hash, now=T0 + timedelta(hours=1)) is None
+    assert _entry(inst, store, first.input_hash, T0 + timedelta(hours=1)) is None
     _run(inst, store, llm)
     assert llm.calls == 2
 
@@ -296,13 +305,12 @@ def test_no_cache_calls_the_llm_and_refreshes_the_entry(inst: Instance, store: S
     llm = CountingLlm()
     clock = Clock()
     first = _run(inst, store, llm, clock=clock)
-    assert first.input_hash is not None
-    created = store.cache_get(first.input_hash, now=clock.at)
+    created = _entry(inst, store, first.input_hash, clock.at)
     llm.output = {"items": ["Reworded"]}
     forced = _run(inst, store, llm, clock=clock, cache=False)
     assert llm.calls == 2
     assert forced.llm[0].cached is False
-    refreshed = store.cache_get(first.input_hash, now=clock.at)
+    refreshed = _entry(inst, store, first.input_hash, clock.at)
     assert created is not None
     assert refreshed is not None
     assert refreshed.created_at > created.created_at
@@ -371,7 +379,7 @@ def test_the_engine_treats_a_broken_cache_as_a_miss(
     assert first.input_hash is not None
     other = PreviousLlm("d" * 64, {"items": []}, [], "1", "m", "anthropic")
 
-    def lookup(self: StoreLlmCache, key: str) -> Any:
+    async def lookup(self: StoreLlmCache, key: str, **kwargs: Any) -> Any:
         if answer == "raise":
             raise RuntimeError("synthetic")
         return other if answer == "other-key" else {"output": 1}
@@ -397,33 +405,43 @@ def test_the_engine_treats_a_broken_cache_as_a_miss(
 def test_a_malformed_entry_is_a_miss(store: Store, response: Any) -> None:
     from horae.contracts import Usage
 
-    key = "c" * 64
-    store.cache_put(
-        key,
-        skill="pack/brief",
-        skill_version="1",
-        model="m",
-        response=response,
-        usage=Usage(tokens_in=0, tokens_out=0, usd=0.0),
-        at=T0,
-    )
     cache = StoreLlmCache(store, CacheConfig(), lambda: T0 + timedelta(seconds=1), read=True)
-    assert cache.lookup(key) is None
-    good = {"output": 1, "intents": [], "backend": "anthropic", "model": "m", "skill_version": "1"}
-    store.cache_put(
-        key,
-        skill="pack/brief",
-        skill_version="1",
-        model="m",
-        response=good,
-        usage=Usage(tokens_in=0, tokens_out=0, usd=0.0),
-        at=T0,
-    )
-    hit = cache.lookup(key)
+    key = "c" * 64
+    stored = cache.stored_key(key, "default")
+
+    def put(value: Any) -> None:
+        store.cache_put(
+            stored,
+            skill="pack/brief",
+            skill_version="1",
+            model="m",
+            response=value,
+            usage=Usage(tokens_in=0, tokens_out=0, usd=0.0),
+            at=T0,
+        )
+
+    def lookup(on: StoreLlmCache) -> PreviousLlm | None:
+        return asyncio.run(on.lookup(key, model_alias="default", output_schema=None))
+
+    put(response)
+    assert lookup(cache) is None
+    assert store.cache_get(stored, now=T0) is None  # a malformed entry is deleted
+    good = {
+        "output": 1,
+        "intents": [],
+        "backend": "anthropic",
+        "model": "m",
+        "skill_version": "1",
+        "run_id": "r1",
+    }
+    put(good)
+    hit = lookup(cache)
     assert isinstance(hit, PreviousLlm)
     assert hit.input_hash == key
+    # No alias in `horae.yaml`: the stored backend and model; the producing run.
+    assert (hit.backend, hit.model, hit.source_run) == ("anthropic", "m", "r1")
     off = StoreLlmCache(store, CacheConfig(), lambda: T0 + timedelta(seconds=1), read=False)
-    assert off.lookup(key) is None
+    assert lookup(off) is None
 
 
 # --- replay ------------------------------------------------------------------------------------
@@ -462,3 +480,492 @@ def test_the_cache_section_loads_from_horae_yaml(tmp_path: Path) -> None:
     root = write_instance(tmp_path / "instance", cache={"ttl_s": 3600, "max_entries": 10})
     loaded = load_instance(root)
     assert loaded.config.cache == CacheConfig(ttl_s=3600, max_entries=10)
+
+
+# --- review fixes (#32): provenance, stored key, re-validation, undo, purge ---------------------
+
+PREAMBLE_SHA256 = "9e01dd06cf4c416bf0522fe4b6eda56d0477e7e494b6513cc2bdd48b6c1fa4a8"
+
+
+def test_an_entry_records_its_producer_and_a_hit_names_it(inst: Instance, store: Store) -> None:
+    llm = CountingLlm()
+    first = _run(inst, store, llm)
+    entry = _entry(inst, store, first.input_hash, T0 + timedelta(minutes=1))
+    assert entry.response["run_id"] == first.id
+    assert entry.response["input_hash"] == first.input_hash
+    assert datetime.fromisoformat(entry.response["created_at"]) == entry.created_at
+    again = _run(inst, store, llm)
+    (call,) = again.llm
+    assert call.request == {
+        "skill": "pack/brief",
+        "model": "default",
+        "reused_input_hash": first.input_hash,
+        "source_run": first.id,
+    }
+    # The record keeps the engine key, not the stored one.
+    assert again.input_hash == first.input_hash
+    assert (call.backend, call.model) == ("claude-cli", "sonnet")
+
+
+def test_a_hit_names_the_current_backend_and_model(inst: Instance, store: Store) -> None:
+    from horae.contracts import Usage
+
+    cache = _cache(inst, store)
+    key = "e" * 64
+    store.cache_put(
+        cache.stored_key(key, "default"),
+        skill="pack/brief",
+        skill_version="1",
+        model="old",
+        response={
+            "output": {},
+            "intents": [],
+            "backend": "anthropic",
+            "model": "old",
+            "skill_version": "1",
+        },
+        usage=Usage(tokens_in=0, tokens_out=0, usd=0.0),
+        at=T0 + timedelta(seconds=1),
+    )
+    cache.clock = lambda: T0 + timedelta(seconds=2)
+    hit = asyncio.run(cache.lookup(key, model_alias="default", output_schema=None))
+    assert hit is not None
+    assert (hit.backend, hit.model, hit.source_run) == ("claude-cli", "sonnet", None)
+
+
+def test_another_backend_or_endpoint_behind_the_alias_is_a_miss(
+    inst: Instance, store: Store
+) -> None:
+    llm = CountingLlm()
+    _run(inst, store, llm)
+    lan_a = {"backend": "ollama", "model": "sonnet", "base_url": "http://192.168.1.10:11434"}
+    lan_b = {**lan_a, "base_url": "http://192.168.1.11:11434"}
+    _run(_with(inst, models={"default": lan_a}), store, llm)  # another backend, same model
+    assert llm.calls == 2
+    _run(_with(inst, models={"default": lan_b}), store, llm)  # another endpoint
+    assert llm.calls == 3
+    _run(_with(inst, models={"default": lan_a}), store, llm)
+    assert llm.calls == 3
+    # A price is not part of the key: what the model answers does not depend on it.
+    priced = {
+        "backend": "claude-cli",
+        "model": "sonnet",
+        "price": {"input_per_mtok": 3.0, "output_per_mtok": 15.0},
+    }
+    _run(_with(inst, models={"default": priced}), store, llm)
+    assert llm.calls == 3
+
+
+def test_the_key_version_follows_the_system_preamble(
+    inst: Instance, store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import hashlib
+
+    from horae.llm.backends import _shared
+    from horae.runner import _cache as cache_module
+
+    # Changing Horae's own framing must bump LLM_KEY_VERSION (and this pin).
+    assert hashlib.sha256(_shared.SYSTEM_PREAMBLE.encode()).hexdigest() == PREAMBLE_SHA256
+    assert _shared.LLM_KEY_VERSION == 1
+    cache = _cache(inst, store)
+    before = cache.stored_key("a" * 64, "default")
+    monkeypatch.setattr(cache_module, "LLM_KEY_VERSION", 2)
+    assert cache.stored_key("a" * 64, "default") != before
+
+
+def test_degraded_or_schema_invalid_outputs_are_not_cached(inst: Instance, store: Store) -> None:
+    record = _run(inst, store, CountingLlm())
+    assert accepted_entry(record) is not None
+    assert accepted_entry(record.model_copy(update={"status": "noop"})) is not None
+    for status in ("degraded", "failed", "undone"):
+        assert accepted_entry(record.model_copy(update={"status": status})) is None
+    invalid = record.llm[0].model_copy(update={"schema_valid": False})
+    assert accepted_entry(record.model_copy(update={"llm": [invalid]})) is None
+
+
+WRITER = """
+import sys
+from datetime import UTC, datetime
+from horae.contracts import Usage
+from horae.store import Store
+with Store.open(sys.argv[1]) as s:
+    for n in range(30):
+        s.cache_put_safe(
+            sys.argv[2], skill="pack/brief", skill_version="1", model="m",
+            response={"writer": sys.argv[3], "n": n},
+            usage=Usage(tokens_in=0, tokens_out=0, usd=0.0), at=datetime.now(UTC),
+        )
+"""
+
+
+def test_two_processes_writing_the_same_key(inst: Instance, store: Store) -> None:
+    key = "f" * 64
+    children = [
+        subprocess.Popen(  # noqa: S603 (this interpreter, a synthetic writer)
+            [sys.executable, "-c", WRITER, str(inst.store_path), key, str(n)],
+            stderr=subprocess.PIPE,
+        )
+        for n in range(2)
+    ]
+    for child in children:
+        _, err = child.communicate(timeout=60)
+        assert child.returncode == 0, err
+    assert store.cache_count() == 1
+    entry = store.cache_get(key, now=datetime.now(UTC))
+    assert entry is not None
+    assert entry.response["writer"] in {"0", "1"}
+    assert entry.response["n"] == 29
+
+
+# --- cross-pipeline reuse: routing is re-checked --------------------------------------------
+
+NOTE_A, NOTE_B = "Notes/a.assistant.md", "Notes/b.assistant.md"
+INBOX = "Inbox.assistant.md"
+
+
+def _pipe(name: str, path: str) -> Any:
+    from horae.contracts import Pipeline
+
+    llm = {"skill": "pack/brief", "model": "default", "budget": {"usd": 0.05, "tokens_out": 99}}
+    return Pipeline.model_validate(
+        {
+            "name": name,
+            "steps": [
+                {"collect": ["fixture.items"]},
+                {"llm": llm},
+                {"act": [{"vault.write_note": {"path": path, "mode": "append-section"}}]},
+            ],
+        }
+    )
+
+
+def _routed_instance(root: Path) -> Instance:
+    from horae.contracts import Lockfile
+
+    names = {"to-a": NOTE_A, "also-a": NOTE_A, "to-b": NOTE_B, "inbox": INBOX}
+    return Instance(
+        root=root,
+        config=InstanceConfig.model_validate(
+            {"models": {"default": {"backend": "claude-cli", "model": "sonnet"}}}
+        ),
+        pipelines={name: _pipe(name, path) for name, path in names.items()},
+        lock=Lockfile(schema_version=1),
+    )
+
+
+def _routed_plugins() -> Plugins:
+    plugins = Plugins()
+    for name, provides in (
+        ("pack", {"skills": ["pack/brief"]}),
+        ("vault", {"sinks": ["vault.write_note"]}),
+    ):
+        plugins.add(
+            {
+                "name": name,
+                "version": "0.1.0",
+                "horae": ">=0.1,<0.2",
+                "provides": provides,
+                "permissions": {"intents": ["note.append_section"]},
+            }
+        )
+    return plugins
+
+
+def _append(path: str) -> dict[str, Any]:
+    return {"type": "note.append_section", "path": path, "heading": "Brief", "content": "2 items"}
+
+
+def test_cross_pipeline_reuse_rechecks_the_bindings(tmp_path: Path, store: Store) -> None:
+    routed = _routed_instance(tmp_path)
+    plugins = _routed_plugins()
+    llm = CountingLlm(intents=[_append(NOTE_A)])
+
+    def run(name: str) -> RunRecord:
+        runner = Runner(routed, store, Ports(plugins, plugins, llm), clock=Clock())
+        return asyncio.run(runner.run(name))
+
+    first = run("to-a")
+    assert (first.status, llm.calls) == ("ok", 1)
+    # Same skill, model and viewed input in another pipeline bound to the same note: reused.
+    same = run("also-a")
+    assert (same.status, llm.calls) == ("ok", 1)
+    assert same.llm[0].cached is True
+    assert same.input_hash == first.input_hash
+    # Bound to another note: the reused explicit target no longer routes, so it is a miss
+    # (the model is called; its answer names the same note, so this run fails to route).
+    other = run("to-b")
+    assert llm.calls == 2
+    assert other.status == "failed"
+    assert not any(call.cached for call in other.llm)
+
+
+# --- undo invalidates (decision 45 B) --------------------------------------------------------
+
+
+def test_undo_invalidates_the_entry_of_the_run(tmp_path: Path, store: Store) -> None:
+    from horae.apply import StaticSinks
+    from horae.apply.testing import FixtureSink
+    from horae.apply.undo import undo_run
+
+    inbox = _routed_instance(tmp_path)
+    plugins = _routed_plugins()
+    sink = FixtureSink(files={INBOX: b"# Inbox\n"})
+    llm = CountingLlm(intents=[_append(INBOX)])
+    clock = Clock()
+
+    def run() -> RunRecord:
+        sinks = StaticSinks(default=sink)
+        runner = Runner(inbox, store, Ports(plugins, plugins, llm, sinks), clock=clock)
+        return asyncio.run(runner.run("inbox"))
+
+    def undo(record: RunRecord) -> None:
+        result = asyncio.run(undo_run(store, record.id, StaticSinks(default=sink), clock=clock))
+        assert result.marked_undone, result
+
+    first = run()
+    assert (first.status, llm.calls) == ("ok", 1)
+    assert _entry(inbox, store, first.input_hash, clock.at) is not None
+    undo(first)
+    assert _entry(inbox, store, first.input_hash, clock.at) is None
+    # Run -> undo -> run again asks the model again.
+    second = run()
+    assert (second.llm[0].cached, llm.calls) == (False, 2)
+    # Undoing a run that reused the entry also invalidates it.
+    hit = run()
+    assert (hit.llm[0].cached, llm.calls, hit.status) == (True, 2, "ok")
+    undo(hit)
+    assert _entry(inbox, store, first.input_hash, clock.at) is None
+    assert run().llm[0].cached is False
+    assert llm.calls == 3
+
+
+def test_store_cache_delete_helpers(store: Store) -> None:
+    from horae.contracts import Usage
+
+    usage = Usage(tokens_in=0, tokens_out=0, usd=0.0)
+    responses: list[Any] = [
+        {"input_hash": "a" * 64},
+        {"input_hash": "a" * 64, "other": 1},
+        {"input_hash": "b" * 64},
+        ["a" * 64],
+        "a" * 64,
+    ]
+    for n, response in enumerate(responses):
+        key = f"{n + 1:064x}"
+        store.cache_put(
+            key, skill="s", skill_version="1", model="m", response=response, usage=usage, at=T0
+        )
+    assert store.cache_count() == 5
+    assert store.cache_delete_input("a" * 64) == 2
+    assert store.cache_count() == 3
+    assert store.cache_delete(f"{3:064x}") is True
+    assert store.cache_delete(f"{3:064x}") is False
+    assert store.cache_count() == 2
+    with pytest.raises(ValueError, match="sha256"):
+        store.cache_delete("nope")
+
+
+def test_the_created_at_index_exists(inst: Instance, store: Store) -> None:
+    import sqlite3
+
+    with sqlite3.connect(inst.store_path) as conn:
+        rows = conn.execute("SELECT name FROM sqlite_master WHERE type = 'index'").fetchall()
+    assert ("llm_cache_created",) in rows
+
+
+# --- re-validation on read (decision 45 F) ---------------------------------------------------
+
+
+def _skill_run(cache: StoreLlmCache, llm: Any) -> RunRecord:
+    from horae.engine import execute
+    from horae.skills import DirectorySkills
+    from test_engine_skills import CONTEXT, FIXTURE, START, _pipeline, _plugins
+
+    plugins = _plugins()
+    return asyncio.run(
+        execute(
+            _pipeline(),
+            run_id="20261027T053000Z-brief-01",
+            context=CONTEXT,
+            started_at=START,
+            plugins=plugins,
+            tools=plugins,
+            llm=llm,
+            skills=DirectorySkills({"pack-daily-brief": FIXTURE}),
+            cache=cache,
+            models={"default": "sonnet"},
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        {"output": {"summary": 5, "ranked": []}},  # the output no longer fits
+        {"intents": [{"type": "note.create", "content": "x", "extra": 1}]},  # nor its intents
+        {"output": "not an object"},
+    ],
+)
+def test_a_cached_output_is_validated_again_on_read(
+    inst: Instance, store: Store, tamper: dict[str, Any]
+) -> None:
+    from test_engine_skills import NOTE, OUTPUT
+
+    cache = _cache(inst, store)
+    llm = CountingLlm(output=OUTPUT, intents=[NOTE])
+    first = _skill_run(cache, llm)
+    assert (first.status, llm.calls) == ("ok", 1)
+    assert cache.remember(first)
+    stored = cache.stored_key(first.input_hash or "", "default")
+    hit = _skill_run(cache, llm)
+    assert (hit.llm[0].cached, llm.calls) == (True, 1)  # valid: reused
+    entry = store.cache_get(stored, now=cache.clock())
+    assert entry is not None
+    store.cache_put(
+        stored,
+        skill=entry.skill,
+        skill_version=entry.skill_version,
+        model=entry.model,
+        response={**entry.response, **tamper},
+        usage=entry.usage,
+        at=entry.created_at,
+        expires_at=entry.expires_at,
+    )
+    again = _skill_run(cache, llm)
+    assert llm.calls == 2  # invalid: a miss, the model is called
+    assert again.llm[0].cached is False
+    assert store.cache_get(stored, now=cache.clock()) is None  # and the entry is deleted
+
+
+def test_the_cache_validator_may_be_async_and_fails_closed(inst: Instance, store: Store) -> None:
+    from test_engine_skills import NOTE, OUTPUT
+
+    seen: list[Any] = []
+
+    async def strict(output: Any, schema: Any) -> list[str]:
+        seen.append(output)
+        return ["/: synthetic"]
+
+    def broken(output: Any, schema: Any) -> list[str]:
+        raise RuntimeError("synthetic")
+
+    llm = CountingLlm(output=OUTPUT, intents=[NOTE])
+    first = _skill_run(_cache(inst, store), llm)
+    assert _cache(inst, store).remember(first)
+    for validate in (strict, broken):
+        cache = _cache(inst, store, validate=validate)
+        assert _cache(inst, store).remember(first)
+        assert _skill_run(cache, llm).llm[0].cached is False
+    # The full output: the reserved `intents` put back.
+    assert seen == [{**OUTPUT, "intents": [NOTE]}]
+
+
+def test_check_output_and_the_default_validator(monkeypatch: pytest.MonkeyPatch) -> None:
+    import importlib
+
+    from horae.runner import _cache as cache_module
+    from horae.skills import MAX_OUTPUT_BYTES
+
+    schema = {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]}
+    assert cache_module.check_output({"a": "x"}, schema) == ()
+    assert cache_module.check_output({"a": 1}, schema) == ("$.a: type",)
+    assert cache_module.check_output({}, schema) == ("$: required",)
+    assert cache_module.check_output({"a": "x" * MAX_OUTPUT_BYTES}, schema) == (
+        cache_module.SIZE_ERROR,
+    )
+    assert cache_module.check_output({"a": float("nan")}, schema) == (cache_module.NOT_JSON_ERROR,)
+    many = {"type": "array", "items": {"type": "string"}}
+    assert len(cache_module.check_output(list(range(50)), many)) == cache_module.MAX_CHECK_ERRORS
+
+    real = importlib.import_module
+
+    def missing(name: str) -> Any:
+        if name == "horae.llm.validate":
+            raise ImportError(name)
+        return real(name)
+
+    monkeypatch.setattr(importlib, "import_module", missing)
+    assert cache_module.default_validator() is cache_module.check_output
+
+    async def validate_output(output: Any, schema: Any) -> tuple[str, ...]:
+        return ()
+
+    module = SimpleNamespace(validate_output=validate_output)
+    monkeypatch.setattr(importlib, "import_module", lambda name: module)
+    assert cache_module.default_validator() is validate_output  # #31's, once merged
+    monkeypatch.setattr(importlib, "import_module", lambda name: SimpleNamespace())
+    assert cache_module.default_validator() is cache_module.check_output
+
+
+def test_full_output_puts_the_intents_back() -> None:
+    from horae.runner._cache import full_output
+
+    declared = {"properties": {"intents": {"type": "array"}}}
+    assert full_output({"a": 1}, [], {}) == {"a": 1}
+    assert full_output({"a": 1}, [], declared) == {"a": 1, "intents": []}
+    assert full_output({"a": 1}, [{"t": 1}], {}) == {"a": 1, "intents": [{"t": 1}]}
+    assert full_output(3, [{"t": 1}], declared) == {"intents": [{"t": 1}], "output": 3}
+
+
+# --- horae cache purge (decision 45 E) -------------------------------------------------------
+
+
+def test_horae_cache_purge(tmp_path: Path) -> None:
+    from horae.contracts import Usage
+
+    root = write_instance(tmp_path / "instance")
+    runner = CliRunner()
+
+    def purge(*args: str) -> Any:
+        return runner.invoke(app, ["cache", "purge", "-i", str(root), *args])
+
+    # No store: nothing purged, and none created.
+    done = purge("--all", "--json")
+    assert done.exit_code == 0, done.output
+    assert json.loads(done.stdout)["deleted"] == 0
+    loaded = load_instance(root)
+    assert not loaded.store_path.exists()
+    now = datetime.now(UTC)
+    with Store.open(loaded.store_path) as store:
+        for n, (skill, age) in enumerate([("a/x", 1), ("a/x", 10), ("b/y", 10), ("b/y", 1)]):
+            store.cache_put(
+                f"{n + 1:064x}",
+                skill=skill,
+                skill_version="1",
+                model="m",
+                response={},
+                usage=Usage(tokens_in=0, tokens_out=0, usd=0.0),
+                at=now - timedelta(days=age),
+            )
+    for bad in ((), ("--all", "--older-than", "3"), ("--older-than", "-1")):
+        refused = purge(*bad, "--json")
+        assert refused.exit_code == 2, refused.output
+        assert json.loads(refused.stdout)["error"]["kind"] == "usage"
+    done = purge("--older-than", "5", "--skill", "a/x", "--json")
+    assert done.exit_code == 0, done.output
+    report = json.loads(done.stdout)
+    assert (report["deleted"], report["remaining"], report["skill"]) == (1, 3, "a/x")
+    assert report["older_than_days"] == 5
+    done = purge("--older-than", "5")
+    assert (done.exit_code, done.stdout) == (0, "deleted 1 cache entry; 2 left\n")
+    done = purge("--skill", "b/y")
+    assert (done.exit_code, done.stdout) == (0, "deleted 1 cache entry of skill b/y; 1 left\n")
+    done = purge("--all")
+    assert (done.exit_code, done.stdout) == (0, "deleted 1 cache entry; 0 left\n")
+
+
+def test_horae_cache_purge_problems(tmp_path: Path) -> None:
+    runner = CliRunner()
+    root = tmp_path / "instance"
+    root.mkdir()
+    (root / "horae.yaml").write_text("cache: {ttl_s: 1}\n", encoding="utf-8")
+    done = runner.invoke(app, ["cache", "purge", "-i", str(root), "--all", "--json"])
+    assert done.exit_code == 1
+    assert json.loads(done.stdout)["error"]["kind"] == "config_invalid"
+    good = write_instance(tmp_path / "good")
+    path = load_instance(good).store_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"not a database")
+    done = runner.invoke(app, ["cache", "purge", "-i", str(good), "--all", "--json"])
+    assert done.exit_code == 1
+    assert json.loads(done.stdout)["error"]["kind"] == "store_error"

@@ -202,8 +202,13 @@ def recorded_previous(record: RunRecord) -> PreviousLlm | None:
                 skill_version=call.skill_version,
                 model=call.model,
                 backend=call.backend,
+                source_run=_source_run(call.request.get("source_run")),
             )
     return None
+
+
+def _source_run(value: Any) -> str | None:
+    return value if isinstance(value, str) else None
 
 
 def _leftover(record: RunRecord) -> Usage | None:

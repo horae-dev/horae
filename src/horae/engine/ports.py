@@ -220,18 +220,26 @@ class PreviousLlm:
     skill_version: str
     model: str
     backend: LlmBackendName
+    source_run: str | None = None
+    """The run that produced the output (a cache entry's producer), recorded in the reuse
+    marker of the run that reuses it (`request.source_run`); `None` when unknown."""
 
 
 class LlmCache(Protocol):
     """Looks up accepted LLM outputs by cache key (the unchanged-input path, #32).
 
-    The engine only reads: it calls `lookup` once per `llm` step, with the step's cache key
-    (`RunRecord.input_hash` once accepted). Writing accepted outputs, expiry and purging are
-    the caller's (`horae.runner`). `lookup` may read local storage (the SQLite store) but
-    must not call a model or the network. An exception is a cache miss."""
+    The engine only reads: it awaits `lookup` once per `llm` step, with the step's cache key
+    (`RunRecord.input_hash` once accepted), the step's model alias and, with a loaded skill,
+    its full output schema (the reserved `intents` property included). Writing accepted
+    outputs, expiry and purging are the caller's (`horae.runner`). `lookup` may read and
+    clean local storage (the SQLite store) and validate the entry against `output_schema`
+    (an invalid entry is a miss), but must not call a model or the network. An exception is
+    a cache miss."""
 
-    def lookup(self, key: str) -> PreviousLlm | None:
-        """The live entry for `key` (its `input_hash` is `key`), or `None`."""
+    async def lookup(
+        self, key: str, *, model_alias: str, output_schema: Mapping[str, Any] | None
+    ) -> PreviousLlm | None:
+        """The live, valid entry for `key` (its `input_hash` is `key`), or `None`."""
         ...
 
 

@@ -1548,9 +1548,37 @@ class Store:
         return cur.rowcount
 
     @_api
+    def cache_delete(self, key: str) -> bool:
+        """Delete the entry stored under `key`; return whether there was one."""
+        with self.transaction():
+            cur = self._conn.execute("DELETE FROM llm_cache WHERE key = ?", (_sha(key),))
+        return cur.rowcount > 0
+
+    @_api
+    def cache_delete_input(self, input_hash: str) -> int:
+        """Delete every entry produced for the engine cache key `input_hash` (the
+        `input_hash` its response records, whatever the model alias it was stored under, #32
+        decision 45 B); return how many. Undo calls this when it marks a run `undone`."""
+        with self.transaction():
+            cur = self._conn.execute(
+                "DELETE FROM llm_cache WHERE json_valid(response) "
+                "AND json_type(response) = 'object' "
+                "AND json_extract(response, '$.input_hash') = ?",
+                (_sha(input_hash),),
+            )
+        return cur.rowcount
+
+    @_api
+    def cache_count(self) -> int:
+        """How many entries the LLM cache holds (expired ones included)."""
+        row = self._conn.execute("SELECT count(*) FROM llm_cache").fetchone()
+        return int(row[0])
+
+    @_api
     def cache_trim(self, max_entries: int) -> int:
         """Keep the `max_entries` most recently created entries, delete the others; return how
-        many were deleted."""
+        many were deleted. First in, first out: a hit does not make an entry recent (the
+        `llm_cache_created` index, migration 6, serves the ordering)."""
         if max_entries < 0:
             raise ValueError("max_entries must be >= 0")
         with self.transaction():

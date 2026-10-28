@@ -361,11 +361,11 @@ class CacheConfig(Contract):
     ttl_s: Annotated[StrictInt, Field(ge=MIN_CACHE_TTL_S, le=MAX_CACHE_TTL_S)] = DEFAULT_CACHE_TTL_S
     """Seconds an accepted output is reused for (60 to 366 days; default 7 days), counted
     from when it was produced: a hit does not extend it, so an unchanged input asks the model
-    again at most once per `ttl_s`. It applies to every entry at lookup, also to entries
-    written under an older setting."""
+    again at most once per `ttl_s`. Lowering it applies at once (to every entry, at lookup);
+    raising it applies to new entries (an entry keeps the expiry it was written with)."""
     max_entries: Annotated[StrictInt, Field(ge=1, le=MAX_CACHE_ENTRIES)] = DEFAULT_CACHE_ENTRIES
     """Most entries kept: at the start of each (non-dry) run, expired entries are deleted, then
-    the oldest beyond this many."""
+    the oldest beyond this many (first in, first out: a hit does not make an entry recent)."""
 
 
 class SchedulerConfig(Contract):

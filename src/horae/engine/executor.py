@@ -156,14 +156,16 @@ the LLM (`input_invalid`). The skill is loaded before the backend is checked, so
 skill is `skill_invalid` even without a backend.
 When `previous` (an accepted output, `PreviousLlm`, e.g. the one a replayed run reused) has the
 same key, or else the `cache` (`LlmCache`, the store's `llm_cache` table under the runner, #32)
-holds an entry for the key, no LLM call is made: its output and intents are reused (validated
-and routed again), recorded as an `LlmCall` with `cached=True` and zero usage, and the run
-continues. If the reused intents no longer validate or route (e.g. an explicit target bound to
-`{{date}}` moved to a new day), it is a cache miss: nothing of the entry is recorded and the
-LLM is called. Without a usable entry (or when `cache.lookup` raises: a miss) the LLM is
-called; no backend is called, so no usage is reserved or charged (schemas decision 45). A
-reused run re-proposes the same intents, including `notify.push`: appliers must deduplicate
-notifications (e.g. by `input_hash` and intent).
+holds a live entry for the key that still passes the skill's full output schema (the cache
+re-validates it), no LLM call is made: its output and intents are reused (validated and routed
+again), recorded as an `LlmCall` with `cached=True`, zero usage and the request marker
+`{skill, model, reused_input_hash, source_run?}` (`source_run`: the run that produced it),
+and the run continues. If the reused intents no longer validate or route (e.g. an explicit
+target bound to `{{date}}` moved to a new day), it is a cache miss: nothing of the entry is
+recorded and the LLM is called. Without a usable entry (or when `cache.lookup` raises: a
+miss) the LLM is called. A hit calls no backend, so no usage is reserved or charged (schemas
+decision 45). A reused run re-proposes the same intents, including `notify.push`: appliers
+must deduplicate notifications (e.g. by `input_hash` and intent).
 `timeout_s` (default `DEFAULT_LLM_TIMEOUT_S`) is one deadline for both attempts. The budget
 counts what every attempt cost, including the `usage` of a failed attempt (`LlmError.usage`);
 a backend's cached response costs nothing and counts towards neither the cost nor the budget.
@@ -1179,7 +1181,7 @@ def _cache_key(
     return sha256_hex(key)
 
 
-def _reuse(
+async def _reuse(
     run: _Run,
     step: _Planned,
     spec: LlmSpec,
@@ -1191,8 +1193,9 @@ def _reuse(
     (then the LLM is called)."""
     previous = run.previous
     if (previous is None or previous.input_hash != key) and run.cache is not None:
+        schema = None if step.skill is None else step.skill.output_schema
         try:
-            previous = run.cache.lookup(key)
+            previous = await run.cache.lookup(key, model_alias=spec.model, output_schema=schema)
         except Exception:  # a broken cache is a miss, never a failed run
             previous = None
     if not isinstance(previous, PreviousLlm) or previous.input_hash != key:
@@ -1211,7 +1214,7 @@ def _reuse(
             schema_valid=True,
             model_alias=spec.model,
             input_hash=sha256_hex(viewed),
-            request={"skill": spec.skill, "model": spec.model, "reused_input_hash": key},
+            request=_reuse_marker(spec, key, previous.source_run),
             response=output,
             intents=raw,
             usage=_ZERO,
@@ -1230,6 +1233,15 @@ def _reuse(
     run.llm_calls.append(call)
     run.data, run.input_hash, run.reused = output, key, True
     return _Outcome("ok", output=output, intents=accepted)
+
+
+def _reuse_marker(spec: LlmSpec, key: str, source_run: str | None) -> dict[str, Any]:
+    """The recorded request of a reuse: no call was made (`reused_input_hash`), and the run
+    that produced the output, when known (`source_run`)."""
+    marker: dict[str, Any] = {"skill": spec.skill, "model": spec.model, "reused_input_hash": key}
+    if source_run is not None:
+        marker["source_run"] = source_run
+    return marker
 
 
 def _shown(step: _Planned, viewed: Any) -> dict[str, Any]:
@@ -1257,7 +1269,7 @@ async def _llm_step(run: _Run, step: _Planned) -> _Outcome:
         message = f"{spec.skill}: the step input does not have the shape of the input view"
         return _Outcome("degraded", StepError(kind="input_invalid", message=message), stop=True)
     key = _cache_key(run, spec, plugin, skill, viewed)
-    reused = _reuse(run, step, spec, plugin, key, viewed)
+    reused = await _reuse(run, step, spec, plugin, key, viewed)
     if reused is not None:
         return reused
     prompt = None if skill is None else skill.prompt
