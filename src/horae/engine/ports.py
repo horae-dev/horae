@@ -234,7 +234,9 @@ class LlmCache(Protocol):
     outputs, expiry and purging are the caller's (`horae.runner`). `lookup` may read and
     clean local storage (the SQLite store) and validate the entry against `output_schema`
     (an invalid entry is a miss), but must not call a model or the network. An exception is
-    a cache miss."""
+    a cache miss. A cache may also have `async discard(key, *, model_alias)`, which the engine
+    awaits when the action guard refuses a hit's intents (#35): the entry should be deleted.
+    Its exceptions are ignored."""
 
     async def lookup(
         self, key: str, *, model_alias: str, output_schema: Mapping[str, Any] | None

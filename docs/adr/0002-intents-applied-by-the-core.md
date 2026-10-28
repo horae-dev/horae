@@ -87,7 +87,10 @@ notification links, one-line titles, size limits); the runtime still checks mean
   binds every target to a trusted pipeline parameter: a note `path` or `http.post` `url` to the
   entry's, a notification `link` to the entry's `link_prefix`, and a task status change to a
   fingerprint the run collected. Titles and bodies stay untrusted text that appliers treat as
-  data.
+  data. #35 adds no per-value tags: the action guard ([schemas decision
+  46](../../schemas/README.md#decisions)) checks the LLM's text instead, so every URL in it is
+  an exact string of the viewed input, no embed or script link is ever proposed, and a skill's
+  per-type limits hold; a violation degrades the whole step. Plugin proposals are left to #52.
 
 ## Alternatives considered
 

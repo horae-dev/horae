@@ -1203,8 +1203,9 @@ loosened later without breaking a valid file.
       **`jsonschema` as a runtime dependency** (it was a dev dependency; #31 needs it to
       validate outputs);
     - **(F) intents.** `intents` is a list of types or a mapping `type: max` (1 to 256, #35):
-      at most `max` intents of that type per `llm` step, more is `intent_rejected` (fresh
-      outputs; a reused one over the limit is a cache miss). Omitted or empty: the skill
+      at most `max` intents of that type per `llm` step; more is a `guard` violation that
+      degrades the step (decision 46; it was `intent_rejected` before #35); a reused output
+      over the limit is a cache miss. Omitted or empty: the skill
       proposes none. They must be within the plugin's approved `permissions.intents` (load
       error otherwise). The engine checks the LLM's intents against the plugin's permissions
       **narrowed to the skill's**, on fresh and reused outputs alike, and a
@@ -1706,3 +1707,64 @@ loosened later without breaking a valid file.
       replayed from its tape;
     - **follow-ups**: a per-skill `ttl_s`; LRU instead of first in, first out if hit rates
       show it matters.
+
+### Decisions (#35, design note and maintainer answers on #99)
+
+46. **The action guard on LLM proposals (#35).** Numbering: 44 is #31's (PR #108), 45 #32's.
+    No contract change: the run record's `violations[].kind` already has `guard`, and the
+    step's `error.kind` is the free-form `ErrorKind` `guard_violation`. `horae.engine.guard`
+    runs on every batch of intents the `llm` step proposes (fresh, `previous` or a cache hit),
+    after schema validation and the permission check, **before routing**:
+    - **(1) per-type limits.** A skill's `intents: {type: max}` (decision 39 F) caps the intents
+      of each type per step; more is a guard violation (it was `intent_rejected`). A type the
+      skill does not declare stays `intent_rejected` (a permission breach, the run fails);
+    - **(2) embeds are always refused**, even when the URL is in the input (they fetch when the
+      note renders, without a click): any `![` (Markdown and reference images, Obsidian
+      `![[…]]` embeds), and the HTML tags `img image iframe frame frameset object embed video
+      audio source track picture link script style svg math meta base form input portal applet
+      bgsound param` whatever their attributes;
+    - **(3) refused schemes.** `javascript:`, `vbscript:`, `data:` and `file:` at a word start
+      and followed by a non-space character, anywhere in the text; inside any HTML tag also
+      with whitespace or control characters in the scheme; a protocol-relative `//host` as a
+      Markdown link destination, a link reference definition or an HTML attribute value;
+    - **(4) the input set** (answer 3). Every URL in the text (`scheme://…`, `mailto:…` and
+      `www.…` runs, up to whitespace, `<`, `>` or a control character) must be an **exact
+      string** extracted the same way from the **viewed** input (string values and object keys
+      of what the model was shown), case-sensitive, after dropping at most 16 trailing
+      punctuation characters (`.,;:!?)]}'"*_~` and backtick) on either side. So a known URL may
+      be copied, but never extended (`…?q=<data>`, `…/<data>`). A `notify.push` `link` must be
+      exactly such a URL **and** fall under the entry's `link_prefix` (decision 30). A
+      per-pipeline `strict_links` (only trusted parameters and `link_prefix`) is a follow-up;
+    - **fields scanned**: `note.*` `content` and `heading`, `task.create` `title` and
+      `fingerprint`, `notify.push` `title`, `body` and `link`, every string and object key of an
+      `http.post` `body`. Targets bound by routing (`path`, `http.post` `url`) are not text;
+    - **robust parsing, bounded work.** Every check runs on the text as written and on its
+      HTML-entity-decoded forms (up to three passes: `&#x3c;img`, `&amp;lt;img`), ASCII
+      case-insensitively. Scans are linear (`find` loops that resume after each match, regular
+      expressions without nested quantifiers); a test scans 1 MiB of hostile text per field;
+    - **(answer 4) the whole step degrades.** A violation records one `Violation(kind="guard")`
+      and the step `degraded` with `error.kind` `guard_violation`: none of its intents is
+      routed (also the valid ones), its output is not used, later steps are `skipped`, the
+      run is `degraded`, and no `input_hash` is recorded (so the runner never caches it). The
+      LLM call is recorded with its raw intents (replay and audit);
+    - **(answer 6) content-free detail.** `Violation.detail` (= the step error's message, at
+      most 512 characters) names only closed-set values: the proposer (`skill:<name>`), the
+      intent type and position, the field and the kind of problem, e.g. ``skill:daily-brief/
+      rank proposed note.create #2 with an image or embed in `content` ``, never the URL, its
+      host or the text. The same line is logged at `warning` (`horae.engine`);
+    - **reuse (decision 45).** On a reuse, a guard violation is a **cache miss**: nothing of
+      the entry is recorded (no violation) and the model is called. For a cache hit the engine
+      awaits the cache's optional `discard(key, model_alias=...)`; `StoreLlmCache.discard`
+      deletes the entry (logged, store errors swallowed), so a poisoned entry is not looked up
+      again. A refused `previous` (replay) is only a miss;
+    - **(answer 5) scope.** LLM proposals only; `collect` and `transform` intents are not
+      guarded in v1 (first-party plugins in the D tier, T04); hostile plugins are #52's;
+    - **fencing** (design note C). The backends already fence the input: it is sent as JSON
+      inside `<input>` tags with every `<` written `<` (`horae.llm.backends._shared.
+      escaped`), and repair errors likewise inside `<schema_errors>`, so data can never close
+      the fence (`tests/test_llm_backends_shared.py`). A per-call nonce adds nothing to that
+      and would make requests non-deterministic, so none is added and `LLM_KEY_VERSION` is
+      unchanged;
+    - **known limits**: obfuscated URLs (`hxxps`, zero-width characters inside the scheme)
+      are not links in Obsidian and pass; a URL the input brings may be copied (tenet 5 as
+      written); a brief citing a new URL from the model's own knowledge is refused.

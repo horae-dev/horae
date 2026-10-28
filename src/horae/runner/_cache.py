@@ -244,6 +244,11 @@ class StoreLlmCache:
             _log.warning("LLM cache validation failed (%s)", type(exc).__name__)
             return False
 
+    async def discard(self, key: str, *, model_alias: str) -> None:
+        """Delete the entry for the engine key `key`: the engine's action guard refused its
+        intents on reuse (schemas decision 46). Store errors are logged, never raised."""
+        self._forget(self.stored_key(key, model_alias), "was refused by the action guard")
+
     async def lookup(
         self, key: str, *, model_alias: str, output_schema: Mapping[str, Any] | None
     ) -> PreviousLlm | None:

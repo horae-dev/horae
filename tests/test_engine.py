@@ -415,8 +415,10 @@ def test_no_intents_in_any_spelling(empty: Any) -> None:
 # --- intent routing and binding --------------------------------------------------------------
 
 
-def _route(intents: list[Any], *act: Any, notify: Any = None) -> RunRecord:
+def _route(intents: list[Any], *act: Any, notify: Any = None, shown: Any = None) -> RunRecord:
     plugins = _flow_plugins([])
+    if shown is not None:  # what the source returns (the LLM's input set, #35)
+        plugins.handlers["src.read"] = lambda params, data: shown
     plugins.add(_manifest("other", ("note.create", "notify.push"), sinks=["other.write"]))
     steps: list[dict[str, Any]] = [{"collect": ["src.read"]}, {"llm": LLM}]
     if act:
@@ -651,7 +653,8 @@ def test_notification_links_need_a_trusted_prefix(
 ) -> None:
     push = {**PUSH, "link": link} if link else PUSH
     notify = [{"sink.notify": {"link_prefix": prefix}}] if prefix else None
-    record = _route([push], notify=notify)
+    # The link is in the input (the action guard, #35): only the prefix decides here.
+    record = _route([push], notify=notify, shown={"mail": f"see {link}"})
     if routed:
         assert record.status == "ok", record.error
         assert record.intents[0].applied_by == "sink.notify"

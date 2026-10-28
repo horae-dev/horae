@@ -117,6 +117,17 @@ task titles, notification titles and bodies and `http.post` bodies are untrusted
 the proposer. Appliers (#21/#22) must treat them as data (never as markup to interpret,
 commands, templates or further targets).
 
+**The action guard** (#35, `horae.engine.guard`, schemas decision 46). Every batch the `llm`
+step proposes (fresh or reused) is checked after validation and before routing: at most the
+skill's `intent_limits` of each type, no embed (Markdown image, Obsidian embed, HTML `<img>`,
+`<iframe>`, `<script>`…) and no `javascript:` / `data:` / `file:` link in its text, and every
+URL in its text (and a `notify.push` `link`) an exact string of the viewed input. A refusal
+records a `guard` violation (a content-free detail) and **degrades the whole step**
+(`guard_violation`): nothing it proposed is routed, its output is not used, later steps are
+skipped. On a reuse, a refusal is a cache miss, and a cached entry is deleted (`discard`, when
+the cache has it). Intents of `collect` and `transform` steps are not guarded (first-party
+plugins, #52).
+
 | `mode` | intent types | binding parameter |
 |---|---|---|
 | `create` | `note.create` | `path` (required) |
@@ -150,7 +161,7 @@ sees, also what `LlmRequest.input` and `LlmCall.input_hash` hold), and the key a
 `skill_version` and `skill_digest` (prompt, output schema, view and intents), so a new version
 or an edited prompt is a cache miss; `LlmCall.skill_version` and `LlmCall.skill_digest` are the
 loaded skill's, and the LLM's intents are checked against the plugin's permissions narrowed to
-the skill's `intents`, at most its `intent_limits` of each type (`intent_rejected`). A viewed
+the skill's `intents` (`intent_rejected`). A viewed
 input of `null` (the input does not have the view's shape) degrades the step without calling
 the LLM (`input_invalid`). The skill is loaded before the backend is checked, so an invalid
 skill is `skill_invalid` even without a backend.
@@ -161,8 +172,9 @@ re-validates it), no LLM call is made: its output and intents are reused (valida
 again), recorded as an `LlmCall` with `cached=True`, zero usage and the request marker
 `{skill, model, reused_input_hash, source_run?}` (`source_run`: the run that produced it),
 and the run continues. If the reused intents no longer validate or route (e.g. an explicit
-target bound to `{{date}}` moved to a new day), it is a cache miss: nothing of the entry is
-recorded and the LLM is called. Without a usable entry (or when `cache.lookup` raises: a
+target bound to `{{date}}` moved to a new day) or the action guard refuses them, it is a cache
+miss: nothing of the entry is recorded and the LLM is called (a guarded cache entry is also
+deleted). Without a usable entry (or when `cache.lookup` raises: a
 miss) the LLM is called. A hit calls no backend, so no usage is reserved or charged (schemas
 decision 45). A reused run re-proposes the same intents, including `notify.push`: appliers
 must deduplicate notifications (e.g. by `input_hash` and intent).
@@ -180,6 +192,7 @@ a backend's cached response costs nothing and counts towards neither the cost no
 | collect | every source fails | failed | failed | skipped |
 | transform | a transform fails | failed | failed | skipped |
 | llm | backend error, timeout, budget, invalid output, schema x2 | degraded | degraded | skipped |
+| llm | the action guard refuses its proposals | degraded | degraded | skipped |
 | llm | unchanged input, previous output reused | ok | ok or noop (2) | run |
 | act | after a degraded `collect` (`partial_input`) | skipped | (degraded) | run |
 | act, notify | otherwise | ok | ok | run |
@@ -205,6 +218,7 @@ import contextlib
 import copy
 import datetime
 import json
+import logging
 import math
 import time
 from collections.abc import Awaitable, Callable, Mapping
@@ -249,6 +263,7 @@ from horae.contracts.run import (
 )
 from horae.contracts.types import MAX_ITEMS, HttpsUrl, NotePath, Sha256Hex, Token
 from horae.engine.canonical import canonical_json, canonical_pipeline, pipeline_digest, sha256_hex
+from horae.engine.guard import GUARD_ERROR, guard_for
 from horae.engine.ports import (
     EngineCallError,
     LlmBackend,
@@ -269,6 +284,8 @@ from horae.engine.ports import (
 from horae.engine.template import TemplateError, render, variables
 from horae.intents import MAX_BODY_DEPTH, IntentRejected, safe_excerpt, validate_intents
 from horae.secrets.redact import current as current_redactor
+
+_log = logging.getLogger("horae.engine")
 
 DEFAULT_LLM_TIMEOUT_S = 120.0
 """Timeout of the LLM step (both attempts) when the pipeline sets no `timeout_s`."""
@@ -872,15 +889,16 @@ class _Run:
         pending: int,
         collected: tuple[Any, ...] = (),
         shown: tuple[Any, ...] | None = None,
-        limits: Mapping[str, int] | None = None,
+        guard: Callable[[tuple[Intent, ...]], str | None] | None = None,
     ) -> tuple[list[ProposedIntent], StepError | None]:
         """Validate and route one call's proposals; `pending` intents of this step are kept.
 
         `collected` is input data of the current `collect` step not yet in `self.inputs`
         (searched, with them, for `task.update_status` fingerprints). `shown`, when given, is
         what the proposer was shown (the LLM step's viewed input): fingerprints are searched
-        there only. `limits` caps the intents of each type (a skill's `intents: {type: max}`):
-        more is `intent_rejected`."""
+        there only. `guard` (the LLM step's action guard, `horae.engine.guard`) runs on the
+        validated batch before routing: a detail it returns is recorded as a `guard` violation
+        and returned as a `guard_violation` error (nothing of the batch is routed)."""
         raw = _intent_list(raw)
         entries = [entry for entry in self.entries if entry.step > index]
         unroutable: list[tuple[str, int, str]] = []
@@ -905,11 +923,13 @@ class _Run:
             return [], rejected.step_error()
         if unroutable:  # pragma: no cover (an unfilled target always fails its schema)
             return [], _route_error(source, unroutable)
-        for intent_type, most in sorted((limits or {}).items()):
-            count = sum(1 for intent in typed if intent.type == intent_type)
-            if count > most:
-                message = f"{source}: {count} {intent_type} intents, the skill allows {most}"
-                return [], StepError(kind="intent_rejected", message=_cap(message))
+        if guard is not None:
+            refused = guard(typed)
+            if refused is not None:
+                _log.warning("action guard: %s", refused)
+                if len(self.violations) < MAX_ITEMS:
+                    self.violations.append(Violation(kind="guard", detail=refused))
+                return [], StepError(kind=GUARD_ERROR, message=_cap(refused))
         kept = len(self.intents) + sum(len(p) for p in self.pending.values()) + pending
         if kept + len(typed) > MAX_RUN_INTENTS:
             message = f"more than {MAX_RUN_INTENTS} intents in the run"
@@ -1192,8 +1212,10 @@ async def _reuse(
     """An accepted output for `key`, reused; `None` if there is none or it cannot be reused
     (then the LLM is called)."""
     previous = run.previous
+    from_cache = False
     if (previous is None or previous.input_hash != key) and run.cache is not None:
         schema = None if step.skill is None else step.skill.output_schema
+        from_cache = True
         try:
             previous = await run.cache.lookup(key, model_alias=spec.model, output_schema=schema)
         except Exception:  # a broken cache is a miss, never a failed run
@@ -1223,12 +1245,16 @@ async def _reuse(
         return None
     violations = len(run.violations)
     proposer = _proposer(plugin, step.skill)
+    source = f"skill:{spec.skill}"
     accepted, rejected = run.propose(
-        raw, proposer, f"skill:{spec.skill}", step.index, spec.skill, 0, **_shown(step, viewed)
+        raw, proposer, source, step.index, spec.skill, 0, **_shown(step, viewed, source)
     )
     if rejected is not None:
-        # E.g. a target bound to `{{date}}` moved on: a cache miss, not a failure.
+        # E.g. a target bound to `{{date}}` moved on: a cache miss, not a failure. A cached
+        # entry the action guard refuses is also deleted (schemas decision 46).
         del run.violations[violations:]
+        if from_cache and rejected.kind == GUARD_ERROR:
+            await _discard(run.cache, key, spec.model)
         return None
     run.llm_calls.append(call)
     run.data, run.input_hash, run.reused = output, key, True
@@ -1244,12 +1270,21 @@ def _reuse_marker(spec: LlmSpec, key: str, source_run: str | None) -> dict[str, 
     return marker
 
 
-def _shown(step: _Planned, viewed: Any) -> dict[str, Any]:
-    """With a skill, `task.update_status` fingerprints must come from what the model was
-    shown (the viewed input), and its per-type intent limits apply."""
-    if step.skill is None:
-        return {}
-    return {"shown": (viewed,), "limits": dict(step.skill.intent_limits)}
+async def _discard(cache: LlmCache | None, key: str, model_alias: str) -> None:
+    """Delete a cached entry, when the cache can (`discard`, optional); never raises."""
+    discard = getattr(cache, "discard", None)
+    if callable(discard):
+        with contextlib.suppress(Exception):  # a broken cache never fails the run
+            await discard(key, model_alias=model_alias)
+
+
+def _shown(step: _Planned, viewed: Any, source: str) -> dict[str, Any]:
+    """The action guard on what the model was shown (the viewed input), with the skill's
+    per-type intent limits; with a skill, `task.update_status` fingerprints must also come
+    from the viewed input."""
+    limits = None if step.skill is None else step.skill.intent_limits
+    guard = {"guard": guard_for(viewed, source, limits)}
+    return guard if step.skill is None else {**guard, "shown": (viewed,)}
 
 
 async def _llm_step(run: _Run, step: _Planned) -> _Outcome:
@@ -1371,10 +1406,13 @@ async def _llm_step(run: _Run, step: _Planned) -> _Outcome:
             source = f"skill:{spec.skill}"
             proposer = _proposer(plugin, skill)
             accepted, rejected = run.propose(
-                raw, proposer, source, step.index, spec.skill, 0, **_shown(step, viewed)
+                raw, proposer, source, step.index, spec.skill, 0, **_shown(step, viewed, source)
             )
             if rejected is not None:
-                return _Outcome("failed", rejected, stop=True)
+                # The guard degrades the whole step (nothing of it is routed); a permission or
+                # routing breach fails the run.
+                status: StepStatus = "degraded" if rejected.kind == GUARD_ERROR else "failed"
+                return _Outcome(status, rejected, stop=True)
             run.data, run.input_hash = output, key
             return _Outcome("ok", output=output, intents=accepted)
         repair = errors
