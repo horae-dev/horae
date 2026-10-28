@@ -328,7 +328,7 @@ def test_the_guard_catches_writes(
         lambda: subprocess.Popen([sys.executable, "-c", "pass"]),
     ]
     if hasattr(os, "lchmod"):
-        attempts.append(lambda: os.lchmod(vault / INBOX, 0o600))
+        attempts.append(lambda: getattr(os, "lchmod")(vault / INBOX, 0o600))  # noqa: B009
     if hasattr(os, "setxattr"):
         attempts.append(lambda: getattr(os, "setxattr")(vault / INBOX, "user.x", b"1"))  # noqa: B009
         attempts.append(lambda: getattr(os, "removexattr")(vault / INBOX, "user.x"))  # noqa: B009
