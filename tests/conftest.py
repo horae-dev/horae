@@ -26,9 +26,14 @@ def instance_dir(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def with_secrets(instance_dir: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """The instance with every secret it needs: one in a file, one in the environment."""
+    """The instance with every secret it needs, as files in its secrets directory: one through
+    an explicit `{file: ...}` reference, one found by its name (`secrets/GITHUB_TOKEN`).
+
+    `GITHUB_TOKEN` is also set in the environment, to a different value, to prove that a
+    secret without an explicit `{env: ...}` reference is never read from there."""
     secrets = instance_dir / "secrets"
     secrets.mkdir()
     (secrets / "anthropic_api_key").write_text(ANTHROPIC_KEY + "\n", encoding="utf-8")
-    monkeypatch.setenv("GITHUB_TOKEN", GITHUB_TOKEN)
+    (secrets / "GITHUB_TOKEN").write_text(GITHUB_TOKEN, encoding="utf-8")
+    monkeypatch.setenv("GITHUB_TOKEN", "from-the-environment-never-read")
     return instance_dir

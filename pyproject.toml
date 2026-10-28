@@ -10,6 +10,7 @@ dependencies = [
     "pydantic>=2.14",
     "pyyaml>=6",
     "typer>=0.27",
+    "tzdata>=2026.5",
 ]
 
 [project.scripts]

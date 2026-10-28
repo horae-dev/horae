@@ -1,4 +1,5 @@
 # horae.yaml of a home-server instance (synthetic).
+schema_version: 1
 timezone: Europe/Paris
 state_dir: /data/state
 models:
@@ -9,6 +10,9 @@ models:
     model: mistral-small
     base_url: https://openrouter.example.org/api/v1
     secret: OPENROUTER_API_KEY
+  # http to a single-label host: the `ollama` service of the same Compose project.
+  local: { backend: ollama, model: llama3, base_url: "http://ollama:11434" }
+plugin_defaults: { startup_timeout_s: 10, call_timeout_s: 30 }
 plugins:
   github: { call_timeout_s: 20 }
 secrets:

@@ -40,8 +40,9 @@ pydantic may change them; the drift test then fails in CI and the fix is to rege
 - A breaking change adds `v<N+1>.json` next to the old file; compatible additions stay in `v<N>`.
   Most rules are deliberately tight: loosening one later is a compatible change.
 - Files that Horae writes itself carry `schema_version` (`horae.lock`, run records). Files that
-  people write (pipelines, `plugin.yaml`, `horae.yaml`) do not, so the PLAN.md examples validate
-  unchanged.
+  people write (pipelines, `plugin.yaml`) do not, so the PLAN.md examples validate unchanged.
+  `horae.yaml` accepts an **optional** `schema_version: 1` (the default), so that a future v2
+  file can be told apart (decision 26).
 
 ## Rules worth knowing
 
@@ -77,6 +78,7 @@ pydantic may change them; the drift test then fails in CI and the fix is to rege
 | Note path (intents) | relative POSIX path: no leading `/`, no `\`, no control characters, no empty segment, **no segment starting with `.`** (so no `.`, `..`, `.obsidian/` or hidden files) |
 | `permissions.paths` | normalised absolute POSIX path: no `.`/`..`/empty segment, no trailing `/`, not `/`, no `\` or control characters |
 | Secret name | `^[A-Z][A-Z0-9_]*$` (not starting with `_`); `HORAE_*` reserved; `LD_*`, `DYLD_*`, `PYTHON*`, `PATH`, `HOME` rejected |
+| `models.<alias>.base_url` (`horae.yaml`) | `https://` to a host name (`localhost` included), an IPv4 literal or a bracketed IPv6 literal; `http://` only to `localhost`, `127.0.0.0/8`, `10/8`, `172.16/12`, `192.168/16`, `[::1]`, `[fc00::/7]` or a single-label name (`ollama`); optional port; no user info, fragment, backslash, whitespace or control characters (decision 24) |
 | Task title, headings, descriptions | one line: `^[^\x00-\x1f\x7f]+$` |
 | Block id | `^[a-z0-9][a-z0-9-]{0,63}$` |
 | Fingerprint (`task.create.fingerprint`, `task.update_status.task`) | `^[A-Za-z0-9._:-]{1,128}$` |
@@ -110,6 +112,8 @@ JSON Schema cannot express these; the models enforce them and the tests pin the 
   dependency) and decode to letters, marks, digits and `-` only. The second rule rejects what
   IDNA2003 allows but IDNA2008 does not, such as emoji (`xn--ls8h`) and symbols (`xn--g6h`); it
   approximates IDNA2008 rather than implementing RFC 5892 exactly.
+- `instance` (`horae.yaml`): a bracketed IPv6 literal in `base_url` must parse as an IPv6
+  address (the schema only checks its characters and, for `http`, the `fc`/`fd` prefix).
 
 ### Known validator differences
 
@@ -204,15 +208,66 @@ conservative option, so loosening one later is a compatible change.
     A dry run has no `changes`. Untrusted-content tagging is not part of v1.
 22. **`$id` host.** `raw.githubusercontent.com/horae-dev/horae/main/schemas/…`, which this project
     controls and which serves the files once merged. A custom domain can come later as `v<N+1>`.
-23. **`horae.yaml` (instance v1)**, proposed in #16 and pending maintainer review, is kept minimal; every key is optional. `timezone` (IANA,
-    default `UTC`), `state_dir` (default `state`, relative to the instance directory),
-    `models` (alias → `backend` from the run-record list, `model`, optional `base_url` (https
-    only, as decision 6) and `secret`, the name of the secret holding the API key or token),
-    `plugins` (per installed plugin: optional `startup_timeout_s` and `call_timeout_s`, as
-    proposed in the #24 design note), `secrets` (`dir`, default `/run/secrets`, and `refs`:
-    secret name → `{env: VAR}` or `{file: name}`, a single file name inside `dir`) and
-    `scheduler.mode` (`builtin`, the default, or `external`). It never holds a secret value. A
-    secret without a ref is read from the environment variable of the same name, else from the
-    file of the same name in `dir`.
-    Rules the loader (not the schema) checks: time zones exist, `llm.model` aliases are defined,
-    configured plugins are in `horae.lock`, a pipeline's `name` equals its file name.
+
+### Provisional decisions (#16, pending maintainer review)
+
+Taken in #16 so that the loader could be built; each is the conservative option and can be
+loosened later without breaking a valid file.
+
+23. **`horae.yaml` (instance v1)** is kept minimal; every key is optional. `schema_version`
+    (`1`, decision 26), `timezone` (IANA, default `UTC`), `state_dir` (default `state`, relative
+    to the instance directory), `models` (alias → `backend` from the run-record list, `model`,
+    `base_url` (decision 24) and `secret`, the name of the secret holding the API key or token),
+    `plugin_defaults` and `plugins` (decision 26), `secrets` (`dir`, default `/run/secrets`,
+    and `refs`: secret name → `{env: VAR}` or `{file: name}`, a single file name inside `dir`;
+    decision 25) and `scheduler.mode` (`builtin`, the default, or `external`). It never holds a
+    secret value.
+    Rules the loader (not the schema) checks: time zones exist (`zoneinfo.available_timezones()`,
+    with the `tzdata` package as a runtime dependency so that the answer does not depend on the
+    host), `llm.model` aliases are defined, configured plugins are in `horae.lock` (skipped when
+    `horae.lock` itself is invalid), a pipeline's `name` equals its file name.
+24. **Backends and endpoints (A).** `ollama` and `openai-compatible` **require** `base_url`;
+    `anthropic` **requires** `secret`; `claude-cli` needs neither. `base_url` is a `BackendUrl`:
+    `https` is always allowed (any host name, `localhost` included, or an IP literal); plain
+    `http` only to loopback (`localhost`, `127.0.0.0/8`, `[::1]`), private addresses (RFC 1918
+    `10/8`, `172.16/12`, `192.168/16`; IPv6 ULA `fc00::/7`) and single-label names (a Compose or
+    Coolify service such as `http://ollama:11434`), where TLS is usually not available and the
+    traffic does not leave the host or the private network. No user info (credentials belong in
+    a secret), no fragment. The JSON Schema expresses the same rule (one pattern and
+    `if`/`then` for the required keys).
+25. **Secrets come from files unless a reference says otherwise (B).** A secret with no entry
+    in `secrets.refs` is read from `<secrets.dir>/<NAME>` **only**. Environment variables are
+    read only through an explicit `{env: VAR}` reference. This keeps a plugin that declares a
+    secret name from pulling an arbitrary variable of the host environment, and steers
+    deployments towards secret files, which a plugin cannot read through
+    `/proc/<horae-pid>/environ` (see the #24 design note, "Not enforced until M5"). An explicit
+    env reference to a variable that is unset or empty is an error. One trailing newline (`\n`
+    or `\r\n`) is stripped from every value; a value that still contains `\r`, `\n` or NUL, or a
+    file that is not a regular UTF-8 file of at most 64 KiB, is an error. Files are opened once,
+    non-blocking (a FIFO cannot hang `horae doctor`), and checked with `fstat` on that
+    descriptor.
+26. **`schema_version` and plugin timeouts (C).** `horae.yaml` takes an optional
+    `schema_version: 1` (`true` and `1.0` are rejected, as everywhere). `plugin_defaults`
+    (`startup_timeout_s`, default 10, and `call_timeout_s`, default 30) applies to every plugin;
+    `plugins.<name>` may override either. Every timeout is 1 to 600 seconds.
+    `Instance.plugin_timeouts(name)` returns the effective pair for the #24 plugin host.
+27. **`horae doctor` (D).** Exit codes: `0` no problem, `1` problems found, `2` usage error,
+    `70` internal error (`EX_SOFTWARE`; the doctor then prints only the exception type, never
+    its message, traceback or locals, which may hold a resolved secret). `--json` prints
+    `{"schema_version": 1, "ok", "instance", "problems": [{file, line, column, severity,
+    message}]}`; `severity` is always `error` in v1 and is kept so warnings can be added.
+28. **The environment deny list is the #24 host's (E).** `SecretName` rejects only the loader
+    variables of decision 8. The full deny list of the #24 design note (`NODE_OPTIONS`,
+    `BASH_ENV`, `*_PROXY`, `SSL_CERT_*`, `GIT_*`, …) is enforced by the plugin host when it
+    builds a child environment, not by the schema: it is about what a variable does in a child
+    process, not about whether a name is a valid secret name. The #24 `SecretResolver` protocol
+    should return a `Secret` (not `str`), so values stay redacted until the host puts them in
+    the child environment, and the host can redact every value from
+    `SecretResolver.resolved()`.
+29. **Problem positions (F).** A problem points at the **value** when the value is wrong
+    (`scheduler.mode: cron` points at `cron`), and at the **key** when a key is unknown, invalid
+    or missing (a missing key points at its parent's key). A mapping key that is not a valid
+    name is shown as `<key at line N>`, never echoed, since it may be a secret pasted in the
+    wrong place. Messages never show a regular expression, and a union (a pipeline step, a
+    secret reference) gives a single problem, e.g. `unknown step kind 'colect' (expected one
+    of: collect, transform, llm, act, notify)`.

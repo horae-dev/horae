@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Load an instance: `horae.yaml`, `pipelines/*.yaml` and `horae.lock` (PLAN.md §3.1)."""
 
+import functools
+import os
+import stat
 import zoneinfo
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -9,7 +12,7 @@ from pathlib import Path
 from pydantic import BaseModel
 
 from horae.config.documents import Problem, ProblemsError, YamlDocument, read_yaml, validate
-from horae.contracts.instance import InstanceConfig, LlmBackend, ModelAlias
+from horae.contracts.instance import InstanceConfig, LlmBackend, ModelAlias, PluginDefaults
 from horae.contracts.lockfile import Lockfile
 from horae.contracts.pipeline import LlmStep, Pipeline
 from horae.secrets import Secret, SecretError, SecretResolver
@@ -59,8 +62,13 @@ class Instance:
         return self.root / self.config.secrets.dir
 
     def secret_resolver(self, environ: Mapping[str, str] | None = None) -> SecretResolver:
-        """A resolver for this instance's secrets, from `environ` (default: `os.environ`)."""
+        """A resolver for this instance's secrets. `environ` (default: `os.environ`) is read
+        only for the secrets that have an explicit `{env: VAR}` reference."""
         return SecretResolver(self.config.secrets.refs, self.secrets_dir, environ)
+
+    def plugin_timeouts(self, plugin: str) -> PluginDefaults:
+        """The effective startup and call timeouts of `plugin` (for the plugin host)."""
+        return self.config.plugin_timeouts(plugin)
 
     def model(self, alias: str) -> ModelAlias:
         """What `alias` resolves to, or `UnknownModelAlias`."""
@@ -84,6 +92,7 @@ class _Loaded:
     config_doc: YamlDocument | None = None
     lock: Lockfile | None = None
     lock_doc: YamlDocument | None = None
+    lock_invalid: bool = False
     pipelines: dict[str, tuple[Pipeline, YamlDocument]] = field(default_factory=dict)
 
     def load[M: BaseModel](self, path: Path, model: type[M]) -> tuple[M, YamlDocument] | None:
@@ -105,37 +114,68 @@ class _Loaded:
         )
 
 
+@functools.cache
+def _timezones() -> frozenset[str]:
+    return frozenset(zoneinfo.available_timezones())
+
+
 def _timezone_exists(name: str) -> bool:
+    """Whether `name` is a time zone key (not a directory such as `America`)."""
+    return name in _timezones()
+
+
+def _pipeline_files(state: "_Loaded", directory: Path) -> list[Path]:
+    """The pipeline files in `directory`; unreadable or non-regular entries are problems."""
     try:
-        zoneinfo.ZoneInfo(name)
-    except (zoneinfo.ZoneInfoNotFoundError, ValueError):
-        return False
-    return True
-
-
-def _pipeline_files(directory: Path) -> list[Path]:
-    if not directory.is_dir():
+        info = os.stat(directory)
+    except FileNotFoundError:
         return []
-    return sorted(
-        p
-        for p in directory.iterdir()
-        if p.suffix in PIPELINE_SUFFIXES and not p.name.startswith(".") and p.is_file()
-    )
+    except OSError as exc:
+        state.problems.append(
+            Problem(str(directory), None, None, f"cannot be read ({exc.strerror})")
+        )
+        return []
+    if not stat.S_ISDIR(info.st_mode):
+        state.problems.append(Problem(str(directory), None, None, "not a directory"))
+        return []
+    try:
+        entries = sorted(directory.iterdir())
+    except OSError as exc:
+        state.problems.append(
+            Problem(str(directory), None, None, f"cannot be read ({exc.strerror})")
+        )
+        return []
+    files = []
+    for path in entries:
+        if path.suffix not in PIPELINE_SUFFIXES or path.name.startswith("."):
+            continue
+        try:
+            regular = stat.S_ISREG(path.stat().st_mode)
+        except OSError as exc:
+            state.problems.append(
+                Problem(str(path), None, None, f"cannot be read ({exc.strerror})")
+            )
+            continue
+        if not regular:
+            state.problems.append(Problem(str(path), None, None, "not a regular file"))
+            continue
+        files.append(path)
+    return files
 
 
 def _load(root: Path) -> _Loaded:
     state = _Loaded(root)
-    config_path = root / CONFIG_FILE
-    if not config_path.is_file():
-        state.problems.append(Problem(str(config_path), None, None, "file not found"))
-    elif loaded := state.load(config_path, InstanceConfig):
+    if loaded := state.load(root / CONFIG_FILE, InstanceConfig):
         state.config, state.config_doc = loaded
 
     lock_path = root / LOCK_FILE
-    if lock_path.exists() and (lock := state.load(lock_path, Lockfile)):
-        state.lock, state.lock_doc = lock
+    if os.path.lexists(lock_path):
+        if lock := state.load(lock_path, Lockfile):
+            state.lock, state.lock_doc = lock
+        else:
+            state.lock_invalid = True
 
-    for path in _pipeline_files(root / PIPELINES_DIR):
+    for path in _pipeline_files(state, root / PIPELINES_DIR):
         if (loaded_pipeline := state.load(path, Pipeline)) is None:
             continue
         pipeline, doc = loaded_pipeline
@@ -165,12 +205,15 @@ def _cross_check(state: _Loaded) -> None:
         state.problems.append(
             config_doc.problem(("timezone",), f"unknown time zone {config.timezone!r}")
         )
+    # An invalid horae.lock is already a problem: do not report every plugin as missing too.
     locked = state.lock.plugins if state.lock is not None else {}
-    for name in config.plugins:
+    for name in config.plugins if not state.lock_invalid else ():
         if name not in locked:
             state.problems.append(
                 config_doc.problem(
-                    ("plugins", name), f"plugin {name!r} is not installed (not in {LOCK_FILE})"
+                    ("plugins", name),
+                    f"plugin {name!r} is not installed (not in {LOCK_FILE})",
+                    value=False,
                 )
             )
     for pipeline, doc in state.pipelines.values():

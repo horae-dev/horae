@@ -265,6 +265,7 @@ dependencies = [
     { name = "pydantic" },
     { name = "pyyaml" },
     { name = "typer" },
+    { name = "tzdata" },
 ]
 
 [package.dev-dependencies]
@@ -286,6 +287,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.14" },
     { name = "pyyaml", specifier = ">=6" },
     { name = "typer", specifier = ">=0.27" },
+    { name = "tzdata", specifier = ">=2026.5" },
 ]
 
 [package.metadata.requires-dev]
