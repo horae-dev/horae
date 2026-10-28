@@ -311,3 +311,75 @@ loosened later without breaking a valid file.
     must treat as data. Reusing an unchanged input re-proposes identical intents, `notify.push`
     included, so appliers (#21/#22) must deduplicate notifications (e.g. by `input_hash` and
     intent); reused intents that no longer route are a cache miss and the LLM is called.
+
+### Provisional decisions (#19, pending maintainer review)
+
+31. **Run lifecycle (#19).** `horae.yaml` takes an optional `runs.timeout_s` (default 900, 1 to
+    86400 seconds), the run timeout. Per-call limits stay where they are:
+    `plugin_defaults.call_timeout_s` for tool calls (the #24 host) and the pipeline's
+    `llm.timeout_s` for the LLM step (the engine). Other rules of the runner (`horae.runner`),
+    which are not part of a schema (A to G are provisional maintainer decisions):
+    - run ids are `<UTC start, %Y%m%dT%H%M%S%fZ>-<pipeline>-<6 hex>`, so they sort by start
+      time and match `RunId`; a collision (`RunExists`) is retried once with a fresh id;
+    - **(B) liveness is an OS advisory lock.** A run holds `flock(LOCK_EX | LOCK_NB)` on
+      `<state_dir>/locks/<pipeline>.lock` (directory 0700, file 0600, opened
+      `O_CLOEXEC | O_NOFOLLOW`) for its whole life; the kernel releases it however the process
+      ends. A busy lock is retried for 0.2 s, then the run is refused with `PipelineLocked`,
+      naming the running run read from the store (its start, pid and host) when there is one;
+      nothing is written. With the lock held, any `running` row of that pipeline is dead by
+      definition and is abandoned (`failed`, no record, journal kept) as a compare-and-set on
+      its id and last heartbeat (`Store.abandon_run(heartbeat_before=...)`), then `begin_run`.
+      The store's unique index on running runs stays as a second guard (`PipelineBusy` is
+      reported as `PipelineLocked`). Heartbeats (every 10 s) stay for observability but no
+      longer decide liveness: there is no stale delay and no pid or host check. Local
+      filesystems only (no NFS or SMB, as ADR 0006 already requires for the database). POSIX
+      only: Linux (the container target) and macOS (development); without `fcntl` (Windows)
+      taking a lock raises `LocksUnsupported` (Windows is unsupported, no `msvcrt` fallback);
+    - **(G)** recovery covers only the pipeline being started; other pipelines are recovered
+      when they next start. `horae runs` shows a `running` row whose lock is free as
+      `running (stale?)` (`"stale": true` in `--json`), checked without waiting and read-only (a
+      missing lock file is a free lock; one that cannot be opened is not flagged);
+    - **(A)** dry runs take the lock too;
+    - **(C)** the heartbeat interval (10 s), the stop grace period (5 s) and the lock retry
+      (0.2 s) are constants, not `horae.yaml` settings. A heartbeat waits at most 100 ms for
+      the write lock (`HEARTBEAT_BUSY_TIMEOUT_MS`, on a second connection), then skips the
+      beat; heartbeat failures of any kind are logged once per run (exception type only) and
+      never stop the run;
+    - **(D) timeouts.** Past `runs.timeout_s` the run is cancelled and given 5 s to stop. If it
+      stops, its partial record is saved `failed` (the interrupted step `failed` with error kind
+      `timeout`, later steps `skipped`) and `RunTimedOut(record)` is raised. If it finished
+      anyway after the deadline (a step ignored the cancellation), it is saved `failed` with
+      the error `the run timed out after N s (it finished after the deadline)`, never `ok`. If
+      it still has not stopped, the run is abandoned with the error
+      `timeout: the run timed out after N s and its step did not stop within 5 s` and
+      `RunTimedOut` is raised with `record = None`;
+    - **(F) cancellation.** When the caller cancels `Runner.run` (Ctrl-C, or
+      `async with asyncio.timeout(...)`), the partial record is saved (kind `cancelled`; a run
+      cancelled before its first step gets a minimal record, every step `skipped`, error
+      `the run was cancelled before it started`), passed to the `on_record` callback, and a
+      plain `asyncio.CancelledError` is re-raised, so `asyncio.timeout` turns it into
+      `TimeoutError`. `RunTimedOut` is a `RunnerError`, not a `CancelledError`. The same 5 s
+      grace applies (then the run is abandoned with `cancelled: ...`). A cancellation that
+      arrives while the heartbeat stops is not swallowed;
+    - a crash (any other exception) abandons the run with `run crashed (<ExceptionType>)`,
+      never the exception's message; if that abandon fails, it is logged (types only) and the
+      next run of the pipeline recovers the row. A row abandoned by someone else while the run
+      runs is noticed by the heartbeat, the next step write or the final save: the run stops
+      with `RunLost`;
+    - clocks: timestamps and run ids use the wall clock, the run timeout the event loop's
+      monotonic clock. A wall-clock step only shifts recorded times (and may reorder run ids
+      started across it); since liveness is the lock's, it cannot make a live run look dead;
+    - the template time zone is the pipeline trigger's `timezone` when set, else
+      `horae.yaml` `timezone`;
+    - **(E)** the store is `<state_dir>/horae.db`. `horae runs` lists runs (`--pipeline`,
+      `--status`, `--limit`, `--json`) with the exit codes of decision 27. It opens the store
+      with `Store.open(path, read_only=True)`: it never creates the store or any file (no
+      `-wal` / `-shm` when no writer is active), never switches the journal mode and never
+      migrates; a schema older than this Horae exits 1 (`SchemaTooOldError`: "run
+      `horae run` once to migrate it"), a newer one too (`SchemaTooNewError`), and so do
+      permission and other OS errors. The table has an `ERROR` column: the run's error on one
+      line, control and bidi characters collapsed, at most 60 characters. `--json` prints
+      `{"schema_version": 1, "instance", "runs": [{id, pipeline, status, stale, dry_run,
+      abandoned, started_at, finished_at, duration_s, cost: {usd, tokens_in, tokens_out},
+      error}]}`, where `instance` is the resolved absolute path and `error` is the run's full
+      error, which carries step messages as capped by the engine (4096 characters).

@@ -212,6 +212,22 @@
       "title": "PluginSettings",
       "type": "object"
     },
+    "RunsConfig": {
+      "additionalProperties": false,
+      "description": "Bounds of one pipeline run (#19).",
+      "properties": {
+        "timeout_s": {
+          "default": 900.0,
+          "description": "Seconds a whole run may take. Past it the run is cancelled: the current step is\n`failed` with kind `timeout`, later steps are `skipped` and the run is `failed`. Per-call\nlimits are separate: `plugin_defaults.call_timeout_s` and the LLM step's `timeout_s`.",
+          "maximum": 86400.0,
+          "minimum": 1.0,
+          "title": "Timeout S",
+          "type": "number"
+        }
+      },
+      "title": "RunsConfig",
+      "type": "object"
+    },
     "SchedulerConfig": {
       "additionalProperties": false,
       "description": "How pipelines with a `trigger` are started.",
@@ -337,6 +353,10 @@
     },
     "scheduler": {
       "$ref": "#/$defs/SchedulerConfig"
+    },
+    "runs": {
+      "$ref": "#/$defs/RunsConfig",
+      "description": "Bounds of every pipeline run (the run timeout)."
     }
   },
   "title": "Horae instance configuration (horae.yaml)",
