@@ -1,7 +1,7 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": ["config:recommended", "helpers:pinGitHubActionDigests"],
-  "enabledManagers": ["pep621", "github-actions", "pre-commit", "pyenv"],
+  "enabledManagers": ["pep621", "github-actions", "pre-commit", "pyenv", "dockerfile"],
   "pre-commit": { "enabled": true },
   "minimumReleaseAge": "7 days",
   "internalChecksFilter": "strict",

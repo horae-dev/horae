@@ -1,0 +1,9 @@
+# Default deny: the build context is only what the Dockerfile copies.
+*
+!pyproject.toml
+!uv.lock
+!README.md
+!LICENSE
+!src/
+**/__pycache__
+**/*.py[cod]
