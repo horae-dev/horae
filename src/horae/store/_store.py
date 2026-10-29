@@ -579,18 +579,20 @@ class Store:
         return self._read_only
 
     @classmethod
-    def _open_read_only(cls, path: Path, timeout: float) -> Self:
+    def _open_read_only(cls, path: Path, timeout: float, immutable: bool) -> Self:
         """See `open(read_only=True)`."""
         if not path.is_file():
             raise StoreError(f"no database at {path}")
-        # With no `-wal` file, every committed change is in the main file: open it immutable,
-        # so SQLite creates no `-wal` / `-shm` (a read-only connection would otherwise create
-        # them, with the database file's permissions, and could not remove them). A writer
-        # that starts meanwhile appends to its own WAL, so this one-shot read sees the last
-        # checkpoint. With a `-wal`, a writer is (or was) active: open it read-only, sharing
-        # the existing `-shm`.
+        # `immutable` (the CLI's listings): with no `-wal` file, every committed change is in
+        # the main file, so open it immutable and SQLite creates no `-wal` / `-shm` (a
+        # read-only connection would otherwise create them, with the database file's
+        # permissions, and could not remove them). SQLite then takes no lock and trusts the
+        # file not to change: right for a one-shot command, not when a writer may checkpoint
+        # into the main file during the read (the API, in the scheduler's process). Otherwise,
+        # and whenever a `-wal` exists, plain `mode=ro`: a WAL reader with its read lock and
+        # the shared `-shm`, which sees every committed transaction consistently.
         wal = path.with_name(path.name + "-wal")
-        query = "mode=ro" if wal.exists() else "mode=ro&immutable=1"
+        query = "mode=ro&immutable=1" if immutable and not wal.exists() else "mode=ro"
         try:
             conn = sqlite3.connect(
                 f"{path.resolve().as_uri()}?{query}", uri=True, timeout=timeout, autocommit=True
@@ -624,6 +626,7 @@ class Store:
         *,
         busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
         read_only: bool = False,
+        immutable: bool = True,
     ) -> Self:
         """Open (creating it if needed) and migrate the database at `path`.
 
@@ -641,8 +644,13 @@ class Store:
         `read_only=True` (for listings such as `horae runs`) creates nothing, switches
         nothing and never migrates: the database must exist (else `StoreError`), and a schema
         older than this Horae raises `SchemaTooOldError` (newer: `SchemaTooNewError`). Writes
-        then fail with a `StoreError`. When no writer is active, no `-wal` / `-shm` file is
-        created either."""
+        then fail with a `StoreError`. When no writer is active (no `-wal` file), the database
+        is opened `immutable`, so no `-wal` / `-shm` file is created either: for one-shot
+        reads (`horae runs`). `immutable=False` (the HTTP API, which reads while the
+        scheduler's runs write and checkpoint in the same process) always opens it plain
+        `mode=ro`, with SQLite's locks: such a read may leave an empty `-wal` and a `-shm`
+        behind (with the database file's permissions), which the next writer's close
+        removes. `immutable` is ignored without `read_only`."""
         if sqlite3.sqlite_version_info < MIN_SQLITE:
             raise UnsupportedSQLite(
                 f"SQLite {sqlite3.sqlite_version} is too old; Horae needs 3.37 or later"
@@ -652,7 +660,7 @@ class Store:
         path = Path(path)
         timeout = busy_timeout_ms / 1000
         if read_only:
-            return cls._open_read_only(path, timeout)
+            return cls._open_read_only(path, timeout, immutable)
         old_umask = os.umask(0o077)
         try:
             if _initialised(path):
