@@ -28,6 +28,12 @@ its declared secret resolved, on the step's first call. A backend that is not av
 fails the step with `backend_unavailable`, and a skill whose prompt is not loaded with
 `skill_unavailable` (until #27); the run is then `degraded`.
 
+**Push monitor** (#39, schemas decision 49 F). When `horae.yaml` `scheduler.monitors` has
+an entry for the pipeline, its push URL (a secret) is pinged once the run has ended: `up` for
+`ok`, `noop` and `degraded`, `down` for anything else (failed, timed out, lost, interrupted,
+a store or plugin problem). Not for a dry run, nor when the pipeline is already running (the
+run in progress pings). A failed ping is a warning on stderr and never changes the exit code.
+
 Exit codes (`horae.cli_output`): 0 the run finished `ok`, `noop` or `degraded` (a dry run:
 planned without problems), 1 configuration, plugin, store or runtime problem (the run
 `failed` or timed out, or was lost; a dry run whose plan could not start a plugin), 2
@@ -40,6 +46,7 @@ interrupted.
 import asyncio
 import re
 import signal
+import time
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -71,6 +78,7 @@ from horae.contracts import RunRecord
 from horae.contracts.types import MAX_ITEMS
 from horae.engine.template import BUILTIN_VARS
 from horae.runner import LocksUnsupported, PipelineLocked, RunLost, Runner, RunTimedOut
+from horae.scheduler import RunOutcome, ping
 from horae.store import Store, StoreError
 
 _VAR_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
@@ -165,6 +173,8 @@ class _Run:
     changes: ChangeSet | None = None
     run_id: str | None = None
     """The run's id, as soon as its row exists (`Runner.run(on_begin=)`)."""
+    outcome: str | None = None
+    """How the run ended, for its push monitor (`horae.scheduler.RunOutcome.status`)."""
 
     def begin(self, run_id: str) -> None:
         self.run_id = run_id
@@ -331,7 +341,7 @@ def _run(
     dry_run: bool,
     var: list[str],
     json_output: bool,
-    runner: Callable[[Coroutine[Any, Any, RunRecord]], RunRecord],
+    runner: Callable[[Coroutine[Any, Any, Any]], Any],
     cache: bool = True,
 ) -> int:
     vars = parse_vars(var)
@@ -342,17 +352,51 @@ def _run(
             EXIT_REFUSED, "unknown_pipeline", f"unknown pipeline {name!r} (pipelines: {known})"
         )
     out = _Run()
+    started = time.monotonic()
     try:
-        record = runner(cancel_on_signals(_execute(instance, name, dry_run, vars, out, cache)))
+        code = _attempt(instance, name, dry_run, vars, json_output, runner, cache, out)
+    except CommandFailed as failed:
+        if failed.kind != "pipeline_locked":
+            out.outcome = failed.kind
+        raise
+    except Exception:
+        out.outcome = "internal"
+        raise
+    finally:
+        monitored = name in instance.config.scheduler.monitors
+        if monitored and not dry_run and out.outcome is not None:
+            outcome = RunOutcome(out.outcome, out.run_id)
+            runner(ping(instance, name, outcome, time.monotonic() - started))
+    return code
+
+
+def _attempt(
+    instance: Instance,
+    name: str,
+    dry_run: bool,
+    vars: dict[str, str],
+    json_output: bool,
+    runner: Callable[[Coroutine[Any, Any, Any]], Any],
+    cache: bool,
+    out: _Run,
+) -> int:
+    """One run of `name`; sets `out.outcome` (except when the pipeline is locked)."""
+    try:
+        record: RunRecord = runner(
+            cancel_on_signals(_execute(instance, name, dry_run, vars, out, cache))
+        )
     except Interrupted as stop:
+        out.outcome = "cancelled"
         _emit(json_output, *_interrupted(instance, out, stop.signum))
         return 128 + stop.signum
     except RunTimedOut as timed_out:
+        out.outcome = "timeout"
         _emit(json_output, timed_out.record, None, "timeout", str(timed_out), out.run_id)
         return EXIT_PROBLEMS
     except PipelineLocked as locked:
         raise CommandFailed(EXIT_LOCKED, "pipeline_locked", str(locked)) from None
     except RunLost as lost:
+        out.outcome = "run_lost"
         saved = out.saved[-1] if out.saved else None
         _emit(json_output, saved, None, "run_lost", str(lost), out.run_id)
         return EXIT_PROBLEMS
@@ -370,11 +414,13 @@ def _run(
         # A crash after the run began: its id, and how to undo an abandoned apply.
         crashed = internal_message(exc)
         del exc
+        out.outcome = "internal"
         note = _abandoned_during_apply(instance, out.run_id)
         if note is not None:
             crashed += f"; {note}"
         _emit(json_output, None, None, "internal", crashed, out.run_id)
         return EXIT_INTERNAL
+    out.outcome = record.status
     code, kind = _record_code(record, out.changes)
     message = None
     if kind == "planned_with_problems":
