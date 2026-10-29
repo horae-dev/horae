@@ -2556,8 +2556,9 @@ loosened later without breaking a valid file.
 
 49. **The built-in scheduler, external triggers and push monitors (#39).** Numbering: 48 is
     #36's; #38 and #42 may be adding decisions in parallel, so this number may move when they
-    merge. One compatible v1 addition to the instance contract (`scheduler.monitors`), one
-    new runtime dependency (`cronsim`) and one command (`horae serve`); no store migration.
+    merge. Compatible v1 additions to the instance contract (`scheduler.monitors`,
+    `scheduler.max_concurrent`, `scheduler.misfire_grace_s`), one new runtime dependency
+    (`cronsim`) and one command (`horae serve`); no store migration.
     - **A, cron library: `cronsim`** (`>=2.7,<3`, pinned in `uv.lock`). Pure Python, no
       dependency, typed (`py.typed`), about 1,200 lines with its `explain` module, maintained by the author of
       Healthchecks.io, where it evaluates every check's schedule, so its daylight-saving
@@ -2575,31 +2576,72 @@ loosened later without breaking a valid file.
       every real occurrence (`tests/test_scheduler.py`, Europe/Paris in March and October).
     - **C, mode.** `scheduler.mode` (`builtin` by default) is overridden by the
       `HORAE_SCHEDULER` environment variable when it is set and not blank: `builtin` or
-      `external`, anything else a configuration error (`horae serve` exits 1). In `external`
+      `external`, matched without regard to case (`External` is `external`), anything else
+      a configuration error (`horae serve` exits 1, `horae doctor` reports it). In `external`
       mode `horae serve` fires nothing (an external scheduler runs `horae run <pipeline>`,
       which is unaffected by the mode); the process still runs, for the HTTP API of #37.
     - **D, missed runs and overlap.** Missed fire times are **skipped**, never caught up: on
       start each pipeline waits for its first fire time after now, and a loop that wakes late
       (a suspended host) runs the fire time it waited for once, then the first one after
       now. The push monitor is what reports a missed run. A fire time while the pipeline's
-      previous scheduled run is still running, or whose run finds the per-pipeline `flock`
-      held (a manual `horae run`: `PipelineLocked`; a scheduled run takes the same lock as
-      any run, decision 31), is **skipped and recorded**: a warning log line and the
-      pipeline's `skipped` / `last_skip` in the scheduler state. A skipped fire time pings no
-      monitor and writes no run row (the run in progress pings and records its own).
+      previous scheduled run is still running or waiting for a slot, or whose run finds the
+      per-pipeline `flock` held (a manual `horae run`: `PipelineLocked`; a scheduled run
+      takes the same lock as any run, decision 31), is **skipped and recorded**: a warning
+      log line and the pipeline's `skipped` / `last_skip` / `last_skip_reason` (`running`,
+      `locked`) in the scheduler state. A skipped fire time pings no monitor and writes no
+      run row (the run in progress pings and records its own). A clock stepped back never
+      fires the same fire time twice (the next one is after both the last one fired and now).
+    - **D2, misfire grace.** A fire time that would start more than
+      `scheduler.misfire_grace_s` late (default 3600, 1 s to 7 days), after a suspended host
+      or while waiting for a slot (D3), is skipped and recorded (`last_skip_reason:
+      misfire`), not run: a run long after its time is more surprising than a missed one,
+      which the monitor reports.
+    - **D3, concurrency.** Scheduled runs are **serialised by default**:
+      `scheduler.max_concurrent` (1 to 16, default 1) runs at most at once. A fire time that
+      finds no free slot waits, first in first out (state `waiting`), and starts when a run
+      ends, unless it is then past its misfire grace (D2); a stop drops the waiting fire
+      times. Interaction with the apply lock (decision 34): whatever `max_concurrent` is, two
+      applies never overlap, since every run's apply holds the instance-wide apply lock and
+      waits for it at most `APPLY_LOCK_WAIT_S` (30 s) before it fails `apply_locked` with
+      nothing applied. With `max_concurrent: 1` scheduled runs never wait on each other's
+      applies (only on a manual `horae run` or `horae undo`); with more, runs proceed side by
+      side and their applies queue on the lock, so a long apply can make another run fail
+      `apply_locked`. Runs side by side share the store (SQLite in WAL mode, decision 36).
+    - **D4, isolation.** A pipeline whose next fire time cannot be computed (an unknown time
+      zone, a date out of range; the loader refuses what it can, but `0 0 29 2 *` is valid
+      and rare) logs an error naming the pipeline and the exception's type only, shows no
+      `next_fire`, and retries after 1 min, doubling up to 1 h; the other pipelines and the
+      runs in progress carry on.
     - **E, the process: `horae serve`.** The long-running entry point of a container (the
       name #37's HTTP API will share: one process). It runs `horae.scheduler.Scheduler`,
-      whose `state()` (`SchedulerState`: `mode`, `active`, and per pipeline `cron`,
-      `timezone`, `next_fire`, `last_fire`, `last_outcome`, `last_run_id`, `running`,
-      `skipped`, `last_skip`; `to_dict()` is JSON-ready, times as `...Z`) is what `/healthz`
-      will report. Scheduled runs run in the process, exactly as `horae run` runs them.
-      **Shutdown**: the first SIGTERM or SIGINT stops every loop and cancels the runs in
-      progress (a cancelled run stops as `horae run` does on SIGTERM: partial record saved
-      `failed`, an apply in progress finished first, within the runner's grace period), their
-      monitors are pinged `down` (`cancelled`), and the command exits **0** (a requested stop
-      is the normal end of a server, unlike an interrupted `horae run`). A second signal is
-      ignored. The wall clock is re-read at least every 30 s while waiting, so a clock step
-      or a suspend delays a fire time by at most that much.
+      whose `state()` (`SchedulerState`: `mode`, `active`, `started_at`, `max_concurrent`,
+      and per pipeline `cron`, `timezone`, `next_fire`, `last_fire`, `last_outcome`,
+      `last_run_id`, `last_ping` (`ok`, `failed`, `skipped`, `none`: no monitor), `running`,
+      `waiting`, `skipped`, `last_skip`, `last_skip_reason`; `to_dict()` is JSON-ready, times
+      as `...Z`) is what `/healthz` will report. The state lives in memory: the skip counts
+      and `last_*` fields start afresh on restart (persisting them is a follow-up). Scheduled
+      runs run in the process, exactly as `horae run` runs them; a crashed run is logged with
+      its run id and `internal error (<type>)`, never the exception's message. The instance
+      is **loaded once**: a change to `horae.yaml`, a pipeline or the lock needs a restart.
+      `horae serve` has no `--json` (it is a process, not a report; `horae cache purge`
+      has none either). The wall clock is re-read at least every 30 s while waiting, so a
+      clock step or a suspend delays a fire time by at most that much.
+    - **E2, shutdown.** The first SIGTERM or SIGINT stops every loop, drops the fire times
+      waiting for a slot and cancels the runs in progress; a cancelled run stops as `horae
+      run` does on SIGTERM (partial record saved `failed`; an apply in progress finished
+      first and saved with its real status). The run is then **reported with the status it
+      was saved with** (status and run id from the saved record, its monitor pinged
+      accordingly: an apply that finished is `ok` and `up`); a run stopped before any record
+      was saved is recorded `cancelled` (keeping its run id, if it began) and pings
+      **nothing**: the monitor's own heartbeat window reports it. `horae run` follows the
+      same rule for an interrupted run, and bounds that ping to 2 s. The command then exits
+      **0** (a requested stop is the normal end of a server, unlike an interrupted `horae
+      run`). A **second** signal stops waiting for the reports and pings (each up to 10 s):
+      the runs are still awaited so that their records are saved (bounded by the runner's 5 s
+      grace period, or for an apply by its sink calls' `call_timeout_s`), then the command
+      exits 128 + that signal (130, 143), so a forced stop is visible. A container should be
+      given **at least 20 s** to stop (compose `stop_grace_period: 20s`; Docker's default is
+      10 s), more when applies are long.
     - **F, push monitors.** `scheduler.monitors.<pipeline>: {secret, kind}`: the push URL
       is a **secret** (it carries the monitor's token), resolved like any other (decision 25)
       and added to the secrets the instance names, so it is primed for redaction (decision
@@ -2607,9 +2649,13 @@ loosened later without breaking a valid file.
       problem. `kind: uptime-kuma` (default) sets the `status` (`up` / `down`), `msg` (the
       outcome word) and `ping` (the run's duration in ms) query parameters; `kind:
       healthchecks` pings the URL for success and `<url>/fail` for a failure. `up` is a run
-      `ok`, `noop` or `degraded`; everything else is `down` (failed, timeout, lost, crashed,
-      cancelled, store or plugin problem). Pinged after every run of the pipeline, scheduled
-      or `horae run`, never for a dry run or a locked pipeline. The network rules are the
+      `ok`, `noop` or `degraded` (a `degraded` run is up, as its exit code is 0); everything
+      else is `down` (failed, timeout, lost, crashed, and a run that could not begin: plugins
+      not matching the lock, a store, lock or I/O problem, the error kind as the message).
+      Pinged after every run of the pipeline, scheduled or `horae run`, never for a dry run,
+      a locked pipeline, or a run stopped before any record was saved (E2). `horae doctor`
+      resolves the secret and checks it is a valid push URL with the ping's own validator,
+      never echoing the value. The network rules are the
       LLM backends' (decisions 24, 40): the URL must be a `BackendUrl` (`https://` anywhere,
       `http://` only to loopback, private or single-label hosts, re-checked at connect time
       by `LanOnlyNetwork`), one `GET`, no retry, no redirect, `trust_env=False`, 10 s for the
@@ -2617,8 +2663,9 @@ loosened later without breaking a valid file.
       non-2xx, unresolvable secret, invalid URL) is one warning in Horae's words, never the
       URL, response or exception message, and **never changes the run's outcome or exit
       code**; the `--json` document of `horae run` is unchanged.
-    - **Not done (follow-ups)**: skipped fire times are not persisted (lost on restart; a
-      store table would need a migration); no catch-up option; no `/start` ping
+    - **Not done (follow-ups)**: skipped fire times and the `last_*` state are not persisted
+      (lost on restart; a store table would need a migration); no reload of a changed
+      instance without a restart; no catch-up option; no `/start` ping
       (Healthchecks) to measure durations on the monitor side; the push URL with Uptime
       Kuma's default query (`?status=up&msg=OK&ping=`) is redacted as a whole, so the
       rewritten URL is never logged by design rather than by redaction.
