@@ -1,0 +1,68 @@
+# Horae with plain Docker Compose (#41). Install guide: docs/operations/compose.md.
+#
+#   cp .env.example .env && $EDITOR .env      # then: mkdir -p secrets (see the guide)
+#   docker compose up -d                       # loopback only: http://127.0.0.1:8080/healthz
+#   docker compose -f docker-compose.yaml -f traefik.yaml up -d   # behind Traefik and SSO
+#
+# The API has no authentication of its own: this file publishes it on 127.0.0.1 only. Never
+# change that to a public address; put Traefik and its SSO middleware in front (traefik.yaml).
+# Tested against the rendered file: tests/test_deploy_templates.py.
+
+name: horae
+
+services:
+  # One-off: creates the example instance in a new, empty volume (`horae init`), then exits.
+  # An instance already there (horae.yaml present) is left alone; a non-empty volume without
+  # horae.yaml is refused by `horae init` (exit 3) and `horae` does not start.
+  horae-init:
+    image: "ghcr.io/horae-dev/horae:${HORAE_IMAGE_TAG:-sha-aadf1e0}"
+    entrypoint: ["sh", "-c"]
+    command: ["test -e /instance/horae.yaml || exec horae init /instance"]
+    restart: "no"
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
+    volumes:
+      - horae-instance:/instance
+
+  horae:
+    # Pinned tag; `<tag>@sha256:<digest>` pins the digest too (docs/operations/compose.md).
+    image: "ghcr.io/horae-dev/horae:${HORAE_IMAGE_TAG:-sha-aadf1e0}"
+    # The image's command (`horae serve`), user, tini (PID 1) and HEALTHCHECK are kept.
+    depends_on:
+      horae-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    environment:
+      # builtin: `horae serve` fires the pipelines' cron triggers. external: host cron or a
+      # systemd timer runs `docker compose exec -T horae horae run <pipeline>`.
+      HORAE_SCHEDULER: "${HORAE_SCHEDULER:-builtin}"
+      # The public host name(s) a proxy serves Horae on, space-separated (loopback is always
+      # allowed). Any other Host is refused: 400 invalid_host.
+      HORAE_ALLOWED_HOSTS: "${HORAE_ALLOWED_HOSTS:-}"
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
+    # SIGTERM: in-progress runs are saved and pinged before exit (schemas decision 49 E2).
+    stop_grace_period: 30s
+    volumes:
+      - horae-instance:/instance
+      # Secret files, one per secret, named after it (ANTHROPIC_API_KEY, ...): Horae's default
+      # secrets directory. Readable by uid 10001; never in the instance repository.
+      - "${HORAE_SECRETS_DIR:?set HORAE_SECRETS_DIR to the directory of secret files (see .env.example)}:/run/secrets:ro"
+    ports:
+      # Loopback only, on purpose: the API has no authentication of its own.
+      - "127.0.0.1:${HORAE_LOCAL_PORT:-8080}:8080"
+
+volumes:
+  horae-instance:
