@@ -77,6 +77,16 @@ way, `scheduler.monitors.<pipeline>: {secret: PUSH_URL}` pings an Uptime Kuma pu
 `kind: healthchecks`), kept as a secret, `up` or `down` after each run; a failed ping is a
 warning and never fails the run.
 
+**HTTP API** ([decision 51](schemas/README.md)). `horae serve` also serves a small read-only
+API on `--host`/`--port` (`HORAE_HOST`, `HORAE_PORT`; `127.0.0.1:8080` by default, `0.0.0.0` in
+the container image): `GET /healthz` (`200` when the store is readable and the scheduler runs,
+else `503`; the store's state and the scheduler's: next and last fire times, outcomes, pings,
+skips), `GET /runs` (newest first, as `horae runs --json`; `limit` up to 100, `cursor` from
+`next_cursor`, `pipeline`, `status`, `all=true` for live skill evals) and `GET /runs/<id>`.
+Every response is redacted and sent with `Cache-Control: no-store` and a `default-src 'none'`
+CSP; there is no CORS and no OpenAPI page. **It has no authentication of its own**: expose it
+only through the reverse proxy and its SSO middleware (only `/act/` is exempt), never directly.
+
 An instance is **not relocatable** in v1: `horae.lock` holds the vault's absolute path and
 `plugins/` the absolute path of the interpreter that installed them. After copying or moving
 one, `horae doctor` reports the paths that no longer match (a lock path that does not exist,

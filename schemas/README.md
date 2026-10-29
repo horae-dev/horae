@@ -2669,3 +2669,81 @@ loosened later without breaking a valid file.
       (Healthchecks) to measure durations on the monitor side; the push URL with Uptime
       Kuma's default query (`?status=up&msg=OK&ping=`) is redacted as a whole, so the
       rewritten URL is never logged by design rather than by redaction.
+
+### Provisional decisions (#37, pending maintainer review)
+
+51. **The HTTP API: `/healthz` and the read-only `/runs` (#37).** Numbering: 49 is #39's and
+    50 is #42's (PR #118, which may merge first), so this is 51. Two new runtime dependencies
+    (`fastapi`, `uvicorn`, pinned in `uv.lock`, both older than the 7-day minimum release
+    age), new options of `horae serve` (`--host`, `--port`), one optional argument of
+    `Store.list_runs` (`before`, a page cursor); no contract change, no store migration.
+    - **A, one process, one event loop.** The API is a FastAPI application served by
+      uvicorn's programmatic `Server` inside `horae serve`, in the scheduler's event loop
+      (`horae.api`): `/healthz` reads the live `Scheduler.state()`, and there is one process
+      to supervise. Horae binds the socket itself before anything starts (a port in use or a
+      bad host is a configuration error, exit 1, `bind_failed`, Horae's message), and
+      uvicorn's own signal handlers, log configuration, access log, `Server` header,
+      proxy-header rewriting and lifespan are off: the redacting log record factory
+      (decision 43) stays in place, and request logging is the proxy's job. FastAPI is
+      imported by `horae serve` only. Endpoints are synchronous and run in the worker
+      thread pool, so a store read never blocks the scheduler's loop.
+    - **B, binding.** `--host` (`HORAE_HOST`, default `127.0.0.1`) and `--port`
+      (`HORAE_PORT`, default 8080). The container image sets `HORAE_HOST=0.0.0.0` so that the
+      reverse proxy (Coolify's Traefik) can reach it on the container network; the port is
+      `EXPOSE`d, never meant to be published. **The API has no authentication of its own:**
+      SSO is the proxy's middleware (PLAN §7, #41: only `/act/` is exempt; `/runs` and
+      `/healthz` require SSO). It must never be exposed without that proxy.
+    - **C, `/healthz`.** `200` when the store opens read-only at this Horae's schema version
+      **and** the scheduler is active (`SchedulerState.active`) or its mode is `external`;
+      `503` otherwise (also while `horae serve` stops). Body: `schema_version` (1),
+      `status` (`ok` / `unavailable`), `version`, `store` (`status` `ok` / `error`, `reason`
+      `missing` / `schema_too_old` / `schema_too_new` / `unreadable` or `null`,
+      `schema_version`) and `scheduler` (`SchedulerState.to_dict()`, decision 49 E). No path,
+      no configuration value beyond the scheduler state, no exception text. `horae serve`
+      creates and migrates the store once at start, so a new instance is healthy before its
+      first run (a failure there is a warning; `/healthz` then says `error`). Behind the
+      SSO proxy an external monitor needs its own way in (a proxy rule for the monitor, or
+      Uptime Kuma on the same network): an operator choice, not Horae's (#41).
+    - **D, `/runs`.** `GET /runs` lists runs newest first (start time, then id) as `horae
+      runs --json` shows them (`horae.run_view.run_json`, shared with the CLI: id, pipeline,
+      status, `stale`, dry run, abandoned, times, duration, cost, error; never the run
+      record, `pid` or `host`). **Keyset pagination**: `limit` (1 to 100, default 20) and an
+      opaque `cursor` (`next_cursor` of the previous page, `null` on the last), stable while
+      runs are added (a new run never shifts a page, unlike an offset). Filters `pipeline`,
+      `status`; live skill evals (`eval:<skill>`) only with `all=true` or their own
+      `pipeline`, as in the CLI. `GET /runs/{id}` is one run, the same object (`404` when
+      unknown). Bad parameters are `400 invalid_request` naming the parameter, never echoing
+      its value. Only `GET` routes exist (`405` otherwise).
+    - **E, read-only store access.** Each request opens the store with
+      `Store.open(read_only=True)` (decision 36): no migration, no WAL switch, no file
+      created, `query_only`. In WAL mode a reader never blocks the scheduler's writes and
+      sees only committed data (tested with a write transaction open). Known limit, shared
+      with `horae runs`: with no `-wal` file the reader opens the database `immutable`, so a
+      writer that starts and checkpoints during that one read could in theory serve it a torn
+      page; a read lasts milliseconds and a checkpoint of a new WAL needs 1,000 pages.
+    - **F, no secrets in responses.** Every body, errors included, is redacted as data
+      (`scrub_data`: strings, keys, numbers) and then as text with the process registry
+      (decision 43), which `horae serve` primes with every secret the instance names; the
+      store already redacts what it writes, so this is the second line. Error bodies are
+      Horae's (`{schema_version, error: {kind, message}}`): an internal error shows its
+      exception type only, a validation error the parameter's name only.
+    - **G, headers and surface.** Every response: `Cache-Control: no-store`,
+      `X-Content-Type-Options: nosniff`, `Content-Security-Policy: default-src 'none';
+      frame-ancestors 'none'`, `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY`,
+      `Content-Type: application/json`. No CORS (no `Access-Control-*` header; a preflight is
+      `405`). The OpenAPI document and the docs pages are **disabled**, on every interface
+      (not only off loopback): the API is three routes, documented here and in the README,
+      and a schema endpoint would be one more thing to keep behind SSO.
+    - **H, shutdown.** The first SIGTERM / SIGINT stops the scheduler (decision 49 E2) and
+      asks the server to stop: it closes its socket and waits up to 5 s for requests in
+      progress. The command exits 0 once both have stopped; a second signal also forces the
+      server. A server that ends on its own stops the scheduler and exits 70.
+    - **I, container.** The image's default command is `horae serve` (it was `--help`), and
+      its `HEALTHCHECK` asks `/healthz` over loopback with the standard library
+      (`python -c`, `urllib`, no proxy): no curl or wget in the image. A container running
+      another command (`init`, `doctor`, `run`) reports unhealthy, which is harmless for a
+      one-off; one with `HORAE_HOST` set to a non-loopback address other than `0.0.0.0`
+      must override the check. `scripts/smoke-image.sh` checks that `horae serve` becomes
+      healthy with the image's own check, serves `/runs` and exits 0 on `docker stop`.
+    - **Not done (follow-ups)**: `/act` (#38) and the SSO-exemption test against the
+      rendered template (#41); no ETag or conditional requests; no metrics endpoint.

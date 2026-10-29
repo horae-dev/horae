@@ -73,7 +73,7 @@ flowchart LR
     subgraph core["Horae core (trusted)"]
       eng["Engine + intent validation + routing"]
       store[("SQLite store")]
-      api["HTTP API /act, /runs"]
+      api["HTTP API /act, /runs, /healthz"]
       mcp["MCP server (M5)"]
     end
     src["Plugin processes<br/>(subprocess M1-M4, container M5+)"]
@@ -156,7 +156,7 @@ and later are new.
 |---|---|---|---|---|---|---|
 | T13 | S | A stolen or replayed `/act` token | HMAC-signed, single use, 24 h expiry, bound to one intent, no secrets or free-form URLs, rate limited (#38) | #38 | D | planned #38 |
 | T14 | T | A link preview or prefetch consumes a single-use token; CSRF on `/act` | `GET /act/<token>` only shows a confirmation and changes nothing; `POST` applies | #38 | D | planned #38 (see [§10](#10-story-updates-requested)) |
-| T15 | I | `/act` is reachable without SSO (PLAN §7); a misconfiguration exempts more than `/act/` | Only `/act/` bypasses SSO; `/runs` and `/healthz` behind SSO; no secrets in responses (#37) | #37; SSO-exemption test: #41 | D | planned #37, #41 |
+| T15 | I | `/act` is reachable without SSO (PLAN §7); a misconfiguration exempts more than `/act/`; the API (`/healthz`, `/runs`) leaks secrets, paths or configuration, is reachable by a neighbour (M6) or a browser page (CORS, caching, framing), or writes to the store | Only `/act/` bypasses SSO; `/runs` and `/healthz` behind SSO (#41). **The API (#37, [decision 51](../schemas/README.md#decisions))** has no authentication of its own and must never be exposed without the proxy: `horae serve` binds `127.0.0.1` by default (`--host` / `HORAE_HOST`; the image sets `0.0.0.0` for the proxy on the container network and only `EXPOSE`s the port); `GET` routes only, read-only store access (`Store.open(read_only=True)`, `query_only`, nothing created; a WAL reader never blocks the scheduler); runs shown as `horae runs --json` shows them (never the run record, `pid` or `host`); every body, errors included, redacted as data then as text with the process registry (primed with every secret the instance names); error bodies written by Horae (an exception's type only, a parameter's name only, never a request value, a path or an exception message); `/healthz` gives a closed store reason and the scheduler state, no path or configuration; `Cache-Control: no-store`, `nosniff`, CSP `default-src 'none'; frame-ancestors 'none'`, `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY` on every response; no CORS; OpenAPI and docs pages disabled; no `Server` header, no access log, no proxy-header rewriting | `tests/test_api.py` (`test_no_response_ever_holds_a_secret`, with a secret planted raw in a run's error, a journal entry, a run id, a pipeline name, the scheduler state and the request; `test_the_api_is_read_only`, `test_reading_does_not_wait_for_a_writer`, `test_every_response_has_the_security_headers`, `test_no_cors_preflight_and_no_docs`, `test_bad_parameters_are_refused_without_echoing_them`, `test_an_internal_error_shows_only_its_type`, `test_healthz_is_503_when_the_store_cannot_be_read`), `tests/test_api_server.py` (`test_serve_announces_the_api_and_binds_loopback_by_default`); SSO-exemption test: #41 | D | implemented (#37); planned #41 (SSO) |
 | T16 | S | The HMAC key leaks or is never rotated | A dedicated key (a secret, not a shared one); rotation invalidates every outstanding token | #38 | D | planned #38 (see [§10](#10-story-updates-requested)) |
 
 ### B5: MCP clients ↔ Horae's MCP server
