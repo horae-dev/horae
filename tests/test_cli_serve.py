@@ -24,7 +24,7 @@ from horae.scheduler import PingResult, RunOutcome, Schedule, Scheduler
 from runner_fixtures import write_instance
 from test_scheduler import FakeClock, settle
 
-runner = CliRunner()
+runner = CliRunner(env={"HORAE_PORT": "0"})  # never a fixed port in tests
 
 
 @pytest.fixture
@@ -44,7 +44,7 @@ def _signal_when_ready(monkeypatch: pytest.MonkeyPatch, *signums: int) -> list[b
     seen: list[bool] = []
 
     async def ready_then_signal(
-        scheduler: Scheduler, on_ready: Callable[[], object] | None = None
+        scheduler: Scheduler, on_ready: Callable[[], object] | None = None, **kwargs: Any
     ) -> int:
         loop = asyncio.get_running_loop()
 
@@ -54,7 +54,7 @@ def _signal_when_ready(monkeypatch: pytest.MonkeyPatch, *signums: int) -> list[b
                 os.kill(os.getpid(), signum)
 
         # `call_soon`: once `run_forever` has started (it runs before this callback).
-        return await real(scheduler, on_ready=lambda: loop.call_soon(send))
+        return await real(scheduler, on_ready=lambda: loop.call_soon(send), **kwargs)
 
     monkeypatch.setattr(cli_serve, "serve_until_signal", ready_then_signal)
     return seen
