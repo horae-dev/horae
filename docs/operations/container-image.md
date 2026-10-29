@@ -143,6 +143,27 @@ version, and v1 has no command to reinstall them (plugin install and verify is #
 `horae init` into a new empty volume, review the new `plugins/` and `horae.lock` entries, and copy
 them into your instance (or move your `pipelines/`, `vault/` and `state/` to the new one).
 
+### Bumping the deploy templates
+
+The deploy templates pin a `sha-<short>` tag by default, written **once per file**: the
+`x-horae-image` line of [`deploy/coolify/docker-compose.yaml`](../../deploy/coolify/docker-compose.yaml)
+and of [`deploy/compose/docker-compose.yaml`](../../deploy/compose/docker-compose.yaml)
+(`.env.example` leaves `HORAE_IMAGE_TAG` empty, so it uses that default). Renovate does not
+bump it: a `sha-*` tag is not a version it can order. **Release step**, after `main` published
+the commit (its `sha-<short>` exists and is signed) and after the 7-day wait the repository
+applies to its own dependencies (`minimumReleaseAge` in `renovate.json`) when the change is not
+urgent:
+
+1. Verify the signature of the new tag's digest (above).
+2. Replace the tag in both `x-horae-image` lines (the same value; once releases exist, the
+   release tag `X.Y.Z`).
+3. `uv run pytest tests/test_deploy_templates.py` (it checks both files carry one, identical,
+   default) and commit.
+
+A deployed Coolify resource keeps the tag it stored at its first deployment; operators update
+by changing `HORAE_IMAGE_TAG` ([coolify.md](coolify.md#updates)). In production, operators pin
+the digest as well: `HORAE_IMAGE_TAG=<tag>@sha256:<digest>`.
+
 ## Testing locally
 
 `scripts/smoke-image.sh IMAGE [PLATFORM]` is the CI smoke test: non-root, PID 1 is tini,

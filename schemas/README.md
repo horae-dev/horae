@@ -2876,6 +2876,7 @@ loosened later without breaking a valid file.
       (`>=1.9,<2`): the API relies on Starlette's handler behaviour (exception handlers,
       middleware order, `redirect_slashes`), so a change of major version must be a
       deliberate bump, not a side effect of a FastAPI update.
-    - **Not done (follow-ups)**: `/act` (#38), the SSO-exemption test against the rendered
-      template and the network that only the proxy shares (#41), `api.allowed_hosts` in
-      `horae.yaml`; no ETag or conditional requests; no metrics endpoint.
+    - **Not done (follow-ups)**: `/act` (#38), `api.allowed_hosts` in `horae.yaml`; no ETag
+      or conditional requests; no metrics endpoint. Done in #41: the SSO-exemption test
+      against the rendered templates and the network shared only with the proxy
+      (`tests/test_deploy_templates.py`, docs/security.md T15).

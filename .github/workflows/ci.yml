@@ -211,10 +211,56 @@ jobs:
       - name: Smoke test (non-root, read-only root filesystem, tmpfs, no network)
         run: scripts/smoke-image.sh horae:smoke
 
+  # The deploy templates (#41) as Docker Compose reads them: valid with sample settings, and
+  # refused when a required variable is missing. The routing (only /act/ without SSO) is
+  # tested by tests/test_deploy_templates.py. Nothing is pulled or started.
+  deploy:
+    name: Deploy templates (docker compose config)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Plain compose, with the sample .env (alone and with traefik.yaml)
+        working-directory: deploy/compose
+        run: |
+          set -euo pipefail
+          docker compose --env-file .env.example -f docker-compose.yaml config --quiet
+          docker compose --env-file .env.example -f docker-compose.yaml -f traefik.yaml config --quiet
+      - name: Plain compose, a missing required variable fails
+        working-directory: deploy/compose
+        run: |
+          set -euo pipefail
+          if docker compose -f docker-compose.yaml config --quiet 2> "${RUNNER_TEMP}/err.txt"; then
+            echo "::error::rendered without HORAE_SECRETS_DIR"
+            exit 1
+          fi
+          grep -q "required variable HORAE_SECRETS_DIR is missing a value" "${RUNNER_TEMP}/err.txt"
+      - name: Coolify template, with sample magic variables, and without each required one
+        working-directory: deploy/coolify
+        env:
+          SERVICE_FQDN_HORAE: horae.example.test
+          HORAE_SSO_FORWARD_AUTH_URL: http://authentik-server:9000/outpost.goauthentik.io/auth/traefik
+          HORAE_ANTHROPIC_API_KEY: placeholder-not-a-key
+          HORAE_MONITOR_DAILY_BRIEF_URL: https://kuma.example.test/api/push/placeholder1
+          HORAE_MONITOR_REMIND_URL: https://kuma.example.test/api/push/placeholder2
+        run: |
+          set -euo pipefail
+          docker compose -f docker-compose.yaml config --quiet
+          for name in HORAE_SSO_FORWARD_AUTH_URL HORAE_ANTHROPIC_API_KEY \
+                      HORAE_MONITOR_DAILY_BRIEF_URL HORAE_MONITOR_REMIND_URL; do
+            if env -u "${name}" docker compose -f docker-compose.yaml config --quiet 2> "${RUNNER_TEMP}/err.txt"; then
+              echo "::error::rendered without ${name}"
+              exit 1
+            fi
+            grep -q "required variable ${name} is missing a value" "${RUNNER_TEMP}/err.txt"
+          done
+
   ci-ok:
     name: CI OK
     if: ${{ always() }}
-    needs: [lock, lint, types, test, sdk, gitleaks, codeql, image]
+    needs: [lock, lint, types, test, sdk, gitleaks, codeql, image, deploy]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions: {}
