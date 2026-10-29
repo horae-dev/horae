@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Smoke test for the container image (#40).
+# Smoke test for the container image (#40, #37).
 # Usage: scripts/smoke-image.sh IMAGE [PLATFORM]
 #   PLATFORM (e.g. linux/arm64) runs the image for that platform (under QEMU when foreign).
 #   EXPECTED_VERSION=X.Y.Z in the environment also checks that `horae --version` reports it.
@@ -23,7 +23,11 @@ fail() {
 }
 
 volumes=()
+containers=()
 cleanup() {
+  if [ "${#containers[@]}" -gt 0 ]; then
+    docker rm -f "${containers[@]}" > /dev/null 2>&1 || true
+  fi
   if [ "${#volumes[@]}" -gt 0 ]; then
     docker volume rm -f "${volumes[@]}" > /dev/null || true
   fi
@@ -116,3 +120,35 @@ new_volume
 "${run[@]}" -v "${volume}:/instance" "$image" doctor > /dev/null \
   || fail "horae doctor on the volume's root (HORAE_INSTANCE=/instance)"
 echo "ok: init and doctor on the root of an empty volume"
+
+# --- the default command: horae serve, its HTTP API and the HEALTHCHECK (#37) ------------------
+# Detached, without --rm, so that its exit code can be read after the stop. The image's own
+# HEALTHCHECK command runs (only its interval is shortened); no network, loopback only.
+cmd="$(docker image inspect --format '{{json .Config.Cmd}}' "$image")"
+[ "$cmd" = '["serve"]' ] || fail "default command is ${cmd}, not [\"serve\"]"
+server="horae-smoke-serve-$$"
+containers+=("$server")
+docker run -d --name "$server" ${platform_args[@]+"${platform_args[@]}"} \
+  --tmpfs "/tmp:rw,noexec,nosuid,size=16m" --network none --cap-drop ALL \
+  --security-opt no-new-privileges --read-only --health-interval 1s --health-start-period 60s \
+  -v "${volume}:/instance" "$image" > /dev/null
+health=""
+for _ in $(seq 1 60); do
+  health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$server")"
+  [ "$health" = "healthy" ] && break
+  [ "$(docker inspect --format '{{.State.Running}}' "$server")" = "true" ] \
+    || { docker logs "$server" >&2; fail "horae serve exited"; }
+  sleep 1
+done
+[ "$health" = "healthy" ] || { docker logs "$server" >&2; fail "horae serve is '${health}'"; }
+runs_probe='import urllib.request as u, json
+r = u.build_opener(u.ProxyHandler({})).open("http://127.0.0.1:8080/runs?limit=1", timeout=5)
+assert r.headers["Cache-Control"] == "no-store", r.headers
+print(json.load(r)["schema_version"])'
+[ "$(docker exec "$server" python -c "$runs_probe")" = "1" ] || fail "GET /runs"
+docker stop --time 20 "$server" > /dev/null
+code="$(docker inspect --format '{{.State.ExitCode}}' "$server")"
+[ "$code" = "0" ] || { docker logs "$server" >&2; fail "horae serve exited ${code} on SIGTERM"; }
+docker logs "$server" 2>&1 | grep -q '^horae serve: stopped$' \
+  || { docker logs "$server" >&2; fail "horae serve did not report its stop"; }
+echo "ok: horae serve is healthy (HEALTHCHECK on /healthz), serves /runs, stops with exit 0"

@@ -88,9 +88,30 @@ The note lands in the volume's `vault/Daily/`. Compose equivalent: `read_only: t
 `tmpfs: [/tmp]`, `cap_drop: [ALL]`, `security_opt: [no-new-privileges:true]`, a volume on
 `/instance`.
 
-The image has no pip, no ensurepip, no uv and no compiler. Its `HEALTHCHECK` runs
-`horae --version` until the HTTP API ([#37](https://github.com/horae-dev/horae/issues/37)) gives
-it `/healthz`.
+The image has no pip, no ensurepip, no uv and no compiler.
+
+### `horae serve`, the HTTP API and the health check
+
+The default command is `horae serve` ([#37](https://github.com/horae-dev/horae/issues/37),
+[decision 51](../../schemas/README.md#decisions)): the built-in scheduler and the HTTP API
+(`GET /healthz`, `GET /runs`, `GET /runs/<id>`), read-only, on port 8080. The image sets
+`HORAE_HOST=0.0.0.0` so that the reverse proxy can reach it on the container network. **The API
+has no authentication of its own**: put it behind the proxy's SSO middleware (only `/act/` is
+exempt, #41) and never publish the port (`-p 8080:8080` on a public interface exposes the run
+list to anyone). Set `HORAE_HOST=127.0.0.1` when nothing else needs to reach it.
+
+```
+docker run -d --name horae "${opts[@]}" --stop-timeout 20 ghcr.io/horae-dev/horae:edge
+docker inspect --format '{{.State.Health.Status}}' horae   # healthy once /healthz answers 200
+```
+
+Its `HEALTHCHECK` asks `/healthz` over loopback with the standard library (`python -c` and
+`urllib`, no proxy; there is no curl or wget in the image): `200` when the store is readable and
+the scheduler runs (or `HORAE_SCHEDULER=external`), `503` otherwise. A container running
+another command (`init`, `doctor`, `run`) reports unhealthy, which is harmless for a one-off. If
+you set `HORAE_PORT`, the check follows it; if you set `HORAE_HOST` to an address other than
+`0.0.0.0` or loopback, override the check. Give the container at least 20 s to stop
+(`--stop-timeout 20`, compose `stop_grace_period: 20s`).
 
 ### Stable paths, and upgrading
 
@@ -115,5 +136,6 @@ them into your instance (or move your `pipelines/`, `vault/` and `state/` to the
 `scripts/smoke-image.sh IMAGE [PLATFORM]` is the CI smoke test: non-root, PID 1 is tini,
 `--version` format (and `EXPECTED_VERSION` if set), a read-only root filesystem probed as root
 against a writable control, no pip/ensurepip/uv/compiler, then `init`, `doctor` and
-`run daily-fixture` on named volumes with no network. Run it after `docker build -t horae:test .`;
+`run daily-fixture` on named volumes with no network, and finally the default `horae serve`:
+healthy by the image's own `HEALTHCHECK`, `/runs` answering, exit 0 on `docker stop`. Run it after `docker build -t horae:test .`;
 pull requests run it on native amd64.
