@@ -21,6 +21,7 @@ from pydantic import TypeAdapter
 from pydantic.json_schema import GenerateJsonSchema, JsonSchemaMode, JsonSchemaValue
 from pydantic_core import CoreSchema
 
+from horae.contracts.evals import EvalCase, RecordedResponse
 from horae.contracts.instance import InstanceConfig
 from horae.contracts.intents import INTENT_MODELS, Intent
 from horae.contracts.lockfile import Lockfile
@@ -108,6 +109,13 @@ SCHEMAS: tuple[SchemaSpec, ...] = (
     SchemaSpec("run-record", 1, RunRecord, "Horae run record"),
     SchemaSpec("instance", 1, InstanceConfig, "Horae instance configuration (horae.yaml)"),
     SchemaSpec("skill", 1, SkillManifest, "Horae skill (skill.yaml)"),
+    SchemaSpec("eval-case", 1, EvalCase, "Horae skill eval case (evals/<case>.yaml)"),
+    SchemaSpec(
+        "eval-recorded",
+        1,
+        RecordedResponse,
+        "Horae skill eval recorded response (evals/recorded/<backend>/<case>.json)",
+    ),
 )
 
 

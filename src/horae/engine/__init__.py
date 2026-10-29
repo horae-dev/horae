@@ -18,8 +18,11 @@ from horae.engine.executor import (
     PlannedCall,
     RunCancelled,
     StepHook,
+    check_task_fingerprints,
     execute,
+    fill_target,
     planned_calls,
+    secrets_in_viewed,
 )
 from horae.engine.ports import (
     Deidentifier,
@@ -81,11 +84,14 @@ __all__ = [
     "UnknownPlugin",
     "canonical_json",
     "canonical_pipeline",
+    "check_task_fingerprints",
     "execute",
+    "fill_target",
     "make_context",
     "pipeline_digest",
     "planned_calls",
     "render",
     "render_string",
+    "secrets_in_viewed",
     "variables",
 ]

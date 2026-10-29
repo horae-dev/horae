@@ -100,8 +100,8 @@ def test_number_bounds_count_the_larger_extreme() -> None:
     assert size({"type": "integer", "minimum": 0, "maximum": 10**30}) == 31
     assert size({"type": "number", "minimum": 0, "maximum": 1}) == 25
     # `enum` / `const` count `1` as possibly `1.0`, and floats by their repr.
-    assert size({"const": 1}) == 3
-    assert size({"enum": [1.5, 1e300]}) == len(str(int(1e300)))
+    assert size({"type": "integer", "const": 1}) == 3
+    assert size({"type": "number", "enum": [1.5, 1e300]}) == len(str(int(1e300)))
     # A bounded `enum` beside an unbounded `type` bounds the value.
     assert size({"type": "integer", "enum": [1, 2]}) == 3
 
@@ -126,6 +126,21 @@ _TEXT = st.text(max_size=8)
 _KEY = st.text(min_size=1, max_size=6)
 
 
+def _types(*values: Any) -> list[str]:
+    """The JSON types of `values` (an `enum` or `const` needs a `type` beside it)."""
+    names = {
+        "null"
+        if v is None
+        else "boolean"
+        if isinstance(v, bool)
+        else "integer"
+        if isinstance(v, int)
+        else "string"
+        for v in values
+    }
+    return sorted(names)
+
+
 def _leaf() -> st.SearchStrategy[dict[str, Any]]:
     integer = st.tuples(st.integers(-(10**18), 10**18), st.integers(0, 10**18)).map(
         lambda t: {"type": "integer", "minimum": t[0], "maximum": t[0] + t[1]}
@@ -136,9 +151,9 @@ def _leaf() -> st.SearchStrategy[dict[str, Any]]:
     string = st.integers(0, 6).map(lambda n: {"type": "string", "maxLength": n})
     scalars = st.one_of(st.none(), st.booleans(), st.integers(-(10**20), 10**20), _TEXT)
     enum = st.lists(scalars, min_size=1, max_size=4, unique_by=json.dumps).map(
-        lambda values: {"enum": values}
+        lambda values: {"type": _types(*values), "enum": values}
     )
-    const = scalars.map(lambda value: {"const": value})
+    const = scalars.map(lambda value: {"type": _types(value), "const": value})
     simple = st.sampled_from([{"type": "boolean"}, {"type": "null"}])
     return st.one_of(integer, number, string, enum, const, simple)
 

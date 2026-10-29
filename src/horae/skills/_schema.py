@@ -20,6 +20,9 @@ so the bound holds for what it stores. Rules, beyond the draft 2020-12 metaschem
   a `$ref` cycle (a recursive schema) is refused, and so is a chain of more than
   `MAX_REF_HOPS` `$ref`s; every subschema under `$defs` / `definitions` must be bounded,
   referenced or not;
+- an `enum` or a `const` has a `type` beside it (schemas decision 48 D4: the structured-
+  output modes of the backends need one; `"enum": ["a"]` alone is refused, `"type":
+  "string", "enum": ["a"]` is not);
 - no regular expressions: `pattern`, `patternProperties`, `propertyNames` and
   `"format": "regex"` are refused (a regex chosen by a plugin author is a ReDoS risk; #31 must
   still run validation in a worker it can kill on a timeout);
@@ -194,6 +197,14 @@ def _self_contained(schema: Any) -> None:
                 raise SchemaProblem(f"{where}: `{key}` is not allowed in a skill output schema")
         if node.get("format") == "regex":
             raise SchemaProblem(f'{where}: `"format": "regex"` is not allowed')
+        for key in ("enum", "const"):
+            if key in node and "type" not in node:
+                # The backends' structured-output modes need it (Anthropic's
+                # `transform_schema` refuses an `enum` or `const` without one).
+                raise SchemaProblem(
+                    f"{where}: `{key}` needs a `type` beside it (e.g. "
+                    f'`"type": "string"`): structured output requires one'
+                )
         ref = node.get("$ref")
         if ref is not None and not (ref == "#" or ref.startswith("#/")):
             raise SchemaProblem(f"{where}: `$ref` must be local (`#/...`), not {ref!r}")

@@ -1,0 +1,4 @@
+# guard is `pass` or `violation`.
+schema_version: 1
+input: {}
+expect: { guard: ok }

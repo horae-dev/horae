@@ -206,7 +206,11 @@ the pseudonymized output and is re-identified the same way, but only when its
 without de-identification): otherwise it is a miss. A policy that cannot
 de-identify (`DeidUnavailable`, e.g. an unreadable vocabulary) degrades the step
 (`deid_unavailable`) before anything is sent. A request refused for a secret
-(`secret_in_request`) also records a `secret_in_request` violation naming the secrets.
+(`secret_in_request`) also records a `secret_in_request` violation naming the secrets. The
+real viewed input is checked for a resolved secret **before** it is pseudonymized (decision
+47 J): de-identification could rewrite part of a secret so that the backend's check of the
+rendered request no longer matches it; the step is then degraded the same way, nothing is
+sent and nothing is billed.
 
 **Step policy** (step status, then the effect on the run; the run status is the worst of
 `failed` > `degraded` > `noop` > `ok`):
@@ -249,7 +253,7 @@ import json
 import logging
 import math
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, NoReturn
 from urllib.parse import urlsplit
@@ -967,19 +971,13 @@ class _Run:
         if kept + len(typed) > MAX_RUN_INTENTS:
             message = f"more than {MAX_RUN_INTENTS} intents in the run"
             return [], StepError(kind="run_intents_exceeded", message=message)
-        known: frozenset[str] | None = None
+        seen = ([snap.data for snap in self.inputs], collected) if shown is None else shown
+        unknown = set(check_task_fingerprints(typed, seen))
         routed: list[ProposedIntent] = []
         for position, intent in enumerate(typed):
-            if isinstance(intent, TaskUpdateStatus):
-                if known is None:
-                    known = (
-                        _strings([snap.data for snap in self.inputs], collected)
-                        if shown is None
-                        else _strings(*shown)
-                    )
-                if intent.task not in known:
-                    unroutable.append(("intent_unrouted", position, intent.type))
-                    continue
+            if position in unknown:
+                unroutable.append(("intent_unrouted", position, intent.type))
+                continue
             takers = [entry for entry in entries if entry.takes(intent)]
             if len(takers) != 1:
                 code = "intent_unrouted" if not takers else "intent_ambiguous"
@@ -1019,7 +1017,34 @@ class _Run:
             code = "intent_unrouted" if not takers else "intent_ambiguous"
             unroutable.append((code, position, intent_type))
             return payload
-        return {**payload, name: takers[0].binds[name]}
+        return fill_target(payload, takers[0].binds)
+
+
+def fill_target(payload: Any, binds: Mapping[str, Any]) -> Any:
+    """`payload` (one raw intent) with its omitted target field (`TARGET_FIELDS`: `path`, or
+    `url` for `http.post`) taken from `binds` (an `act` entry's parameters, or a skill eval
+    case's `targets`); unchanged when it has one, binds none, or is not target-bound."""
+    if not isinstance(payload, dict):
+        return payload
+    intent_type = payload.get("type")
+    if not isinstance(intent_type, str) or intent_type not in TARGET_FIELDS:
+        return payload
+    name = TARGET_FIELDS[intent_type]
+    if payload.get(name) is not None or binds.get(name) is None:
+        return payload
+    return {**payload, name: binds[name]}
+
+
+def check_task_fingerprints(typed: Sequence[Intent], shown: Sequence[Any]) -> list[int]:
+    """The positions in `typed` of the `task.update_status` intents whose `task` fingerprint
+    is not, as an exact string value, in `shown` (what the proposer was shown; rule 4 of the
+    module docstring): a proposer can change the status of a task it was shown, not of one it
+    guessed. Shared by the engine (`_Run.propose`) and the skill eval judge (decision 48)."""
+    updates = [(i, it) for i, it in enumerate(typed) if isinstance(it, TaskUpdateStatus)]
+    if not updates:
+        return []
+    known = _strings(*shown)
+    return [position for position, intent in updates if intent.task not in known]
 
 
 def _violations(raw: object) -> tuple[Violation, ...]:
@@ -1399,6 +1424,16 @@ def _shown(step: _Planned, viewed: Any, source: str) -> dict[str, Any]:
     return guard if step.skill is None else {**guard, "shown": (viewed,)}
 
 
+def secrets_in_viewed(viewed: Any) -> set[str]:
+    """The names of the resolved secrets (process registry) in the real viewed input: in its
+    canonical JSON bytes (every encoding) and in its strings, object keys and whole numbers,
+    as `horae.llm.base.secrets_in` checks a rendered request (T10)."""
+    redactor = current_redactor()
+    if not redactor:
+        return set()
+    return set(redactor.counts(canonical_json(viewed))) | redactor.find(viewed)
+
+
 async def _llm_step(run: _Run, step: _Planned) -> _Outcome:
     spec, plugin, backend = step.llm, step.skill_plugin, run.llm
     if spec is None or plugin is None or backend is None:  # pragma: no cover (planned)
@@ -1418,6 +1453,26 @@ async def _llm_step(run: _Run, step: _Planned) -> _Outcome:
 
     def degraded(kind: str, message: str) -> _Outcome:
         return _Outcome("degraded", StepError(kind=kind, message=_cap(message)), stop=True)
+
+    # T10 before de-identification (schemas decision 47 J): pseudonymizing can
+    # rewrite part of a secret (a classed value or an amount rendering inside it), so the
+    # backend's check of the rendered request would no longer match the whole value while
+    # the rest of it is sent. The real viewed input is checked first; the backend keeps its
+    # check of the rendered bytes (defence in depth).
+    try:
+        held = secrets_in_viewed(viewed)
+    except Exception as error:  # a port bug must not crash the run, nor send unchecked
+        return degraded("host_error", f"unexpected {type(error).__name__} checking for secrets")
+    if held:
+        names = ", ".join(sorted(held))
+        message = (
+            f"the request to model alias {spec.model!r} holds secret {names}: "
+            "refused before sending"
+        )
+        if len(run.violations) < MAX_ITEMS:
+            detail = _cap(f"{spec.skill}: {message}", 500)
+            run.violations.append(Violation(kind="secret_in_request", detail=detail))
+        return degraded("secret_in_request", safe_excerpt(message, 200))
 
     # The step's deadline covers de-identification too (#34 finding 9): it runs in a worker
     # thread, so a slow one times the step out instead of blocking the event loop.
@@ -1814,6 +1869,9 @@ __all__ = [
     "PlannedCall",
     "RunCancelled",
     "StepHook",
+    "check_task_fingerprints",
     "execute",
+    "fill_target",
     "planned_calls",
+    "secrets_in_viewed",
 ]

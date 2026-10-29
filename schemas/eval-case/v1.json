@@ -1,0 +1,254 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/horae-dev/horae/main/schemas/eval-case/v1.json",
+  "$defs": {
+    "Budget": {
+      "additionalProperties": false,
+      "description": "Cost and token ceiling for one LLM step.",
+      "properties": {
+        "usd": {
+          "description": "Maximum spend for the step, in US dollars.",
+          "exclusiveMinimum": 0,
+          "title": "Usd",
+          "type": "number"
+        },
+        "tokens_out": {
+          "description": "Maximum output tokens for the step.",
+          "minimum": 1,
+          "title": "Tokens Out",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "usd",
+        "tokens_out"
+      ],
+      "title": "Budget",
+      "type": "object"
+    },
+    "EvalAssertion": {
+      "additionalProperties": false,
+      "description": "One check on the evaluated document `{\"output\": ..., \"intents\": [...]}` (the output\nwithout its reserved `intents`, and the raw intents), at `pointer`.",
+      "oneOf": [
+        {
+          "required": [
+            "equals"
+          ]
+        },
+        {
+          "required": [
+            "length"
+          ]
+        },
+        {
+          "required": [
+            "contains"
+          ]
+        },
+        {
+          "required": [
+            "exists"
+          ]
+        }
+      ],
+      "properties": {
+        "pointer": {
+          "description": "Where, e.g. `/output/ranked/0/why` or `/intents`.",
+          "maxLength": 512,
+          "pattern": "^(/[^/\\x00-\\x1f\\x7f]*)*$",
+          "title": "Pointer",
+          "type": "string"
+        },
+        "equals": {
+          "default": null,
+          "description": "The value there, exactly (canonical JSON equality).",
+          "title": "Equals"
+        },
+        "length": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The length of the string, array or object there.",
+          "title": "Length"
+        },
+        "contains": {
+          "default": null,
+          "description": "A substring of the string there, or an element of the array there.",
+          "title": "Contains"
+        },
+        "exists": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Whether anything is there.",
+          "title": "Exists"
+        }
+      },
+      "required": [
+        "pointer"
+      ],
+      "title": "EvalAssertion",
+      "type": "object"
+    },
+    "EvalExpect": {
+      "additionalProperties": false,
+      "description": "What a case expects. Everything is optional: an empty `expect` only asks for a\nschema-valid output whose intents the guard accepts.",
+      "properties": {
+        "schema_valid": {
+          "default": true,
+          "description": "Whether the output passes the skill's full output schema (`validate_output`).",
+          "title": "Schema Valid",
+          "type": "boolean"
+        },
+        "output": {
+          "default": null,
+          "description": "The exact output, without its reserved `intents` (canonical JSON equality). Absent:\nnot compared.",
+          "title": "Output"
+        },
+        "assertions": {
+          "items": {
+            "$ref": "#/$defs/EvalAssertion"
+          },
+          "maxItems": 256,
+          "title": "Assertions",
+          "type": "array"
+        },
+        "intents": {
+          "anyOf": [
+            {
+              "items": {},
+              "maxItems": 256,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The exact raw intents, as the model proposed them (before any target is filled).",
+          "title": "Intents"
+        },
+        "intent_counts": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "propertyNames": {
+                "enum": [
+                  "note.create",
+                  "note.append_section",
+                  "note.replace_owned_block",
+                  "task.create",
+                  "task.update_status",
+                  "notify.push",
+                  "http.post"
+                ]
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "How many intents of each type (a type not listed: none).",
+          "title": "Intent Counts"
+        },
+        "guard": {
+          "default": "pass",
+          "description": "Whether the action guard accepts the intents (decision 46); `violation` for a case that\nproves a hostile output is refused.",
+          "enum": [
+            "pass",
+            "violation"
+          ],
+          "title": "Guard",
+          "type": "string"
+        }
+      },
+      "title": "EvalExpect",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "One golden case of a skill, `evals/<case>.yaml`.",
+  "properties": {
+    "schema_version": {
+      "const": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "description": {
+      "anyOf": [
+        {
+          "maxLength": 500,
+          "pattern": "^[^\\x00-\\x1f\\x7f]+$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Description"
+    },
+    "input": {
+      "description": "The step input before the skill's input view (synthetic data only).",
+      "title": "Input"
+    },
+    "targets": {
+      "additionalProperties": {
+        "maxLength": 500,
+        "pattern": "^[^\\x00-\\x1f\\x7f]+$",
+        "type": "string"
+      },
+      "description": "The routed target of each intent type the case's intents need (`note.create:\nDaily/2026-10-28.md`); a note type without one gets `Evals/<case>.md`.",
+      "maxProperties": 4,
+      "propertyNames": {
+        "enum": [
+          "note.create",
+          "note.append_section",
+          "note.replace_owned_block",
+          "http.post"
+        ]
+      },
+      "title": "Targets",
+      "type": "object"
+    },
+    "budget": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Budget"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "The budget of a live call (default: `horae.evals.DEFAULT_BUDGET`)."
+    },
+    "expect": {
+      "$ref": "#/$defs/EvalExpect"
+    }
+  },
+  "required": [
+    "schema_version",
+    "input"
+  ],
+  "title": "Horae skill eval case (evals/<case>.yaml)",
+  "type": "object"
+}

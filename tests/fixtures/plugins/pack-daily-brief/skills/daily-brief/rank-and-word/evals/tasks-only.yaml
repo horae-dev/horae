@@ -1,0 +1,15 @@
+# Synthetic data. No events: the exact output, and no intent.
+schema_version: 1
+description: Tasks without events give a ranked list and no note.
+input:
+  tasks:
+    - { title: Book the train tickets, due: "2026-10-28" }
+    - { title: Read the onboarding guide }
+  events: []
+expect:
+  output:
+    summary: One task is due today.
+    ranked:
+      - { title: Book the train tickets, why: today }
+      - { title: Read the onboarding guide, why: later }
+  intents: []

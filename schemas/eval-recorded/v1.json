@@ -1,0 +1,189 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/horae-dev/horae/main/schemas/eval-recorded/v1.json",
+  "$defs": {
+    "RecordedRequest": {
+      "additionalProperties": false,
+      "description": "The digests of what was sent (SHA-256 of canonical JSON, or of the prompt's UTF-8).",
+      "properties": {
+        "system_sha256": {
+          "description": "The skill's prompt.",
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "System Sha256",
+          "type": "string"
+        },
+        "input_sha256": {
+          "description": "The viewed input.",
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Input Sha256",
+          "type": "string"
+        },
+        "schema_sha256": {
+          "description": "The skill's output schema.",
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Schema Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "system_sha256",
+        "input_sha256",
+        "schema_sha256"
+      ],
+      "title": "RecordedRequest",
+      "type": "object"
+    },
+    "Usage": {
+      "additionalProperties": false,
+      "description": "Tokens and money spent.",
+      "properties": {
+        "tokens_in": {
+          "description": "Input tokens billed at the full input price (for the Anthropic API, `input_tokens`:\ncache reads and writes are counted apart).",
+          "minimum": 0,
+          "title": "Tokens In",
+          "type": "integer"
+        },
+        "tokens_out": {
+          "minimum": 0,
+          "title": "Tokens Out",
+          "type": "integer"
+        },
+        "usd": {
+          "description": "What the tokens cost, from the model alias' `price` in `horae.yaml`; `0` when it has\nnone (then `priced` is `false`).",
+          "minimum": 0,
+          "title": "Usd",
+          "type": "number"
+        },
+        "cache_read_tokens": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Input tokens read from the provider's prompt cache, when it reports them.",
+          "title": "Cache Read Tokens"
+        },
+        "cache_write_tokens": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Input tokens written to the provider's prompt cache, when it reports them.",
+          "title": "Cache Write Tokens"
+        },
+        "priced": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "`false` when the model alias has no `price`, so `usd` is `0` and does not reflect the\nreal cost; absent when unknown (e.g. records written before decision 38).",
+          "title": "Priced"
+        }
+      },
+      "required": [
+        "tokens_in",
+        "tokens_out",
+        "usd"
+      ],
+      "title": "Usage",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "A provider's answer to one case, normalised (`evals/recorded/<backend>/<case>.json`).",
+  "properties": {
+    "schema_version": {
+      "const": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "backend": {
+      "enum": [
+        "claude-cli",
+        "anthropic",
+        "openai-compatible",
+        "ollama"
+      ],
+      "title": "Backend",
+      "type": "string"
+    },
+    "model": {
+      "description": "The concrete model that answered.",
+      "maxLength": 128,
+      "pattern": "^[^\\x00-\\x20\\x7f]+$",
+      "title": "Model",
+      "type": "string"
+    },
+    "skill": {
+      "maxLength": 128,
+      "pattern": "^[a-z][a-z0-9-]*/[a-z][a-z0-9_-]*$",
+      "title": "Skill",
+      "type": "string"
+    },
+    "skill_version": {
+      "maxLength": 128,
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?(\\+[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$",
+      "title": "Skill Version",
+      "type": "string"
+    },
+    "skill_digest": {
+      "description": "The skill's digest when it was recorded (a different one: the recording is stale).",
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Skill Digest",
+      "type": "string"
+    },
+    "request": {
+      "$ref": "#/$defs/RecordedRequest"
+    },
+    "output": {
+      "description": "The parsed JSON output, its reserved `intents` included, redacted.",
+      "title": "Output"
+    },
+    "usage": {
+      "$ref": "#/$defs/Usage"
+    },
+    "stop_reason": {
+      "anyOf": [
+        {
+          "maxLength": 128,
+          "pattern": "^[^\\x00-\\x20\\x7f]+$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Stop Reason"
+    }
+  },
+  "required": [
+    "schema_version",
+    "backend",
+    "model",
+    "skill",
+    "skill_version",
+    "skill_digest",
+    "request",
+    "output",
+    "usage"
+  ],
+  "title": "Horae skill eval recorded response (evals/recorded/<backend>/<case>.json)",
+  "type": "object"
+}

@@ -82,6 +82,7 @@ from horae.contracts.skill import view_steps
 from horae.engine.canonical import canonical_json, sha256_hex
 from horae.engine.ports import DeidUnavailable
 from horae.secrets import SecretError, SecretResolver
+from horae.secrets.redact import current as current_redactor
 
 DEID_VERSION = 2
 """The version of the transforms and of the pseudonym format: part of the LLM cache's stored
@@ -667,23 +668,36 @@ class _Pseudonymizer:
         pieces: list[str] = []
         found = neutralized > 0
         position = 0
+        # T10 belt and braces (decision 47 J): a match overlapping a resolved secret is not
+        # replaced, so a secret is never sent in part (the engine refuses it before this).
+        secrets = current_redactor().text_spans(cleaned)
         for start, end, known in self._phone_spans(cleaned):
-            found |= self._terms(cleaned[position:start], pieces)
+            if _overlaps(start, end, secrets):
+                continue
+            found |= self._terms(cleaned[position:start], pieces, position, secrets)
             pieces.append(self.assigner.token(known))
             self.count(FREE_TEXT)
             position, found = end, True
-        found |= self._terms(cleaned[position:], pieces)
+        found |= self._terms(cleaned[position:], pieces, position, secrets)
         return "".join(pieces) if found else text
 
-    def _terms(self, text: str, pieces: list[str]) -> bool:
+    def _terms(
+        self, text: str, pieces: list[str], base: int, secrets: list[tuple[int, int, str]]
+    ) -> bool:
+        """`text` (at offset `base` of the scanned string) with its known values replaced,
+        appended to `pieces`, except the matches overlapping a span of `secrets`."""
         if not text:
             return False
         if not self.trie.size:
             pieces.append(text)
             return False
-        tokens = [match.group() for match in _TOKENS.finditer(text)]
+        matched = list(_TOKENS.finditer(text))
+        tokens = [match.group() for match in matched]
         position, found = 0, False
         for start, end, value in self.trie.matches([_symbol(token) for token in tokens]):
+            first, last = base + matched[start].start(), base + matched[end - 1].end()
+            if _overlaps(first, last, secrets):
+                continue
             pieces.extend(tokens[position:start])
             if isinstance(value, str):
                 pieces.append(value)
@@ -725,6 +739,11 @@ class _Pseudonymizer:
                 yield start, end, known
                 index += MIN_PHONE_DIGITS
                 floor = end
+
+
+def _overlaps(start: int, end: int, spans: list[tuple[int, int, str]]) -> bool:
+    """Whether `[start, end)` overlaps one of `spans`."""
+    return any(start < span_end and span_start < end for span_start, span_end, _ in spans)
 
 
 def pseudonymize(

@@ -425,7 +425,7 @@ def _write_skill(instance: Path) -> Path:
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "type": {"const": "note.create"},
+            "type": {"type": "string", "const": "note.create"},
             "content": {"type": "string", "maxLength": 99},
         },
     }

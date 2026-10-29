@@ -1,0 +1,25 @@
+# Synthetic data. Overdue tasks rank first, then today's, then the rest; one note proposed.
+schema_version: 1
+description: An overdue task ranks before today's and later ones; events in time order.
+input:
+  tasks:
+    - { title: Renew the library card, due: "2026-10-30", id: t-3, notes: not shown }
+    - { title: Send the quarterly report, due: "2026-10-26", id: t-1 }
+    - { title: Water the plants, due: "2026-10-28", id: t-2 }
+  events:
+    - { start: "2026-10-28T14:00:00+01:00", summary: Dentist, location: not shown }
+    - { start: "2026-10-28T09:30:00+01:00", summary: Team stand-up }
+targets:
+  note.create: Daily/2026-10-28.assistant.md
+expect:
+  schema_valid: true
+  assertions:
+    - { pointer: /output/ranked, length: 3 }
+    - { pointer: /output/ranked/0/title, equals: Send the quarterly report }
+    - { pointer: /output/ranked/0/why, equals: overdue }
+    - { pointer: /output/ranked/1/why, equals: today }
+    - { pointer: /output/ranked/2/why, equals: later }
+    - { pointer: /output/summary, contains: overdue }
+    - { pointer: /intents/0/content, contains: Team stand-up }
+  intent_counts: { note.create: 1 }
+  guard: pass
