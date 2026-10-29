@@ -10,19 +10,25 @@
 
 name: horae
 
+# The image, in ONE place: the default tag is bumped here and in .env.example
+# (docs/operations/container-image.md, "Bumping the deploy templates").
+x-horae-image: &horae-image "ghcr.io/horae-dev/horae:${HORAE_IMAGE_TAG:-sha-aadf1e0}"
+
 services:
   # One-off: creates the example instance in a new, empty volume (`horae init`), then exits.
   # An instance already there (horae.yaml present) is left alone; a non-empty volume without
   # horae.yaml is refused by `horae init` (exit 3) and `horae` does not start.
   horae-init:
-    image: "ghcr.io/horae-dev/horae:${HORAE_IMAGE_TAG:-sha-aadf1e0}"
+    image: *horae-image
     entrypoint: ["sh", "-c"]
     command: ["test -e /instance/horae.yaml || exec horae init /instance"]
     restart: "no"
     user: "10001:10001"
     read_only: true
+    # Nothing is ever executed from /tmp (the image's HOME and TMPDIR): noexec.
     tmpfs:
-      - /tmp
+      - "/tmp:size=64m,noexec,nosuid,nodev"
+    pids_limit: 256
     cap_drop:
       - ALL
     security_opt:
@@ -32,12 +38,14 @@ services:
 
   horae:
     # Pinned tag; `<tag>@sha256:<digest>` pins the digest too (docs/operations/compose.md).
-    image: "ghcr.io/horae-dev/horae:${HORAE_IMAGE_TAG:-sha-aadf1e0}"
+    image: *horae-image
     # The image's command (`horae serve`), user, tini (PID 1) and HEALTHCHECK are kept.
     depends_on:
       horae-init:
         condition: service_completed_successfully
     restart: unless-stopped
+    # Optional memory cap, not set by default (runs are small; an LLM call is remote). For
+    # example `mem_limit: 512m`: a run that exceeds it is killed (OOM) and recorded as failed.
     environment:
       # builtin: `horae serve` fires the pipelines' cron triggers. external: host cron or a
       # systemd timer runs `docker compose exec -T horae horae run <pipeline>`.
@@ -47,8 +55,10 @@ services:
       HORAE_ALLOWED_HOSTS: "${HORAE_ALLOWED_HOSTS:-}"
     user: "10001:10001"
     read_only: true
+    # Nothing is ever executed from /tmp (the image's HOME and TMPDIR): noexec.
     tmpfs:
-      - /tmp
+      - "/tmp:size=64m,noexec,nosuid,nodev"
+    pids_limit: 256
     cap_drop:
       - ALL
     security_opt:
