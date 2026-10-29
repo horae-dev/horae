@@ -1,0 +1,86 @@
+name: Release SDK
+
+# Publishes `horae-sdk` (sdk/) to PyPI with trusted publishing (OIDC, no token), on a
+# `sdk-v<version>` tag only, never on a pull request. The publish job is gated: it runs only
+# in horae-dev/horae, when the repository variable HORAE_SDK_PUBLISH is `true`, in the `pypi`
+# environment (which the maintainer protects with required reviewers). Before the first
+# release the maintainer must register this workflow as a trusted publisher on PyPI
+# (project horae-sdk, workflow release-sdk.yml, environment pypi) and create the environment.
+
+on:
+  push:
+    tags: ["sdk-v*"]
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  UV_LOCKED: "1"
+  UV_PYTHON_PREFERENCE: only-managed
+  # renovate: datasource=github-releases depName=astral-sh/uv
+  UV_VERSION: 0.13.6
+
+jobs:
+  build:
+    name: Build and test horae-sdk
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read # checkout
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false # no cache in a release (cache poisoning)
+      - name: Check the tag matches the SDK version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' sdk/src/horae_sdk/__init__.py)"
+          if [ "${TAG}" != "sdk-v${version}" ]; then
+            echo "tag ${TAG} does not match horae-sdk ${version}" >&2
+            exit 1
+          fi
+      - run: uv sync
+      - run: uv run pytest sdk/tests
+      - run: uv build --package horae-sdk --out-dir dist
+      - name: Check the distributions
+        run: |
+          set -euo pipefail
+          ls dist
+          python3 -m zipfile -l dist/horae_sdk-*.whl | grep -q 'horae_sdk/py.typed'
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: horae-sdk-dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    if: ${{ github.repository == 'horae-dev/horae' && vars.HORAE_SDK_PUBLISH == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/project/horae-sdk/
+    permissions:
+      id-token: write # trusted publishing (OIDC); nothing else
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: horae-sdk-dist
+          path: dist/
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+      - run: uv publish --trusted-publishing always dist/*
