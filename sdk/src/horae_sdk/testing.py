@@ -22,11 +22,17 @@ requests, `_meta` keys and result reading as the core's host), so what passes he
 the host would see.
 
 - `replay(plugin, path)` replays one recording, raising `ReplayMismatch` (an
-  `AssertionError`, with a readable diff) when the output differs;
-- `replay_all(plugin, directory)` replays every `*.json` file of `directory` (sorted) and
-  returns the paths, so a plugin's test suite is one line;
+  `AssertionError`, with a readable diff) when the output differs. It also works inside a
+  running event loop (it then replays in a worker thread); `await areplay(...)` is the async
+  variant;
+- `replay_all(plugin, directory)` (`areplay_all`) replays every `*.json` file of
+  `directory` (sorted) and returns the paths, so a plugin's test suite is one line;
 - with `HORAE_SDK_RECORD=1` in the environment (or `record=True`), the current output is
-  **written** into each file's `expect` instead: record once, review the diff, commit;
+  **written** into each file's `expect` instead, and each rewritten file is named on stderr:
+  record once, review the diff, commit. Record mode is refused (`RecordingRefused`) when `CI`
+  or `GITHUB_ACTIONS` is set, so CI can never pass by rewriting what it checks, and a
+  recording that is a symbolic link is never written through (replaced atomically, in place);
+- `expect` holds `data` and `intents`, or `error` alone: any other key is refused;
 - `call(plugin, tool, ...)` and `operation(plugin, tool, arguments)` are the async primitives
   (a tool call, a sink operation).
 
@@ -35,9 +41,13 @@ service is tested by giving the plugin a fake client in the test and replaying i
 answers through the same recordings.
 """
 
+import asyncio
+import concurrent.futures
 import difflib
 import json
 import os
+import sys
+import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -51,11 +61,17 @@ from horae_sdk.plugin import Plugin
 from horae_sdk.protocol import INPUT_META, INTENTS_META, PATHS_META
 
 RECORD_ENV = "HORAE_SDK_RECORD"
+CI_ENVS = ("CI", "GITHUB_ACTIONS")
 _KEYS = {"tool", "params", "input", "paths", "expect"}
+_EXPECT_KEYS = {"data", "intents"}
 
 
 class ReplayMismatch(AssertionError):
     """A replayed call's output differs from its recording."""
+
+
+class RecordingRefused(RuntimeError):
+    """Record mode was asked for where it must not run (CI), or the file is a link."""
 
 
 @dataclass(frozen=True)
@@ -147,7 +163,16 @@ def _pretty(value: Any) -> list[str]:
 
 
 def check(expected: Mapping[str, Any], replayed: Replayed, where: str = "recording") -> None:
-    """`ReplayMismatch` unless `replayed` matches `expected` (see the module docstring)."""
+    """`ReplayMismatch` unless `replayed` matches `expected` (see the module docstring);
+    `ValueError` for an `expect` with unknown keys, or mixing `error` with `data`/`intents`."""
+    if not isinstance(expected, Mapping):
+        raise ValueError(f"{where}: `expect` must be an object")
+    keys = set(expected)
+    if keys - (_EXPECT_KEYS | {"error"}) or ("error" in keys and keys != {"error"}):
+        raise ValueError(
+            f"{where}: `expect` holds data and intents, or error alone (got"
+            f" {', '.join(sorted(map(str, keys)))})"
+        )
     if "error" in expected:
         if replayed.error is None or str(expected["error"]) not in replayed.error:
             got = replayed.expectation()
@@ -164,21 +189,50 @@ def check(expected: Mapping[str, Any], replayed: Replayed, where: str = "recordi
         raise ReplayMismatch(f"{where}: the output differs\n" + "\n".join(diff))
 
 
-def replay(plugin: Plugin, path: Path, *, record: bool | None = None) -> Replayed:
-    """Replay the recording at `path` (see the module docstring)."""
+def _recording(record: bool | None) -> bool:
+    """Whether to record; `RecordingRefused` when asked to in CI."""
+    wanted = record if record is not None else os.environ.get(RECORD_ENV) == "1"
+    if wanted:
+        found = [name for name in CI_ENVS if os.environ.get(name)]
+        if found:
+            raise RecordingRefused(
+                f"record mode ({RECORD_ENV}=1 or record=True) is refused in CI"
+                f" ({', '.join(found)} set): record locally, review the diff, commit"
+            )
+    return wanted
+
+
+def _write(path: Path, document: Mapping[str, Any]) -> None:
+    """Write `document` to `path` atomically, never through a symbolic link."""
+    if path.is_symlink():
+        raise RecordingRefused(f"{path} is a symbolic link: not recorded through it")
+    text = json.dumps(document, indent=2, ensure_ascii=False) + "\n"
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
+            file.write(text)
+        os.chmod(temporary, 0o644)  # a recording is a normal, committed file
+        os.replace(temporary, path)
+    except BaseException:
+        os.unlink(temporary)
+        raise
+    print(f"horae-sdk: recorded {path}", file=sys.stderr)
+
+
+async def areplay(plugin: Plugin, path: Path, *, record: bool | None = None) -> Replayed:
+    """Replay the recording at `path` (see the module docstring); the async variant."""
+    recording = _recording(record)
     document = load(path)
-    replayed = anyio.run(
-        lambda: call(
-            plugin,
-            document["tool"],
-            document.get("params"),
-            input=document.get("input"),
-            paths=document.get("paths"),
-        )
+    replayed = await call(
+        plugin,
+        document["tool"],
+        document.get("params"),
+        input=document.get("input"),
+        paths=document.get("paths"),
     )
-    if record if record is not None else os.environ.get(RECORD_ENV) == "1":
+    if recording:
         document["expect"] = replayed.expectation()
-        path.write_text(json.dumps(document, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        _write(path, document)
         return replayed
     if "expect" not in document:
         raise ReplayMismatch(f"{path}: no `expect` (record it with {RECORD_ENV}=1)")
@@ -186,20 +240,48 @@ def replay(plugin: Plugin, path: Path, *, record: bool | None = None) -> Replaye
     return replayed
 
 
-def replay_all(plugin: Plugin, directory: Path, *, record: bool | None = None) -> list[Path]:
+async def areplay_all(plugin: Plugin, directory: Path, *, record: bool | None = None) -> list[Path]:
     """Replay every `*.json` recording in `directory`; the paths replayed (at least one)."""
+    _recording(record)
     paths = sorted(directory.glob("*.json"))
     if not paths:
         raise ReplayMismatch(f"no recording in {directory}")
     for path in paths:
-        replay(plugin, path, record=record)
+        await areplay(plugin, path, record=record)
     return paths
 
 
+def _run(function: Any, *args: Any, **kwargs: Any) -> Any:
+    """Run the coroutine function to completion, in a worker thread when this thread is
+    already running an event loop (`anyio.run` cannot nest)."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return anyio.run(lambda: function(*args, **kwargs))
+    with concurrent.futures.ThreadPoolExecutor(1) as pool:
+        return pool.submit(anyio.run, lambda: function(*args, **kwargs)).result()
+
+
+def replay(plugin: Plugin, path: Path, *, record: bool | None = None) -> Replayed:
+    """Replay the recording at `path` (see the module docstring)."""
+    result: Replayed = _run(areplay, plugin, path, record=record)
+    return result
+
+
+def replay_all(plugin: Plugin, directory: Path, *, record: bool | None = None) -> list[Path]:
+    """Replay every `*.json` recording in `directory`; the paths replayed (at least one)."""
+    result: list[Path] = _run(areplay_all, plugin, directory, record=record)
+    return result
+
+
 __all__ = [
+    "CI_ENVS",
     "RECORD_ENV",
+    "RecordingRefused",
     "ReplayMismatch",
     "Replayed",
+    "areplay",
+    "areplay_all",
     "call",
     "check",
     "load",
