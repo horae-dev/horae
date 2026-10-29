@@ -1,0 +1,8 @@
+{
+  "tool": "hello.greet",
+  "params": {"name": "Ada"},
+  "expect": {
+    "data": {"greeting": "Hello, Ada!"},
+    "intents": [{"type": "task.create", "title": "Greet Ada back", "fingerprint": "hello:Ada"}]
+  }
+}
