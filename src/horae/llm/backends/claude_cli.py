@@ -56,12 +56,17 @@ and nothing is sent; when the command is a script whose interpreter is not on `B
 (the npm package's `#!/usr/bin/env node`), the message says so: `command` should name the
 native binary. `horae doctor` runs the same check (`check`). Bumping the range requires
 the live isolation test (`tests/test_llm_claude_cli_live.py`) against the new release, its
-output in the bump PR's body and the version in `docs/security.md` T11.
+output in the bump PR's body and the version in `docs/security.md` T11, and re-verifying how
+many times the new release retries a truncated output (`OUTPUT_ATTEMPTS`; the live output
+limit test checks the reported output is at most `OUTPUT_ATTEMPTS * max_tokens`).
 
 **The result.** stdout must be UTF-8 and one JSON object (strict `_shared.parse`) with `type:
 "result"`. `is_error` maps to `LlmError` kinds (`api_error_status` through
-`_shared.STATUS_KINDS`; with no status, reported `output_tokens` of at least `max_tokens` →
-`output_invalid`, the output truncated at the limit, #113; `error_max_turns` →
+`_shared.STATUS_KINDS`; with no status, reported `output_tokens` of at least `max_tokens`
+with the CLI's own retry or limit handling showing, more than one turn or a `success`
+subtype → `output_invalid`, the output truncated at the limit, charged at least
+`OUTPUT_ATTEMPTS * max_tokens` output tokens when it took more than one turn, #113;
+`error_max_turns` →
 `output_invalid`, "Not logged in" → `auth_failed`, anything else `host_error`); a non-zero
 exit without a result is `host_error`.
 A successful result must have `subtype: "success"`, `num_turns: 1`, no `permission_denials`,
@@ -124,7 +129,9 @@ from horae.secrets.redact import Redactor
 
 CLAUDE_CODE_VERSION_RANGE = ">=2.1.284,<2.2"
 """The Claude Code releases this backend runs (a minor range, refused outside it; answer 2
-on #97). 2.1.284 is the release the flags were checked against."""
+on #97). 2.1.284 is the release the flags were checked against. A bump needs the live test
+against the new release (its output in the PR body), the version in `docs/security.md` T11
+and a re-verified retry count of a truncated output (`OUTPUT_ATTEMPTS`, #113)."""
 MIN_VERSION = (2, 1, 284)
 BELOW_VERSION = (2, 2, 0)
 
@@ -146,7 +153,9 @@ second turn, before its answer; `max_tokens` then bounds the answer itself."""
 OUTPUT_ATTEMPTS = 4
 """How many outputs of up to `max_tokens` one call may be billed: Claude Code retries a
 truncated output on its own, up to 3 times (seen live on 2.1.284, #113), so the reservation
-(`ModelBackends.worst_case`), the conservative charge and the stdout cap cover 4."""
+(`ModelBackends.worst_case`), the conservative charge and the stdout cap cover 4, and a step
+on a `claude-cli` alias gets `max_tokens` = its `tokens_out` / 4. Re-verify it live before
+bumping `CLAUDE_CODE_VERSION_RANGE` (a release may retry more or fewer times)."""
 MAX_OUTPUT_ENV = "CLAUDE_CODE_MAX_OUTPUT_TOKENS"
 """Where the step's `max_tokens` goes in a call's environment (decision 42 F)."""
 CEILING_ENV = "GIT_CEILING_DIRECTORIES"
@@ -169,7 +178,8 @@ EMPTY_MCP = '{"mcpServers":{}}'
 PAYLOAD_KEYS = frozenset({"argv", "stdin", "max_tokens"})
 
 MAX_STDOUT_BYTES = MAX_RESPONSE_BYTES
-"""The largest stdout accepted (8 MiB); a call accepts `_shared.response_cap(max_tokens)`."""
+"""The largest stdout accepted (8 MiB); a call accepts `_shared.response_cap(OUTPUT_ATTEMPTS *
+max_tokens)` (`_stdout_cap`)."""
 MAX_VERSION_BYTES = 4096
 VERSION_TIMEOUT_S = 15.0
 MAX_SYSTEM_BYTES = 64 << 10
@@ -180,20 +190,38 @@ DRAIN_S = 1.0
 """How long stdout, then stderr, may stay open after the process exited (a grandchild holding
 it)."""
 _POLL_S = 0.01
-_FENCED = re.compile(
-    r"\A\s*```(?:json)?[ \t]*\r?\n(?P<body>.*?)\s*```\s*\Z", re.DOTALL | re.IGNORECASE
-)
+_FENCE = "```"
+_INFO_STRINGS = frozenset({"", "json"})
 _VERSION = re.compile(r"^(\d{1,6})\.(\d{1,6})\.(\d{1,6}) \(Claude Code\)\n?$")
 API = "claude-cli"
 
 
 def unfenced(text: str) -> str:
-    """The body of `text` when it is exactly one Markdown code fence (an optional `json` info
-    string, any case; whitespace around it), else `text` unchanged. The model wraps its JSON
-    in one (#113); the body must still be one JSON value, so prose around the fence, two
-    fences or a fence inside text stay invalid."""
-    match = _FENCED.match(text)
-    return text if match is None else match.group("body")
+    """The body of `text` when it is exactly one Markdown code fence, else `text` unchanged.
+    The model wraps its JSON in one (#113). Surrounding whitespace stripped, the opening line is
+    exactly three backticks and an optional `json` info string (any case, trailing spaces or
+    tabs, LF or CRLF) and the closing three backticks end the text on a line of their own;
+    the body (what lies between) must still be one JSON value, so prose around the fence,
+    two fences, a fence inside text, `~~~` or four-backtick fences stay invalid.
+
+    Linear string operations only (no regular expression): the result may be as large as
+    the stdout cap, and a backtracking pattern over it would block the event loop."""
+    stripped = text.strip()
+    if not stripped.startswith(_FENCE) or not stripped.endswith(_FENCE):
+        return text
+    newline = stripped.find("\n")
+    if newline < 0:
+        return text
+    info = stripped[len(_FENCE) : newline].removesuffix("\r").rstrip(" \t")
+    if info.lower() not in _INFO_STRINGS:
+        return text
+    rest = stripped[newline + 1 :]
+    if len(rest) < len(_FENCE):
+        return text
+    before = rest[: -len(_FENCE)].rstrip(" \t")
+    if before and not before.endswith("\n"):
+        return text  # the closing fence is not on a line of its own
+    return before.removesuffix("\n").removesuffix("\r")
 
 
 def argv(model: str, system: str) -> list[str]:
@@ -677,16 +705,25 @@ class ClaudeCliBackend:
                 stderr=stderr,
                 usage=self.conservative(payload),
             )
-        usage = self._usage(data, payload)
         if data.get("is_error") is not False:
-            raise self._error(data, usage, stderr, at_limit=self._at_limit(data, payload))
+            at_limit = self._at_limit(data, payload)
+            retried = at_limit and (count(data.get("num_turns")) or 0) > 1
+            # Claude Code billed every retried output, even if it reports only the last one.
+            least_out = OUTPUT_ATTEMPTS * int(payload["max_tokens"]) if retried else 0
+            usage = self._usage(data, payload, least_out=least_out)
+            raise self._error(data, usage, stderr, at_limit=at_limit)
+        usage = self._usage(data, payload)
         if outcome.returncode != 0:
             raise LlmError(
                 "host_error", f"{API} {exit_status(outcome.returncode)}", stderr=stderr, usage=usage
             )
         return self._success(data, payload, usage, stderr)
 
-    def _usage(self, data: Mapping[str, Any], payload: Mapping[str, Any]) -> Usage:
+    def _usage(
+        self, data: Mapping[str, Any], payload: Mapping[str, Any], *, least_out: int = 0
+    ) -> Usage:
+        """The reported usage, floored (`floored`; its output at least `least_out`), or the
+        conservative charge when none is usable."""
         notional = _usd(data.get("total_cost_usd"))
         reported = data.get("usage")
         if not isinstance(reported, dict):
@@ -702,7 +739,7 @@ class ClaudeCliBackend:
             self._spec.price,
             payload,
             tokens_in,
-            tokens_out,
+            max(tokens_out, least_out),
             output_bytes=utf8_size(result) if isinstance(result, str) else 0,
             max_tokens=int(payload["max_tokens"]),
             cache_read=count(reported.get("cache_read_input_tokens")),
@@ -753,11 +790,16 @@ class ClaudeCliBackend:
 
     @staticmethod
     def _at_limit(data: Mapping[str, Any], payload: Mapping[str, Any]) -> bool:
-        """Whether a failed call reported at least `max_tokens` output tokens: Claude Code
-        gave up on an output truncated at the limit (after its own retries, #113)."""
+        """Whether a failed call is Claude Code giving up on an output truncated at the limit
+        (after its own retries, #113): it reported at least `max_tokens` output tokens, and
+        shows its own retry or limit handling, more than one turn or a `success` subtype (as
+        2.1.284 did: `success`, 4 turns, no HTTP status). Else the error is not a truncation."""
         reported = data.get("usage")
         tokens_out = count(reported.get("output_tokens")) if isinstance(reported, dict) else None
-        return tokens_out is not None and tokens_out >= int(payload["max_tokens"])
+        if tokens_out is None or tokens_out < int(payload["max_tokens"]):
+            return False
+        turns = count(data.get("num_turns")) or 0
+        return turns > 1 or data.get("subtype") == "success"
 
     def _success(
         self,

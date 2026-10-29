@@ -182,6 +182,28 @@ def test_every_backend_of_the_suite_is_registered() -> None:
     assert set(FACTORIES) == {kind.name for kind in KINDS} | {CLI}
 
 
+# How many outputs of up to `max_tokens` one call of each built-in backend may bill
+# (`output_attempts`): `worst_case` reserves that many and `max_tokens` divides the step's
+# `tokens_out` by it. Only `claude-cli` retries a truncated output on its own (#113); a new
+# backend, or a change here, must be a deliberate decision (schemas decision 42).
+OUTPUT_ATTEMPTS = {"anthropic": 1, "openai-compatible": 1, "ollama": 1, "claude-cli": 4}
+
+
+def test_every_built_in_backend_declares_the_expected_output_attempts(
+    kind: Kind, secrets: SecretResolver
+) -> None:
+    assert set(OUTPUT_ATTEMPTS) == set(FACTORIES)
+    llm = backends(kind, secrets, kind.recorder("success"))
+    assert llm.prepare(request()).output_attempts == OUTPUT_ATTEMPTS[kind.name] == 1
+
+
+def test_claude_cli_declares_the_expected_output_attempts(
+    fake_claude: Fake, cli_secrets: SecretResolver
+) -> None:
+    llm = cli_backends(fake_claude, cli_secrets)
+    assert llm.prepare(request()).output_attempts == OUTPUT_ATTEMPTS[CLI] == 4
+
+
 # --- success and the outgoing request ---------------------------------------------------------
 
 

@@ -923,15 +923,44 @@ def test_managed_settings_are_found_by_name_only(
         ('```JSON\n{"ok": true}\n```', '{"ok": true}'),
         ("```\n[1, 2]\n```", "[1, 2]"),
         ('  \n```json  \r\n{"ok": true}\r\n```\n\n', '{"ok": true}'),
-        ('```json\n{"ok": true}```', '{"ok": true}'),
+        ('```json\r\n{"ok": true}\r\n```\r\n', '{"ok": true}'),  # CRLF
+        ('```json\n{"a": "```x```"}\n```', '{"a": "```x```"}'),  # backticks in a JSON string
+        ('```json\n{\n  "ok": true\n}\n  ```', '{\n  "ok": true\n}'),  # an indented closing
+        ("```json\n```", ""),  # an empty body: no JSON value
+        ("```json\n   \n\t\n```", "   \n\t"),  # a whitespace-only body: no JSON value
         ('{"ok": true}', '{"ok": true}'),
+        # Refused (returned unchanged): the closing fence not on its own line, prose around
+        # the fence, another info string, a one-line fence, four backticks, tildes.
+        ('```json\n{"ok": true}```', '```json\n{"ok": true}```'),
         ('Here:\n```json\n{"ok": true}\n```', 'Here:\n```json\n{"ok": true}\n```'),
+        ('```json\n{"ok": true}\n```\nDone.', '```json\n{"ok": true}\n```\nDone.'),
         ('```python\n{"ok": true}\n```', '```python\n{"ok": true}\n```'),
+        ('``` json\n{"ok": true}\n```', '``` json\n{"ok": true}\n```'),
         ('```json {"ok": true}```', '```json {"ok": true}```'),
+        ('````json\n{"ok": true}\n````', '````json\n{"ok": true}\n````'),
+        ('```json\n{"ok": true}\n````', '```json\n{"ok": true}\n````'),
+        ('~~~json\n{"ok": true}\n~~~', '~~~json\n{"ok": true}\n~~~'),
+        ("```", "```"),
+        ("```\n``", "```\n``"),
     ],
 )
 def test_unfenced_strips_exactly_one_enclosing_fence(text: str, body: str) -> None:
     assert unfenced(text) == body
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "```json\n" + " " * (1 << 20),  # unterminated: the old pattern was quadratic on this
+        "```json\n" + " " * (1 << 20) + "x",
+        "```json\n" + " \n" * (1 << 19) + "```",
+        "```" + " " * (1 << 20) + "```",
+    ],
+)
+def test_unfenced_is_linear_on_a_large_whitespace_result(text: str) -> None:
+    start = time.perf_counter()
+    unfenced(text)
+    assert time.perf_counter() - start < 1.0
 
 
 def test_a_fenced_result_is_parsed(fake: Fake, secrets: SecretResolver) -> None:
@@ -993,6 +1022,12 @@ def test_an_output_truncated_at_the_limit_is_output_invalid_with_its_usage(
         (63, {}, "host_error"),  # under it: not a truncation
         (None, {}, "host_error"),  # no usage: no signal
         (256, {"api_error_status": 429}, "rate_limited"),  # an HTTP status wins
+        # The CLI's own retry or limit handling must show too: more than one turn or a
+        # `success` subtype (2.1.284: both). With neither it is not a truncation.
+        (64, {"num_turns": 1}, "output_invalid"),  # `success` alone
+        (64, {"subtype": "error_during_execution"}, "output_invalid"),  # 4 turns alone
+        (64, {"num_turns": 1, "subtype": "error_during_execution"}, "host_error"),
+        (64, {"num_turns": None, "subtype": None}, "host_error"),
     ],
 )
 def test_the_truncation_signal_is_the_reported_output(
@@ -1034,11 +1069,40 @@ def test_the_reservation_covers_every_output_attempt(fake: Fake, secrets: Secret
 
 
 @pytest.mark.parametrize(
-    ("value", "attempts"), [(4, 4), (1, 1), (0, 1), (17, 1), (True, 1), ("4", 1)]
+    ("turns", "reported", "charged"),
+    [
+        (4, 64, 4 * 64),  # retried: every output is charged, even if one was reported
+        (4, 300, 300),  # a larger report stands
+        (1, 64, 64),  # one turn: the single output reported
+    ],
 )
-def test_output_attempts_is_read_defensively(value: Any, attempts: int) -> None:
+def test_a_retried_truncation_is_charged_every_output(
+    fake: Fake, secrets: SecretResolver, turns: int, reported: int, charged: int
+) -> None:
+    fake.behave(result=_truncated(reported, num_turns=turns), exit=1)
+    error = fails(fake, secrets, completion(max_tokens=64))
+    assert error.kind == "output_invalid"
+    assert error.usage is not None
+    assert error.usage.tokens_out == charged
+
+
+def test_output_attempts_is_one_when_undeclared() -> None:
+    assert output_attempts(object()) == 1
+
+
+@pytest.mark.parametrize(("value", "attempts"), [(4, 4), (1, 1), (16, 16), (17, 16), (10**9, 16)])
+def test_a_declared_output_attempts_is_clamped_to_the_maximum(value: int, attempts: int) -> None:
     class Declared:
         output_attempts = value
 
     assert output_attempts(Declared()) == attempts
-    assert output_attempts(object()) == 1
+
+
+@pytest.mark.parametrize("value", [0, -1, True, False, "4", 4.0, None])
+def test_an_unusable_output_attempts_fails_closed(value: Any) -> None:
+    class Declared:
+        output_attempts = value
+
+    with pytest.raises(LlmError) as info:
+        output_attempts(Declared())
+    assert info.value.kind == "backend_unavailable"

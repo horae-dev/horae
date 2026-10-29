@@ -243,7 +243,8 @@ class ProviderBackend(Protocol):
     """One provider adapter. Makes one request per `send`, with no tools and no retry.
 
     A backend may also declare `output_attempts` (an `int`, read with `output_attempts`): how
-    many outputs of up to `max_tokens` one `send` may be billed (1 when absent)."""
+    many outputs of up to `max_tokens` one `send` may be billed (1 when absent; any other
+    value than an `int` of at least 1 makes the backend unavailable)."""
 
     @property
     def name(self) -> LlmBackendName: ...
@@ -454,17 +455,28 @@ def input_price(price: ModelPrice, *, may_write_cache: bool = False) -> float:
 
 
 MAX_OUTPUT_ATTEMPTS = 16
-"""The largest `output_attempts` taken from a backend (a larger or unusable value is 1)."""
+"""The largest `output_attempts` taken from a backend (a larger integer is clamped to it)."""
 
 
 def output_attempts(backend: object) -> int:
     """`backend.output_attempts`: how many outputs of up to `max_tokens` one call may be
-    billed (`claude-cli` recovers from a truncated output on its own: 4); 1 when absent or
-    not an integer from 1 to `MAX_OUTPUT_ATTEMPTS`."""
-    value = getattr(backend, "output_attempts", 1)
-    if isinstance(value, bool) or not isinstance(value, int):
+    billed (`claude-cli` recovers from a truncated output on its own: 4). 1 when the backend
+    declares none; an integer above `MAX_OUTPUT_ATTEMPTS` is clamped to it (it reserves at
+    least as much as declared would, up to the cap).
+
+    Raises `LlmError("backend_unavailable")` for any other declared value (0, negative, a
+    `bool`, not an `int`): a misconfigured backend fails closed instead of reserving one
+    output where it may bill several."""
+    if not hasattr(backend, "output_attempts"):
         return 1
-    return value if 1 <= value <= MAX_OUTPUT_ATTEMPTS else 1
+    value = backend.output_attempts
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise LlmError(
+            "backend_unavailable",
+            f"backend declares an unusable output_attempts {repr(value)[:40]} (an integer "
+            "of at least 1)",
+        )
+    return min(value, MAX_OUTPUT_ATTEMPTS)
 
 
 def max_tokens(
