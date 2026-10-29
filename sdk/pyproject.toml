@@ -9,6 +9,7 @@ requires-python = ">=3.12"
 # The same MCP SDK range as the core's plugin host, so a plugin speaks the protocol the host
 # is tested with.
 dependencies = [
+    "anyio>=4.5",
     "mcp>=2.3,<2.4",
     "pyyaml>=6",
 ]
@@ -20,8 +21,10 @@ classifiers = [
 [project.urls]
 Homepage = "https://github.com/horae-dev/horae/tree/main/sdk"
 
+# The build backend is pinned exactly: a release builds with a known hatchling (Renovate's pep621
+# manager bumps it, after the same 7-day minimum release age as everything else).
 [build-system]
-requires = ["hatchling>=1.27"]
+requires = ["hatchling==1.32.4"]
 build-backend = "hatchling.build"
 
 [tool.hatch.version]
@@ -31,4 +34,6 @@ path = "src/horae_sdk/__init__.py"
 packages = ["src/horae_sdk"]
 
 [tool.hatch.build.targets.sdist]
-include = ["/src/horae_sdk", "/tests", "/examples", "/README.md", "/LICENSE"]
+# No tests: they run against the core (its host, contracts and schemas), so they cannot run from
+# the sdist alone; they live in the core repository.
+include = ["/src/horae_sdk", "/examples", "/README.md", "/LICENSE"]

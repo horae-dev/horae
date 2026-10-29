@@ -1,11 +1,23 @@
 name: Release SDK
 
 # Publishes `horae-sdk` (sdk/) to PyPI with trusted publishing (OIDC, no token), on a
-# `sdk-v<version>` tag only, never on a pull request. The publish job is gated: it runs only
-# in horae-dev/horae, when the repository variable HORAE_SDK_PUBLISH is `true`, in the `pypi`
-# environment (which the maintainer protects with required reviewers). Before the first
-# release the maintainer must register this workflow as a trusted publisher on PyPI
-# (project horae-sdk, workflow release-sdk.yml, environment pypi) and create the environment.
+# `sdk-v<version>` tag only, never on a pull request, and only for a commit that is on main
+# (a tag pushed on any other commit, e.g. an unreviewed branch, fails the build job). The
+# publish job is gated: it runs only in horae-dev/horae, when the repository variable
+# HORAE_SDK_PUBLISH is `true`, in the `pypi` environment.
+#
+# Before the first release the maintainer must:
+#   - create the `pypi` environment with **required reviewers** and its deployment branches and
+#     tags restricted to `sdk-v*` (Settings > Environments > pypi > "Selected branches and
+#     tags": one tag rule `sdk-v*`, no branch rule), so only an approved run for such a tag
+#     gets the OIDC token PyPI trusts;
+#   - protect `sdk-v*` tags with a tag ruleset (only maintainers create them);
+#   - register this workflow as a trusted publisher on PyPI (project horae-sdk, workflow
+#     release-sdk.yml, environment pypi).
+#
+# Attestations (PEP 740): `uv publish` (0.13.6) uploads `<file>.publish.attestation` files
+# found next to the distributions, but does not create them, and none are created here.
+# Signing them needs a Sigstore step in the publish job: a follow-up (schemas decision 50).
 
 on:
   push:
@@ -33,7 +45,15 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0 # the whole history and origin/main, for the check below
           persist-credentials: false
+      - name: Check the tagged commit is on main
+        run: |
+          set -euo pipefail
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
+            echo "${GITHUB_SHA} is not on main: a release tag must point at a merged commit" >&2
+            exit 1
+          fi
       - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           version: ${{ env.UV_VERSION }}

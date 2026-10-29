@@ -536,12 +536,14 @@ dev = [
 name = "horae-sdk"
 source = { editable = "sdk" }
 dependencies = [
+    { name = "anyio" },
     { name = "mcp" },
     { name = "pyyaml" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "anyio", specifier = ">=4.5" },
     { name = "mcp", specifier = ">=2.3,<2.4" },
     { name = "pyyaml", specifier = ">=6" },
 ]

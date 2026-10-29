@@ -51,7 +51,7 @@ dev = [
 ]
 
 # The plugin SDK (`sdk/`, published as `horae-sdk`) is a workspace member: one lock, and the
-# core's lint, types, tests and coverage gate cover it.
+# core's lint, types and tests cover it. Coverage is gated per package (below).
 [tool.uv.workspace]
 members = ["sdk"]
 
@@ -95,7 +95,11 @@ filterwarnings = ["error"]
 source = ["horae", "horae_sdk"]
 branch = true
 
+# Both packages are measured, but the report (and the 85% gate of `pytest --cov`) is the core's
+# alone, so the SDK's tests cannot carry it. CI gates the SDK separately on the same data:
+# `coverage report --include='sdk/src/horae_sdk/*' --fail-under=85`.
 [tool.coverage.report]
+include = ["src/horae/*"]
 fail_under = 85
 show_missing = true
 exclude_also = ["if TYPE_CHECKING:"]

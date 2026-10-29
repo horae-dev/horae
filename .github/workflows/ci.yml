@@ -78,8 +78,11 @@ jobs:
           version: ${{ env.UV_VERSION }}
           cache-python: true
       - run: uv sync
-      # The coverage gate comes from [tool.coverage.report] fail_under in pyproject.toml.
+      # The coverage gate comes from [tool.coverage.report] in pyproject.toml: 85% of the core
+      # alone (src/horae). The SDK (horae-sdk) gets its own 85% gate on the same data.
       - run: uv run pytest --cov --cov-report=term-missing --cov-report=xml
+      - name: Coverage gate of the SDK (horae_sdk alone)
+        run: uv run coverage report --include='sdk/src/horae_sdk/*' --fail-under=85
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: ${{ !cancelled() }}
         with:
@@ -109,6 +112,15 @@ jobs:
           python3 -m zipfile -l dist/horae_sdk-*.whl | tee "${RUNNER_TEMP}/wheel.txt"
           grep -q 'horae_sdk/py.typed' "${RUNNER_TEMP}/wheel.txt"
           grep -q 'licenses/LICENSE' "${RUNNER_TEMP}/wheel.txt"
+      - name: Check the sdist (no tests: they need the core)
+        run: |
+          set -euo pipefail
+          tar -tzf dist/horae_sdk-*.tar.gz | tee "${RUNNER_TEMP}/sdist.txt"
+          grep -q '/src/horae_sdk/py.typed$' "${RUNNER_TEMP}/sdist.txt"
+          if grep -q '/tests/' "${RUNNER_TEMP}/sdist.txt"; then
+            echo "the sdist holds tests" >&2
+            exit 1
+          fi
 
   gitleaks:
     name: Secret scan (gitleaks)
