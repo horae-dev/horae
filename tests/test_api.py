@@ -3,9 +3,13 @@
 any response, the security headers. Driven in process (`TestClient`); the real server bind
 and the shutdown with the scheduler are in `test_api_server.py`."""
 
+import base64
 import hashlib
 import json
+import logging
+import random
 import sqlite3
+import threading
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -17,16 +21,20 @@ from typer.testing import CliRunner
 
 from horae import __version__
 from horae.api import (
+    INVALID_HOST_MESSAGE,
+    MAX_LOGGED_HOSTS,
     MAX_PAGE,
     SECURITY_HEADERS,
     ApiContext,
     allowed_host,
     create_app,
+    decode_cursor,
     encode_cursor,
     host_of,
 )
 from horae.cli import app as cli_app
 from horae.config import load_instance
+from horae.run_view import RunStatusFilter
 from horae.scheduler import PipelineState, SchedulerState
 from horae.secrets import Secret
 from horae.secrets.redact import encodings, remember
@@ -124,6 +132,26 @@ def test_healthz_is_503_when_the_builtin_scheduler_is_not_running(
     assert response.json()["status"] == "unavailable"
     assert response.json()["scheduler"]["active"] is False
     assert response.json()["store"]["status"] == "ok"
+
+
+def test_healthz_checks_the_store_in_its_own_executor(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Not in the worker pool `/runs` shares (finding: a busy pool must not fail the check),
+    # and not on the event loop (SQLite would block it).
+    from horae.api import _app
+
+    threads: list[str] = []
+    real = _app._store_health
+
+    def spy(path: Path) -> tuple[dict[str, Any], bool]:
+        threads.append(threading.current_thread().name)
+        return real(path)
+
+    monkeypatch.setattr(_app, "_store_health", spy)
+    assert client.get("/healthz").status_code == 200
+    assert len(threads) == 1
+    assert threads[0].startswith("horae-healthz")
 
 
 def test_healthz_is_ok_in_external_mode(client: TestClient, state: State) -> None:
@@ -243,6 +271,9 @@ def test_live_skill_evals_are_listed_only_when_asked(client: TestClient, store_p
         {"cursor": "not a cursor"},
         {"cursor": encode_cursor(T0, "x")[:-3] + "!!!"},
         {"cursor": "W10"},  # base64url of "[]"
+        {"cursor": "WyI5OTk5LTEyLTMxVDIzOjU5OjU5LTA1OjAwIiwieCJd"},  # overflows in astimezone
+        {"cursor": encode_cursor(T0, "x") + "="},  # padded: not as the API writes it
+        {"status": "stale"},  # a flag, not a status (as in `horae runs --status`)
         {"cursor": "x" * 600},
         {"pipeline": "p" * 65},
     ],
@@ -257,6 +288,101 @@ def test_bad_parameters_are_refused_without_echoing_them(
     assert error["message"].startswith("invalid parameter: ")
     for value in params.values():
         assert str(value) not in response.text
+
+
+def _cursor(value: Any) -> str:
+    raw = json.dumps(value, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def test_a_tampered_cursor_is_400_never_500(client: TestClient, store_path: Path) -> None:
+    _seed(store_path, 3)
+    overflow = _cursor(["9999-12-31T23:59:59-05:00", "x"])
+    assert decode_cursor(overflow) is None
+    response = client.get("/runs", params={"cursor": overflow})
+    assert response.status_code == 400
+    assert response.json()["error"]["message"] == "invalid parameter: cursor"
+    tampered = [
+        overflow,
+        _cursor(["0001-01-01T00:00:00+14:00", "x"]),
+        _cursor(["9999-12-31T23:59:59.999999+00:00", "x"]),  # valid shape, far future: ok
+        _cursor(["2026-03-01T06:00:00Z", "x"]),
+        _cursor(["2026-03-01T06:00:00+00:00", ""]),
+        _cursor(["2026-03-01T06:00:00+00:00", 1]),
+        _cursor(["2026-03-01T06:00:00+00:00", "x", "y"]),
+        _cursor({"a": 1}),
+        _cursor("[" * 400),
+    ]
+    rng = random.Random(37)  # noqa: S311 (a fuzz, not a secret)
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_=+/ %"
+    tampered += ["".join(rng.choices(alphabet, k=rng.randint(1, 80))) for _ in range(40)]
+    real = encode_cursor(T0, "run-01")
+    for _ in range(20):  # one character of a real cursor changed
+        i = rng.randrange(len(real))
+        tampered.append(real[:i] + rng.choice(alphabet[:64]) + real[i + 1 :])
+    for cursor in tampered:
+        status = client.get("/runs", params={"cursor": cursor}).status_code
+        assert status in (200, 400), cursor
+        assert (status == 200) == (decode_cursor(cursor) is not None), cursor
+
+
+def test_equal_start_times_keep_their_order_across_pages(
+    client: TestClient, store_path: Path
+) -> None:
+    with Store.open(store_path) as store:
+        for i in range(5):  # five runs started at the same instant
+            _finished(store, f"tie-{i}", f"p{i}", T0)
+        _finished(store, "older", "p9", T0 - timedelta(minutes=1))
+    seen: list[str] = []
+    cursor: str | None = None
+    while True:
+        params: dict[str, Any] = {"limit": 2, **({"cursor": cursor} if cursor else {})}
+        body = client.get("/runs", params=params).json()
+        seen += [run["id"] for run in body["runs"]]
+        if (cursor := body["next_cursor"]) is None:
+            break
+    assert seen == ["tie-4", "tie-3", "tie-2", "tie-1", "tie-0", "older"]
+
+
+def test_a_cursor_whose_run_was_deleted_still_pages_on(
+    client: TestClient, store_path: Path
+) -> None:
+    expected = _seed(store_path, 6)
+    first = client.get("/runs", params={"limit": 2}).json()
+    last_shown = first["runs"][-1]["id"]
+    conn = sqlite3.connect(store_path)
+    try:
+        conn.execute("DELETE FROM runs WHERE id = ?", (last_shown,))
+        conn.commit()
+    finally:
+        conn.close()
+    rest = client.get("/runs", params={"limit": 10, "cursor": first["next_cursor"]}).json()
+    # The cursor is a position (start time, id), not a row: the next page starts after it.
+    assert [run["id"] for run in rest["runs"]] == expected[2:]
+    assert rest["next_cursor"] is None
+
+
+def test_a_trailing_slash_is_404_not_a_redirect(client: TestClient) -> None:
+    for path in ("/runs/", "/healthz/"):
+        response = client.get(path, follow_redirects=False)
+        assert response.status_code == 404, path
+        assert "location" not in response.headers
+        assert response.json()["error"]["kind"] == "not_found"
+
+
+def test_the_status_filter_accepts_what_horae_runs_accepts(
+    client: TestClient, root: Path, store_path: Path
+) -> None:
+    _seed(store_path, 2)
+    for status in RunStatusFilter:
+        assert client.get("/runs", params={"status": status.value}).status_code == 200
+        args = ["runs", "-i", str(root), "-s", status.value, "--all", "--json"]
+        cli = CliRunner().invoke(cli_app, args)
+        assert cli.exit_code == 0, cli.output
+        api = client.get("/runs", params={"status": status.value, "all": "true"}).json()
+        assert api["runs"] == json.loads(cli.stdout)["runs"]
+    failed = client.get("/runs", params={"status": "failed"}).json()["runs"]
+    assert len(failed) == 2
 
 
 def test_the_page_size_is_capped(client: TestClient, store_path: Path) -> None:
@@ -300,9 +426,15 @@ def test_the_api_is_read_only(client: TestClient, store_path: Path, method: str,
     assert "GET" in response.headers["allow"]
     for read in ("/runs", "/runs/run-00", "/healthz"):
         client.get(read)
-    # Reading created nothing (no -wal / -shm) and changed nothing.
-    assert sorted(p.name for p in store_path.parent.iterdir()) == before
+    # Reading changed nothing. Plain `mode=ro` (decision 51 E) may leave an empty `-wal` and
+    # a `-shm`, nothing else; the next writer's close removes them.
+    wal = store_path.with_name(store_path.name + "-wal")
+    after = {p.name for p in store_path.parent.iterdir()}
+    assert after - set(before) <= {wal.name, store_path.name + "-shm"}
+    assert not wal.exists() or wal.stat().st_size == 0
     assert hashlib.sha256(store_path.read_bytes()).hexdigest() == digest
+    Store.open(store_path).close()
+    assert sorted(p.name for p in store_path.parent.iterdir()) == before
 
 
 def test_reading_does_not_wait_for_a_writer(client: TestClient, store_path: Path) -> None:
@@ -469,7 +601,7 @@ def test_a_request_for_another_host_is_refused(
     assert response.status_code == 400
     assert response.json() == {
         "schema_version": 1,
-        "error": {"kind": "invalid_host", "message": "invalid host"},
+        "error": {"kind": "invalid_host", "message": "host not allowed (see HORAE_ALLOWED_HOSTS)"},
     }
     if host:
         assert host not in response.text
@@ -506,6 +638,47 @@ def test_several_host_headers_are_refused(client: TestClient) -> None:
     assert response.status_code == 400
 
 
+def test_each_refused_host_is_logged_once_sanitised_and_bounded(
+    root: Path, store_path: Path, state: State, caplog: pytest.LogCaptureFixture
+) -> None:
+    context = ApiContext(store_path, store_path.parent, state)
+    injected = "evil.example\r\n2026-01-01 INFO forged line\u202e" + "x" * 200
+    with (
+        caplog.at_level(logging.WARNING, logger="horae.api"),
+        TestClient(create_app(context), base_url=LOCAL) as test_client,
+    ):
+        for _ in range(3):
+            assert test_client.get("/healthz", headers={"Host": REBOUND}).status_code == 400
+        raw = injected.encode("utf-8")  # the bytes a hostile client sends
+        assert test_client.get("/healthz", headers={b"Host": raw}).status_code == 400
+        for i in range(MAX_LOGGED_HOSTS + 5):
+            test_client.get("/healthz", headers={"Host": f"other-{i}.example"})
+    lines = [r.getMessage() for r in caplog.records if r.name == "horae.api"]
+    assert sum(REBOUND in line for line in lines) == 1  # deduplicated
+    assert all("\n" not in line and "\r" not in line for line in lines)
+    assert all(line.isascii() for line in lines)  # no bidi or control character
+    assert any("evil.example\\r\\n" in line for line in lines)  # escaped, visible
+    assert all(len(line) < 250 for line in lines)  # truncated
+    assert all("HORAE_ALLOWED_HOSTS" in line for line in lines[:-1])
+    # Bounded: MAX_LOGGED_HOSTS values, then one line saying it stops.
+    assert len(lines) == MAX_LOGGED_HOSTS + 1
+    assert "not logging them any more" in lines[-1]
+
+
+def test_the_invalid_host_message_names_the_setting() -> None:
+    assert INVALID_HOST_MESSAGE == "host not allowed (see HORAE_ALLOWED_HOSTS)"
+
+
+def test_docker_service_names_with_an_underscore_are_allowed(
+    root: Path, store_path: Path, state: State
+) -> None:
+    assert allowed_host("Horae_App") == "horae_app"
+    context = ApiContext(store_path, store_path.parent, state, frozenset({"horae_app"}))
+    with TestClient(create_app(context), base_url=LOCAL) as test_client:
+        assert test_client.get("/healthz", headers={"Host": "horae_app:8080"}).status_code == 200
+        assert test_client.get("/healthz", headers={"Host": "other_app"}).status_code == 400
+
+
 @pytest.mark.parametrize(
     ("value", "normalised"),
     [
@@ -513,6 +686,7 @@ def test_several_host_headers_are_refused(client: TestClient) -> None:
         ("[::1]", "::1"),
         ("10.0.0.5", "10.0.0.5"),
         ("horae", "horae"),
+        ("horae_app", "horae_app"),
     ],
 )
 def test_allowed_hosts_are_normalised(value: str, normalised: str) -> None:

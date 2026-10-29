@@ -79,10 +79,14 @@ if TYPE_CHECKING:  # imported when serving only: the other commands never load F
     from horae.api import ApiServer
 
 logger = logging.getLogger("horae.scheduler")
+api_logger = logging.getLogger("horae.api")
+"""The API's logger (refused `Host` values, `horae.api._app`): shown on stderr like the
+scheduler's."""
 
 DEFAULT_HOST = "127.0.0.1"
 """The HTTP API listens on loopback unless told otherwise (`--host`, `HORAE_HOST`)."""
 DEFAULT_PORT = 8080
+WILDCARD_HOSTS = frozenset({"0.0.0.0", "::", ""})  # noqa: S104 (compared, not bound)
 
 _SIGNALS = (signal.SIGTERM, signal.SIGINT)
 
@@ -267,7 +271,7 @@ def build_api(
     from horae.api import ApiContext, BindError, allowed_host, bind, build_server, create_app
 
     extra = [*allowed_hosts]
-    if host not in ("0.0.0.0", "::", ""):  # noqa: S104 (compared, not bound)
+    if host not in WILDCARD_HOSTS:
         extra.append(host)
     try:
         hosts = frozenset(allowed_host(value) for value in extra)
@@ -279,6 +283,20 @@ def build_api(
         raise CommandFailed(EXIT_PROBLEMS, "bind_failed", str(exc)) from None
     context = ApiContext(instance.store_path, instance.state_dir, scheduler.state, hosts)
     return build_server(create_app(context), sock)
+
+
+def warn_if_no_allowed_host(host: str, allowed_hosts: Sequence[str]) -> None:
+    """Warn (decision 51 G2) when the API listens on every interface (`0.0.0.0`, `::`: the
+    container, for the proxy) but accepts loopback `Host` values only: every request through
+    the proxy would be refused, while the loopback `HEALTHCHECK` stays green. A warning, not
+    a refusal: `HORAE_HOST=0.0.0.0` with only loopback clients is still a valid setup."""
+    if host in WILDCARD_HOSTS and not allowed_hosts:
+        logger.warning(
+            "api: listening on every interface (%s) with no allowed host: requests through "
+            "the proxy are refused (400) until HORAE_ALLOWED_HOSTS (or --allowed-host) names "
+            "its public hostname; only localhost, 127.0.0.1 and ::1 are served",
+            host or "0.0.0.0",  # noqa: S104 (shown, not bound)
+        )
 
 
 def _serve(
@@ -294,10 +312,12 @@ def _serve(
     api = build_api(instance, scheduler, host, port, allowed_hosts)
     handler = logging.StreamHandler(sys.stderr)
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-    previous = logger.level
-    logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
+    previous = [(each, each.level) for each in (logger, api_logger)]
+    for each, _ in previous:
+        each.addHandler(handler)
+        each.setLevel(logging.INFO)
     try:
+        warn_if_no_allowed_host(host, allowed_hosts)
         triggered = scheduler.state().pipelines
         if scheduler.mode == "builtin":
             echo(
@@ -316,8 +336,9 @@ def _serve(
         code = runner(serve_until_signal(scheduler, api=api))
     finally:
         api.sock.close()
-        logger.removeHandler(handler)
-        logger.setLevel(previous)
+        for each, level in previous:
+            each.removeHandler(handler)
+            each.setLevel(level)
     echo("horae serve: stopped" + ("" if code == EXIT_OK else " (forced)"), err=True)
     return code
 

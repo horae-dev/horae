@@ -16,30 +16,42 @@ binds to loopback by default.
   filtered by `pipeline` and `status`; live skill evals only with `all=true` or their
   `pipeline`. `next_cursor` (opaque) gives the next page, `null` on the last one.
   `/runs/{id}` is one run, the same object (`404` when unknown).
-- **Store access**: each request opens the store read-only (`Store.open(read_only=True)`:
-  no migration, no write; a WAL reader never blocks the scheduler's writes) in a worker
-  thread, never on the event loop.
+- **Store access**: each request opens the store read-only, plain `mode=ro`
+  (`Store.open(read_only=True, immutable=False)`: no migration, no write; a WAL reader with
+  SQLite's locks, so a run that writes and checkpoints in this process never tears a read,
+  and the reader never blocks it) in a worker thread, never on the event loop. `/runs` uses
+  the shared worker pool; `/healthz` is asynchronous and reads the store in its own small
+  executor, so a pool busy with slow `/runs` requests does not fail the health check.
 - **No secrets in responses**: every response body, errors included, is redacted as data
   then as text with the process registry (`horae.secrets.redact.current()`), as the CLI's
   JSON is. Error bodies are written by Horae (`{schema_version, error: {kind, message}}`)
   and never echo a request value, a path or an exception's message.
 - **Headers**: `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`,
   `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`,
-  `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY` on every response; no CORS; the
-  OpenAPI document and the docs pages are disabled.
+  `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY` on every response from the app
+  (uvicorn's own replies to a malformed request, before the app runs, have none); no CORS;
+  the OpenAPI document and the docs pages are disabled; no slash redirect (`/runs/` is
+  `404`, never a redirect).
 - **Host check (DNS rebinding)**: a request whose `Host` is not an allowed host is `400
-  invalid_host` before any route runs (the host is never echoed). Allowed: `localhost`,
-  `127.0.0.1`, `::1` and the hosts `horae serve` is given (`--allowed-host`, the proxy's
-  public hostname), any port. A web page that rebinds its own name to 127.0.0.1 sends its
-  own name as `Host`, so it cannot read the API from the user's browser.
+  invalid_host` before any route runs (the host is never echoed in the response). Allowed:
+  `localhost`, `127.0.0.1`, `::1` and the hosts `horae serve` is given (`--allowed-host`,
+  the proxy's public hostname), any port. A web page that rebinds its own name to 127.0.0.1
+  sends its own name as `Host`, so it cannot read the API from the user's browser. Each
+  refused `Host` value is logged once (warning, `horae.api`; sanitised, truncated, at most
+  `MAX_LOGGED_HOSTS` distinct values), so a misconfigured proxy is visible in the logs even
+  though the loopback `HEALTHCHECK` stays green.
 """
 
+import asyncio
 import base64
 import binascii
 import ipaddress
 import json
+import logging
 import re
+import threading
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -54,7 +66,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from horae import __version__
 from horae.apply.render import dumps
-from horae.run_view import run_json, stale_flags
+from horae.run_view import RunStatusFilter, run_json, stale_flags
 from horae.scheduler import SchedulerState
 from horae.secrets.redact import current as current_redactor
 from horae.store import (
@@ -62,8 +74,9 @@ from horae.store import (
     SchemaTooOldError,
     Store,
     StoreError,
-    StoreRunStatus,
 )
+
+logger = logging.getLogger("horae.api")
 
 API_SCHEMA_VERSION = 1
 """`schema_version` of every API document."""
@@ -72,6 +85,11 @@ MAX_PAGE = 100
 """The largest `limit` of `/runs`."""
 MAX_CURSOR = 512
 """The longest cursor accepted (characters)."""
+MAX_LOGGED_HOSTS = 32
+"""How many distinct refused `Host` values are logged (then one last line says it stops)."""
+MAX_LOGGED_HOST_CHARS = 64
+"""How much of a refused `Host` value is logged."""
+INVALID_HOST_MESSAGE = "host not allowed (see HORAE_ALLOWED_HOSTS)"
 
 SECURITY_HEADERS: dict[str, str] = {
     "cache-control": "no-store",
@@ -114,7 +132,9 @@ def _error(status: int, kind: str, message: str) -> RedactedJSON:
 
 
 class SecurityHeaders:
-    """Adds `SECURITY_HEADERS` to every HTTP response (also those Horae did not build)."""
+    """Adds `SECURITY_HEADERS` to every HTTP response from the app (also those Horae did not
+    build, such as Starlette's own errors; not uvicorn's replies to a request it could not
+    parse, which never reach the app)."""
 
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
@@ -144,25 +164,34 @@ def encode_cursor(started_at: datetime, run_id: str) -> str:
     return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii").rstrip("=")
 
 
+_CURSOR_TIME = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{6})?\+00:00$")
+"""A start time as `encode_cursor` writes it (the store's times are UTC)."""
+
+
 def decode_cursor(cursor: str) -> tuple[datetime, str] | None:
-    """`(started_at, run_id)`, or `None` for a cursor this API did not make."""
+    """`(started_at, run_id)`, or `None` for a cursor this API did not make.
+
+    Total: whatever `cursor` holds, it returns or gives `None`, never raises. Only the exact
+    shape `encode_cursor` writes is accepted (canonical base64url, a two-string JSON array,
+    a UTC time in `isoformat`'s form, a run id of 1 to 128 characters, re-encoding to the
+    same cursor), so no time zone arithmetic can overflow later."""
     try:
+        if not cursor.isascii():
+            return None
         raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
         value = json.loads(raw.decode("utf-8"))
-    except (binascii.Error, ValueError):
-        return None
-    if not (
-        isinstance(value, list)
-        and len(value) == 2
-        and all(isinstance(part, str) for part in value)
-        and 1 <= len(value[1]) <= 128
-    ):
-        return None
-    try:
+        if not (
+            isinstance(value, list)
+            and len(value) == 2
+            and all(isinstance(part, str) for part in value)
+            and 1 <= len(value[1]) <= 128
+            and _CURSOR_TIME.match(value[0])
+        ):
+            return None
         started = datetime.fromisoformat(value[0])
-    except ValueError:
-        return None
-    if started.tzinfo is None or started.utcoffset() is None:
+        if encode_cursor(started, value[1]) != cursor:
+            return None
+    except (binascii.Error, ValueError, OverflowError, TypeError, RecursionError):
         return None
     return started, value[1]
 
@@ -170,13 +199,15 @@ def decode_cursor(cursor: str) -> tuple[datetime, str] | None:
 DEFAULT_ALLOWED_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 """The `Host` values always accepted (loopback: the container's HEALTHCHECK, a local client)."""
 _HOSTNAME = re.compile(
-    r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$"
+    r"^[a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?(\.[a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?)*$"
 )
+"""DNS labels, `_` allowed too (Docker service and container names: `horae_app`)."""
 
 
 def allowed_host(value: str) -> str:
     """`value` as an allowed host (lower case, no trailing dot, an IPv6 address without its
-    brackets), or `ValueError`: a DNS name or an IP address, no port, wildcard or path."""
+    brackets), or `ValueError`: a DNS name (`_` allowed, as in Docker service names) or an
+    IP address, no port, wildcard or path."""
     host = value.strip().lower()
     if host.startswith("[") and host.endswith("]"):
         host = host[1:-1]
@@ -212,19 +243,50 @@ def host_of(header: str | None) -> str | None:
         return None
 
 
+def _loggable(values: list[bytes]) -> str:
+    """The `Host` value(s) of a refused request, safe for one log line: printable ASCII only
+    (`ascii()` escapes control, bidi and other non-ASCII characters), truncated."""
+    if not values:
+        return "(none)"
+    text = ", ".join(value.decode("latin-1") for value in values)
+    cut = text[:MAX_LOGGED_HOST_CHARS]
+    return ascii(cut) + ("..." if len(text) > len(cut) else "")
+
+
 class HostCheck:
-    """Refuses (`400 invalid_host`) an HTTP request whose `Host` is not in `allowed`."""
+    """Refuses (`400 invalid_host`) an HTTP request whose `Host` is not in `allowed`, and
+    logs each refused value once (at most `MAX_LOGGED_HOSTS` of them)."""
 
     def __init__(self, app: ASGIApp, allowed: frozenset[str]) -> None:
         self.app = app
         self.allowed = allowed
+        self._logged: set[str] = set()
+        self._full = False
+
+    def _log_refused(self, values: list[bytes]) -> None:
+        # Called on the event loop only: no lock needed for the set.
+        shown = _loggable(values)
+        if shown in self._logged or self._full:
+            return
+        if len(self._logged) >= MAX_LOGGED_HOSTS:
+            self._full = True
+            logger.warning("api: more refused Host values; not logging them any more")
+            return
+        self._logged.add(shown)
+        # Through the process's redacting log record factory, like every record.
+        logger.warning(
+            "api: refused a request for Host %s (not an allowed host: set HORAE_ALLOWED_HOSTS "
+            "or --allowed-host to the proxy's public hostname)",
+            shown,
+        )
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "http":
             values = [v for k, v in scope.get("headers", []) if k.lower() == b"host"]
             host = host_of(values[0].decode("latin-1")) if len(values) == 1 else None
             if host is None or host not in self.allowed:
-                await _error(400, "invalid_host", "invalid host")(scope, receive, send)
+                self._log_refused(values)
+                await _error(400, "invalid_host", INVALID_HOST_MESSAGE)(scope, receive, send)
                 return
         await self.app(scope, receive, send)
 
@@ -246,7 +308,7 @@ def _store_health(path: Path) -> tuple[dict[str, Any], bool]:
         return {"status": "error", "reason": "missing", "schema_version": None}, False
     reason: StoreReason
     try:
-        with Store.open(path, read_only=True) as store:
+        with Store.open(path, read_only=True, immutable=False) as store:
             version = store.schema_version
     except SchemaTooOldError:
         reason = "schema_too_old"
@@ -259,6 +321,20 @@ def _store_health(path: Path) -> tuple[dict[str, Any], bool]:
     return {"status": "error", "reason": reason, "schema_version": None}, False
 
 
+_health_lock = threading.Lock()
+_health_executor: ThreadPoolExecutor | None = None
+
+
+def _health_pool() -> ThreadPoolExecutor:
+    """The executor of `/healthz`'s store check: two threads of its own, shared by every app,
+    so the check never waits for the worker pool `/runs` uses."""
+    global _health_executor
+    with _health_lock:
+        if _health_executor is None:
+            _health_executor = ThreadPoolExecutor(2, thread_name_prefix="horae-healthz")
+        return _health_executor
+
+
 def create_app(context: ApiContext) -> FastAPI:
     """The API's ASGI application (see the module docstring)."""
     app = FastAPI(
@@ -268,6 +344,7 @@ def create_app(context: ApiContext) -> FastAPI:
         docs_url=None,
         redoc_url=None,
         default_response_class=RedactedJSON,
+        redirect_slashes=False,  # `/runs/` is a 404, not a redirect to `/runs`
     )
     # The last added runs first: the headers wrap everything, the host check runs before
     # any route.
@@ -305,8 +382,15 @@ def create_app(context: ApiContext) -> FastAPI:
         return _error(500, "internal", message)
 
     @app.get("/healthz")
-    def healthz() -> Response:
-        store, store_ok = _store_health(context.store_path)
+    async def healthz() -> Response:
+        # Asynchronous: the store check runs in `/healthz`'s own executor (never on the loop,
+        # never queued behind `/runs` in the shared pool), and `Scheduler.state()` is read on
+        # the event loop, the scheduler's own (`horae serve` runs both in one loop), so the
+        # snapshot cannot interleave with the scheduler changing it.
+        loop = asyncio.get_running_loop()
+        store, store_ok = await loop.run_in_executor(
+            _health_pool(), _store_health, context.store_path
+        )
         scheduler = context.scheduler_state()
         alive = scheduler.active or scheduler.mode == "external"
         healthy = store_ok and alive
@@ -322,7 +406,7 @@ def create_app(context: ApiContext) -> FastAPI:
     def _read(read: Callable[[Store], Any]) -> Any:
         if not context.store_path.is_file():
             return None
-        with Store.open(context.store_path, read_only=True) as store:
+        with Store.open(context.store_path, read_only=True, immutable=False) as store:
             return read(store)
 
     @app.get("/runs")
@@ -330,7 +414,7 @@ def create_app(context: ApiContext) -> FastAPI:
         limit: Annotated[int, Query(ge=1, le=MAX_PAGE)] = DEFAULT_PAGE,
         cursor: Annotated[str | None, Query(min_length=1, max_length=MAX_CURSOR)] = None,
         pipeline: Annotated[str | None, Query(min_length=1, max_length=64)] = None,
-        status: StoreRunStatus | None = None,
+        status: RunStatusFilter | None = None,
         all_runs: Annotated[bool, Query(alias="all")] = False,
     ) -> Response:
         before = None
@@ -340,7 +424,7 @@ def create_app(context: ApiContext) -> FastAPI:
             found = _read(
                 lambda store: store.list_runs(
                     pipeline=pipeline,
-                    status=status,
+                    status=None if status is None else status.value,
                     limit=limit + 1,
                     evals=all_runs or pipeline is not None,
                     before=before,
@@ -377,7 +461,9 @@ __all__ = [
     "API_SCHEMA_VERSION",
     "DEFAULT_ALLOWED_HOSTS",
     "DEFAULT_PAGE",
+    "INVALID_HOST_MESSAGE",
     "MAX_CURSOR",
+    "MAX_LOGGED_HOSTS",
     "MAX_PAGE",
     "SECURITY_HEADERS",
     "ApiContext",

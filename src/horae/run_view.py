@@ -8,11 +8,25 @@ redact the document before they send it (`horae.cli_output.to_json`, the API's r
 
 from collections.abc import Sequence
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
 from horae.runner import lock_is_free
 from horae.store import RunSummary
+
+
+class RunStatusFilter(StrEnum):
+    """The statuses a listing filters on: `horae runs --status` and the API's `/runs?status=`
+    accept the same values (schemas decision 51 D). `stale` is not one: it is a flag computed
+    from the pipeline locks after the store's query (`stale_flags`), not a stored status."""
+
+    running = "running"
+    ok = "ok"
+    noop = "noop"
+    degraded = "degraded"
+    failed = "failed"
+    undone = "undone"
 
 
 def iso(value: datetime | None) -> str | None:
@@ -51,4 +65,4 @@ def run_json(run: RunSummary, stale: bool) -> dict[str, Any]:
     }
 
 
-__all__ = ["iso", "run_json", "stale_flags"]
+__all__ = ["RunStatusFilter", "iso", "run_json", "stale_flags"]

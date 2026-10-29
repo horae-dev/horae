@@ -4,6 +4,7 @@ ephemeral loopback port, the stop together with the scheduler on SIGTERM (the tw
 of decision 49 E2), and a port that cannot be bound."""
 
 import asyncio
+import logging
 import os
 import signal
 import socket
@@ -19,7 +20,13 @@ from horae import cli_serve
 from horae.api import ApiServer, BindError, bind
 from horae.cli import EXIT_INTERNAL, EXIT_OK, EXIT_PROBLEMS, EXIT_SIGTERM, EXIT_USAGE, app
 from horae.cli_output import CommandFailed
-from horae.cli_serve import build_api, build_scheduler, prepare_store, serve_until_signal
+from horae.cli_serve import (
+    build_api,
+    build_scheduler,
+    prepare_store,
+    serve_until_signal,
+    warn_if_no_allowed_host,
+)
 from horae.config import load_instance
 from horae.scheduler import Scheduler
 from runner_fixtures import write_instance
@@ -181,3 +188,48 @@ def test_allowed_hosts_come_from_the_environment_too(
     )
     assert seen == [5]
     assert result.exit_code == EXIT_PROBLEMS
+
+
+@pytest.mark.parametrize(
+    ("host", "allowed", "warned"),
+    [
+        ("0.0.0.0", (), True),  # noqa: S104 (not bound)
+        ("::", (), True),
+        ("0.0.0.0", ("horae.example.org",), False),  # noqa: S104 (not bound)
+        ("127.0.0.1", (), False),
+        ("10.0.0.5", (), False),  # a specific address is an allowed host itself
+    ],
+)
+def test_a_wildcard_bind_without_an_allowed_host_warns(
+    caplog: pytest.LogCaptureFixture, host: str, allowed: tuple[str, ...], warned: bool
+) -> None:
+    with caplog.at_level(logging.WARNING, logger="horae.scheduler"):
+        warn_if_no_allowed_host(host, allowed)
+    found = [r.getMessage() for r in caplog.records if "HORAE_ALLOWED_HOSTS" in r.getMessage()]
+    assert bool(found) is warned
+    if warned:
+        assert host in found[0]
+
+
+def test_serve_warns_at_start_when_no_allowed_host_is_set_on_a_wildcard(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = cli_serve.serve_until_signal
+
+    async def stop_when_ready(
+        scheduler: Scheduler, on_ready: Callable[[], object] | None = None, **kwargs: Any
+    ) -> int:
+        loop = asyncio.get_running_loop()
+        on = lambda: loop.call_soon(os.kill, os.getpid(), signal.SIGTERM)  # noqa: E731
+        return await real(scheduler, on_ready=on, **kwargs)
+
+    monkeypatch.setattr(cli_serve, "serve_until_signal", stop_when_ready)
+    result = CliRunner().invoke(
+        app,
+        ["serve", "-i", str(root), "--host", "0.0.0.0", "--port", "0"],  # noqa: S104
+    )
+    assert result.exit_code == EXIT_OK, result.output
+    assert "WARNING api: listening on every interface (0.0.0.0) with no allowed host" in (
+        result.stderr
+    )
+    assert "HORAE_ALLOWED_HOSTS" in result.stderr

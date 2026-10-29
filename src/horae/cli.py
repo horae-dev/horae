@@ -11,7 +11,6 @@ import re
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import timedelta
-from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -59,7 +58,7 @@ from horae.config import (
 from horae.contracts import InstanceConfig, RunRecord
 from horae.llm.deid import load_deidentifier
 from horae.replay import LockRegistry, ReplayResult, definition_for, replay
-from horae.run_view import iso, run_json, stale_flags
+from horae.run_view import RunStatusFilter, iso, run_json, stale_flags
 from horae.secrets import logs
 from horae.skills import DirectorySkills
 from horae.store import MAX_LIST_RUNS, RunSummary, Store, StoreError
@@ -195,15 +194,6 @@ def doctor(
 
 RUNS_SCHEMA_VERSION = 1
 """Version of the `horae runs --json` report."""
-
-
-class RunStatusFilter(StrEnum):
-    running = "running"
-    ok = "ok"
-    noop = "noop"
-    degraded = "degraded"
-    failed = "failed"
-    undone = "undone"
 
 
 def _duration(value: timedelta | None) -> str:
