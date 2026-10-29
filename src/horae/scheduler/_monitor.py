@@ -80,17 +80,54 @@ def ping_url(url: str, monitor: PushMonitor, outcome: RunOutcome, duration_s: fl
     )
 
 
-def _reason(error: Exception) -> str:
-    """A closed description of a failed exchange (never the exception's message)."""
+Reason = Literal[
+    "timeout",
+    "refused",
+    "unreadable",
+    "connection",
+    "unresolved",
+    "not_a_push_url",
+    "status",
+    "error",
+]
+"""Why a ping failed: a closed set, logged through `REASONS` (never the URL, the response or
+an exception's message)."""
+REASONS: Mapping[Reason, str] = {
+    "timeout": "timed out",
+    "refused": "refused: the http:// host does not resolve to a LAN address",
+    "unreadable": "an unreadable or oversized response",
+    "connection": "connection failed",
+    "unresolved": "its secret could not be resolved",
+    "not_a_push_url": "its secret is not an https:// URL or an http:// URL on the LAN",
+    "status": "the monitor answered an error status",
+    "error": "an unexpected error",
+}
+
+
+@dataclass(frozen=True)
+class _Failure:
+    reason: Reason
+    status: int = 0
+    """The HTTP status, for `status`."""
+
+
+def _reason(error: Exception) -> Reason:
+    """The closed reason of a failed exchange (never the exception's message)."""
     if isinstance(error, httpx2.TimeoutException | TimeoutError):
-        return "timed out"
+        return "timeout"
     if isinstance(error, Refused):
-        return "refused: the http:// host does not resolve to a LAN address"
+        return "refused"
     if isinstance(error, Unreadable):
-        return "an unreadable or oversized response"
+        return "unreadable"
     if isinstance(error, httpx2.TransportError):
-        return "connection failed"
-    return f"error {type(error).__name__}"
+        return "connection"
+    return "error"
+
+
+def _describe(failure: _Failure) -> str:
+    """`failure` in Horae's own words: a fixed text, and the status code for `status`."""
+    text = REASONS[failure.reason]
+    return f"{text} {failure.status:d}" if failure.reason == "status" else text
 
 
 async def ping(
@@ -110,17 +147,17 @@ async def ping(
         return "none"
     logs.install()
     try:
-        reason = await _send(instance, monitor, outcome, duration_s, inner, environ)
+        failure = await _send(instance, monitor, outcome, duration_s, inner, environ)
     except Exception as exc:  # pragma: no cover - `_send` handles its own errors
-        reason = _reason(exc)
+        failure = _Failure(_reason(exc))
         del exc
-    if reason is None:
+    if failure is None:
         return "sent"
     logger.warning(
         "push monitor of pipeline %s: the %s ping failed (%s); the run is not affected",
         pipeline,
         "up" if outcome.up else "down",
-        reason,
+        _describe(failure),
     )
     return "failed"
 
@@ -132,15 +169,15 @@ async def _send(
     duration_s: float,
     inner: httpx2.AsyncBaseTransport | None,
     environ: Mapping[str, str] | None,
-) -> str | None:
-    """`None` when the monitor answered 2xx, else the reason."""
+) -> _Failure | None:
+    """`None` when the monitor answered 2xx, else why not."""
     try:
         secret = instance.secret_resolver(environ).resolve(monitor.secret)
     except SecretError:
-        return f"secret {monitor.secret} could not be resolved"
+        return _Failure("unresolved")
     url = secret.reveal()
     if not is_push_url(url):  # the check `horae doctor` makes; the value is never shown
-        return f"secret {monitor.secret} is not an https:// URL or an http:// URL on the LAN"
+        return _Failure("not_a_push_url")
     target = ping_url(url, monitor, outcome, duration_s)
     error: Exception | None = None
     status = 0
@@ -168,17 +205,19 @@ async def _send(
     if error is not None:
         reason = _reason(error)
         del error
-        return reason
+        return _Failure(reason)
     if not 200 <= status < 300:
-        return f"status {status}"
+        return _Failure("status", status)
     return None
 
 
 __all__ = [
     "PING_RESPONSE_CAP",
     "PING_TIMEOUT_S",
+    "REASONS",
     "UP_STATUSES",
     "PingResult",
+    "Reason",
     "RunOutcome",
     "ping",
     "ping_url",

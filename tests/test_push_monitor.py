@@ -258,8 +258,12 @@ def _assert_quiet(result: Any, caplog: pytest.LogCaptureFixture, reason: str) ->
 @pytest.mark.parametrize(
     ("status", "headers", "reason"),
     [
-        (500, {}, "status 500"),
-        (302, {"location": "http://127.0.0.1:1/elsewhere"}, "status 302"),
+        (500, {}, "the monitor answered an error status 500"),
+        (
+            302,
+            {"location": "http://127.0.0.1:1/elsewhere"},
+            "the monitor answered an error status 302",
+        ),
         (200, {"content-length": str(10 << 20)}, "an unreadable or oversized response"),
     ],
 )
@@ -341,7 +345,7 @@ def test_a_url_outside_the_network_rules_is_refused_without_showing_it(
     root = _root(tmp_path, monkeypatch, value)
     with caplog.at_level(logging.WARNING):
         result = _invoke("run", "collect", "-i", str(root), "--json")
-    _assert_quiet(result, caplog, "secret PUSH_URL is not an https:// URL")
+    _assert_quiet(result, caplog, "its secret is not an https:// URL")
 
 
 def test_an_unresolvable_secret_is_a_warning(
@@ -355,7 +359,7 @@ def test_an_unresolvable_secret_is_a_warning(
     with caplog.at_level(logging.WARNING):
         result = _invoke("run", "collect", "-i", str(root), "--json")
     assert result.exit_code == EXIT_OK
-    assert "secret PUSH_URL could not be resolved" in caplog.text
+    assert "its secret could not be resolved" in caplog.text
 
 
 def test_a_run_that_could_not_begin_pings_down_with_its_error_kind(
