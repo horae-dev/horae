@@ -48,7 +48,16 @@ dev = [
     "types-regex>=2024.11",
     "ruff>=0.17",
     "hypothesis>=6.100",
+    "horae-sdk",
 ]
+
+# The plugin SDK (`sdk/`, published as `horae-sdk`) is a workspace member: one lock, and the
+# core's lint, types and tests cover it. Coverage is gated per package (below).
+[tool.uv.workspace]
+members = ["sdk"]
+
+[tool.uv.sources]
+horae-sdk = { workspace = true }
 
 [tool.uv]
 required-version = ">=0.13"
@@ -57,7 +66,7 @@ exclude-newer = "7 days"
 [tool.ruff]
 line-length = 100
 target-version = "py312"
-src = ["src", "tests", "scripts"]
+src = ["src", "tests", "scripts", "sdk/src", "sdk/tests", "sdk/examples"]
 extend-exclude = ["tools"]
 
 [tool.ruff.lint]
@@ -65,16 +74,17 @@ select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "S", "PT"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101"]
+"sdk/tests/**" = ["S101"]
 
 [tool.mypy]
 strict = true
-files = ["src", "tests", "scripts"]
+files = ["src", "tests", "scripts", "sdk/src", "sdk/tests", "sdk/examples"]
 python_version = "3.12"
 warn_unreachable = true
 enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "sdk/tests"]
 addopts = "-ra --strict-config --strict-markers"
 xfail_strict = true
 markers = [
@@ -83,10 +93,14 @@ markers = [
 filterwarnings = ["error"]
 
 [tool.coverage.run]
-source = ["horae"]
+source = ["horae", "horae_sdk"]
 branch = true
 
+# Both packages are measured, but the report (and the 85% gate of `pytest --cov`) is the core's
+# alone, so the SDK's tests cannot carry it. CI gates the SDK separately on the same data:
+# `coverage report --include='sdk/src/horae_sdk/*' --fail-under=85`.
 [tool.coverage.report]
+include = ["src/horae/*"]
 fail_under = 85
 show_missing = true
 exclude_also = ["if TYPE_CHECKING:"]
