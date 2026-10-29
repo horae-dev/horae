@@ -112,7 +112,7 @@ jobs:
           python3 -m zipfile -l dist/horae_sdk-*.whl | tee "${RUNNER_TEMP}/wheel.txt"
           grep -q 'horae_sdk/py.typed' "${RUNNER_TEMP}/wheel.txt"
           grep -q 'licenses/LICENSE' "${RUNNER_TEMP}/wheel.txt"
-      - name: Check the sdist (no tests: they need the core)
+      - name: "Check the sdist (no tests: they need the core)"
         run: |
           set -euo pipefail
           tar -tzf dist/horae_sdk-*.tar.gz | tee "${RUNNER_TEMP}/sdist.txt"
