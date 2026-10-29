@@ -17,6 +17,8 @@ dependencies = [
     "jsonschema>=4.26,<4.27",
     "referencing>=0.35",
     "cronsim>=2.7,<3",
+    "fastapi>=0.161,<0.162",
+    "uvicorn>=0.54,<0.55",
 ]
 
 [project.scripts]
