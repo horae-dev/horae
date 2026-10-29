@@ -122,6 +122,14 @@ if "${run[@]}" --entrypoint python "$image" -m pip --version > /dev/null 2>&1; t
 fi
 echo "ok: no pip, ensurepip, uv or build tools"
 
+# --- only the core is installed ----------------------------------------------------------------
+# horae-sdk (sdk/, a uv workspace member) is a dev dependency of the core: `uv sync --no-dev`
+# leaves it out, and the build context does not even hold sdk/ (.dockerignore).
+found="$("${run[@]}" --entrypoint python "$image" -c 'import importlib.util as u
+print(" ".join(n for n in ("horae", "horae_sdk") if u.find_spec(n) is not None))')"
+[ "$found" = "horae" ] || fail "installed top-level packages: '${found}' (expected only horae)"
+echo "ok: horae is installed, horae-sdk is not"
+
 # --- an instance on a volume: init, doctor, run ----------------------------------------------
 # A new named volume takes the image's /instance ownership (10001, mode 0700).
 new_volume

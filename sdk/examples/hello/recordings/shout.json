@@ -1,0 +1,5 @@
+{
+  "tool": "hello.shout",
+  "input": {"greeting": "Hello, Ada!", "count": 2},
+  "expect": {"data": {"greeting": "HELLO, ADA!", "count": 2}, "intents": []}
+}

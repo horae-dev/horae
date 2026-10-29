@@ -26,6 +26,10 @@ ENV UV_LINK_MODE=copy \
     UV_PROJECT_ENVIRONMENT=/opt/venv
 WORKDIR /build
 # Dependencies first, from the lockfile only: this layer is reused until uv.lock changes.
+# The lock also holds the workspace member horae-sdk (sdk/), which is only a dev dependency of the
+# core: with --frozen uv reads the lock as it is, never the members' pyproject.toml, and --no-dev
+# leaves the SDK out, so sdk/ is not part of the build context (.dockerignore). The smoke test
+# checks the SDK is not in the image.
 COPY pyproject.toml uv.lock ./
 # The uv cache is a BuildKit cache mount: kept between builds, never part of a layer.
 RUN --mount=type=cache,target=/root/.cache/uv \

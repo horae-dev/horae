@@ -1,4 +1,5 @@
-# Default deny: the build context is only what the Dockerfile copies.
+# Default deny: the build context is only what the Dockerfile copies. sdk/ (the horae-sdk workspace
+# member, a dev dependency only) stays out: `uv sync --frozen --no-dev` does not need it.
 *
 !pyproject.toml
 !uv.lock
