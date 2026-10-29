@@ -1640,6 +1640,42 @@ loosened later without breaking a valid file.
       accepted residual), **E** (the first live run with positive controls in the PR body is
       the merge gate) and **F** (`CLAUDE_CODE_MAX_OUTPUT_TOKENS`), pending the maintainer's
       review like the rest of this decision.
+    - **Amendment (#113, live run)**: the first live run against Claude Code 2.1.284 (the
+      `haiku` alias) found three things the fake did not show; the rules above are amended
+      as follows, and with them the whole live test passes (17 tests, every positive control
+      fired). (1) **Code fences.** With Horae's system prompt the model answers
+      ```` ```json ```` fenced JSON (also with thinking off), which the strict "one JSON
+      value" rule refused. A `result` that is **exactly one** enclosing Markdown code fence
+      (an optional `json` info string, any case, whitespace around it) around one JSON value
+      is now accepted (`claude_cli.unfenced`); prose before or after it, two fences or a
+      fence inside text stay `output_invalid`. `SYSTEM_PREAMBLE` is unchanged (it is shared by
+      every backend and part of the LLM cache key). `--json-schema` (the CLI's structured
+      output) was considered and **rejected**: it works through an internal
+      `StructuredOutput` tool (`num_turns: 2`, `stop_reason: "tool_use"`), which breaks the
+      one-turn, no-tool invariants. (2) **Thinking.** The model thinks by default: an
+      `{"ok": true}` answer cost 126 output tokens (115 of them thinking) and, at a 64-token
+      limit, took a hidden second turn. `MAX_THINKING_TOKENS=0` joins the switches (B): 13
+      output tokens, `thinking_tokens: 0`, one turn, and `max_tokens` bounds the answer
+      itself (live-tested with a control: without the switch, the same call thinks). (3)
+      **The output limit.** An answer longer than `max_tokens` is not cut: Claude Code
+      retries the truncated output on its own up to 3 times, then exits 1 with `is_error`,
+      `subtype: "success"`, no `api_error_status`, `num_turns: 4` and `output_tokens` 4 ×
+      `max_tokens` (256 at 64). So one call can bill **4 outputs** of `max_tokens`: a
+      provider backend now declares `output_attempts` (1 when absent, read defensively;
+      `claude-cli`: `OUTPUT_ATTEMPTS = 4`), carried on `PreparedRequest` and
+      `RenderedRequest`; `worst_case` (decision 41) reserves `output_attempts × max_tokens`
+      output tokens, and `max_tokens` divides the step's remaining `tokens_out` and `usd` by
+      it so that the reservation still fits the step's budget (a `claude-cli` step with
+      `tokens_out: 2000` gets `max_tokens` 500; the alias' `max_output_tokens` caps each
+      output, not divided). The conservative charge and the stdout cap cover 4 outputs too.
+      On a success the bound stays `max_tokens` (`num_turns` must be 1: one output). An
+      `is_error` result with no HTTP status whose reported `output_tokens` is at least
+      `max_tokens` is now `output_invalid` ("the output was truncated at the limit", on the
+      reported count, never the CLI's text), charged its reported usage; it was
+      `host_error`. The live output-limit test also checks the reported output is at most
+      4 × `max_tokens`. The same run printed that `--restricted` and `--safe-mode` keep token
+      auth (a success) and `--bare` does not ("Not logged in"); none is adopted (B: a
+      separate decision).
 
 ### Provisional decisions (#53, pending maintainer review)
 
