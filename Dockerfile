@@ -98,6 +98,9 @@ EXPOSE 8080
 # runs; 503 or no answer: unhealthy) with the standard library: no curl or wget in the image, and
 # no proxy (ProxyHandler({}) ignores *_PROXY). Any error, a 503 included, exits 1. A container
 # running another command (init, doctor, run) reports unhealthy, which is harmless for a one-off.
+# The check follows HORAE_PORT, not a `--port` flag: change the port with HORAE_PORT (a `serve
+# --port N` command makes the check ask the wrong port and the container unhealthy). It asks
+# 127.0.0.1: with HORAE_HOST=:: (IPv6 only, IPV6_V6ONLY) or another specific address, override it.
 HEALTHCHECK --interval=60s --timeout=10s --start-period=20s --retries=3 \
     CMD ["python", "-c", "import os, urllib.request as u; u.build_opener(u.ProxyHandler({})).open('http://127.0.0.1:' + os.environ.get('HORAE_PORT', '8080') + '/healthz', timeout=5)"]
 
