@@ -56,6 +56,7 @@ from horae.llm.base import (
     ProviderBackend,
     RenderedRequest,
     Validator,
+    output_attempts,
     production_validator,
 )
 from horae.llm.deid import Deidentifier, Pseudonymized, field_classes
@@ -504,6 +505,10 @@ class _Replay:
     def may_write_cache(self) -> bool:
         return getattr(self._inner, "may_write_cache", False) is True
 
+    @property
+    def output_attempts(self) -> int:
+        return output_attempts(self._inner)
+
     def render(self, completion: Any) -> dict[str, Any]:
         return self._inner.render(completion)
 
@@ -639,6 +644,10 @@ class _Capture:
     @property
     def may_write_cache(self) -> bool:
         return getattr(self._inner, "may_write_cache", False) is True
+
+    @property
+    def output_attempts(self) -> int:
+        return output_attempts(self._inner)
 
     def render(self, completion: Any) -> dict[str, Any]:
         return self._inner.render(completion)
