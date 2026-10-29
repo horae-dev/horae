@@ -293,11 +293,11 @@ AuthHeader = Callable[[str], tuple[str, str]]
 
 REFUSAL_STOP_REASONS = frozenset({"refusal", "content_filter"})
 """Stop reasons (`CompletionResult.stop_reason`) of a refusal, across the built-in backends
-(`anthropic` `refusal`, `openai-compatible` `content_filter`)."""
+(`anthropic` and `claude-cli` `refusal`, `openai-compatible` `content_filter`)."""
 TRUNCATION_STOP_REASONS = frozenset(
     {"max_tokens", "model_context_window_exceeded", "length", "model_length"}
 )
-"""Stop reasons of a truncated output (`anthropic` `max_tokens` and
+"""Stop reasons of a truncated output (`anthropic` and `claude-cli` `max_tokens` and
 `model_context_window_exceeded`, `openai-compatible` `length` and `model_length`, `ollama`
 `length`). A live backend raises `output_invalid` on any of them; a replayed recording that
 carries one is refused the same way (`horae.evals`, schemas decision 48 D)."""

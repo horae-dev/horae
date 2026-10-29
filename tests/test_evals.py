@@ -7,7 +7,7 @@ import os
 import shutil
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import httpx2
 import pytest
@@ -320,7 +320,10 @@ def test_an_input_outside_the_view_is_an_error(pack: Path) -> None:
     assert document["cases"][0]["error"]["kind"] == "input_invalid"
 
 
-def test_a_backend_without_factory_is_an_error(pack: Path) -> None:
+def test_a_backend_without_factory_is_an_error(pack: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from horae.llm.backends import FACTORIES
+
+    monkeypatch.delitem(cast("dict[str, Any]", FACTORIES), "claude-cli")
     source = _recorded(pack, "tasks-only")
     target = _evals(pack) / "recorded" / "claude-cli" / "tasks-only.json"
     target.parent.mkdir()

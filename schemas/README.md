@@ -1475,7 +1475,7 @@ loosened later without breaking a valid file.
       the instance's time zone (a 23- or 25-hour day is one day);
     - **provider prompt caches**: a `ProviderBackend` declares `may_write_cache` (default
       `False`; `anthropic` is `False`, since Horae sends no `cache_control`; `claude-cli`
-      #29 is expected to be `True`). For such a backend the input bound is priced at the
+      is `True`, decision 42). For such a backend the input bound is priced at the
       cache write price (`cache_write_per_mtok`, else twice the input price) in both
       `max_tokens` and `worst_case`, so a settled call never exceeds its reservation; a
       backend without it that reports cache writes beyond the bound is flagged
@@ -1491,6 +1491,155 @@ loosened later without breaking a valid file.
     - **follow-ups**: a monthly ceiling; provider-side spend limits (#63); calling
       `prune_usage` from a retention setting.
 
+
+### Provisional decisions (#29, pending maintainer review)
+
+42. **The `claude-cli` backend with isolation (#29, the design note on
+    [#97](https://github.com/horae-dev/horae/pull/97); every recommendation accepted).**
+    One compatible v1 addition and the rules of `horae.llm.backends.claude_cli`. **Not a legal
+    assessment**: personal headless use of `claude -p` on your own plan is PLAN.md's ⚠️
+    unverified reading (risk #70); this backend is "personal use under your plan's terms",
+    and `anthropic` with an API key stays the recommended backend for published setups
+    ([ADR 0005](../docs/adr/0005-claude-cli-backend-and-its-terms.md)).
+    - **contract change** (optional): `models.<alias>.command`, an absolute path (no control
+      characters, at most 1024 characters), accepted for `backend: claude-cli` only (the model
+      and the JSON Schema both refuse it on another backend). Unset, `claude` is looked up on
+      the fixed child `PATH` (`/usr/local/bin:/usr/bin:/bin`), **never** Horae's own `PATH`
+      (answer 6). The native installer puts `claude` in `~/.local/bin`, which is not on it:
+      such setups set `command`. `command` must name the **native binary**: the npm package's
+      `claude` is a `#!/usr/bin/env node` script, and `node` is usually not on the fixed
+      `PATH`, so its `--version` fails; the error then says so (finding 9). Symlinks are
+      resolved when the backend first runs it, so one run uses one release;
+    - **token mode only (answer 1)**: the alias' `secret` (a `CLAUDE_CODE_OAUTH_TOKEN` made
+      with `claude setup-token`) is passed as `CLAUDE_CODE_OAUTH_TOKEN`, revealed into the
+      child's mapping only. The contract keeps `secret` optional (a login mode may come
+      later), but an alias without it is refused at the first call (`backend_unavailable`,
+      nothing runs) and by `horae doctor` (an error). A secret that cannot be resolved, or
+      holds a NUL, is `auth_failed`. Checked locally on 2.1.284: with an empty `HOME` and no
+      token the CLI answers "Not logged in" (no ambient login, keychain included, is used);
+    - **render, then send** (decision 38): the payload is `{argv, stdin, max_tokens}`;
+      `argv` is fixed but for the model and the system prompt, `stdin` holds the untrusted
+      input and the repair errors (fenced and escaped as for every backend; never in `argv`,
+      which `ps` shows), `max_tokens` the output budget (passed as
+      `CLAUDE_CODE_MAX_OUTPUT_TOKENS`, F; it also sizes the stdout cap, the usage floor and
+      the conservative charge). `send` refuses any other payload (`invalid_request`): `argv`
+      must have exactly the template's length and equal it item for item (a shorter or
+      longer list is refused before any item is read, finding 4). The system prompt (`SYSTEM_PREAMBLE`, then the skill's
+      trusted prompt) goes in `--system-prompt`, at most 64 KiB (`invalid_request`);
+    - **the flags (answer 3)**: `-p --output-format json --model <model> --tools ""
+      --strict-mcp-config --mcp-config {"mcpServers":{}} --setting-sources ""
+      --no-session-persistence --disable-slash-commands --permission-mode dontAsk
+      --max-turns 1 --system-prompt <system>`. On 2.1.284 every flag is listed by `claude
+      --help` but `--max-turns` (hidden), and every one is **accepted** by the parser (checked
+      locally with an empty `HOME`: an unknown option fails with `unknown option`, these do
+      not). Their **behaviour** is verified by the live test
+      (`tests/test_llm_claude_cli_live.py`, `@pytest.mark.live`, skipped unless
+      `HORAE_LIVE_CLAUDE=1` and a token are given, never in CI): no tool runs and none is
+      reported, user settings and their hooks are not loaded, user and project MCP servers
+      do not start, no `CLAUDE.md` reaches the model (in the working directory, in `HOME` or
+      in an ancestor of the workspace), the system prompt replaces the default one, no
+      transcript or memory is written, no ambient login is used, the output limit is
+      honoured. **Each negative assertion has a positive control** (finding 2): the same
+      source with the one flag or switch that removes it turned back on must fire its
+      canary first, else the test fails as broken for that release. **(E) merge gate, not
+      yet run live**: the maintainer runs the live test once and pastes its output into
+      #105's body before the flag set is final and the PR merges. `--bare`, `--restricted`
+      and `--safe-mode` are **not** in `argv` (B): `--bare`'s help says OAuth and the
+      keychain are never read under it, which seems to exclude token auth; the live test
+      prints what each does with the token (evaluation only) and one is adopted only once a
+      live run shows it keeps token auth;
+    - **the environment**: exactly `PATH` (the fixed one), `HOME` and `TMPDIR` (fresh empty
+      per-call directories, 0700), `LANG=C.UTF-8`, `TZ=UTC`, `DISABLE_AUTOUPDATER=1`,
+      `DISABLE_TELEMETRY=1`, `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`,
+      `CLAUDE_CODE_DISABLE_CLAUDE_MDS=1` and `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` (B),
+      `GIT_CEILING_DIRECTORIES` (the workspace root, C), `CLAUDE_CODE_MAX_OUTPUT_TOKENS` (the
+      call's `max_tokens`, F; not for the version check) and the token; nothing is inherited
+      (`ANTHROPIC_*`, `*_PROXY`, `NODE_OPTIONS`, `CLAUDE_CONFIG_DIR` never reach it), built on
+      the plugin host's `base_env`. **To verify live**: that the switches stop auto-update,
+      telemetry and non-essential traffic on the pinned release (not checkable from the
+      test: no network capture), that `CLAUDE_CODE_DISABLE_CLAUDE_MDS` and
+      `CLAUDE_CODE_DISABLE_AUTO_MEMORY` do what their names say (the `CLAUDE.md` and memory
+      live tests), and that `CLAUDE_CODE_MAX_OUTPUT_TOKENS` bounds the output (its live test;
+      a reported `output_tokens` above `max_tokens` is `output_invalid` anyway, see the
+      result);
+    - **the process** (the plugin host's posture, decision 35): an argument list (no shell),
+      the working directory an empty per-call directory, umask 077, a new session (its own
+      process group), the per-call directories removed afterwards, also when the caller
+      cancels the call (the group is killed first; finding 10). The step's timeout, then
+      `SIGTERM` to the group and `SIGKILL` 2 s later (`timeout`, no usage: the ledger keeps
+      the reservation as an estimate); stdout at most `response_cap(max_tokens)` bytes (1 to
+      8 MiB, the HTTP backends' body cap, T33; `output_invalid`, charged conservatively, the
+      group killed at once; finding 7); stderr captured head and tail (64 KiB), its tail
+      drained for at most 1 s after the exit before the reader stops (finding 8), and
+      redacted with every resolved secret before it reaches an `LlmError`;
+    - **(C) the workspace**: each call's `home`, `tmp` and `cwd` are in a fresh directory
+      under `<state_dir>/llm-runs` (Horae-owned, created 0700, refused when it is a symlink
+      or not this user's, made 0700 when looser), not the system temporary directory, which
+      other users share; `GIT_CEILING_DIRECTORIES` is that root, so git finds no repository
+      above it (the instance is often one). The factory receives it through
+      `horae.llm.backends.model_backends(work_dir=...)`, which `horae.runner.open_ports`
+      calls with `<state_dir>/llm-runs`; a backend built without one (a test, a library use,
+      `horae doctor`'s version check, which writes nothing in the state directory) falls back
+      to a fresh 0700 directory in the system temporary directory. A `CLAUDE.md` in the state
+      directory or the instance is an ancestor of the working directory: B's switch and
+      `--setting-sources ""` keep it out (live-tested with a control);
+    - **(D) managed settings**: administrator-managed settings (`/etc/claude-code/
+      managed-settings.json` and `managed-mcp.json` on Linux, the same names under
+      `/Library/Application Support/ClaudeCode/` on macOS) apply to every `claude` run and
+      no flag turns them off: they can add hooks, an environment and MCP servers. `horae
+      doctor` **warns** when one of them exists (by name; their contents are never read).
+      They, and remote-managed settings (pushed by an organisation's admin console, not
+      visible as a file), are an **accepted residual** of T11: they are set by the machine's
+      administrator or the plan's organisation, both already trusted with the token;
+    - **the version pin (answers 2, 7)**: `CLAUDE_CODE_VERSION_RANGE = ">=2.1.284,<2.2"`
+      (2.1.284 is the release checked). `<command> --version` runs once per backend (one per
+      alias per run), in the same isolated environment without the token; its output must be
+      `X.Y.Z (Claude Code)`. Outside the range, or unreadable, the alias is
+      `backend_unavailable` for the rest of the run and nothing is sent (when the command is
+      a `#!` script whose interpreter is not on the fixed `PATH`, the message names the
+      interpreter and says to point `command` at the native binary); `horae doctor` runs
+      the same check (an error). Bumping the range needs the live test's output for the new
+      release in the bump PR's body and the version in `docs/security.md` T11;
+    - **the result (answer 5)**: stdout must be UTF-8 and one JSON object (strict parsing)
+      with `type: "result"`. `is_error` (anything but `false`): `api_error_status` through the
+      HTTP status table, `error_max_turns` → `output_invalid`, a result starting "Not logged
+      in" → `auth_failed`, else `host_error` (no `error_max_budget_usd` mapping: Horae passes
+      no `--max-budget-usd`, so it is dead code until it does; finding 11); the usage is
+      attached only when the result reports spend (so a refusal releases its reservation,
+      decision 41). A non-zero exit without a result is `host_error`. A success needs
+      `subtype: "success"` (finding 5), `num_turns: 1`, no `permission_denials`, a stop reason
+      other than `tool_use` or `max_tokens`, a reported `output_tokens` no larger than
+      `max_tokens` (else the limit was not honoured: `output_invalid` with the usage as
+      reported, the conservative choice, which the ledger flags `over_reservation` when it
+      passes the reservation; finding 1), and a `result` that parses as one JSON value (no
+      fence stripping; `--json-schema` is not used, schema validation is #31's); any other
+      result is `output_invalid` with its usage. Messages are Horae's; the CLI's text never
+      is;
+    - **usage and cost (answer 4)**: tokens from `usage` (`input_tokens`, `output_tokens`,
+      cache reads and writes), floored as decision 40 K, charged conservatively when missing
+      or unusable. `total_cost_usd` (a finite number from 0 to 10⁶, else ignored) is notional
+      under a subscription but **counts** against the step and daily budgets: `usd` is the
+      larger of it and the alias' `price` applied to the tokens, and `priced` is `true` when
+      either is known. `may_write_cache` is `true` (decision 41: Claude Code caches by itself),
+      so the input bound is priced at the cache write price. **(A) `price` is required** for
+      a `claude-cli` alias an `llm` step uses: `horae doctor` reports its absence as an
+      **error** (not a warning), and the backend refuses the first call without one
+      (`backend_unavailable`, nothing runs), so every call has a dollar reservation before
+      it is made (the notional `total_cost_usd` is known only after). A price under the
+      plan's notional rates still bounds the call; the larger of the two settles it.
+      **Follow-up**: pass the remaining step `usd` as `--max-budget-usd` (a second fence)
+      once `Completion` carries it, with its `error_max_budget_usd` mapping;
+    - **conformance**: `claude-cli` joins the backend-agnostic tests of
+      `tests/test_llm_backends_shared.py` with a fake `claude` (`tests/claude_cli_fake.py`);
+      the HTTP-only ones are skipped there with their reason;
+    - **the security review (on #105)**: eleven findings (numbered above where they changed a
+      rule) and six provisional decisions, **A** (`price` required), **B** (the `CLAUDE.md`
+      and auto-memory switches now; `--bare` / `--restricted` / `--safe-mode` only after a
+      live run), **C** (the workspace under `<state_dir>/llm-runs`, `GIT_CEILING_DIRECTORIES`),
+      **D** (doctor warns about managed settings; managed and remote-managed settings an
+      accepted residual), **E** (the first live run with positive controls in the PR body is
+      the merge gate) and **F** (`CLAUDE_CODE_MAX_OUTPUT_TOKENS`), pending the maintainer's
+      review like the rest of this decision.
 
 ### Provisional decisions (#53, pending maintainer review)
 

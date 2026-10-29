@@ -63,6 +63,14 @@ sends `{type: json_object}` for a server without JSON Schema support, `none` sen
 BACKENDS_WITH_STRUCTURED_OUTPUT: tuple[LlmBackend, ...] = ("openai-compatible",)
 """Backends whose alias may set `structured_output` and `max_tokens_field`."""
 
+BACKENDS_WITH_COMMAND: tuple[LlmBackend, ...] = ("claude-cli",)
+"""Backends that run a local executable, whose alias may set `command` (schemas decision 42)."""
+
+CommandPath = Annotated[
+    str, Strict(), StringConstraints(pattern=r"^/[^\x00-\x1f\x7f]*$", max_length=1024)
+]
+"""An absolute path to an executable (no control characters)."""
+
 MaxTokensField = Literal["max_tokens", "max_completion_tokens"]
 """The request field an `openai-compatible` alias puts its output limit in (schemas decision
 40): `max_tokens` (the default, what most servers take) or `max_completion_tokens` (what
@@ -222,6 +230,13 @@ class ModelAlias(Contract):
                 {
                     "if": {
                         "required": ["backend"],
+                        "properties": {"backend": {"not": {"enum": list(BACKENDS_WITH_COMMAND)}}},
+                    },
+                    "then": {"not": {"required": ["command"]}},
+                },
+                {
+                    "if": {
+                        "required": ["backend"],
                         "properties": {"backend": {"enum": list(BACKENDS_NEEDING_HTTPS)}},
                     },
                     "then": {
@@ -257,6 +272,12 @@ class ModelAlias(Contract):
     """`openai-compatible` only: how the output is constrained (`json_schema` when unset, or
     `json_object` / `none` for a server that lacks JSON Schema support). See
     `StructuredOutput`."""
+    command: CommandPath | None = None
+    """`claude-cli` only: the absolute path of the native `claude` executable (not the npm
+    package's `#!/usr/bin/env node` script, whose `node` is not on the child `PATH`; symlinks
+    are resolved when the backend first runs it). Unset, `claude` is looked up on the fixed
+    child `PATH` (`/usr/local/bin:/usr/bin:/bin`), never on Horae's own `PATH` (schemas
+    decision 42)."""
     max_tokens_field: MaxTokensField | None = None
     """`openai-compatible` only: the request field of the output limit (`max_tokens` when
     unset, or `max_completion_tokens`). See `MaxTokensField`."""
@@ -290,6 +311,8 @@ class ModelAlias(Contract):
             for name in ("structured_output", "max_tokens_field"):
                 if getattr(self, name) is not None:
                     raise ValueError(f"backend {self.backend!r} takes no `{name}`")
+        if self.backend not in BACKENDS_WITH_COMMAND and self.command is not None:
+            raise ValueError(f"backend {self.backend!r} takes no `command`")
         return self
 
 

@@ -264,6 +264,29 @@
           "if": {
             "properties": {
               "backend": {
+                "not": {
+                  "enum": [
+                    "claude-cli"
+                  ]
+                }
+              }
+            },
+            "required": [
+              "backend"
+            ]
+          },
+          "then": {
+            "not": {
+              "required": [
+                "command"
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "backend": {
                 "enum": [
                   "anthropic"
                 ]
@@ -380,6 +403,21 @@
           "default": null,
           "description": "`openai-compatible` only: how the output is constrained (`json_schema` when unset, or\n`json_object` / `none` for a server that lacks JSON Schema support). See\n`StructuredOutput`.",
           "title": "Structured Output"
+        },
+        "command": {
+          "anyOf": [
+            {
+              "maxLength": 1024,
+              "pattern": "^/[^\\x00-\\x1f\\x7f]*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "`claude-cli` only: the absolute path of the native `claude` executable (not the npm\npackage's `#!/usr/bin/env node` script, whose `node` is not on the child `PATH`; symlinks\nare resolved when the backend first runs it). Unset, `claude` is looked up on the fixed\nchild `PATH` (`/usr/local/bin:/usr/bin:/bin`), never on Horae's own `PATH` (schemas\ndecision 42).",
+          "title": "Command"
         },
         "max_tokens_field": {
           "anyOf": [

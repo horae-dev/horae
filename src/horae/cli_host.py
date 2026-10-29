@@ -27,7 +27,7 @@ from horae.contracts.pipeline import LlmStep
 from horae.contracts.plugin import StdioRuntime
 from horae.contracts.skill import OUTPUT_SCHEMA_FILE
 from horae.engine import UnknownPlugin
-from horae.llm.backends import FACTORIES, schema_problems
+from horae.llm.backends import FACTORIES, claude_cli, schema_problems
 from horae.llm.backends._shared import lan_address
 from horae.llm.deid import vocabulary_problem
 from horae.llm.validate import worker_problem
@@ -190,7 +190,11 @@ def _backend_problems(instance: Instance) -> list[Problem]:
     cloud backend without a `price` (its calls are then recorded at `usd: 0` and the step's
     `usd` budget does not bound them; schemas decision 38 A), and a warning when it sends a
     `secret` to an `http://` `base_url` (the key crosses the LAN in clear; decision 40).
-    Aliases no pipeline uses are not checked."""
+    A `claude-cli` alias (decision 42) needs its `secret` (token mode), an executable found at
+    a supported version (`claude_cli.check`, which runs `<command> --version`) and a `price`
+    (decision 42 A: the backend refuses to run without one, so that every call has a dollar
+    reservation), and gets a warning when administrator-managed Claude Code settings exist
+    (decision 42 D: no flag turns them off). Aliases no pipeline uses are not checked."""
     used = sorted(
         {
             step.llm.model
@@ -215,6 +219,8 @@ def _backend_problems(instance: Instance) -> list[Problem]:
                     f"this version of Horae (available: {available})",
                 )
             )
+        elif spec.backend == "claude-cli":
+            problems.extend(_claude_cli_problems(alias, spec))
         elif _is_cloud(spec) and spec.price is None:
             problems.append(
                 Problem(
@@ -257,6 +263,59 @@ def _backend_problems(instance: Instance) -> list[Problem]:
                     severity="warning",
                 )
             )
+    return problems
+
+
+def _claude_cli_problems(alias: str, spec: ModelAlias) -> list[Problem]:
+    """The `claude-cli` checks of `_backend_problems`."""
+    problems: list[Problem] = []
+    if spec.secret is None:
+        problems.append(
+            Problem(
+                CONFIG_FILE,
+                None,
+                None,
+                f"models.{alias}.secret: backend 'claude-cli' needs `secret`, a "
+                f"{claude_cli.TOKEN_ENV} made with `claude setup-token` (token mode is the "
+                "only mode)",
+            )
+        )
+    failure = claude_cli.check(spec)
+    if failure is not None:
+        problems.append(
+            Problem(
+                CONFIG_FILE,
+                None,
+                None,
+                f"models.{alias}.command: {failure} (supported: Claude Code "
+                f"{claude_cli.CLAUDE_CODE_VERSION_RANGE})",
+            )
+        )
+    if spec.price is None:
+        problems.append(
+            Problem(
+                CONFIG_FILE,
+                None,
+                None,
+                f"models.{alias}.price: backend 'claude-cli' needs `price` (the notional "
+                "total_cost_usd is known only after a call; the price reserves each call's "
+                "dollars before it is made)",
+            )
+        )
+    managed = claude_cli.managed_settings()
+    if managed:
+        problems.append(
+            Problem(
+                CONFIG_FILE,
+                None,
+                None,
+                f"models.{alias}: administrator-managed Claude Code settings exist "
+                f"({', '.join(managed)}): they apply to every `claude` run, Horae's included, "
+                "and may add hooks, environment variables or MCP servers that no flag turns "
+                "off (not read by Horae; see docs/security.md T11)",
+                severity="warning",
+            )
+        )
     return problems
 
 
