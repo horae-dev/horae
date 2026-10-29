@@ -30,9 +30,14 @@ fails the step with `backend_unavailable`, and a skill whose prompt is not loade
 
 **Push monitor** (#39, schemas decision 49 F). When `horae.yaml` `scheduler.monitors` has
 an entry for the pipeline, its push URL (a secret) is pinged once the run has ended: `up` for
-`ok`, `noop` and `degraded`, `down` for anything else (failed, timed out, lost, interrupted,
-a store or plugin problem). Not for a dry run, nor when the pipeline is already running (the
-run in progress pings). A failed ping is a warning on stderr and never changes the exit code.
+`ok`, `noop` and `degraded`, `down` for anything else (failed, timed out, lost, crashed), and
+`down` too when the run could not begin (the plugins do not match the lock, a store, lock or
+I/O problem, an internal error: the message is the error kind). An interrupted run pings with
+the status of the record it saved (an apply that finished: its real status), within
+`INTERRUPTED_PING_S`; one stopped before any record was saved pings nothing (the monitor's
+own heartbeat window reports it). Not for a dry run, nor when the pipeline is already running
+(the run in progress pings). A failed ping is a warning on stderr and never changes the exit
+code.
 
 Exit codes (`horae.cli_output`): 0 the run finished `ok`, `noop` or `degraded` (a dry run:
 planned without problems), 1 configuration, plugin, store or runtime problem (the run
@@ -44,6 +49,7 @@ interrupted.
 """
 
 import asyncio
+import logging
 import re
 import signal
 import time
@@ -78,7 +84,7 @@ from horae.contracts import RunRecord
 from horae.contracts.types import MAX_ITEMS
 from horae.engine.template import BUILTIN_VARS
 from horae.runner import LocksUnsupported, PipelineLocked, RunLost, Runner, RunTimedOut
-from horae.scheduler import RunOutcome, ping
+from horae.scheduler import PingResult, RunOutcome, ping
 from horae.store import Store, StoreError
 
 _VAR_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
@@ -97,6 +103,9 @@ _SIGNALS = (signal.SIGINT, signal.SIGTERM)
 _APPLY_LOCKED = "apply_locked:"
 _IN_RECORD = frozenset({"run_failed", "apply_locked"})
 """Error kinds whose message is the record's error (printed with the record)."""
+INTERRUPTED_PING_S = 2.0
+"""Seconds the push-monitor ping of an interrupted run may take (the process is stopping)."""
+_monitor_log = logging.getLogger("horae.scheduler.monitor")
 
 
 def parse_vars(values: list[str]) -> dict[str, str]:
@@ -166,28 +175,32 @@ async def cancel_on_signals[T](work: Coroutine[Any, Any, T]) -> T:
 
 
 @dataclass
-class _Run:
-    """What one `horae run` produced."""
+class RunCapture:
+    """What one run produced: `horae run`, or a scheduled run of `horae serve`."""
 
     saved: list[RunRecord] = field(default_factory=list)
     changes: ChangeSet | None = None
     run_id: str | None = None
     """The run's id, as soon as its row exists (`Runner.run(on_begin=)`)."""
     outcome: str | None = None
-    """How the run ended, for its push monitor (`horae.scheduler.RunOutcome.status`)."""
+    """How the run ended, for its push monitor (`horae.scheduler.RunOutcome.status`; `None`:
+    no ping)."""
+    interrupted: bool = False
 
     def begin(self, run_id: str) -> None:
         self.run_id = run_id
 
 
-async def _execute(
+async def execute_run(
     instance: Instance,
     name: str,
     dry_run: bool,
     vars: dict[str, str],
-    out: _Run,
+    out: RunCapture,
     cache: bool = True,
 ) -> RunRecord:
+    """Run `name` once through the instance's plugins (`live_ports`), its records and id
+    captured in `out`. Raises what `Runner.run` raises (a cancellation included)."""
     async with live_ports(instance) as live:
         with Store.open(instance.store_path) as store:
             runner = Runner(instance, store, live.ports)
@@ -302,7 +315,7 @@ def _emit(
         echo(f"horae run: {safe(message or kind)}", err=True)
 
 
-def _abandoned_during_apply(instance: Instance, run_id: str) -> str | None:
+def abandoned_during_apply(instance: Instance, run_id: str) -> str | None:
     """ "abandoned during apply; run `horae undo <id>`" when the run's row says so."""
     try:
         with Store.open(instance.store_path, read_only=True) as store:
@@ -317,7 +330,7 @@ def _abandoned_during_apply(instance: Instance, run_id: str) -> str | None:
 
 
 def _interrupted(
-    instance: Instance, out: _Run, signum: int
+    instance: Instance, out: RunCapture, signum: int
 ) -> tuple[RunRecord | None, None, str, str, str | None]:
     """What `_emit` prints for a run interrupted by `signum`."""
     saved = out.saved[-1] if out.saved else None
@@ -328,7 +341,7 @@ def _interrupted(
     elif saved is not None:
         what = f"run {saved.id} was saved as failed (cancelled)"
     elif out.run_id is not None:
-        note = _abandoned_during_apply(instance, out.run_id)
+        note = abandoned_during_apply(instance, out.run_id)
         what = note or f"run {out.run_id} was abandoned (see `horae runs`)"
     else:
         what = "the run had not started"
@@ -351,7 +364,7 @@ def _run(
         raise CommandFailed(
             EXIT_REFUSED, "unknown_pipeline", f"unknown pipeline {name!r} (pipelines: {known})"
         )
-    out = _Run()
+    out = RunCapture()
     started = time.monotonic()
     try:
         code = _attempt(instance, name, dry_run, vars, json_output, runner, cache, out)
@@ -366,8 +379,27 @@ def _run(
         monitored = name in instance.config.scheduler.monitors
         if monitored and not dry_run and out.outcome is not None:
             outcome = RunOutcome(out.outcome, out.run_id)
-            runner(ping(instance, name, outcome, time.monotonic() - started))
+            work = ping(instance, name, outcome, time.monotonic() - started)
+            runner(_bounded_ping(work, name, outcome) if out.interrupted else work)
     return code
+
+
+async def _bounded_ping(
+    work: Coroutine[Any, Any, PingResult], name: str, outcome: RunOutcome
+) -> PingResult:
+    """`work` (a ping), given at most `INTERRUPTED_PING_S`."""
+    try:
+        async with asyncio.timeout(INTERRUPTED_PING_S):
+            return await work
+    except TimeoutError:
+        _monitor_log.warning(
+            "push monitor of pipeline %s: the %s ping was not sent within %g s of the "
+            "interruption; the run is not affected",
+            name,
+            "up" if outcome.up else "down",
+            INTERRUPTED_PING_S,
+        )
+        return "failed"
 
 
 def _attempt(
@@ -378,15 +410,18 @@ def _attempt(
     json_output: bool,
     runner: Callable[[Coroutine[Any, Any, Any]], Any],
     cache: bool,
-    out: _Run,
+    out: RunCapture,
 ) -> int:
-    """One run of `name`; sets `out.outcome` (except when the pipeline is locked)."""
+    """One run of `name`; sets `out.outcome` (not when the pipeline is locked, nor for a run
+    interrupted before any record was saved)."""
     try:
         record: RunRecord = runner(
-            cancel_on_signals(_execute(instance, name, dry_run, vars, out, cache))
+            cancel_on_signals(execute_run(instance, name, dry_run, vars, out, cache))
         )
     except Interrupted as stop:
-        out.outcome = "cancelled"
+        out.interrupted = True
+        if out.saved:  # the status it was saved with (an apply that finished: its own)
+            out.outcome, out.run_id = out.saved[-1].status, out.saved[-1].id
         _emit(json_output, *_interrupted(instance, out, stop.signum))
         return 128 + stop.signum
     except RunTimedOut as timed_out:
@@ -415,7 +450,7 @@ def _attempt(
         crashed = internal_message(exc)
         del exc
         out.outcome = "internal"
-        note = _abandoned_during_apply(instance, out.run_id)
+        note = abandoned_during_apply(instance, out.run_id)
         if note is not None:
             crashed += f"; {note}"
         _emit(json_output, None, None, "internal", crashed, out.run_id)
@@ -489,10 +524,14 @@ def run(
 
 
 __all__ = [
+    "INTERRUPTED_PING_S",
     "MAX_VARS",
     "PLUGIN_START_KINDS",
     "Interrupted",
+    "RunCapture",
+    "abandoned_during_apply",
     "cancel_on_signals",
+    "execute_run",
     "parse_vars",
     "run",
 ]

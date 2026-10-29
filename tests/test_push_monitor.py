@@ -7,6 +7,8 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
+import signal
 import threading
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
@@ -21,14 +23,21 @@ import pytest
 import yaml
 from typer.testing import CliRunner
 
+import horae.runner._runner as runner_module
+from apply_fixtures import INBOX
+from apply_fixtures import PIPELINE as DRY_BRIEF
+from apply_fixtures import plugins as brief_plugins
 from horae import cli_run, cli_serve
-from horae.apply import StaticSinks
-from horae.cli import EXIT_LOCKED, EXIT_OK, EXIT_PROBLEMS, app
+from horae.apply import StaticSinks, apply_changes
+from horae.apply.testing import FixtureSink
+from horae.cli import EXIT_LOCKED, EXIT_OK, EXIT_PROBLEMS, EXIT_SIGTERM, app
+from horae.cli_output import CommandFailed
 from horae.config import Instance, load_instance
 from horae.contracts.instance import PushMonitor
 from horae.runner import PipelineLock, Ports
-from horae.scheduler import RunOutcome, Schedule, Scheduler, ping, ping_url
+from horae.scheduler import PingResult, RunOutcome, Schedule, Scheduler, ping, ping_url
 from horae.scheduler import _monitor as monitor_module
+from horae.store import Store
 from runner_fixtures import Plugins, write_instance
 from test_scheduler import FakeClock, settle
 
@@ -96,12 +105,12 @@ def server() -> Iterator[_Server]:
 
 @pytest.fixture
 def fake_ports(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
-    holder = SimpleNamespace(plugins=Plugins())
+    holder = SimpleNamespace(plugins=Plugins(), sinks=None)
 
     @asynccontextmanager
     async def live_ports(instance: Instance) -> AsyncIterator[Any]:
-        ports = Ports(plugins=holder.plugins, tools=holder.plugins, sinks=None)
-        yield SimpleNamespace(ports=ports, sinks=StaticSinks())
+        ports = Ports(plugins=holder.plugins, tools=holder.plugins, sinks=holder.sinks)
+        yield SimpleNamespace(ports=ports, sinks=holder.sinks or StaticSinks())
 
     monkeypatch.setattr(cli_run, "live_ports", live_ports)
     return holder
@@ -109,18 +118,27 @@ def fake_ports(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
 
 def _root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, url: str, **monitor: Any) -> Path:
     monkeypatch.setenv(ENV, url)
-    scheduler = {
-        "monitors": {
-            "collect": {"secret": "PUSH_URL", **monitor},
-            "broken": {"secret": "PUSH_URL", **monitor},
-            "slow": {"secret": "PUSH_URL", **monitor},
-        }
-    }
-    return write_instance(
+    names = ("collect", "broken", "slow", "dry-brief")
+    scheduler = {"monitors": {name: {"secret": "PUSH_URL", **monitor} for name in names}}
+    root = write_instance(
         tmp_path / "instance",
         secrets={"refs": {"PUSH_URL": {"env": ENV}}},
         scheduler=scheduler,
     )
+    definition = DRY_BRIEF.model_dump(mode="json", exclude_none=True)
+    (root / "pipelines" / "dry-brief.yaml").write_text(yaml.safe_dump(definition), "utf-8")
+    return root
+
+
+APPEND = {"type": "note.append_section", "path": INBOX, "heading": "B", "content": "x"}
+
+
+def _applying(holder: SimpleNamespace) -> FixtureSink:
+    """`dry-brief` proposes one note change, applied to an in-memory vault."""
+    holder.plugins = brief_plugins([APPEND])
+    sink = FixtureSink(files={INBOX: b"# Inbox\n"})
+    holder.sinks = StaticSinks(default=sink)
+    return sink
 
 
 def _invoke(*args: str) -> Any:
@@ -340,6 +358,62 @@ def test_an_unresolvable_secret_is_a_warning(
     assert "secret PUSH_URL could not be resolved" in caplog.text
 
 
+def test_a_run_that_could_not_begin_pings_down_with_its_error_kind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, server: _Server
+) -> None:
+    class Mismatch:
+        async def __aenter__(self) -> Any:
+            raise CommandFailed(EXIT_PROBLEMS, "plugins_invalid", "synthetic mismatch")
+
+        async def __aexit__(self, *exc: object) -> None:
+            return None
+
+    monkeypatch.setattr(cli_run, "live_ports", lambda instance: Mismatch())
+    root = _root(tmp_path, monkeypatch, server.url())
+    assert _invoke("run", "collect", "-i", str(root)).exit_code == EXIT_PROBLEMS
+    [(_, query, _)] = server.requests
+    assert (query["status"], query["msg"]) == (["down"], ["plugins_invalid"])
+
+
+def test_an_interrupted_run_pings_the_status_it_saved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, server: _Server, fake_ports: Any
+) -> None:
+    sink = _applying(fake_ports)
+
+    async def interrupted(*args: Any, **kwargs: Any) -> Any:
+        os.kill(os.getpid(), signal.SIGTERM)  # during the (shielded) apply
+        await asyncio.sleep(0)
+        return await apply_changes(*args, **kwargs)
+
+    monkeypatch.setattr(runner_module, "apply_changes", interrupted)
+    root = _root(tmp_path, monkeypatch, server.url())
+    result = _invoke("run", "dry-brief", "-i", str(root), "--json")
+    assert result.exit_code == EXIT_SIGTERM
+    assert json.loads(result.stdout)["run"]["status"] == "ok"
+    assert b"## B" in sink.files[INBOX]
+    [(_, query, _)] = server.requests
+    assert (query["status"], query["msg"]) == (["up"], ["ok"])
+
+
+def test_the_ping_of_an_interrupted_run_is_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    server: _Server,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(cli_run, "INTERRUPTED_PING_S", 0.05)
+    server.delay = 5.0
+    instance = load_instance(_root(tmp_path, monkeypatch, server.url()))
+    outcome = RunOutcome("failed")
+    with caplog.at_level(logging.WARNING):
+        result = asyncio.run(
+            cli_run._bounded_ping(ping(instance, "collect", outcome, 1.0), "collect", outcome)
+        )
+    assert result == "failed"
+    assert "the down ping was not sent within 0.05 s of the interruption" in caplog.text
+    assert TOKEN not in caplog.text
+
+
 def test_the_url_is_redacted_if_it_is_ever_printed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, server: _Server, fake_ports: Any
 ) -> None:
@@ -357,31 +431,55 @@ def test_the_url_is_redacted_if_it_is_ever_printed(
 T0 = datetime(2026, 1, 5, 5, 0, tzinfo=UTC)
 
 
+class _Reported:
+    """A ping function that pings for real and then records the pipeline (event-driven)."""
+
+    def __init__(self, instance: Instance) -> None:
+        self.instance = instance
+        self.done: dict[str, asyncio.Event] = {}
+
+    def event(self, name: str) -> asyncio.Event:
+        return self.done.setdefault(name, asyncio.Event())
+
+    async def __call__(self, name: str, outcome: RunOutcome, duration_s: float) -> PingResult:
+        try:
+            return await ping(self.instance, name, outcome, duration_s)
+        finally:
+            self.event(name).set()
+
+
+def _real_scheduler(
+    instance: Instance, clock: FakeClock, reported: _Reported, *entries: Schedule, **kw: Any
+) -> Scheduler:
+    return Scheduler(
+        entries,
+        mode="builtin",
+        run=lambda name: cli_serve.run_scheduled(instance, name),
+        ping=reported,
+        clock=clock,
+        **kw,
+    )
+
+
 def test_a_scheduled_run_runs_the_pipeline_and_pings(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, server: _Server, fake_ports: Any
 ) -> None:
     root = _root(tmp_path, monkeypatch, server.url())
     instance = load_instance(root)
+    assert cli_serve.build_scheduler(instance, {}).mode == "builtin"
 
     async def body() -> None:
         clock = FakeClock(T0)
-        scheduler = cli_serve.build_scheduler(instance, {})
-        scheduler = Scheduler(
-            [Schedule("collect", "1 5 * * *", "UTC")],
-            mode=scheduler.mode,
-            run=lambda name: cli_serve.run_scheduled(instance, name),
-            ping=lambda name, outcome, duration: ping(instance, name, outcome, duration),
-            clock=clock,
+        reported = _Reported(instance)
+        scheduler = _real_scheduler(
+            instance, clock, reported, Schedule("collect", "1 5 * * *", "UTC")
         )
         task = asyncio.create_task(scheduler.run_forever())
         await settle()
         await clock.set(T0 + timedelta(minutes=1))
-        for _ in range(200):
-            if not scheduler.state().pipelines[0].running and server.requests:
-                break
-            await asyncio.sleep(0.01)
+        await reported.event("collect").wait()
         entry = scheduler.state().pipelines[0]
-        assert entry.last_outcome == "ok"
+        assert (entry.last_outcome, entry.last_ping, entry.running) == ("ok", "ok", False)
         assert entry.last_run_id is not None
         scheduler.stop()
         await task
@@ -389,6 +487,132 @@ def test_a_scheduled_run_runs_the_pipeline_and_pings(
     asyncio.run(body())
     [(_, query, _)] = server.requests
     assert query["status"] == ["up"]
+
+
+def test_a_run_cancelled_by_stop_during_its_apply_reports_its_saved_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, server: _Server, fake_ports: Any
+) -> None:
+    sink = _applying(fake_ports)
+    root = _root(tmp_path, monkeypatch, server.url())
+    instance = load_instance(root)
+    holder: dict[str, Scheduler] = {}
+
+    async def stopped_meanwhile(*args: Any, **kwargs: Any) -> Any:
+        holder["scheduler"].stop()  # SIGTERM in `horae serve`, during the shielded apply
+        await asyncio.sleep(0)
+        return await apply_changes(*args, **kwargs)
+
+    monkeypatch.setattr(runner_module, "apply_changes", stopped_meanwhile)
+
+    async def body() -> None:
+        clock = FakeClock(T0)
+        reported = _Reported(instance)
+        scheduler = _real_scheduler(
+            instance, clock, reported, Schedule("dry-brief", "1 5 * * *", "UTC")
+        )
+        holder["scheduler"] = scheduler
+        task = asyncio.create_task(scheduler.run_forever())
+        await settle()
+        await clock.set(T0 + timedelta(minutes=1))
+        await task  # returns once the run has been saved and reported
+
+    asyncio.run(body())
+    entry = holder["scheduler"].state().pipelines[0]
+    assert (entry.last_outcome, entry.last_ping) == ("ok", "ok")
+    assert b"## B" in sink.files[INBOX]
+    assert entry.last_run_id is not None
+    with Store.open(instance.store_path, read_only=True) as store:
+        summary = store.run_summary(entry.last_run_id)
+    assert summary is not None
+    assert summary.status == "ok"
+    [(_, query, _)] = server.requests
+    assert (query["status"], query["msg"]) == (["up"], ["ok"])
+
+
+def test_a_run_cancelled_by_stop_before_its_apply_is_saved_failed_and_pings_down(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, server: _Server, fake_ports: Any
+) -> None:
+    root = _root(tmp_path, monkeypatch, server.url())
+    instance = load_instance(root)
+
+    async def body() -> Scheduler:
+        clock = FakeClock(T0)
+        reported = _Reported(instance)
+        scheduler = _real_scheduler(instance, clock, reported, Schedule("slow", "1 5 * * *", "UTC"))
+        task = asyncio.create_task(scheduler.run_forever())
+        await settle()
+        await clock.set(T0 + timedelta(minutes=1))
+        await fake_ports.plugins.started.wait()  # the run is in its slow step
+        scheduler.stop()
+        await task
+        return scheduler
+
+    entry = asyncio.run(body()).state().pipelines[0]
+    assert (entry.last_outcome, entry.last_ping) == ("failed", "ok")
+    [(_, query, _)] = server.requests
+    assert (query["status"], query["msg"]) == (["down"], ["failed"])
+
+
+def test_two_pipelines_run_side_by_side_against_one_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, server: _Server, fake_ports: Any
+) -> None:
+    root = _root(tmp_path, monkeypatch, server.url())
+    instance = load_instance(root)
+
+    async def body() -> Scheduler:
+        clock = FakeClock(T0)
+        reported = _Reported(instance)
+        scheduler = _real_scheduler(
+            instance,
+            clock,
+            reported,
+            Schedule("collect", "1 5 * * *", "UTC"),
+            Schedule("slow", "1 5 * * *", "UTC"),
+            max_concurrent=2,
+        )
+        task = asyncio.create_task(scheduler.run_forever())
+        await settle()
+        await clock.set(T0 + timedelta(minutes=1))
+        await fake_ports.plugins.started.wait()
+        await reported.event("collect").wait()  # finished while `slow` still runs
+        assert scheduler.state().pipelines[1].running
+        fake_ports.plugins.release.set()
+        await reported.event("slow").wait()
+        scheduler.stop()
+        await task
+        return scheduler
+
+    collect, slow = asyncio.run(body()).state().pipelines
+    with Store.open(instance.store_path, read_only=True) as store:
+        for entry in (collect, slow):
+            assert entry.last_run_id is not None
+            summary = store.run_summary(entry.last_run_id)
+            assert summary is not None
+            assert summary.status == entry.last_outcome
+            assert entry.last_outcome in {"ok", "noop"}
+    assert sorted(q["status"][0] for _, q, _ in server.requests) == ["up", "up"]
+
+
+def test_a_crashed_scheduled_run_is_logged_with_its_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fake_ports: Any,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def crash(instance: Instance, name: str, *args: Any, **kwargs: Any) -> Any:
+        args[-1].begin("20260105T050100Z-collect-01")
+        raise RuntimeError("synthetic-detail")
+
+    monkeypatch.setattr(cli_serve, "execute_run", crash)
+    instance = load_instance(_root(tmp_path, monkeypatch, "unused-value"))
+    with caplog.at_level(logging.ERROR, logger="horae.scheduler"):
+        outcome = asyncio.run(cli_serve.run_scheduled(instance, "collect"))
+    assert outcome == RunOutcome("internal", "20260105T050100Z-collect-01")
+    assert (
+        "scheduler: run 20260105T050100Z-collect-01 of collect crashed: internal error "
+        "(RuntimeError); please report it"
+    ) in caplog.text
+    assert "synthetic-detail" not in caplog.text
 
 
 def test_a_scheduled_run_never_overlaps_a_manual_run(
