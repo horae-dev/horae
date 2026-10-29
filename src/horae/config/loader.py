@@ -11,8 +11,16 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
+from horae.config.cron import cron_problem
 from horae.config.documents import Problem, ProblemsError, YamlDocument, read_yaml, validate
-from horae.contracts.instance import InstanceConfig, LlmBackend, ModelAlias, PluginDefaults
+from horae.config.schedule import ModeError, scheduler_mode
+from horae.contracts.instance import (
+    InstanceConfig,
+    LlmBackend,
+    ModelAlias,
+    PluginDefaults,
+    is_push_url,
+)
 from horae.contracts.lockfile import Lockfile
 from horae.contracts.pipeline import LlmStep, Pipeline
 from horae.engine.canonical import sha256_hex
@@ -52,6 +60,7 @@ def redaction_names(config: InstanceConfig, lock: Lockfile | None) -> tuple[str,
     for plugin in () if lock is None else lock.plugins.values():
         names.update(plugin.permissions.secrets)
     names.update(spec.secret for spec in config.models.values() if spec.secret)
+    names.update(monitor.secret for monitor in config.scheduler.monitors.values())
     return tuple(sorted(names))
 
 
@@ -285,12 +294,23 @@ def _cross_check(state: _Loaded) -> None:
                     value=False,
                 )
             )
+    for name in config.scheduler.monitors:
+        if name not in names:
+            state.problems.append(
+                config_doc.problem(
+                    ("scheduler", "monitors", name),
+                    f"push monitor for unknown pipeline {name!r}",
+                    value=False,
+                )
+            )
     for pipeline, doc in state.pipelines.values():
         zone = pipeline.trigger.timezone if pipeline.trigger else None
         if zone is not None and not _timezone_exists(zone):
             state.problems.append(
                 doc.problem(("trigger", "timezone"), f"unknown time zone {zone!r}")
             )
+        if pipeline.trigger is not None and (reason := cron_problem(pipeline.trigger.cron)):
+            state.problems.append(doc.problem(("trigger", "cron"), reason))
         for index, step in enumerate(pipeline.steps):
             if isinstance(step, LlmStep) and step.llm.model not in config.models:
                 known = ", ".join(sorted(config.models)) or "none"
@@ -326,7 +346,9 @@ class CheckResult:
 
 
 def check_instance(root: Path, environ: Mapping[str, str] | None = None) -> CheckResult:
-    """Every problem of the instance in `root`, including secrets that cannot be resolved.
+    """Every problem of the instance in `root`, including secrets that cannot be resolved, a
+    push monitor's secret that is not a usable push URL, and an invalid `HORAE_SCHEDULER`
+    (read from `environ`, else the process environment).
 
     Secret values are read to prove they resolve, then dropped; they never reach a problem."""
     state = _load(root)
@@ -341,6 +363,10 @@ def check_instance(root: Path, environ: Mapping[str, str] | None = None) -> Chec
             for alias, spec in state.config.models.items()
             if spec.secret is not None
         ]
+        wanted += [
+            (monitor.secret, state.config_doc, ("scheduler", "monitors", name, "secret"))
+            for name, monitor in state.config.scheduler.monitors.items()
+        ]
         if state.lock is not None and state.lock_doc is not None:
             wanted += [
                 (name, state.lock_doc, ("plugins", plugin, "permissions", "secrets", index))
@@ -349,7 +375,20 @@ def check_instance(root: Path, environ: Mapping[str, str] | None = None) -> Chec
             ]
         for name, doc, loc in wanted:
             try:
-                resolver.resolve(name)
+                secret = resolver.resolve(name)
             except SecretError as exc:
                 problems.append(doc.problem(loc, str(exc)))
+                continue
+            # The ping's own check of a push URL; the value is never shown (it has a token).
+            if loc[:2] == ("scheduler", "monitors") and not is_push_url(secret.reveal()):
+                problems.append(
+                    doc.problem(
+                        loc, f"secret {name} is not an https:// URL or an http:// URL on the LAN"
+                    )
+                )
+            del secret
+        try:
+            scheduler_mode(state.config.scheduler.mode, environ)
+        except ModeError as exc:
+            problems.append(Problem(str(state.config_doc.path), None, None, str(exc)))
     return CheckResult(sorted(set(problems), key=Problem.sort_key), instance)

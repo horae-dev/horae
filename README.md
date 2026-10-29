@@ -63,6 +63,20 @@ cooperatively and names it: before the apply its partial record is saved `failed
 apply has started it finishes (each sink call is bounded by its timeout) and the record is
 saved before the run is reported interrupted (a second signal is ignored).
 
+**Scheduling** ([decision 49](schemas/README.md)). A pipeline's `trigger: {cron: "30 5 * * *"}`
+(optional `timezone`, else the instance's) is run by `horae serve`, the long-running process
+of a container, until SIGTERM (it then cancels and saves the runs in progress and exits 0;
+give the container at least 20 s to stop, e.g. compose `stop_grace_period: 20s`). It reads
+the instance once at start: restart it after changing the configuration, and it logs on
+stderr (no `--json`). Scheduled runs run one at a time by default
+(`scheduler.max_concurrent`). Missed fire times are not caught up, a fire time more than
+`scheduler.misfire_grace_s` (1 h) late is skipped, and a fire time while the pipeline is
+still running, here or in a manual `horae run`, is skipped and logged. With `HORAE_SCHEDULER=external` (or `scheduler.mode: external`) no trigger
+fires: Coolify Scheduled Tasks, cron or a systemd timer call `horae run <pipeline>`. Either
+way, `scheduler.monitors.<pipeline>: {secret: PUSH_URL}` pings an Uptime Kuma push URL (or
+`kind: healthchecks`), kept as a secret, `up` or `down` after each run; a failed ping is a
+warning and never fails the run.
+
 An instance is **not relocatable** in v1: `horae.lock` holds the vault's absolute path and
 `plugins/` the absolute path of the interpreter that installed them. After copying or moving
 one, `horae doctor` reports the paths that no longer match (a lock path that does not exist,

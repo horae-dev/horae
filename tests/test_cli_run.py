@@ -453,7 +453,7 @@ def test_a_crash_is_an_internal_error(
     async def crash(*args: Any) -> Any:
         raise RuntimeError("sentinel-secret-value")
 
-    monkeypatch.setattr(cli_run, "_execute", crash)
+    monkeypatch.setattr(cli_run, "execute_run", crash)
     result = runner.invoke(app, ["run", "collect", "-i", str(root), "--json"])
     assert result.exit_code == EXIT_INTERNAL == 70
     assert json.loads(result.stdout)["error"]["kind"] == "internal"
@@ -467,7 +467,7 @@ def test_store_and_lost_runs_are_problems(
     async def lost(*args: Any) -> Any:
         raise runner_module.RunLost("r1")
 
-    monkeypatch.setattr(cli_run, "_execute", lost)
+    monkeypatch.setattr(cli_run, "execute_run", lost)
     code, report = _json("collect", "-i", str(root))
     assert code == EXIT_PROBLEMS
     assert report["error"]["kind"] == "run_lost"
@@ -476,13 +476,13 @@ def test_store_and_lost_runs_are_problems(
     async def unsupported(*args: Any) -> Any:
         raise LocksUnsupported("no fcntl")
 
-    monkeypatch.setattr(cli_run, "_execute", unsupported)
+    monkeypatch.setattr(cli_run, "execute_run", unsupported)
     assert _json("collect", "-i", str(root))[1]["error"]["kind"] == "locks_unsupported"
 
     async def broken(*args: Any) -> Any:
         raise OSError(28, "No space left on device", "/some/where/locks/x.lock")
 
-    monkeypatch.setattr(cli_run, "_execute", broken)
+    monkeypatch.setattr(cli_run, "execute_run", broken)
     code, report = _json("collect", "-i", str(root))
     assert code == EXIT_PROBLEMS
     assert report["error"] == {
@@ -493,7 +493,7 @@ def test_store_and_lost_runs_are_problems(
     async def store_broken(*args: Any) -> Any:
         raise StoreError("database is locked")
 
-    monkeypatch.setattr(cli_run, "_execute", store_broken)
+    monkeypatch.setattr(cli_run, "execute_run", store_broken)
     code, report = _json("collect", "-i", str(root))
     assert code == EXIT_PROBLEMS
     assert report["error"]["kind"] == "store_error"
