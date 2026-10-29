@@ -3,7 +3,7 @@
 [`horae-dev/template-plugin`](https://github.com/horae-dev/template-plugin) is a GitHub
 template repository for a new Horae plugin written with [`horae-sdk`](../../sdk/README.md).
 "Use this template" gives a repository whose CI passes unchanged; you then rename the example
-and write your own tools.
+with `scripts/rename.py` (its CI still passes) and write your own tools.
 
 ## What it holds
 
@@ -20,24 +20,45 @@ and write your own tools.
   plugin over stdio as the plugin host does.
 - **CI** (`.github/workflows/ci.yml`): `uv lock --check`, ruff, mypy strict, pytest with an
   85% coverage gate, gitleaks over the full history, and an aggregate **CI OK** check;
-  actions pinned by commit, `permissions: contents: read`, no persisted credentials.
+  actions pinned by commit, `permissions: contents: read`, no persisted credentials. In the
+  template repository only, a **Template copy** job `git archive`s the commit into a fresh
+  repository, renames it with `scripts/rename.py` and runs the same checks on the copy, so a
+  renamed repository is known to pass; downstream copies skip it and CI OK counts that skip as
+  a pass.
+- **`scripts/rename.py <dist-name> <package> <plugin-name>`** (standard library only): renames
+  the package and every reference to the example (distribution name, imports, the plugin's
+  `NAME`, which namespaces its refs and fingerprints, the recordings, docstrings, titles), runs
+  `uv lock`, regenerates `plugin.yaml`, re-records the recordings outside CI and fails if a
+  reference is left.
 - **`graft.yaml` and `AGENTS.md`**: the same review policy and working rules as the core
-  (`plugin.yaml`, workflows, `auth/`, `pyproject.toml` and `renovate.json` are sensitive),
+  (`plugin.yaml`, workflows, `auth/`, `pyproject.toml`, `uv.lock`, `.pre-commit-config.yaml`
+  and `renovate.json` are sensitive),
   plus `.pre-commit-config.yaml` (ruff, gitleaks), `renovate.json` (7-day minimum release
   age) and a pull request template.
 
 ## Using it
 
 The template's [README](https://github.com/horae-dev/template-plugin#use-this-template) has
-the steps: create the repository, rename `example` / `example_plugin`, write the tools and
-their permissions, regenerate `plugin.yaml`, record fixtures (`HORAE_SDK_RECORD=1 uv run
-pytest`, refused in CI) and run the CI commands locally.
+the steps: create the repository, run `scripts/rename.py` (the README also lists the manual
+rename, which must include `uv lock` and re-recording), write the tools and their
+permissions, regenerate `plugin.yaml`, record fixtures (`HORAE_SDK_RECORD=1 uv run pytest`,
+refused in CI) and run the CI commands locally.
+
+Commits carry Graft trailers (`git commit --trailer ...`). Work done in one repository for an
+issue of another, such as this page for a template issue, writes the task as
+`Graft-Task: <owner>/<repo>#<n>` (for example `horae-dev/template-plugin#2`) rather than `#<n>`.
 
 ## horae-sdk before PyPI
 
-Until `horae-sdk` is published, the template takes it from this repository in
-`[tool.uv.sources]`, pinned to a full commit of `main` (`subdirectory = "sdk"`). Renovate bumps
-the pin weekly (a git commit has no release date, so the 7-day age cannot apply); its pull
-request needs `uv lock`. After the first `Release SDK` run (`sdk-v<version>` tag), remove the
-git source and the Renovate manager from the template so the requirement resolves from PyPI.
-A change to the SDK's public API should be checked against the template's tests.
+Until `horae-sdk` is published, the template takes it from this repository's `main` branch
+in `[tool.uv.sources]` (`branch = "main"`, `subdirectory = "sdk"`), and its `uv.lock` pins the
+exact commit, so CI's `uv lock --check` and every install use the same SDK until the lock
+changes. Renovate's weekly lock file maintenance moves the lock to the latest `main` (a git
+commit has no release date, so the 7-day age cannot apply: review that pull request like any
+dependency bump). Installing from git clones this repository, so it must stay public. After
+the first `Release SDK` run (`sdk-v<version>` tag), remove the git source from the template so
+the requirement resolves from PyPI.
+
+Nothing here checks the template against an SDK change yet: before changing the SDK's public
+API, run the template's tests against it by hand (in a template checkout, point
+`[tool.uv.sources]` at the branch with the change, `uv lock`, then `uv run pytest`). A follow-up should add a core CI job that does this on every SDK change.
