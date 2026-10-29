@@ -5,6 +5,7 @@ import json
 import os
 import stat
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml
@@ -198,3 +199,60 @@ def test_a_target_created_meanwhile_is_not_overwritten(
     assert json.loads(out)["error"]["kind"] == "target_not_empty"
     assert _leftovers(target) == ["mine.md"]
     assert _leftovers(tmp_path) == ["instance"]
+
+
+def _btrfs_listdir(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Model btrfs: listing a directory descriptor only returns the entries that existed
+    when it was opened, however often it is listed again."""
+    real_open, real_close, real_listdir = os.open, os.close, os.listdir
+    snapshots: dict[int, list[str]] = {}
+
+    def opening(path: Any, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+        fd = real_open(path, flags, mode, dir_fd=dir_fd)
+        if flags & os.O_DIRECTORY:
+            snapshots[fd] = real_listdir(fd)
+        return fd
+
+    def closing(fd: int) -> None:
+        snapshots.pop(fd, None)
+        real_close(fd)
+
+    def listing(path: Any = ".") -> list[str]:
+        if isinstance(path, int) and path in snapshots:
+            return list(snapshots[path])
+        return real_listdir(path)
+
+    monkeypatch.setattr(os, "open", opening)
+    monkeypatch.setattr(os, "close", closing)
+    monkeypatch.setattr(os, "listdir", listing)
+
+
+def test_init_fills_an_empty_directory_on_btrfs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "instance"
+    target.mkdir()
+    _btrfs_listdir(monkeypatch)
+    code, out = _init(str(target), "--json")
+    assert code == EXIT_OK, out
+    assert (target / "horae.lock").is_file()
+    assert not [name for name in os.listdir(target) if name.startswith(".horae-init-")]
+
+
+def test_an_entry_appearing_in_an_empty_target_is_not_overwritten(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "instance"
+    target.mkdir()
+    real = install
+
+    def racing(directory: Path, *, python: str | None = None) -> dict[str, Path]:
+        (target / "mine.md").write_text("mine", encoding="utf-8")
+        return real(directory, python=python)
+
+    monkeypatch.setattr(cli_init, "install", racing)
+    _btrfs_listdir(monkeypatch)
+    code, out = _init(str(target), "--json")
+    assert code == EXIT_REFUSED
+    assert json.loads(out)["error"]["kind"] == "target_not_empty"
+    assert _leftovers(target) == ["mine.md"]
