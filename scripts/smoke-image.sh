@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
-# Smoke test for the container image (#40).
+# Smoke test for the container image (#40, #37).
 # Usage: scripts/smoke-image.sh IMAGE [PLATFORM]
 #   PLATFORM (e.g. linux/arm64) runs the image for that platform (under QEMU when foreign).
 #   EXPECTED_VERSION=X.Y.Z in the environment also checks that `horae --version` reports it.
+#   SMOKE_SERVE_WAIT_S (seconds `horae serve` gets to become healthy), SMOKE_PROBE_TIMEOUT_S
+#   (each HTTP probe and health check) and SMOKE_STOP_S (`docker stop --time`) default to
+#   60 / 10 / 20 natively and 300 / 60 / 90 when PLATFORM is emulated (not the daemon's arch).
 # Runs the image the way production does: read-only root filesystem, tmpfs /tmp, no network,
 # all capabilities dropped, no privilege escalation, a volume on /instance.
 set -euo pipefail
@@ -13,6 +16,26 @@ platform_args=()
 if [ -n "$platform" ]; then
   platform_args=(--platform "$platform")
 fi
+# Emulated (QEMU): Python starts many times slower, so `horae serve` and each probe get more time.
+native_arch="$(docker version --format '{{.Server.Arch}}' 2> /dev/null || echo unknown)"
+emulated=false
+if [ -n "$platform" ] && [ "${platform#*/}" != "$native_arch" ] \
+  && [ "${platform#*/}" != "${native_arch}/v8" ]; then
+  emulated=true
+fi
+if [ "$emulated" = true ]; then
+  serve_wait="${SMOKE_SERVE_WAIT_S:-300}"
+  probe_timeout="${SMOKE_PROBE_TIMEOUT_S:-60}"
+  stop_time="${SMOKE_STOP_S:-90}"
+else
+  serve_wait="${SMOKE_SERVE_WAIT_S:-60}"
+  probe_timeout="${SMOKE_PROBE_TIMEOUT_S:-10}"
+  stop_time="${SMOKE_STOP_S:-20}"
+fi
+for value in "$serve_wait" "$probe_timeout" "$stop_time"; do
+  [[ "$value" =~ ^[1-9][0-9]*$ ]] || { echo "FAIL: not a number of seconds: '${value}'" >&2; exit 1; }
+done
+
 base=(docker run --rm ${platform_args[@]+"${platform_args[@]}"} --tmpfs "/tmp:rw,noexec,nosuid,size=16m" --network none
       --cap-drop ALL --security-opt no-new-privileges)
 run=("${base[@]}" --read-only)
@@ -23,7 +46,11 @@ fail() {
 }
 
 volumes=()
+containers=()
 cleanup() {
+  if [ "${#containers[@]}" -gt 0 ]; then
+    docker rm -f "${containers[@]}" > /dev/null 2>&1 || true
+  fi
   if [ "${#volumes[@]}" -gt 0 ]; then
     docker volume rm -f "${volumes[@]}" > /dev/null || true
   fi
@@ -124,3 +151,42 @@ new_volume
 "${run[@]}" -v "${volume}:/instance" "$image" doctor > /dev/null \
   || fail "horae doctor on the volume's root (HORAE_INSTANCE=/instance)"
 echo "ok: init and doctor on the root of an empty volume"
+
+# --- the default command: horae serve, its HTTP API and the HEALTHCHECK (#37) ------------------
+# Detached, without --rm, so that its exit code can be read after the stop. The image's own
+# HEALTHCHECK command runs (only its interval, start period and timeout are changed); no
+# network, loopback only.
+cmd="$(docker image inspect --format '{{json .Config.Cmd}}' "$image")"
+[ "$cmd" = '["serve"]' ] || fail "default command is ${cmd}, not [\"serve\"]"
+server="horae-smoke-serve-$$"
+containers+=("$server")
+docker run -d --name "$server" ${platform_args[@]+"${platform_args[@]}"} \
+  --tmpfs "/tmp:rw,noexec,nosuid,size=16m" --network none --cap-drop ALL \
+  --security-opt no-new-privileges --read-only --health-interval 1s \
+  --health-start-period "${serve_wait}s" --health-timeout "${probe_timeout}s" \
+  -v "${volume}:/instance" "$image" > /dev/null
+health=""
+for _ in $(seq 1 "$serve_wait"); do
+  health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$server")"
+  [ "$health" = "healthy" ] && break
+  [ "$(docker inspect --format '{{.State.Running}}' "$server")" = "true" ] \
+    || { docker logs "$server" >&2; fail "horae serve exited"; }
+  sleep 1
+done
+[ "$health" = "healthy" ] || { docker logs "$server" >&2; fail "horae serve is '${health}'"; }
+runs_probe='import urllib.request as u, json, sys
+r = u.build_opener(u.ProxyHandler({})).open(
+    "http://127.0.0.1:8080/runs?limit=1", timeout=float(sys.argv[1]))
+assert r.headers["Cache-Control"] == "no-store", r.headers
+print(json.load(r)["schema_version"])'
+[ "$(docker exec "$server" python -c "$runs_probe" "$probe_timeout")" = "1" ] \
+  || fail "GET /runs"
+docker stop --time "$stop_time" "$server" > /dev/null
+code="$(docker inspect --format '{{.State.ExitCode}}' "$server")"
+[ "$code" = "0" ] || { docker logs "$server" >&2; fail "horae serve exited ${code} on SIGTERM"; }
+docker logs "$server" 2>&1 | grep -q '^horae serve: stopped$' \
+  || { docker logs "$server" >&2; fail "horae serve did not report its stop"; }
+# The image listens on 0.0.0.0 and no HORAE_ALLOWED_HOSTS is set here: it must say so.
+docker logs "$server" 2>&1 | grep -q 'WARNING api: listening on every interface (0.0.0.0).*HORAE_ALLOWED_HOSTS' \
+  || { docker logs "$server" >&2; fail "horae serve did not warn about HORAE_ALLOWED_HOSTS"; }
+echo "ok: horae serve is healthy (HEALTHCHECK on /healthz), serves /runs, stops with exit 0"

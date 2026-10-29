@@ -78,7 +78,9 @@ ENV PATH=/opt/venv/bin:$PATH \
     PYTHONSAFEPATH=1 \
     HOME=/tmp \
     TMPDIR=/tmp \
-    HORAE_INSTANCE=/instance
+    HORAE_INSTANCE=/instance \
+    HORAE_HOST=0.0.0.0 \
+    HORAE_PORT=8080
 
 # The instance directory (horae.yaml, horae.lock, pipelines/, plugins/, state/, vault/) is the
 # one writable place: mount a named volume (`-v horae:/instance`, which starts owned by 10001) or
@@ -88,10 +90,23 @@ ENV PATH=/opt/venv/bin:$PATH \
 WORKDIR /instance
 USER 10001:10001
 
-# `horae --version` is the only check that is meaningful before the HTTP API exists; #37 replaces
-# it with a /healthz probe.
-HEALTHCHECK --interval=60s --timeout=10s --start-period=10s --retries=3 \
-    CMD ["horae", "--version"]
+# `horae serve` (the default command) runs the scheduler and the HTTP API (#37). The API has no
+# authentication of its own: it listens on 0.0.0.0:8080 inside the container for the reverse
+# proxy, whose SSO middleware guards it; never publish the port directly (no `-p` on a public
+# interface). Set HORAE_HOST=127.0.0.1 when nothing else needs to reach it. Requests must carry
+# an allowed Host (DNS-rebinding defence): loopback is always allowed (the HEALTHCHECK below);
+# set HORAE_ALLOWED_HOSTS to the proxy's public hostname(s), space-separated.
+EXPOSE 8080
+
+# The health check asks /healthz over loopback (200: the store is readable and the scheduler
+# runs; 503 or no answer: unhealthy) with the standard library: no curl or wget in the image, and
+# no proxy (ProxyHandler({}) ignores *_PROXY). Any error, a 503 included, exits 1. A container
+# running another command (init, doctor, run) reports unhealthy, which is harmless for a one-off.
+# The check follows HORAE_PORT, not a `--port` flag: change the port with HORAE_PORT (a `serve
+# --port N` command makes the check ask the wrong port and the container unhealthy). It asks
+# 127.0.0.1: with HORAE_HOST=:: (IPv6 only, IPV6_V6ONLY) or another specific address, override it.
+HEALTHCHECK --interval=60s --timeout=10s --start-period=20s --retries=3 \
+    CMD ["python", "-c", "import os, urllib.request as u; u.build_opener(u.ProxyHandler({})).open('http://127.0.0.1:' + os.environ.get('HORAE_PORT', '8080') + '/healthz', timeout=5)"]
 
 ENTRYPOINT ["tini", "--", "horae"]
-CMD ["--help"]
+CMD ["serve"]
