@@ -25,7 +25,7 @@ from horae_sdk import (
     Transform,
     intents,
 )
-from horae_sdk.protocol import MAX_NOTE_BYTES
+from horae_sdk.protocol import MAX_INTENTS, MAX_MESSAGE_BYTES, MAX_NOTE_BYTES, MESSAGE_MARGIN
 from horae_sdk.sinks import decode, encode
 from horae_sdk.testing import Replayed, ReplayMismatch, call, operation
 
@@ -193,7 +193,7 @@ def test_sink_operations_follow_the_host_contract() -> None:
     other = {"paths": paths, "intent": {"type": "notify.push", "body": "x"}}
     assert run(operation(plugin, "notes.apply", other))["error"]["kind"] == "not_supported"
     bad = run(operation(plugin, "notes.apply", {**arguments, "content": "not base64!"}))
-    assert bad["error"]["kind"] == "content_invalid"
+    assert bad["error"]["kind"] == "output_invalid"
     assert plugin.provides() == {"sinks": ["notes.write_note"]}
     with pytest.raises(ReplayMismatch, match="not a source"):
         run(call(plugin, "notes.read"))
@@ -292,3 +292,54 @@ def test_paths(tmp_path: Path) -> None:
     assert paths.allowed("x.md") is None
     assert Paths.from_wire("junk") == Paths()
     assert paths.to_wire() == {"read": [str(tmp_path / "ro")], "write": [str(vault)]}
+
+
+def test_results_over_the_host_limits_are_refused_before_sending() -> None:
+    plugin = Plugin("big", permissions=Permissions(intents=["notify.push"]))
+
+    @plugin.source("big.many")
+    def many(call: Call, count: int = MAX_INTENTS) -> Output:
+        return Output({}, [intents.notify_push("x")] * count)
+
+    @plugin.source("big.data")
+    def data(call: Call, size: int, char: str = "\u00e9", wrap: bool = True) -> Any:
+        text = char * size
+        return {"text": text} if wrap else text
+
+    @plugin.source("big.odd")
+    def odd(call: Call) -> Output:
+        return Output({}, [{"type": "x" * 10_000}])
+
+    assert len(run(call(plugin, "big.many")).intents) == MAX_INTENTS
+    too_many = run(call(plugin, "big.many", {"count": MAX_INTENTS + 1})).error or ""
+    assert f"more than {MAX_INTENTS}" in too_many
+    limit = MAX_MESSAGE_BYTES - MESSAGE_MARGIN
+    # 2 bytes a character in UTF-8; a backslash is 2 bytes once escaped, 4 in a text block
+    assert run(call(plugin, "big.data", {"size": limit // 2 - 64})).error is None
+    assert run(call(plugin, "big.data", {"size": limit // 3, "char": "\\"})).error is None
+    for arguments in (
+        {"size": limit // 2},
+        {"size": limit // 3, "char": "\\", "wrap": False},
+    ):
+        refused = run(call(plugin, "big.data", arguments)).error or ""
+        assert "over the host's limit" in refused
+    undeclared = run(call(plugin, "big.odd")).error or ""
+    assert len(undeclared) < 200  # the undeclared type is cut, as apply cuts it
+
+
+def test_a_sink_result_over_the_limit_is_an_error() -> None:
+    class Chatty(Notifier):
+        def identity(self, paths: Paths) -> str:
+            return "x" * (MAX_MESSAGE_BYTES - MESSAGE_MARGIN)
+
+        def apply(self, request: ApplyRequest) -> Applied:
+            return Applied("t", details={"bad": object()})
+
+    plugin = Plugin("chatty", permissions=Permissions(intents=["notify.push"]))
+    plugin.add(Chatty(["chatty.push"]))
+    identity = run(operation(plugin, "chatty.identity", {"paths": {}}))
+    assert identity["error"]["kind"] == "output_too_large"
+    applied = run(
+        operation(plugin, "chatty.apply", {"paths": {}, "intent": intents.notify_push("x")})
+    )
+    assert applied["error"]["kind"] == "sink_failed"

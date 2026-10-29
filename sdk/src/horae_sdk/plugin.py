@@ -23,6 +23,9 @@ plugin.run()  # serve over stdio
 block, never a second copy), anything else as one JSON text block. Proposed intents (`dict`s,
 e.g. from `horae_sdk.intents`) go in `_meta["dev.horae/intents"]`; one whose type is not in
 the plugin's `permissions.intents` fails the call here (the core would reject the whole step).
+A result is refused here, before it is sent, when it holds more than `MAX_INTENTS` (256)
+intents (the core would refuse the whole step, `batch_too_large`) or when its message would
+not fit the host's `MAX_MESSAGE_BYTES` (the host would kill the plugin, `output_too_large`).
 `PluginError(message)` is a tool error (`isError`, the host's `tool_error`); any other
 exception is logged to stderr and becomes a generic tool error naming its type, so an
 exception's text never reaches the core unless the plugin chooses to.
@@ -44,7 +47,16 @@ from mcp.server.mcpserver import Context, MCPServer
 from mcp_types import CallToolResult, ContentBlock, TextContent
 
 from horae_sdk.manifest import DEFAULT_HORAE, Permissions, manifest
-from horae_sdk.protocol import INPUT_META, INTENTS_META, PATHS_META, Paths, meta_of
+from horae_sdk.protocol import (
+    INPUT_META,
+    INTENTS_META,
+    MAX_INTENTS,
+    MAX_MESSAGE_BYTES,
+    MESSAGE_MARGIN,
+    PATHS_META,
+    Paths,
+    meta_of,
+)
 from horae_sdk.sinks import Applied, ApplyRequest, Sink, SinkError, decode, encode
 
 ToolRole = Literal["sources", "transforms"]
@@ -207,7 +219,8 @@ class Plugin:
 
     def run(self) -> None:  # pragma: no cover (runs in the plugin's process)
         """Serve over stdio until the core closes stdin."""
-        warnings.simplefilter("ignore")
+        # Warnings go to stderr (never the protocol channel); only the SDK's own are muted.
+        warnings.filterwarnings("ignore", module=r"horae_sdk(\.|$)")
         logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
         self.server.run("stdio")
 
@@ -264,15 +277,25 @@ class Plugin:
         `PluginError` when it is not JSON or proposes an undeclared intent."""
         output = value if isinstance(value, Output) else Output(value)
         intents = [dict(intent) for intent in output.intents]
+        if len(intents) > MAX_INTENTS:
+            raise PluginError(
+                f"{ref}: {len(intents)} intents, more than {MAX_INTENTS} in one result"
+                " (the core refuses the whole step)"
+            )
         for intent in intents:
             kind = intent.get("type")
             if kind not in self.permissions.intents:
-                raise PluginError(f"{ref}: intent {kind!r} is not in permissions.intents")
+                raise PluginError(f"{ref}: intent {str(kind)[:40]!r} is not in permissions.intents")
         try:
             text = json.dumps(output.data, allow_nan=False)
-            json.dumps(intents, allow_nan=False)
+            size = _wire_size(output.data, intents, structured=isinstance(output.data, dict))
         except (TypeError, ValueError):
             raise PluginError(f"{ref}: the output is not JSON") from None
+        if size > MAX_MESSAGE_BYTES - MESSAGE_MARGIN:
+            raise PluginError(
+                f"{ref}: the output is about {size} bytes, over the host's limit of"
+                f" {MAX_MESSAGE_BYTES - MESSAGE_MARGIN} for one message"
+            )
         meta = {INTENTS_META: intents} if intents else None
         if isinstance(output.data, dict):
             return CallToolResult(content=_text("ok"), structured_content=output.data, _meta=meta)
@@ -370,6 +393,22 @@ class Plugin:
             self.server.add_tool(function, name=f"{ns}.{function.__name__}")
 
 
+def _compact(value: Any) -> str:
+    return json.dumps(value, allow_nan=False, ensure_ascii=False, separators=(",", ":"))
+
+
+def _wire_size(data: Any, intents: list[dict[str, Any]], *, structured: bool) -> int:
+    """The UTF-8 size of what a result puts on the wire, without the JSON-RPC envelope
+    (`MESSAGE_MARGIN` covers it): the data once (as `structuredContent`, or as a JSON text
+    block, escaped again as a string), and the intents."""
+    payload = _compact(data)
+    if not structured:
+        payload = _compact(payload)
+    return len(payload.encode("utf-8", "surrogatepass")) + len(
+        _compact(intents).encode("utf-8", "surrogatepass")
+    )
+
+
 async def _read(sink: Sink, paths: dict[str, Any], path: str) -> dict[str, Any]:
     content = await _maybe_await(sink.read(Paths.from_wire(paths), path))
     if content is not None and not isinstance(content, bytes):
@@ -386,6 +425,12 @@ async def _operation(run: Callable[[], Any]) -> CallToolResult:
     except Exception as error:
         _log.exception("sink operation failed")
         data = {"error": {"kind": "sink_failed", "message": type(error).__name__}}
+    try:
+        size = _wire_size(data, [], structured=True)
+    except (TypeError, ValueError):
+        data, size = {"error": {"kind": "sink_failed", "message": "the result is not JSON"}}, 0
+    if size > MAX_MESSAGE_BYTES - MESSAGE_MARGIN:
+        data = {"error": {"kind": "output_too_large", "message": f"a result of {size} bytes"}}
     failure = data.get("error")
     summary = f"error: {failure['kind']}" if isinstance(failure, dict) else "ok"
     return CallToolResult(content=_text(summary), structured_content=data)

@@ -26,8 +26,9 @@ A sink that only handles non-note intents (a notifier) leaves `read`, `restore` 
 where the vault is). A failure is `SinkError(kind, message)`: `kind` matches `^[a-z_]{1,32}$`
 (e.g. `target_changed`, `not_supported`, `vault_unset`, `config_invalid`), returned to the
 core as `{"error": {"kind", "message"}}`. Note bytes travel as base64, at most
-`MAX_NOTE_BYTES` decoded each way (`note_too_large`, checked before encoding). Methods may be
-plain or `async`.
+`MAX_NOTE_BYTES` decoded each way (`note_too_large`, checked before encoding); content that
+is not base64 is `output_invalid`, the kind the core's own sinks use
+(`horae.plugins.host.sink.decode`). Methods may be plain or `async`.
 """
 
 import base64
@@ -80,13 +81,13 @@ def decode(value: object) -> bytes | None:
     if value is None:
         return None
     if not isinstance(value, str):
-        raise SinkError("content_invalid", "content is not a base64 string")
+        raise SinkError("output_invalid", "content is not a base64 string")
     if len(value) > 4 * -(-MAX_NOTE_BYTES // 3):
         raise _too_large()
     try:
         return base64.b64decode(value.encode("ascii"), validate=True)
     except (UnicodeEncodeError, binascii.Error, ValueError):
-        raise SinkError("content_invalid", "content is not valid base64") from None
+        raise SinkError("output_invalid", "content is not valid base64") from None
 
 
 @dataclass(frozen=True)

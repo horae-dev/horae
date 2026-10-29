@@ -12,7 +12,11 @@
   JSON; `isError: true` is a tool error. Proposed intents travel in the result's
   `_meta["dev.horae/intents"]` (a list).
 - Messages are capped at `MAX_MESSAGE_BYTES` (8 MiB) by the host: a larger one costs the
-  plugin its process (`output_too_large`).
+  plugin its process (`output_too_large`). The SDK refuses such a result before sending it
+  (a tool error, or a sink operation's `output_too_large`), keeping `MESSAGE_MARGIN` for the
+  JSON-RPC envelope.
+- One step proposes at most `MAX_INTENTS` (256) intents (`horae.intents.MAX_INTENTS`): the
+  core refuses the whole step otherwise (`batch_too_large`), so the SDK refuses it first.
 """
 
 import os
@@ -25,6 +29,7 @@ INTENTS_META = "dev.horae/intents"
 PATHS_META = "dev.horae/paths"
 MAX_MESSAGE_BYTES = 8 * 1024 * 1024
 MESSAGE_MARGIN = 64 * 1024
+MAX_INTENTS = 256
 MAX_NOTE_BYTES = (MAX_MESSAGE_BYTES - MESSAGE_MARGIN) // 4 * 3
 """The largest note sent over MCP either way, decoded (`horae.plugins.host.sink`)."""
 
@@ -76,6 +81,7 @@ def meta_of(meta: Any) -> Mapping[str, Any]:
 __all__ = [
     "INPUT_META",
     "INTENTS_META",
+    "MAX_INTENTS",
     "MAX_MESSAGE_BYTES",
     "MAX_NOTE_BYTES",
     "MESSAGE_MARGIN",
