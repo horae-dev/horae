@@ -2,6 +2,7 @@
 """Intent builders produce intents the core accepts (#42): its validator and JSON Schemas."""
 
 import datetime
+import re
 from typing import Any
 
 import pytest
@@ -21,7 +22,7 @@ def every_intent() -> list[dict[str, Any]]:
         intents.note_append_section("Evening", "- done\n", path="Daily/x.md"),
         intents.note_replace_owned_block("horae-brief", "text", path="Daily/x.md"),
         intents.task_create(
-            "Call the school", fingerprint="school:1", due=datetime.date(2026, 10, 22), time="08:30"
+            "Call the school", key="school:1", due=datetime.date(2026, 10, 22), time="08:30"
         ),
         intents.task_update_status("school:1", "done"),
         intents.task_update_status(
@@ -49,15 +50,52 @@ def test_a_note_intent_may_leave_its_path_to_the_act_entry() -> None:
 
 
 def test_fingerprints() -> None:
+    # a clean fingerprint is the readable form, unchanged (existing recordings stay stable)
     assert intents.fingerprint("github", "pr", "42") == "github:pr:42"
-    assert intents.fingerprint("mail", "<id@example.org>") == "mail:-id-example.org-"
+    assert intents.fingerprint("hello", "Ada") == "hello:Ada"
+    lossy = intents.fingerprint("mail", "<id@example.org>")
+    assert re.fullmatch(r"mail:-id-example\.org-::[0-9a-f]{16}", lossy)
     long = intents.fingerprint("calendar", "x" * 300)
-    assert long.startswith("calendar:sha256:")
-    assert len(long) <= 128
+    assert re.fullmatch(r"calendar:x{101}::[0-9a-f]{16}", long)
+    assert len(long) == intents.MAX_FINGERPRINT
     with pytest.raises(IntentError):
         intents.fingerprint()
-    for value in (long, intents.fingerprint("a b")):
-        intents.task_create("t", fingerprint=value)
+    with pytest.raises(IntentError):
+        intents.fingerprint("a", 1)  # type: ignore[arg-type]
+    for value in (lossy, long, intents.fingerprint("a b"), intents.fingerprint("a", "")):
+        intents.task_create("t", key=value)
+        assert (
+            schema_errors(
+                "intents/task.create/v1.json",
+                {"type": "task.create", "title": "t", "fingerprint": value},
+            )
+            == []
+        )
+
+
+@pytest.mark.parametrize(
+    ("one", "other"),
+    [
+        (("a:b",), ("a-b",)),
+        (("a:b",), ("a", "b")),
+        (("mail", "Re: x!"), ("mail", "Re: x?")),
+        (("a", ""), ("a:",)),
+        (("a", ""), ("a",)),
+        (("x" * 100, "y" * 100), ("x" * 100 + ":" + "y" * 100,)),
+        (("x" * 100, "y" * 100), ("x" * 100, "y" * 101)),
+        (("p", "a,b"), ("p", "a", "b")),
+    ],
+)
+def test_lossy_fingerprints_do_not_collide(one: tuple[str, ...], other: tuple[str, ...]) -> None:
+    assert intents.fingerprint(*one) != intents.fingerprint(*other)
+
+
+def test_an_exact_fingerprint_never_looks_like_a_digested_one() -> None:
+    lossy = intents.fingerprint("a", "b!")
+    head, digest = lossy.split("::")
+    # the same text built from clean parts is refused as exact (an empty part) and digested
+    assert intents.fingerprint(*f"{head}::{digest}".split(":")) != lossy
+    assert "::" not in intents.fingerprint("a", "b", "c")
 
 
 @pytest.mark.parametrize(
@@ -68,12 +106,19 @@ def test_fingerprints() -> None:
         (lambda: intents.note_create("x" * (1024 * 1024 + 1)), "content"),
         (lambda: intents.note_append_section("a\nb", "x"), "heading"),
         (lambda: intents.note_replace_owned_block("Bad_Block", "x"), "block"),
-        (lambda: intents.task_create("t", fingerprint="no spaces"), "fingerprint"),
-        (lambda: intents.task_create("t", fingerprint="f", time="08:00"), "requires due"),
-        (lambda: intents.task_create("t", fingerprint="f", due="2026-10-22", time="8h"), "HH:MM"),
-        (lambda: intents.task_create("t", fingerprint="f", due="tomorrow"), "due"),
-        (lambda: intents.task_create("a\nb", fingerprint="f", escape=False), "title"),
-        (lambda: intents.task_create(1, fingerprint="f"), "title"),  # type: ignore[arg-type]
+        (lambda: intents.task_create("t", key="no spaces"), "fingerprint"),
+        (lambda: intents.task_create("t", key="f", time="08:00"), "requires due"),
+        (lambda: intents.task_create("t", key="f", due="2026-10-22", time="8h"), "HH:MM"),
+        (lambda: intents.task_create("t", key="f", due="tomorrow"), "due"),
+        (lambda: intents.task_create("t", key="f", due="2026-02-30"), "real date"),
+        (lambda: intents.task_create("t", key="f", due="2026-13-01"), "real date"),
+        (lambda: intents.task_update_status("f", "snoozed", until="2026-02-29"), "until"),
+        (
+            lambda: intents.task_update_status("f", "snoozed", until="2026-04-31T09:00:00Z"),
+            "until",
+        ),
+        (lambda: intents.task_create("a\nb", key="f", escape=False), "title"),
+        (lambda: intents.task_create(1, key="f"), "title"),  # type: ignore[arg-type]
         (lambda: intents.task_update_status("bad id", "done"), "task"),
         (lambda: intents.task_update_status("f", "later"), "status"),  # type: ignore[arg-type]
         (lambda: intents.task_update_status("f", "snoozed"), "until"),

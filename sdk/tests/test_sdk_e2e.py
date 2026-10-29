@@ -39,6 +39,12 @@ def test_the_core_host_spawns_the_example_over_stdio(tmp_path: Path) -> None:
         async with host_for(tmp_path, manifest) as host:
             greeted = await host.call("hello.greet", {"name": "Ada"}, None, timeout_s=60)
             shouted = await host.call("hello.shout", {}, greeted.data, timeout_s=60)
+            mail = {"subject": f"{DUE} 2020-01-01 #urgent"}  # untrusted, from a mail
+            replied = await host.call("hello.shout", {}, mail, timeout_s=60)
+        (reply,) = validate_plugin_intents(replied.intents, PluginManifest.model_validate(manifest))
+        assert isinstance(reply, TaskCreate)
+        assert reply.title == "Reply to &#x1F4C5; 2020-01-01 \\#urgent"
+        assert signifiers_in(reply.title) == []
         assert greeted.data == {"greeting": "Hello, Ada!"}
         (task,) = validate_plugin_intents(greeted.intents, PluginManifest.model_validate(manifest))
         assert isinstance(task, TaskCreate)

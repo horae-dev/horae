@@ -4,7 +4,7 @@
 name: hello
 version: 0.1.0
 horae: '>=0'
-description: Greets someone and proposes a task to greet them back.
+description: Greets someone and proposes tasks to greet them back and to reply.
 license: Apache-2.0
 provides:
   sources:

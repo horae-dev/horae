@@ -35,6 +35,7 @@ def test_the_example_replays_its_recordings() -> None:
     assert [path.name for path in replayed] == [
         "greet-ada.json",
         "greet-hostile-name.json",
+        "shout-hostile-subject.json",
         "shout.json",
     ]
 

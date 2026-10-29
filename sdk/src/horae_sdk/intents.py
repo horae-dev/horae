@@ -9,13 +9,20 @@ mistake fails in the plugin's own tests rather than as a rejected step. The core
 judge: it checks everything again.
 
 `task_create` **escapes the title** for Obsidian Tasks by default (`horae_sdk.tasks`,
-threat model T02): a title from an untrusted source (a mail subject, an issue title) cannot
-set a date, a recurrence, a priority, a tag or a link. The escaping is idempotent, so a
-Tasks sink escaping again changes nothing. Pass `escape=False` only for a task that never
+threat model T02, schemas decision 50): a title from an untrusted source (a mail subject, an
+issue title) cannot set a date, a recurrence, a priority, a tag or a link. The intent's
+`title` is therefore the **Tasks-safe form** (cut to 500 characters after escaping), not the
+plain text: a Tasks sink writes it as it is (`tasks.task_line` escapes again, idempotently), a
+sink for another target shows `tasks.plain_text(title)` (display only). The builder is
+**total** on the title: a title with nothing printable left becomes `(untitled)`, so one
+hostile item never aborts a whole `collect`. Pass `escape=False` only for a task that never
 reaches Tasks syntax; the title is then still made one line (control characters refused).
+
+Follow-up (decision 50): escape at the sink only and keep the plain title in the intent.
 """
 
 import hashlib
+import json
 import re
 from collections.abc import Mapping
 from datetime import date, datetime
@@ -39,7 +46,10 @@ MAX_HEADING = 200
 MAX_BODY = 4096
 MAX_CONTENT = 1024 * 1024
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+MAX_FINGERPRINT = 128
 _FINGERPRINT = re.compile(r"[A-Za-z0-9._:-]{1,128}")
+_CLEAN_PART = re.compile(r"[A-Za-z0-9._-]+")
+_DIGEST_HEX = 16
 _SEGMENT = r"[^./\\\x00-\x1f\x7f][^/\\\x00-\x1f\x7f]{0,254}"
 _NOTE_PATH = re.compile(rf"{_SEGMENT}(/{_SEGMENT})*")
 _BLOCK = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
@@ -71,10 +81,38 @@ def _line(value: object, what: str, limit: int) -> str:
     return value
 
 
+def _text(value: object) -> bool:
+    """`value` is a string of at most `MAX_CONTENT` characters (checked at run time: a
+    plugin's own code may not be type-checked)."""
+    return isinstance(value, str) and len(value) <= MAX_CONTENT
+
+
+def _real_date(text: object) -> bool:
+    """`text` is `YYYY-MM-DD` and a real calendar date (no 2026-02-30)."""
+    if not isinstance(text, str) or not _DATE.fullmatch(text):
+        return False
+    try:
+        date.fromisoformat(text)
+    except ValueError:
+        return False
+    return True
+
+
+def _real_timestamp(text: object) -> bool:
+    """`text` is an RFC 3339 date-time with an offset that exists on the calendar."""
+    if not isinstance(text, str) or len(text) > 64 or not _TIMESTAMP.fullmatch(text):
+        return False
+    try:
+        datetime.fromisoformat(text)
+    except ValueError:
+        return False
+    return True
+
+
 def _date(value: object, what: str) -> str:
     text = value.isoformat() if isinstance(value, date) else value
-    if not isinstance(text, str) or not _DATE.fullmatch(text):
-        raise IntentError(f"{what} must be a date, YYYY-MM-DD")
+    if not isinstance(text, str) or not _real_date(text):
+        raise IntentError(f"{what} must be a real date, YYYY-MM-DD")
     return text
 
 
@@ -94,17 +132,27 @@ def _content(content: object) -> str:
 
 
 def fingerprint(*parts: str) -> str:
-    """A stable task fingerprint from `parts` (e.g. `fingerprint("github", "pr", "42")` is
-    `github:pr:42`): the parts joined with `:`, characters outside `A-Z a-z 0-9 . _ : -`
-    replaced with `-`; longer than 128 characters, `<first part>:sha256:<digest prefix>`."""
-    if not parts or not all(_matches(_ANY, part, MAX_CONTENT) for part in parts):
-        raise IntentError("a fingerprint needs at least one non-empty part")
-    joined = ":".join(re.sub(r"[^A-Za-z0-9._-]", "-", part) for part in parts)
-    if len(joined) <= 128:
-        return joined
-    digest = hashlib.sha256(":".join(parts).encode("utf-8")).hexdigest()
-    head = re.sub(r"[^A-Za-z0-9._-]", "-", parts[0])[:48]
-    return f"{head}:sha256:{digest[:64]}"
+    """A stable task fingerprint from `parts` (`fingerprint("github", "pr", "42")` is
+    `github:pr:42`).
+
+    The readable form is the parts joined with `:`, each part's characters outside
+    `A-Z a-z 0-9 . _ -` replaced with `-`. When that form is **exact** (every part non-empty
+    and already in that alphabet, at most 128 characters) it is the fingerprint, so a clean
+    fingerprint never changes. Otherwise (a character replaced, an empty part, a cut) the
+    readable form is lossy and could be collided on purpose (`a:b` / `a-b`, `Re: x!` /
+    `Re: x?`), so the fingerprint is its first 110 characters, then `::` and 16 hex digits
+    of the SHA-256 of the parts as a JSON array (an unambiguous encoding). An exact form
+    never holds `::`, so the two shapes cannot collide; two lossy ones collide only if
+    their digests do (64 bits)."""
+    if not parts or not all(_text(part) for part in parts):
+        raise IntentError("a fingerprint needs at least one part, each a string")
+    readable = ":".join(re.sub(r"[^A-Za-z0-9._-]", "-", part) for part in parts)
+    exact = all(_CLEAN_PART.fullmatch(part) for part in parts)
+    if exact and len(readable) <= MAX_FINGERPRINT:
+        return readable
+    encoded = json.dumps(list(parts), ensure_ascii=False, separators=(",", ":"))
+    digest = hashlib.sha256(encoded.encode("utf-8", "surrogatepass")).hexdigest()[:_DIGEST_HEX]
+    return f"{readable[: MAX_FINGERPRINT - 2 - _DIGEST_HEX]}::{digest}"
 
 
 def note_create(content: str, *, path: str | None = None) -> Intent:
@@ -134,24 +182,23 @@ def note_replace_owned_block(block: str, content: str, *, path: str | None = Non
 def task_create(
     title: str,
     *,
-    fingerprint: str,
+    key: str,
     due: str | date | None = None,
     time: str | None = None,
     escape: bool = True,
 ) -> Intent:
-    """`task.create`. The title is escaped for Obsidian Tasks unless `escape=False` (see the
-    module docstring) and cut to 500 characters; `time` (`HH:MM`) requires `due`."""
+    """`task.create` with fingerprint `key` (e.g. from `fingerprint(...)`). The title is
+    escaped for Obsidian Tasks unless `escape=False` (see the module docstring), then cut to
+    500 characters; nothing printable left, it is `(untitled)`. `due` must be a real date,
+    and `time` (`HH:MM`) requires `due`."""
     if not isinstance(title, str):
         raise IntentError("title must be a string")
     if escape:
-        try:
-            title = escape_title(title, max_length=MAX_TITLE)
-        except ValueError:
-            raise IntentError("title is empty once escaped") from None
+        title = escape_title(title, max_length=MAX_TITLE)
     intent: Intent = {"type": "task.create", "title": _line(title, "title", MAX_TITLE)}
-    if not _matches(_FINGERPRINT, fingerprint):
-        raise IntentError("fingerprint must be 1 to 128 of A-Z a-z 0-9 . _ : -")
-    intent["fingerprint"] = fingerprint
+    if not _matches(_FINGERPRINT, key):
+        raise IntentError("key (the fingerprint) must be 1 to 128 of A-Z a-z 0-9 . _ : -")
+    intent["fingerprint"] = key
     if due is not None:
         intent["due"] = _date(due, "due")
     if time is not None:
@@ -185,7 +232,7 @@ def task_update_status(
     elif isinstance(until, date):
         until = until.isoformat()
     if until is not None:
-        if not (_matches(_DATE, until) or _matches(_TIMESTAMP, until)):
+        if not (_real_date(until) or _real_timestamp(until)):
             raise IntentError("until must be YYYY-MM-DD or an RFC 3339 date-time with an offset")
         intent["until"] = until
     return intent
@@ -223,6 +270,7 @@ def http_post(
 
 __all__ = [
     "INTENT_TYPES",
+    "MAX_FINGERPRINT",
     "Intent",
     "IntentError",
     "fingerprint",
