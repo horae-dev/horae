@@ -14,6 +14,10 @@ follows it works too.
 
 ## A minimal plugin
 
+To start a new plugin repository, use the
+[plugin template](../docs/plugins/template.md) (`horae-dev/template-plugin`): an example
+plugin, `plugin.yaml`, recorded-input tests and CI that pass as soon as it is created.
+
 [`examples/hello/hello_plugin.py`](examples/hello/hello_plugin.py), a source and a transform:
 
 ```python
