@@ -30,11 +30,10 @@ from dataclasses import dataclass
 from typing import Literal
 
 import httpx2
-from pydantic import TypeAdapter, ValidationError
 
 from horae import __version__
 from horae.config import Instance
-from horae.contracts.instance import BackendUrl, PushMonitor
+from horae.contracts.instance import PushMonitor, is_push_url
 from horae.llm.backends._shared import RESPONSE_CAP, Refused, Unreadable, transport
 from horae.secrets import SecretError, logs
 
@@ -46,8 +45,6 @@ PING_RESPONSE_CAP = 64 * 1024
 """Largest response body accepted (it is not used: only the status is)."""
 UP_STATUSES = frozenset({"ok", "noop", "degraded"})
 """Run outcomes pinged `up`; every other outcome is `down`."""
-
-_URL = TypeAdapter(BackendUrl)
 
 PingResult = Literal["none", "sent", "failed"]
 """`none`: the pipeline has no monitor; `sent`: the monitor answered 2xx; `failed`: see the
@@ -141,10 +138,8 @@ async def _send(
         secret = instance.secret_resolver(environ).resolve(monitor.secret)
     except SecretError:
         return f"secret {monitor.secret} could not be resolved"
-    try:
-        url = _URL.validate_python(secret.reveal())
-    except ValidationError:
-        # Never shown: the error would quote the value.
+    url = secret.reveal()
+    if not is_push_url(url):  # the check `horae doctor` makes; the value is never shown
         return f"secret {monitor.secret} is not an https:// URL or an http:// URL on the LAN"
     target = ping_url(url, monitor, outcome, duration_s)
     error: Exception | None = None
