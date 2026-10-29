@@ -124,10 +124,14 @@ a read-only root filesystem and a one-off `horae init` on a new volume:
   Empty* service behind Coolify's Traefik and an SSO forwardAuth (for example authentik); only
   `/act/` is exempt from SSO. Required variables block the deployment until they are set;
   Scheduled Tasks run `horae run daily-brief` and `horae run remind`, each with an Uptime Kuma
-  push monitor. Guide: [docs/operations/coolify.md](docs/operations/coolify.md).
+  push monitor. One Horae per Coolify server (fixed Traefik names). Guide:
+  [docs/operations/coolify.md](docs/operations/coolify.md).
 - **Plain Docker Compose**: [`deploy/compose/`](deploy/compose/), on `127.0.0.1` only, with an
   optional Traefik and SSO override; built-in scheduler or host cron. Guide:
   [docs/operations/compose.md](docs/operations/compose.md).
+
+Both pull `ghcr.io/horae-dev/horae` without credentials, which needs the GHCR package to be
+public: check first (the guides give the one-line check and the registry login otherwise).
 
 `tests/test_deploy_templates.py` checks the rendered files (routing, hardening, required
 variables).
