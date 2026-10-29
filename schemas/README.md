@@ -2551,3 +2551,74 @@ loosened later without breaking a valid file.
     - **follow-ups**: `budget_from`; a `--repair` live mode that exercises the repair retry;
       `horae eval --all` over every installed skill; a JSON Schema for the eval report
       (`schemas/eval-report/v1.json`); a real `pack-daily-brief` repository with its cases.
+
+### Provisional decisions (#39, pending maintainer review)
+
+49. **The built-in scheduler, external triggers and push monitors (#39).** Numbering: 48 is
+    #36's; #38 and #42 may be adding decisions in parallel, so this number may move when they
+    merge. One compatible v1 addition to the instance contract (`scheduler.monitors`), one
+    new runtime dependency (`cronsim`) and one command (`horae serve`); no store migration.
+    - **A, cron library: `cronsim`** (`>=2.7,<3`, pinned in `uv.lock`). Pure Python, no
+      dependency, typed (`py.typed`), about 1,200 lines with its `explain` module, maintained by the author of
+      Healthchecks.io, where it evaluates every check's schedule, so its daylight-saving
+      behaviour is exercised in production. `croniter` was considered: larger, and it went
+      through an end-of-life notice and a change of maintainers; APScheduler is a whole
+      scheduler with its own job store and executors, more than needed (Horae has its run
+      lock and store). `cronsim` also validates the fields (`horae.config.cron.cron_problem`): an
+      expression the contract's shape accepts but that cannot fire (`0 0 30 2 *`, `61 * * *
+      *`) is a loader problem at `trigger.cron` (also in `horae doctor`).
+    - **B, time zone.** A trigger is evaluated in its own `timezone`, else `horae.yaml`
+      `timezone` (decision 13; UTC when neither is set); fire times are stored and reported
+      in UTC. Daylight saving follows Debian cron, as `cronsim` implements it: a time in the
+      skipped hour fires once at the first instant after the gap, a time in the repeated hour
+      fires once (its first occurrence), and an expression whose hour field is `*` fires at
+      every real occurrence (`tests/test_scheduler.py`, Europe/Paris in March and October).
+    - **C, mode.** `scheduler.mode` (`builtin` by default) is overridden by the
+      `HORAE_SCHEDULER` environment variable when it is set and not blank: `builtin` or
+      `external`, anything else a configuration error (`horae serve` exits 1). In `external`
+      mode `horae serve` fires nothing (an external scheduler runs `horae run <pipeline>`,
+      which is unaffected by the mode); the process still runs, for the HTTP API of #37.
+    - **D, missed runs and overlap.** Missed fire times are **skipped**, never caught up: on
+      start each pipeline waits for its first fire time after now, and a loop that wakes late
+      (a suspended host) runs the fire time it waited for once, then the first one after
+      now. The push monitor is what reports a missed run. A fire time while the pipeline's
+      previous scheduled run is still running, or whose run finds the per-pipeline `flock`
+      held (a manual `horae run`: `PipelineLocked`; a scheduled run takes the same lock as
+      any run, decision 31), is **skipped and recorded**: a warning log line and the
+      pipeline's `skipped` / `last_skip` in the scheduler state. A skipped fire time pings no
+      monitor and writes no run row (the run in progress pings and records its own).
+    - **E, the process: `horae serve`.** The long-running entry point of a container (the
+      name #37's HTTP API will share: one process). It runs `horae.scheduler.Scheduler`,
+      whose `state()` (`SchedulerState`: `mode`, `active`, and per pipeline `cron`,
+      `timezone`, `next_fire`, `last_fire`, `last_outcome`, `last_run_id`, `running`,
+      `skipped`, `last_skip`; `to_dict()` is JSON-ready, times as `...Z`) is what `/healthz`
+      will report. Scheduled runs run in the process, exactly as `horae run` runs them.
+      **Shutdown**: the first SIGTERM or SIGINT stops every loop and cancels the runs in
+      progress (a cancelled run stops as `horae run` does on SIGTERM: partial record saved
+      `failed`, an apply in progress finished first, within the runner's grace period), their
+      monitors are pinged `down` (`cancelled`), and the command exits **0** (a requested stop
+      is the normal end of a server, unlike an interrupted `horae run`). A second signal is
+      ignored. The wall clock is re-read at least every 30 s while waiting, so a clock step
+      or a suspend delays a fire time by at most that much.
+    - **F, push monitors.** `scheduler.monitors.<pipeline>: {secret, kind}`: the push URL
+      is a **secret** (it carries the monitor's token), resolved like any other (decision 25)
+      and added to the secrets the instance names, so it is primed for redaction (decision
+      43) and checked by `horae doctor`; a monitor for an unknown pipeline is a loader
+      problem. `kind: uptime-kuma` (default) sets the `status` (`up` / `down`), `msg` (the
+      outcome word) and `ping` (the run's duration in ms) query parameters; `kind:
+      healthchecks` pings the URL for success and `<url>/fail` for a failure. `up` is a run
+      `ok`, `noop` or `degraded`; everything else is `down` (failed, timeout, lost, crashed,
+      cancelled, store or plugin problem). Pinged after every run of the pipeline, scheduled
+      or `horae run`, never for a dry run or a locked pipeline. The network rules are the
+      LLM backends' (decisions 24, 40): the URL must be a `BackendUrl` (`https://` anywhere,
+      `http://` only to loopback, private or single-label hosts, re-checked at connect time
+      by `LanOnlyNetwork`), one `GET`, no retry, no redirect, `trust_env=False`, 10 s for the
+      whole exchange, the body bounded at 64 KiB and unused. A failure (timeout, refused,
+      non-2xx, unresolvable secret, invalid URL) is one warning in Horae's words, never the
+      URL, response or exception message, and **never changes the run's outcome or exit
+      code**; the `--json` document of `horae run` is unchanged.
+    - **Not done (follow-ups)**: skipped fire times are not persisted (lost on restart; a
+      store table would need a migration); no catch-up option; no `/start` ping
+      (Healthchecks) to measure durations on the monitor side; the push URL with Uptime
+      Kuma's default query (`?status=up&msg=OK&ping=`) is redacted as a whole, so the
+      rewritten URL is never logged by design rather than by redaction.
