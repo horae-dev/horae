@@ -19,6 +19,7 @@ dependencies = [
     "cronsim>=2.7,<3",
     "fastapi>=0.161,<0.162",
     "uvicorn>=0.54,<0.55",
+    "starlette>=1.9,<2",
 ]
 
 [project.scripts]
