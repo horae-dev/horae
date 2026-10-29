@@ -2551,3 +2551,73 @@ loosened later without breaking a valid file.
     - **follow-ups**: `budget_from`; a `--repair` live mode that exercises the repair retry;
       `horae eval --all` over every installed skill; a JSON Schema for the eval report
       (`schemas/eval-report/v1.json`); a real `pack-daily-brief` repository with its cases.
+
+### Provisional decisions (#42, pending maintainer review)
+
+50. **The plugin SDK: Tasks-safe task titles and fingerprints (#42, review findings).**
+    Numbering: 49 is #39's, on its unmerged branch, so this takes 50. The SDK (`sdk/`,
+    `horae-sdk`) is not a contract of the core, but its escaping is the T02 control
+    ([`docs/security.md`](../docs/security.md)), so its rules are recorded here:
+    - **(A) the intent's title is the Tasks-safe form.** `horae_sdk.intents.task_create`
+      escapes the title (`horae_sdk.tasks.escape_title`), as the acceptance criterion of #42
+      asks ("intent builders escape"), and the 500-character cut of the `Title` contract
+      happens **after** escaping. Sinks writing Tasks syntax still use `tasks.task_line` /
+      `task_line_for`, which escape again (idempotent: unchanged). A sink for another target
+      shows `tasks.plain_text(title)`, for plain-text display only (renamed from
+      `unescape_title`; never fed to a Markdown or Tasks target, and not an exact inverse).
+      **Follow-up:** escape at the sink only and keep the plain title in the intent (the
+      intent would then carry what the source said, and each sink would escape for its own
+      syntax);
+    - **(B) builders are total on the title.** A title with nothing printable left after
+      escaping (only zero-width, bidi, controls or whitespace) becomes `(untitled)`
+      (`tasks.UNTITLED`, escaped), so one hostile item never aborts a whole `collect`;
+    - **(C) escaping rules.** Signifiers become uppercase-hex character references;
+      Markdown and Obsidian punctuation gets a backslash; every rule that looks back looks
+      at the last piece **written**, not the last character read (`\::` gave a literal `::`).
+      `::` keeps a backslash on its second colon. The second `%` of `%%` and `=` of `==`
+      become `&#x25;` / `&#x3D;`: comments and highlights are Obsidian extensions, not
+      CommonMark, nothing documents that a backslash neutralises them, and a reference leaves
+      no `%%` / `==` in the line even for a parser that drops backslashes first (a reference
+      is decoded only when rendering, after the syntax is parsed). Autolinks: the `:` of a
+      URL scheme (a run of `A-Z a-z 0-9 + . -` holding a letter, followed by a non-space) and
+      the `.` of a `www.` prefix get a backslash, so `https://`, `obsidian://`,
+      `javascript:` and `www.` are not autolinked (`10:30` and `Re: x` are left alone; a bare
+      e-mail address is not changed). The cut never separates a combining mark, a variation
+      selector or an emoji modifier from its character; it is not a full grapheme
+      segmentation (no dependency for it): a regional-indicator flag may be split;
+    - **(D) idempotence trade-offs** (no behaviour change): a backslash escape already in the
+      title and a reference in the SDK's own form (uppercase hex, of a signifier, `%` or `=`)
+      pass through and render as that character; any other reference (`&amp;`, lowercase
+      hex) has its `&` escaped and renders literally;
+    - **(E) verification.** `sdk/tests/test_sdk_tasks.py` ports the Tasks plugin's emoji and
+      Dataview field regexes (with the optional U+FE0F), its tag regex and the Obsidian
+      constructs, checks that they see every field of a hostile title and none of its
+      escaped form, and a Hypothesis property over a hostile alphabet checks that no `::`,
+      `%%`, `==` or raw signifier survives. Obsidian itself is not run in CI:
+      `sdk/README.md` ("Manual check in a real vault") is the checklist for a release that
+      changes `horae_sdk.tasks`;
+    - **(F) fingerprints.** `intents.fingerprint(*parts)` keeps the readable form (parts
+      joined with `:`, other characters as `-`) when it is exact (every part non-empty and in
+      `A-Z a-z 0-9 . _ -`, at most 128 characters), so clean fingerprints and the recordings
+      using them are stable. Otherwise the readable form is lossy and attacker-collidable
+      (`a:b` / `a-b`, `Re: x!` / `Re: x?`), so it is cut to 110 characters and followed by
+      `::` and 16 hex digits of the SHA-256 of the parts as a JSON array. An exact form never
+      holds `::`, so the two shapes cannot collide. `task_create`'s fingerprint parameter is
+      `key` (it shadowed the function);
+    - **(G) protocol limits in the SDK.** A result with more than 256 intents
+      (`horae.intents.MAX_INTENTS`) or a message over `MAX_MESSAGE_BYTES` minus
+      `MESSAGE_MARGIN` is refused by the SDK before sending (a tool error, or a sink
+      operation's `output_too_large`), with a plugin-side message; content from the core
+      that is not base64 is `output_invalid`, the kind of the core's own sinks; an undeclared
+      intent type is echoed cut to 40 characters;
+    - **(H) the test harness.** Record mode (`HORAE_SDK_RECORD=1`, `record=True`) is refused
+      when `CI` or `GITHUB_ACTIONS` is set, names each rewritten file on stderr, writes
+      atomically and never through a symbolic link; `replay` works inside a running event
+      loop (`areplay`, `areplay_all`); `check` refuses unknown `expect` keys;
+    - **(I) release.** `release-sdk.yml` refuses a tag whose commit is not on main
+      (`git merge-base --is-ancestor`), the `pypi` environment must be restricted to `sdk-v*`
+      tags with required reviewers, and the build backend is pinned (`hatchling==1.32.4`,
+      bumped by Renovate). PyPI attestations are **not** produced: `uv publish` 0.13.6
+      uploads existing `.publish.attestation` files but does not create them (follow-up: a
+      Sigstore signing step). Coverage is gated at 85% for the core (`src/horae`) and the SDK
+      separately, and the sdist no longer ships the tests (they need the core).

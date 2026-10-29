@@ -19,7 +19,7 @@ from horae_sdk.tasks import (
     task_line,
     task_line_for,
 )
-from sdk_helpers import DUE, HOSTILE, REMINDER, signifiers_in
+from sdk_helpers import DUE, HOSTILE, REMINDER, SDK, signifiers_in
 
 
 def unescaped_markup(text: str) -> list[str]:
@@ -176,6 +176,16 @@ def test_the_manual_checklist_title() -> None:
     assert plain_text(escaped) == title
     assert tasks_fields(f"- [ ] {escaped}") == []
     assert tasks_fields(f"- [ ] {title}")  # the ported regexes do see the raw title
+
+
+def test_the_readme_shows_the_line_the_manual_check_writes() -> None:
+    title = (
+        f"{DUE} 2020-01-01 \U0001f501 every day #t [[x]] %%c%% ==h=="
+        " https://example.org www.example.org"
+    )
+    readme = (SDK / "README.md").read_text(encoding="utf-8")
+    assert f"`{title}`" in readme
+    assert f"\n   {task_line(title, due='2030-01-01')}\n" in readme
 
 
 def test_idempotence_trade_offs() -> None:
