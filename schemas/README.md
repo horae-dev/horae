@@ -2675,7 +2675,7 @@ loosened later without breaking a valid file.
 51. **The HTTP API: `/healthz` and the read-only `/runs` (#37).** Numbering: 49 is #39's and
     50 is #42's (PR #118, which may merge first), so this is 51. Two new runtime dependencies
     (`fastapi`, `uvicorn`, pinned in `uv.lock`, both older than the 7-day minimum release
-    age), new options of `horae serve` (`--host`, `--port`), one optional argument of
+    age), new options of `horae serve` (`--host`, `--port`, `--allowed-host`), one optional argument of
     `Store.list_runs` (`before`, a page cursor); no contract change, no store migration.
     - **A, one process, one event loop.** The API is a FastAPI application served by
       uvicorn's programmatic `Server` inside `horae serve`, in the scheduler's event loop
@@ -2734,6 +2734,21 @@ loosened later without breaking a valid file.
       `405`). The OpenAPI document and the docs pages are **disabled**, on every interface
       (not only off loopback): the API is three routes, documented here and in the README,
       and a schema endpoint would be one more thing to keep behind SSO.
+    - **G2, Host check (DNS rebinding; added after the security review of this branch).**
+      With the default loopback bind, a web page could point its own name at 127.0.0.1 and
+      read `/runs` and `/healthz` from the user's browser (same origin for the page). So a
+      request whose `Host` is not an allowed host is refused before any route runs: `400`,
+      `{kind: invalid_host, message: "invalid host"}`, the host never echoed, with the
+      security headers. Always allowed: `localhost`, `127.0.0.1`, `::1` (any port; the
+      container's `HEALTHCHECK` and a local client). Also allowed: each `--allowed-host`
+      (`HORAE_ALLOWED_HOSTS`, space-separated): the proxy's public hostname, which Traefik
+      forwards as `Host`; and the bind address itself when it is not a wildcard. An allowed
+      host is a DNS name or an IP address, compared exactly after lower-casing and dropping a
+      trailing dot: no wildcard, no port, no sub-domain matching (a bad value is a usage
+      error, exit 2). A missing, malformed or repeated `Host` is refused. Set on the command
+      line (and the environment) rather than in `horae.yaml`: it is a property of the
+      deployment, like `--host`, and needs no contract change; an `api.allowed_hosts` key can
+      follow if instance repos want it.
     - **H, shutdown.** The first SIGTERM / SIGINT stops the scheduler (decision 49 E2) and
       asks the server to stop: it closes its socket and waits up to 5 s for requests in
       progress. The command exits 0 once both have stopped; a second signal also forces the

@@ -7,20 +7,25 @@ other commands never load FastAPI."""
 
 from horae.api._app import (
     API_SCHEMA_VERSION,
+    DEFAULT_ALLOWED_HOSTS,
     DEFAULT_PAGE,
     MAX_CURSOR,
     MAX_PAGE,
     SECURITY_HEADERS,
     ApiContext,
+    HostCheck,
     RedactedJSON,
+    allowed_host,
     create_app,
     decode_cursor,
     encode_cursor,
+    host_of,
 )
 from horae.api._server import GRACEFUL_SHUTDOWN_S, ApiServer, BindError, bind, build_server
 
 __all__ = [
     "API_SCHEMA_VERSION",
+    "DEFAULT_ALLOWED_HOSTS",
     "DEFAULT_PAGE",
     "GRACEFUL_SHUTDOWN_S",
     "MAX_CURSOR",
@@ -29,10 +34,13 @@ __all__ = [
     "ApiContext",
     "ApiServer",
     "BindError",
+    "HostCheck",
     "RedactedJSON",
+    "allowed_host",
     "bind",
     "build_server",
     "create_app",
     "decode_cursor",
     "encode_cursor",
+    "host_of",
 ]

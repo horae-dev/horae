@@ -42,7 +42,7 @@ import logging
 import os
 import signal
 import sys
-from collections.abc import Callable, Coroutine, Mapping
+from collections.abc import Callable, Coroutine, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any
 
@@ -53,6 +53,7 @@ from horae.cli_output import (
     EXIT_INTERNAL,
     EXIT_OK,
     EXIT_PROBLEMS,
+    EXIT_USAGE,
     CommandFailed,
     echo,
     internal_message,
@@ -252,15 +253,31 @@ def prepare_store(instance: Instance) -> None:
         del exc
 
 
-def build_api(instance: Instance, scheduler: Scheduler, host: str, port: int) -> "ApiServer":
-    """The API server, bound to `host:port` (`CommandFailed(bind_failed)` if it cannot be)."""
-    from horae.api import ApiContext, BindError, bind, build_server, create_app
+def build_api(
+    instance: Instance,
+    scheduler: Scheduler,
+    host: str,
+    port: int,
+    allowed_hosts: Sequence[str] = (),
+) -> "ApiServer":
+    """The API server, bound to `host:port` (`CommandFailed(bind_failed)` if it cannot be),
+    accepting the `Host` values `allowed_hosts` besides loopback (`CommandFailed(usage)` for
+    one that is not a DNS name or an IP address). A bind address other than a wildcard
+    (`0.0.0.0`, `::`) is accepted as a `Host` too."""
+    from horae.api import ApiContext, BindError, allowed_host, bind, build_server, create_app
 
+    extra = [*allowed_hosts]
+    if host not in ("0.0.0.0", "::", ""):  # noqa: S104 (compared, not bound)
+        extra.append(host)
+    try:
+        hosts = frozenset(allowed_host(value) for value in extra)
+    except ValueError as exc:
+        raise CommandFailed(EXIT_USAGE, "usage", f"--allowed-host: {exc}") from None
     try:
         sock = bind(host, port)
     except BindError as exc:
         raise CommandFailed(EXIT_PROBLEMS, "bind_failed", str(exc)) from None
-    context = ApiContext(instance.store_path, instance.state_dir, scheduler.state)
+    context = ApiContext(instance.store_path, instance.state_dir, scheduler.state, hosts)
     return build_server(create_app(context), sock)
 
 
@@ -270,10 +287,11 @@ def _serve(
     runner: Callable[[Coroutine[Any, Any, int]], int],
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
+    allowed_hosts: Sequence[str] = (),
 ) -> int:
     instance = load(instance_dir)
     scheduler = build_scheduler(instance, environ)
-    api = build_api(instance, scheduler, host, port)
+    api = build_api(instance, scheduler, host, port, allowed_hosts)
     handler = logging.StreamHandler(sys.stderr)
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     previous = logger.level
@@ -327,13 +345,25 @@ def serve(
         int,
         typer.Option("--port", envvar="HORAE_PORT", min=0, max=65535, help="Port of the HTTP API."),
     ] = DEFAULT_PORT,
+    allowed_host: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--allowed-host",
+            envvar="HORAE_ALLOWED_HOSTS",
+            help=(
+                "A Host the HTTP API accepts besides localhost, 127.0.0.1 and ::1: the "
+                "proxy's public hostname (repeatable; HORAE_ALLOWED_HOSTS: space-separated)."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Run the long-lived Horae process: the built-in scheduler and the HTTP API, until
     SIGTERM or SIGINT.
 
     The HTTP API (GET /healthz, GET /runs, GET /runs/<id>; read-only, no authentication of
     its own) listens on --host:--port, 127.0.0.1:8080 by default. Never expose it without
-    the reverse proxy and its SSO middleware.
+    the reverse proxy and its SSO middleware. A request whose Host header is not localhost,
+    127.0.0.1, ::1 or an --allowed-host is refused (400): set the proxy's public hostname.
 
     In builtin mode (horae.yaml scheduler.mode, or HORAE_SCHEDULER=builtin) every pipeline
     with a trigger runs at its cron fire times, in its trigger's time zone (else the
@@ -349,7 +379,11 @@ def serve(
     second signal stops waiting for the pings (exit 130/143). Allow it at least 20 s to stop.
     Exit codes: 0 stopped, 1 configuration problem (also: the address cannot be bound), 2
     usage error, 70 internal error, 130/143 forced by a second SIGINT/SIGTERM."""
-    run_command("serve", False, lambda: _serve(instance, os.environ, asyncio.run, host, port))
+    run_command(
+        "serve",
+        False,
+        lambda: _serve(instance, os.environ, asyncio.run, host, port, allowed_host or ()),
+    )
 
 
 __all__ = [

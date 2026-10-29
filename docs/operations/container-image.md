@@ -100,6 +100,11 @@ has no authentication of its own**: put it behind the proxy's SSO middleware (on
 exempt, #41) and never publish the port (`-p 8080:8080` on a public interface exposes the run
 list to anyone). Set `HORAE_HOST=127.0.0.1` when nothing else needs to reach it.
 
+Set `HORAE_ALLOWED_HOSTS` to the public hostname the proxy serves Horae on (space-separated if
+several, e.g. `HORAE_ALLOWED_HOSTS=horae.example.org`): the API refuses (`400 invalid_host`)
+any request whose `Host` is not loopback or one of these, its defence against DNS rebinding. A
+neighbour container calling `http://horae:8080/` needs `horae` in the list too.
+
 ```
 docker run -d --name horae "${opts[@]}" --stop-timeout 20 ghcr.io/horae-dev/horae:edge
 docker inspect --format '{{.State.Health.Status}}' horae   # healthy once /healthz answers 200

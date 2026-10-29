@@ -16,7 +16,15 @@ from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
 from horae import __version__
-from horae.api import MAX_PAGE, SECURITY_HEADERS, ApiContext, create_app, encode_cursor
+from horae.api import (
+    MAX_PAGE,
+    SECURITY_HEADERS,
+    ApiContext,
+    allowed_host,
+    create_app,
+    encode_cursor,
+    host_of,
+)
 from horae.cli import app as cli_app
 from horae.config import load_instance
 from horae.scheduler import PipelineState, SchedulerState
@@ -26,6 +34,7 @@ from horae.store import SCHEMA_VERSION, Store
 from runner_fixtures import write_instance
 
 T0 = datetime(2026, 3, 1, 6, 0, tzinfo=UTC)
+LOCAL = "http://localhost"  # the default TestClient host, `testserver`, is not allowed
 
 
 class State:
@@ -67,7 +76,8 @@ def state() -> State:
 @pytest.fixture
 def client(root: Path, store_path: Path, state: State) -> Iterator[TestClient]:
     context = ApiContext(store_path, store_path.parent, state)
-    with TestClient(create_app(context), raise_server_exceptions=False) as test_client:
+    app = create_app(context)
+    with TestClient(app, base_url=LOCAL, raise_server_exceptions=False) as test_client:
         yield test_client
 
 
@@ -415,7 +425,8 @@ def test_an_internal_error_shows_only_its_type(root: Path, store_path: Path) -> 
         raise RuntimeError(f"leaky {SECRET}")
 
     context = ApiContext(store_path, store_path.parent, broken)
-    with TestClient(create_app(context), raise_server_exceptions=False) as test_client:
+    app = create_app(context)
+    with TestClient(app, base_url=LOCAL, raise_server_exceptions=False) as test_client:
         response = test_client.get("/healthz")
     assert response.status_code == 500
     assert response.json()["error"] == {
@@ -424,3 +435,100 @@ def test_an_internal_error_shows_only_its_type(root: Path, store_path: Path) -> 
     }
     assert SECRET not in response.text
     assert response.headers["x-content-type-options"] == "nosniff"
+
+
+# --- Host check (DNS rebinding) ---------------------------------------------------------------
+
+REBOUND = "rebind.attacker.example"  # synthetic: a name its owner points at 127.0.0.1
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        REBOUND,
+        f"{REBOUND}:8080",
+        "testserver",
+        "localhost.attacker.example",
+        "127.0.0.1.attacker.example",
+        "horae.example.org.attacker.example",
+        "sub.horae.example.org",
+        "",
+        "localhost:http",
+        "localhost:8080:1",
+        "[::1",
+        "local host",
+    ],
+)
+@pytest.mark.parametrize("path", ["/healthz", "/runs", "/runs/run-00", "/nope"])
+def test_a_request_for_another_host_is_refused(
+    root: Path, store_path: Path, state: State, host: str, path: str
+) -> None:
+    context = ApiContext(store_path, store_path.parent, state, frozenset({"horae.example.org"}))
+    with TestClient(create_app(context), base_url=LOCAL) as test_client:
+        response = test_client.get(path, headers={"Host": host})
+    assert response.status_code == 400
+    assert response.json() == {
+        "schema_version": 1,
+        "error": {"kind": "invalid_host", "message": "invalid host"},
+    }
+    if host:
+        assert host not in response.text
+    assert response.headers["cache-control"] == "no-store"
+    assert "access-control-allow-origin" not in response.headers
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "localhost",
+        "localhost:8080",
+        "127.0.0.1",
+        "127.0.0.1:8080",
+        "[::1]:8080",
+        "[::1]",
+        "LOCALHOST",
+        "horae.example.org",
+        "Horae.Example.Org.",
+        "horae.example.org:443",
+    ],
+)
+def test_loopback_and_configured_hosts_are_accepted(
+    root: Path, store_path: Path, state: State, host: str
+) -> None:
+    context = ApiContext(store_path, store_path.parent, state, frozenset({"HORAE.example.org."}))
+    with TestClient(create_app(context), base_url=LOCAL) as test_client:
+        assert test_client.get("/healthz", headers={"Host": host}).status_code == 200
+
+
+def test_several_host_headers_are_refused(client: TestClient) -> None:
+    # Two Host headers: ambiguous, refused whatever they say.
+    response = client.get("/healthz", headers=[("Host", "localhost"), ("Host", REBOUND)])
+    assert response.status_code == 400
+
+
+@pytest.mark.parametrize(
+    ("value", "normalised"),
+    [
+        ("Horae.Example.Org.", "horae.example.org"),
+        ("[::1]", "::1"),
+        ("10.0.0.5", "10.0.0.5"),
+        ("horae", "horae"),
+    ],
+)
+def test_allowed_hosts_are_normalised(value: str, normalised: str) -> None:
+    assert allowed_host(value) == normalised
+
+
+@pytest.mark.parametrize(
+    "value", ["", "*.example.org", "*", "a.example.org:8080", "a/b", "a b", "-a.org", "é.org"]
+)
+def test_an_allowed_host_must_be_a_name_or_an_address(value: str) -> None:
+    with pytest.raises(ValueError, match="DNS name or an IP address"):
+        allowed_host(value)
+
+
+def test_the_host_of_a_header() -> None:
+    assert host_of("[::1]:8080") == "::1"
+    assert host_of("Horae.Example.Org.:443") == "horae.example.org"
+    assert host_of(None) is None
+    assert host_of("localhost:99999999") is None

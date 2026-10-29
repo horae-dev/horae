@@ -17,7 +17,8 @@ from typer.testing import CliRunner
 
 from horae import cli_serve
 from horae.api import ApiServer, BindError, bind
-from horae.cli import EXIT_INTERNAL, EXIT_OK, EXIT_PROBLEMS, EXIT_SIGTERM, app
+from horae.cli import EXIT_INTERNAL, EXIT_OK, EXIT_PROBLEMS, EXIT_SIGTERM, EXIT_USAGE, app
+from horae.cli_output import CommandFailed
 from horae.cli_serve import build_api, build_scheduler, prepare_store, serve_until_signal
 from horae.config import load_instance
 from horae.scheduler import Scheduler
@@ -29,9 +30,10 @@ def root(tmp_path: Path) -> Path:
     return write_instance(tmp_path / "instance")
 
 
-async def _get(port: int, path: str) -> httpx2.Response:
+async def _get(port: int, path: str, host: str | None = None) -> httpx2.Response:
+    headers = {} if host is None else {"Host": host}
     async with httpx2.AsyncClient(trust_env=False, timeout=5) as client:
-        return await client.get(f"http://127.0.0.1:{port}{path}")
+        return await client.get(f"http://127.0.0.1:{port}{path}", headers=headers)
 
 
 @pytest.mark.parametrize("signals", [1, 2])
@@ -41,7 +43,7 @@ def test_the_api_answers_on_a_real_socket_and_stops_with_the_scheduler(
     instance = load_instance(root)
     prepare_store(instance)
     scheduler = build_scheduler(instance, {})
-    api = build_api(instance, scheduler, "127.0.0.1", 0)
+    api = build_api(instance, scheduler, "127.0.0.1", 0, ["horae.example.org"])
     port = api.address[1]
 
     async def body() -> tuple[int, int, int, bool]:
@@ -56,6 +58,11 @@ def test_the_api_answers_on_a_real_socket_and_stops_with_the_scheduler(
         runs = await _get(port, "/runs")
         assert health.json()["scheduler"]["active"] is True
         assert "server" not in health.headers
+        # DNS rebinding: a page whose own name points at 127.0.0.1 sends that name.
+        rebound = await _get(port, "/runs", host="rebind.attacker.example")
+        assert rebound.status_code == 400
+        assert rebound.json()["error"]["kind"] == "invalid_host"
+        assert (await _get(port, "/healthz", host="horae.example.org")).status_code == 200
         for _ in range(signals):
             os.kill(os.getpid(), signal.SIGTERM)
             await asyncio.sleep(0)
@@ -145,3 +152,32 @@ def test_a_server_that_ends_on_its_own_stops_the_scheduler(
 
     assert asyncio.run(body()) == EXIT_INTERNAL
     assert scheduler.state().active is False
+
+
+@pytest.mark.parametrize("value", ["*.example.org", "horae.example.org:443", "a/b"])
+def test_a_bad_allowed_host_is_a_usage_error(root: Path, value: str) -> None:
+    result = CliRunner().invoke(
+        app, ["serve", "-i", str(root), "--port", "0", "--allowed-host", value]
+    )
+    assert result.exit_code == EXIT_USAGE
+    assert "horae serve: --allowed-host: an allowed host is a DNS name" in result.stderr
+
+
+def test_allowed_hosts_come_from_the_environment_too(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[int] = []
+
+    def fake_build_api(*args: Any) -> Any:
+        seen.append(len(args))
+        assert list(args[4]) == ["horae.example.org", "horae.lan"]
+        raise CommandFailed(EXIT_PROBLEMS, "bind_failed", "stop here")
+
+    monkeypatch.setattr(cli_serve, "build_api", fake_build_api)
+    result = CliRunner().invoke(
+        app,
+        ["serve", "-i", str(root)],
+        env={"HORAE_ALLOWED_HOSTS": "horae.example.org horae.lan", "HORAE_PORT": "0"},
+    )
+    assert seen == [5]
+    assert result.exit_code == EXIT_PROBLEMS

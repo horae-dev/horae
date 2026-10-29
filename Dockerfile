@@ -89,7 +89,9 @@ USER 10001:10001
 # `horae serve` (the default command) runs the scheduler and the HTTP API (#37). The API has no
 # authentication of its own: it listens on 0.0.0.0:8080 inside the container for the reverse
 # proxy, whose SSO middleware guards it; never publish the port directly (no `-p` on a public
-# interface). Set HORAE_HOST=127.0.0.1 when nothing else needs to reach it.
+# interface). Set HORAE_HOST=127.0.0.1 when nothing else needs to reach it. Requests must carry
+# an allowed Host (DNS-rebinding defence): loopback is always allowed (the HEALTHCHECK below);
+# set HORAE_ALLOWED_HOSTS to the proxy's public hostname(s), space-separated.
 EXPOSE 8080
 
 # The health check asks /healthz over loopback (200: the store is readable and the scheduler

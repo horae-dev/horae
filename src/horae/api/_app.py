@@ -27,11 +27,18 @@ binds to loopback by default.
   `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`,
   `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY` on every response; no CORS; the
   OpenAPI document and the docs pages are disabled.
+- **Host check (DNS rebinding)**: a request whose `Host` is not an allowed host is `400
+  invalid_host` before any route runs (the host is never echoed). Allowed: `localhost`,
+  `127.0.0.1`, `::1` and the hosts `horae serve` is given (`--allowed-host`, the proxy's
+  public hostname), any port. A web page that rebinds its own name to 127.0.0.1 sends its
+  own name as `Host`, so it cannot read the API from the user's browser.
 """
 
 import base64
 import binascii
+import ipaddress
 import json
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -160,14 +167,78 @@ def decode_cursor(cursor: str) -> tuple[datetime, str] | None:
     return started, value[1]
 
 
+DEFAULT_ALLOWED_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+"""The `Host` values always accepted (loopback: the container's HEALTHCHECK, a local client)."""
+_HOSTNAME = re.compile(
+    r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$"
+)
+
+
+def allowed_host(value: str) -> str:
+    """`value` as an allowed host (lower case, no trailing dot, an IPv6 address without its
+    brackets), or `ValueError`: a DNS name or an IP address, no port, wildcard or path."""
+    host = value.strip().lower()
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    host = host.removesuffix(".")
+    try:
+        return str(ipaddress.ip_address(host))
+    except ValueError:
+        pass
+    if len(host) > 253 or not _HOSTNAME.match(host):
+        raise ValueError("an allowed host is a DNS name or an IP address (no port, no wildcard)")
+    return host
+
+
+def host_of(header: str | None) -> str | None:
+    """The host of a `Host` header (lower case, port and trailing dot removed, IPv6 without
+    brackets), or `None` when it is missing or malformed."""
+    if not header:
+        return None
+    value = header.strip().lower()
+    if value.startswith("["):
+        end = value.find("]")
+        if end < 0:
+            return None
+        host, rest = value[1:end], value[end + 1 :]
+    else:
+        host, colon, port = value.partition(":")
+        rest = colon + port
+    if rest and not (rest.startswith(":") and rest[1:].isdigit() and len(rest) <= 6):
+        return None
+    try:
+        return allowed_host(host)
+    except ValueError:
+        return None
+
+
+class HostCheck:
+    """Refuses (`400 invalid_host`) an HTTP request whose `Host` is not in `allowed`."""
+
+    def __init__(self, app: ASGIApp, allowed: frozenset[str]) -> None:
+        self.app = app
+        self.allowed = allowed
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http":
+            values = [v for k, v in scope.get("headers", []) if k.lower() == b"host"]
+            host = host_of(values[0].decode("latin-1")) if len(values) == 1 else None
+            if host is None or host not in self.allowed:
+                await _error(400, "invalid_host", "invalid host")(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
 @dataclass(frozen=True)
 class ApiContext:
     """What the API reads: the store (read-only), the state directory (the pipeline locks,
-    for `stale`) and the scheduler's state."""
+    for `stale`) and the scheduler's state; and the `Host` values it accepts besides
+    `DEFAULT_ALLOWED_HOSTS` (normalised with `allowed_host`)."""
 
     store_path: Path
     state_dir: Path
     scheduler_state: Callable[[], SchedulerState]
+    allowed_hosts: frozenset[str] = frozenset()
 
 
 def _store_health(path: Path) -> tuple[dict[str, Any], bool]:
@@ -198,6 +269,10 @@ def create_app(context: ApiContext) -> FastAPI:
         redoc_url=None,
         default_response_class=RedactedJSON,
     )
+    # The last added runs first: the headers wrap everything, the host check runs before
+    # any route.
+    allowed = DEFAULT_ALLOWED_HOSTS | {allowed_host(host) for host in context.allowed_hosts}
+    app.add_middleware(HostCheck, allowed=allowed)
     app.add_middleware(SecurityHeaders)
 
     @app.exception_handler(HTTPException)
@@ -300,13 +375,17 @@ def create_app(context: ApiContext) -> FastAPI:
 
 __all__ = [
     "API_SCHEMA_VERSION",
+    "DEFAULT_ALLOWED_HOSTS",
     "DEFAULT_PAGE",
     "MAX_CURSOR",
     "MAX_PAGE",
     "SECURITY_HEADERS",
     "ApiContext",
+    "HostCheck",
     "RedactedJSON",
+    "allowed_host",
     "create_app",
     "decode_cursor",
     "encode_cursor",
+    "host_of",
 ]
