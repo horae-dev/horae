@@ -1,43 +1,118 @@
 #!/usr/bin/env bash
-# Smoke test for the container image (#40). Usage: scripts/smoke-image.sh IMAGE
+# Smoke test for the container image (#40).
+# Usage: scripts/smoke-image.sh IMAGE [PLATFORM]
+#   PLATFORM (e.g. linux/arm64) runs the image for that platform (under QEMU when foreign).
+#   EXPECTED_VERSION=X.Y.Z in the environment also checks that `horae --version` reports it.
 # Runs the image the way production does: read-only root filesystem, tmpfs /tmp, no network,
-# all capabilities dropped, no privilege escalation.
+# all capabilities dropped, no privilege escalation, a volume on /instance.
 set -euo pipefail
 
-image="${1:?usage: smoke-image.sh IMAGE}"
-run=(docker run --rm --read-only --tmpfs /tmp:rw,noexec,nosuid,size=16m --network none
-     --cap-drop ALL --security-opt no-new-privileges)
-
-uid="$("${run[@]}" --entrypoint id "$image" -u)"
-if [ "$uid" = "0" ]; then
-  echo "FAIL: the image runs as root (uid 0)" >&2
-  exit 1
+image="${1:?usage: smoke-image.sh IMAGE [PLATFORM]}"
+platform="${2:-}"
+platform_args=()
+if [ -n "$platform" ]; then
+  platform_args=(--platform "$platform")
 fi
+base=(docker run --rm ${platform_args[@]+"${platform_args[@]}"} --tmpfs "/tmp:rw,noexec,nosuid,size=16m" --network none
+      --cap-drop ALL --security-opt no-new-privileges)
+run=("${base[@]}" --read-only)
+
+fail() {
+  echo "FAIL: $*" >&2
+  exit 1
+}
+
+volumes=()
+cleanup() {
+  if [ "${#volumes[@]}" -gt 0 ]; then
+    docker volume rm -f "${volumes[@]}" > /dev/null || true
+  fi
+}
+trap cleanup EXIT
+new_volume() {  # sets $volume (not run in a subshell, so cleanup sees every volume)
+  volume="horae-smoke-$$-${#volumes[@]}"
+  docker volume create "$volume" > /dev/null
+  volumes+=("$volume")
+}
+
+# --- identity ------------------------------------------------------------------------------
+uid="$("${run[@]}" --entrypoint id "$image" -u)"
+[ "$uid" != "0" ] || fail "the image runs as root (uid 0)"
 echo "ok: runs as uid ${uid}"
 
 configured="$(docker image inspect --format '{{.Config.User}}' "$image")"
 case "$configured" in
-  ''|0|0:*|root|root:*) echo "FAIL: image USER is '${configured}'" >&2; exit 1 ;;
+  ''|0|0:*|root|root:*) fail "image USER is '${configured}'" ;;
 esac
 echo "ok: image USER is ${configured}"
 
-"${run[@]}" "$image" --version
-"${run[@]}" "$image" --help > /dev/null
-echo "ok: horae --version and --help work with a read-only root filesystem"
+# --- PID 1 is tini -------------------------------------------------------------------------
+entrypoint="$(docker image inspect --format '{{json .Config.Entrypoint}}' "$image")"
+[ "$entrypoint" = '["tini","--","horae"]' ] || fail "entrypoint is ${entrypoint}"
+# The image's own PID-1 program, started the way the entrypoint starts it, sees itself as PID 1.
+pid1="$("${run[@]}" --entrypoint tini "$image" -- cat /proc/1/comm)"
+[ "$pid1" = "tini" ] || fail "PID 1 is '${pid1}', not tini"
+echo "ok: entrypoint ${entrypoint}, PID 1 is tini"
 
-# A write to the root filesystem must fail (proves --read-only is in effect), /tmp must work.
-if "${run[@]}" --entrypoint sh "$image" -c 'touch /usr/probe' 2>/dev/null; then
-  echo "FAIL: the root filesystem is writable" >&2
-  exit 1
+# --- CLI -----------------------------------------------------------------------------------
+version="$("${run[@]}" "$image" --version)"
+[[ "$version" =~ ^horae\ [0-9]+\.[0-9]+\.[0-9]+([.+-][0-9A-Za-z.+-]+)?$ ]] \
+  || fail "unexpected --version output: '${version}'"
+if [ -n "${EXPECTED_VERSION:-}" ] && [ "$version" != "horae ${EXPECTED_VERSION}" ]; then
+  fail "--version reports '${version}', expected 'horae ${EXPECTED_VERSION}'"
 fi
-"${run[@]}" --entrypoint sh "$image" -c 'touch /tmp/probe'
-echo "ok: root filesystem read-only, /tmp writable"
+"${run[@]}" "$image" --help > /dev/null
+echo "ok: ${version}; --help works with a read-only root filesystem"
 
-# No package manager or compiler in the final image.
-for tool in pip uv gcc cc make; do
+# --- read-only root filesystem ---------------------------------------------------------------
+# Probed as root (still with every capability dropped): root owns /usr, so the write can only
+# fail because the filesystem is read-only. The same probe without --read-only must succeed,
+# which proves the probe is able to fail.
+probe='touch /usr/probe 2>&1'
+if out="$("${run[@]}" --user 0:0 --entrypoint sh "$image" -c "$probe")"; then
+  fail "the root filesystem is writable (even with --read-only)"
+fi
+case "$out" in
+  *"Read-only file system"*) ;;
+  *) fail "writing /usr failed for another reason than a read-only filesystem: ${out}" ;;
+esac
+"${base[@]}" --user 0:0 --entrypoint sh "$image" -c "$probe" > /dev/null \
+  || fail "control probe: root cannot write /usr even without --read-only"
+"${run[@]}" --entrypoint sh "$image" -c 'touch /tmp/probe'
+echo "ok: root filesystem read-only (probe checked against a writable control), /tmp writable"
+
+# --- no package manager or compiler ---------------------------------------------------------
+for tool in pip pip3 uv gcc cc make; do
   if "${run[@]}" --entrypoint sh "$image" -c "command -v ${tool}" > /dev/null 2>&1; then
-    echo "FAIL: ${tool} is present in the final image" >&2
-    exit 1
+    fail "${tool} is present in the final image"
   fi
 done
-echo "ok: no pip, uv or build tools"
+if "${run[@]}" --entrypoint python "$image" -c 'import ensurepip' > /dev/null 2>&1; then
+  fail "ensurepip is present in the final image"
+fi
+if "${run[@]}" --entrypoint python "$image" -m pip --version > /dev/null 2>&1; then
+  fail "python -m pip works in the final image"
+fi
+echo "ok: no pip, ensurepip, uv or build tools"
+
+# --- an instance on a volume: init, doctor, run ----------------------------------------------
+# A new named volume takes the image's /instance ownership (10001, mode 0700).
+new_volume
+owner="$("${run[@]}" -v "${volume}:/instance" --entrypoint stat "$image" -c '%u:%g' /instance)"
+[ "$owner" = "10001:10001" ] || fail "a new volume on /instance is owned by ${owner}"
+inst=("${run[@]}" -v "${volume}:/instance")
+"${inst[@]}" "$image" init /instance/smoke > /dev/null || fail "horae init /instance/smoke"
+"${inst[@]}" "$image" doctor -i /instance/smoke > /dev/null || fail "horae doctor"
+"${inst[@]}" "$image" run daily-fixture -i /instance/smoke > /dev/null \
+  || fail "horae run daily-fixture"
+notes="$("${inst[@]}" --entrypoint find "$image" /instance/smoke/vault/Daily -type f -name '*.md')"
+[ -n "$notes" ] || fail "horae run daily-fixture wrote no note in vault/Daily/"
+echo "ok: init, doctor and run daily-fixture on a volume, no network (${notes##*/})"
+
+# The volume's root itself, an existing empty directory (the usual `-v horae:/instance` case).
+new_volume
+"${run[@]}" -v "${volume}:/instance" "$image" init /instance > /dev/null \
+  || fail "horae init /instance on an empty volume"
+"${run[@]}" -v "${volume}:/instance" "$image" doctor > /dev/null \
+  || fail "horae doctor on the volume's root (HORAE_INSTANCE=/instance)"
+echo "ok: init and doctor on the root of an empty volume"
