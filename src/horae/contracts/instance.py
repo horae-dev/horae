@@ -16,6 +16,8 @@ from pydantic import (
     Strict,
     StrictInt,
     StringConstraints,
+    TypeAdapter,
+    ValidationError,
     model_validator,
 )
 
@@ -431,6 +433,25 @@ class PushMonitor(Contract):
     """The monitor's push protocol."""
 
 
+_PUSH_URL: TypeAdapter[str] = TypeAdapter(BackendUrl)
+
+
+def is_push_url(value: str) -> bool:
+    """Whether `value` may be a push monitor's URL (a `BackendUrl`, decision 24): the check
+    `horae doctor` and the ping both make. Never says why: the error would quote the value."""
+    try:
+        _PUSH_URL.validate_python(value)
+    except ValidationError:
+        return False
+    return True
+
+
+MAX_CONCURRENT_RUNS = 16
+"""Most scheduled runs `scheduler.max_concurrent` may allow at once."""
+DEFAULT_MISFIRE_GRACE_S = 3600
+MAX_MISFIRE_GRACE_S = 7 * 86400
+
+
 class SchedulerConfig(Contract):
     """How pipelines with a `trigger` are started, and the push monitors of their runs."""
 
@@ -443,6 +464,16 @@ class SchedulerConfig(Contract):
     )
     """Push monitors by pipeline name: pinged `up` or `down` after each run of the pipeline,
     scheduled or `horae run` (not a dry run). A failed ping never fails the run."""
+    max_concurrent: Annotated[StrictInt, Field(ge=1, le=MAX_CONCURRENT_RUNS)] = 1
+    """Most scheduled runs in progress at once in `horae serve` (default 1: scheduled runs are
+    serialised). A fire time that finds no free slot waits, first in first out, unless it
+    would then start more than `misfire_grace_s` late. Whatever this is, two applies never
+    run at once: they share the instance's apply lock (decision 34)."""
+    misfire_grace_s: Annotated[StrictInt, Field(ge=1, le=MAX_MISFIRE_GRACE_S)] = (
+        DEFAULT_MISFIRE_GRACE_S
+    )
+    """Seconds a fire time may start late (after a suspended host, or while waiting for a
+    slot) before it is skipped and recorded instead of run (default 1 hour)."""
 
 
 class DailyBudget(Contract):

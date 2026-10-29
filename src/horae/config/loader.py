@@ -13,7 +13,14 @@ from pydantic import BaseModel
 
 from horae.config.cron import cron_problem
 from horae.config.documents import Problem, ProblemsError, YamlDocument, read_yaml, validate
-from horae.contracts.instance import InstanceConfig, LlmBackend, ModelAlias, PluginDefaults
+from horae.config.schedule import ModeError, scheduler_mode
+from horae.contracts.instance import (
+    InstanceConfig,
+    LlmBackend,
+    ModelAlias,
+    PluginDefaults,
+    is_push_url,
+)
 from horae.contracts.lockfile import Lockfile
 from horae.contracts.pipeline import LlmStep, Pipeline
 from horae.engine.canonical import sha256_hex
@@ -339,7 +346,9 @@ class CheckResult:
 
 
 def check_instance(root: Path, environ: Mapping[str, str] | None = None) -> CheckResult:
-    """Every problem of the instance in `root`, including secrets that cannot be resolved.
+    """Every problem of the instance in `root`, including secrets that cannot be resolved, a
+    push monitor's secret that is not a usable push URL, and an invalid `HORAE_SCHEDULER`
+    (read from `environ`, else the process environment).
 
     Secret values are read to prove they resolve, then dropped; they never reach a problem."""
     state = _load(root)
@@ -366,7 +375,20 @@ def check_instance(root: Path, environ: Mapping[str, str] | None = None) -> Chec
             ]
         for name, doc, loc in wanted:
             try:
-                resolver.resolve(name)
+                secret = resolver.resolve(name)
             except SecretError as exc:
                 problems.append(doc.problem(loc, str(exc)))
+                continue
+            # The ping's own check of a push URL; the value is never shown (it has a token).
+            if loc[:2] == ("scheduler", "monitors") and not is_push_url(secret.reveal()):
+                problems.append(
+                    doc.problem(
+                        loc, f"secret {name} is not an https:// URL or an http:// URL on the LAN"
+                    )
+                )
+            del secret
+        try:
+            scheduler_mode(state.config.scheduler.mode, environ)
+        except ModeError as exc:
+            problems.append(Problem(str(state.config_doc.path), None, None, str(exc)))
     return CheckResult(sorted(set(problems), key=Problem.sort_key), instance)

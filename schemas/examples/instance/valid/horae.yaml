@@ -45,6 +45,9 @@ scheduler:
   monitors:
     daily-brief: { secret: DAILY_BRIEF_PUSH_URL }
     remind: { secret: REMIND_PUSH_URL, kind: healthchecks }
+  # Used by `horae serve` in builtin mode: one scheduled run at a time, skipped if 1 h late.
+  max_concurrent: 1
+  misfire_grace_s: 3600
 runs: { timeout_s: 1200 }
 # Daily LLM spend ceilings across runs, in the instance's time zone (decision 41).
 budgets:

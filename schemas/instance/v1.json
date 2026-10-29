@@ -661,6 +661,22 @@
           "title": "Monitors",
           "type": "object",
           "additionalProperties": false
+        },
+        "max_concurrent": {
+          "default": 1,
+          "description": "Most scheduled runs in progress at once in `horae serve` (default 1: scheduled runs are\nserialised). A fire time that finds no free slot waits, first in first out, unless it\nwould then start more than `misfire_grace_s` late. Whatever this is, two applies never\nrun at once: they share the instance's apply lock (decision 34).",
+          "maximum": 16,
+          "minimum": 1,
+          "title": "Max Concurrent",
+          "type": "integer"
+        },
+        "misfire_grace_s": {
+          "default": 3600,
+          "description": "Seconds a fire time may start late (after a suspended host, or while waiting for a\nslot) before it is skipped and recorded instead of run (default 1 hour).",
+          "maximum": 604800,
+          "minimum": 1,
+          "title": "Misfire Grace S",
+          "type": "integer"
         }
       },
       "title": "SchedulerConfig",
