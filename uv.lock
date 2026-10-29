@@ -11,6 +11,12 @@ resolution-markers = [
 exclude-newer = "0001-01-01T00:00:00Z" # This has no effect and is included for backwards compatibility when using relative exclude-newer values.
 exclude-newer-span = "P7D"
 
+[manifest]
+members = [
+    "horae",
+    "horae-sdk",
+]
+
 [[package]]
 name = "annotated-doc"
 version = "0.0.5"
@@ -483,6 +489,7 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "horae-sdk" },
     { name = "hypothesis" },
     { name = "jsonschema", extra = ["format-nongpl"] },
     { name = "mypy" },
@@ -511,6 +518,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "horae-sdk", editable = "sdk" },
     { name = "hypothesis", specifier = ">=6.100" },
     { name = "jsonschema", extras = ["format-nongpl"], specifier = ">=4.26,<4.27" },
     { name = "mypy", specifier = ">=2.4" },
@@ -522,6 +530,20 @@ dev = [
     { name = "types-jsonschema", specifier = ">=4.23" },
     { name = "types-pyyaml", specifier = ">=6" },
     { name = "types-regex", specifier = ">=2024.11" },
+]
+
+[[package]]
+name = "horae-sdk"
+source = { editable = "sdk" }
+dependencies = [
+    { name = "mcp" },
+    { name = "pyyaml" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "mcp", specifier = ">=2.3,<2.4" },
+    { name = "pyyaml", specifier = ">=6" },
 ]
 
 [[package]]

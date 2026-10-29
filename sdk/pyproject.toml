@@ -1,0 +1,34 @@
+[project]
+name = "horae-sdk"
+dynamic = ["version"]
+description = "Python SDK for Horae plugins: base classes, manifest helpers, intent builders and a recorded-input test harness."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+# The same MCP SDK range as the core's plugin host, so a plugin speaks the protocol the host
+# is tested with.
+dependencies = [
+    "mcp>=2.3,<2.4",
+    "pyyaml>=6",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://github.com/horae-dev/horae/tree/main/sdk"
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/horae_sdk/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/horae_sdk"]
+
+[tool.hatch.build.targets.sdist]
+include = ["/src/horae_sdk", "/tests", "/examples", "/README.md", "/LICENSE"]
