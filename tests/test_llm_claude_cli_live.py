@@ -56,8 +56,11 @@ WORD = "heliotrope"
 OK = 'Answer {"ok": true}.'
 ASK_WORD = (
     'Answer {"word": <the secret word given anywhere in your instructions, context or memory '
-    "files, as a string, or null if none was given>}."
+    "files, as a string, or null if none was given>}. Give only that JSON object: no "
+    "explanation."
 )
+"""Without the last sentence the model sometimes explains a `null` after the JSON (seen live
+on 2.1.284, #113), which the backend rightly refuses (`output_invalid`)."""
 
 
 def _command() -> str | None:
@@ -159,8 +162,10 @@ def result(*args: Any, **kwargs: Any) -> dict[str, Any]:
 
 
 def answer(data: Mapping[str, Any]) -> Any:
+    """The JSON value of a successful result, as the backend reads it (one enclosing code
+    fence allowed: the model wraps its JSON in one, #113)."""
     assert data["is_error"] is False, data.get("result")
-    return json.loads(data["result"])
+    return json.loads(claude_cli.unfenced(data["result"]))
 
 
 SYSTEM = "Answer with one JSON value only, no prose and no code fence."
@@ -265,9 +270,42 @@ def test_live_the_output_limit_is_honoured(
         print(f"refused: {refused.kind}: {refused.message} usage={refused.usage}")
         assert "over the max_tokens limit" not in refused.message, "the limit was not honoured"
         assert refused.kind == "output_invalid"  # cut short at the limit: honoured
+        # Claude Code retries a truncated output by itself (#113): at most OUTPUT_ATTEMPTS
+        # outputs of the limit, what the reservation covers.
+        assert refused.usage is not None
+        assert refused.usage.tokens_out <= claude_cli.OUTPUT_ATTEMPTS * 64
         return
     print(outcome)
     assert outcome.usage.tokens_out <= 64
+
+
+def _thinking(data: Mapping[str, Any]) -> int:
+    """`usage.output_tokens_details.thinking_tokens` (0 when absent)."""
+    usage = data.get("usage")
+    details = usage.get("output_tokens_details") if isinstance(usage, dict) else None
+    tokens = details.get("thinking_tokens") if isinstance(details, dict) else None
+    return tokens if isinstance(tokens, int) else 0
+
+
+@skip_unless_live
+def test_live_extended_thinking_is_off(
+    spec: ModelAlias, secrets: SecretResolver, tmp_path: Path
+) -> None:
+    """`MAX_THINKING_TOKENS=0` (#113): no hidden thinking tokens and one turn, with the
+    backend's exact arguments and environment. Control: the same call with the switch unset
+    thinks (skipped, after the real check, when this release or model does not think by
+    default)."""
+    drop = ["MAX_THINKING_TOKENS"]
+    control = result(spec, secrets, args(), OK, Call(tmp_path / "control"), env_drop=drop)
+    thought = _thinking(control)
+    print(f"control: thinking_tokens={thought} usage={control.get('usage')}")
+    data = result(spec, secrets, args(), OK, Call(tmp_path / "real"))
+    print(f"real: thinking_tokens={_thinking(data)} usage={data.get('usage')}")
+    assert answer(data) == {"ok": True}
+    assert data["num_turns"] == 1
+    assert _thinking(data) == 0
+    if thought == 0:
+        pytest.skip(f"CONTROL: {MODEL} did not think without the switch, nothing to compare")
 
 
 # --- the isolation flags, each with its positive control -------------------------------------
