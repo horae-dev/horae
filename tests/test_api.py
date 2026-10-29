@@ -451,29 +451,29 @@ def test_reading_does_not_wait_for_a_writer(client: TestClient, store_path: Path
 
 # --- no secrets, headers ---------------------------------------------------------------------
 
-SECRET = "planted-secret-value-0123456789"  # noqa: S105 (synthetic)
+PLANTED = "planted-secret-value-0123456789"  # synthetic: planted to prove it never leaks
 
 
 def test_no_response_ever_holds_a_secret(
     client: TestClient, store_path: Path, state: State
 ) -> None:
-    remember(Secret("API_PLANTED", SECRET))
+    remember(Secret("API_PLANTED", PLANTED))
     with Store.open(store_path) as store:
         _finished(store, "run-clean", "collect", T0)
-        _finished(store, f"run-{SECRET}", "collect", T0 + timedelta(minutes=1))
-        _finished(store, "run-named", f"p-{SECRET}", T0 + timedelta(minutes=2))
+        _finished(store, f"run-{PLANTED}", "collect", T0 + timedelta(minutes=1))
+        _finished(store, "run-named", f"p-{PLANTED}", T0 + timedelta(minutes=2))
     # Planted behind the store's back (the store itself redacts what it writes): a run's
     # error and a journal entry hold the raw value.
     with sqlite3.connect(store_path) as conn:
         conn.execute(
-            "UPDATE runs SET error = ? WHERE id = ?", (f"boom: token={SECRET}", "run-clean")
+            "UPDATE runs SET error = ? WHERE id = ?", (f"boom: token={PLANTED}", "run-clean")
         )
         conn.execute(
             "INSERT INTO journal (run_id, seq, intent, intent_type, target, undoable, "
             "created_at) VALUES (?, 0, 0, 'notify.push', ?, 0, ?)",
-            ("run-clean", f"ntfy:{SECRET}", "2026-03-01T06:00:00.000000Z"),
+            ("run-clean", f"ntfy:{PLANTED}", "2026-03-01T06:00:00.000000Z"),
         )
-        planted = conn.execute("SELECT count(*) FROM runs WHERE instr(error, ?) > 0", (SECRET,))
+        planted = conn.execute("SELECT count(*) FROM runs WHERE instr(error, ?) > 0", (PLANTED,))
         assert planted.fetchone() == (1,)
     state.state = SchedulerState(
         "builtin",
@@ -482,7 +482,7 @@ def test_no_response_ever_holds_a_secret(
         1,
         (
             PipelineState(
-                f"p-{SECRET}", "30 5 * * *", "UTC", last_run_id=f"run-{SECRET}", last_outcome="ok"
+                f"p-{PLANTED}", "30 5 * * *", "UTC", last_run_id=f"run-{PLANTED}", last_outcome="ok"
             ),
         ),
     )
@@ -493,19 +493,19 @@ def test_no_response_ever_holds_a_secret(
         first,
         client.get("/runs", params={"limit": 1, "cursor": first.json()["next_cursor"]}),
         client.get("/runs/run-clean"),
-        client.get(f"/runs/run-{SECRET}"),
-        client.get("/runs", params={"pipeline": f"p-{SECRET}"}),
-        client.get("/runs", params={"pipeline": SECRET * 3}),
-        client.get("/runs", params={"limit": SECRET}),
-        client.get("/runs", params={"cursor": SECRET}),
-        client.get(f"/{SECRET}"),
-        client.post(f"/runs/{SECRET}"),
+        client.get(f"/runs/run-{PLANTED}"),
+        client.get("/runs", params={"pipeline": f"p-{PLANTED}"}),
+        client.get("/runs", params={"pipeline": PLANTED * 3}),
+        client.get("/runs", params={"limit": PLANTED}),
+        client.get("/runs", params={"cursor": PLANTED}),
+        client.get(f"/{PLANTED}"),
+        client.post(f"/runs/{PLANTED}"),
     ]
     assert {r.status_code for r in responses} >= {200, 400, 404, 405}
     redacted = 0
     for response in responses:
         text = response.text + json.dumps(dict(response.headers))
-        for form in encodings(SECRET):
+        for form in encodings(PLANTED):
             assert form not in text, (response.request.url.path, response.text)
         redacted += response.text.count("[REDACTED:API_PLANTED]")
     assert redacted >= 6  # the error, the ids, the pipeline names, the scheduler state
@@ -554,7 +554,7 @@ def test_no_cors_preflight_and_no_docs(client: TestClient) -> None:
 
 def test_an_internal_error_shows_only_its_type(root: Path, store_path: Path) -> None:
     def broken() -> SchedulerState:
-        raise RuntimeError(f"leaky {SECRET}")
+        raise RuntimeError(f"leaky {PLANTED}")
 
     context = ApiContext(store_path, store_path.parent, broken)
     app = create_app(context)
@@ -565,7 +565,7 @@ def test_an_internal_error_shows_only_its_type(root: Path, store_path: Path) -> 
         "kind": "internal",
         "message": "internal error (RuntimeError)",
     }
-    assert SECRET not in response.text
+    assert PLANTED not in response.text
     assert response.headers["x-content-type-options"] == "nosniff"
 
 
