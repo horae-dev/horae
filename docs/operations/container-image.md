@@ -102,8 +102,12 @@ list to anyone). Set `HORAE_HOST=127.0.0.1` when nothing else needs to reach it.
 
 Set `HORAE_ALLOWED_HOSTS` to the public hostname the proxy serves Horae on (space-separated if
 several, e.g. `HORAE_ALLOWED_HOSTS=horae.example.org`): the API refuses (`400 invalid_host`)
-any request whose `Host` is not loopback or one of these, its defence against DNS rebinding. A
-neighbour container calling `http://horae:8080/` needs `horae` in the list too.
+any request whose `Host` is not loopback or one of these, its defence against DNS rebinding.
+Without it `horae serve` warns at start, and each refused `Host` is logged once. A neighbour
+container calling `http://horae:8080/` needs `horae` in the list too (`_` is allowed, as in
+Docker service names). The Host check is a defence against browsers, not neighbours: any
+container on Horae's network can reach port 8080 and send any `Host`, so put Horae on a network
+shared only with the proxy.
 
 ```
 docker run -d --name horae "${opts[@]}" --stop-timeout 20 ghcr.io/horae-dev/horae:edge
@@ -114,8 +118,11 @@ Its `HEALTHCHECK` asks `/healthz` over loopback with the standard library (`pyth
 `urllib`, no proxy; there is no curl or wget in the image): `200` when the store is readable and
 the scheduler runs (or `HORAE_SCHEDULER=external`), `503` otherwise. A container running
 another command (`init`, `doctor`, `run`) reports unhealthy, which is harmless for a one-off. If
-you set `HORAE_PORT`, the check follows it; if you set `HORAE_HOST` to an address other than
-`0.0.0.0` or loopback, override the check. Give the container at least 20 s to stop
+you set `HORAE_PORT`, the check follows it; a `serve --port N` command does not (the check keeps
+asking 8080), so change the port with `HORAE_PORT`. If you set `HORAE_HOST` to `::` (IPv6 only)
+or to an address other than `0.0.0.0` or loopback, override the check. A healthy container does
+not prove the proxy can reach Horae: the check uses a loopback `Host`, so a wrong
+`HORAE_ALLOWED_HOSTS` only shows in the logs. Give the container at least 20 s to stop
 (`--stop-timeout 20`, compose `stop_grace_period: 20s`).
 
 ### Stable paths, and upgrading

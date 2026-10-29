@@ -88,7 +88,10 @@ CSP; there is no CORS and no OpenAPI page. **It has no authentication of its own
 only through the reverse proxy and its SSO middleware (only `/act/` is exempt), never directly.
 Against DNS rebinding it answers only requests whose `Host` is `localhost`, `127.0.0.1`, `::1`
 or an `--allowed-host` (`HORAE_ALLOWED_HOSTS`, space-separated): set the proxy's public
-hostname there, or every proxied request gets `400 invalid_host`.
+hostname there, or every proxied request gets `400 invalid_host` (`horae serve` warns at start
+when it listens on `0.0.0.0` or `::` without one, and logs each refused `Host` once). In a
+container, change the port with `HORAE_PORT` rather than `--port` (the image's health check
+follows `HORAE_PORT`).
 
 An instance is **not relocatable** in v1: `horae.lock` holds the vault's absolute path and
 `plugins/` the absolute path of the interpreter that installed them. After copying or moving
