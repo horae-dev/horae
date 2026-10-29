@@ -586,6 +586,37 @@
       "title": "PluginSettings",
       "type": "object"
     },
+    "PushMonitor": {
+      "additionalProperties": false,
+      "description": "A push monitor pinged after every run of one pipeline (#39, schemas decision 49 F).",
+      "properties": {
+        "secret": {
+          "description": "The secret holding the push URL (it carries the monitor's token, so it is never written\nin `horae.yaml`): resolved like any secret (`secrets.refs`, else `<secrets.dir>/<NAME>`).\n`https://` to any host, `http://` only to the LAN (the `base_url` rule, decision 24).",
+          "maxLength": 128,
+          "not": {
+            "pattern": "^(HORAE(_|$)|LD_|DYLD_|PYTHON|PATH$|HOME$)"
+          },
+          "pattern": "^[A-Z][A-Z0-9_]*$",
+          "title": "Secret",
+          "type": "string"
+        },
+        "kind": {
+          "default": "uptime-kuma",
+          "description": "The monitor's push protocol.",
+          "enum": [
+            "uptime-kuma",
+            "healthchecks"
+          ],
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "secret"
+      ],
+      "title": "PushMonitor",
+      "type": "object"
+    },
     "RunsConfig": {
       "additionalProperties": false,
       "description": "Bounds of one pipeline run (#19).",
@@ -604,17 +635,32 @@
     },
     "SchedulerConfig": {
       "additionalProperties": false,
-      "description": "How pipelines with a `trigger` are started.",
+      "description": "How pipelines with a `trigger` are started, and the push monitors of their runs.",
       "properties": {
         "mode": {
           "default": "builtin",
-          "description": "`builtin`: Horae's own cron. `external`: triggers are ignored and an external scheduler\n(Coolify, systemd, cron) calls `horae run <pipeline>`.",
+          "description": "`builtin`: Horae's own cron. `external`: triggers are ignored and an external scheduler\n(Coolify, systemd, cron) calls `horae run <pipeline>`. The `HORAE_SCHEDULER` environment\nvariable, when set, overrides it.",
           "enum": [
             "builtin",
             "external"
           ],
           "title": "Mode",
           "type": "string"
+        },
+        "monitors": {
+          "description": "Push monitors by pipeline name: pinged `up` or `down` after each run of the pipeline,\nscheduled or `horae run` (not a dry run). A failed ping never fails the run.",
+          "maxProperties": 256,
+          "patternProperties": {
+            "^[a-z][a-z0-9-]*$": {
+              "$ref": "#/$defs/PushMonitor"
+            }
+          },
+          "propertyNames": {
+            "maxLength": 64
+          },
+          "title": "Monitors",
+          "type": "object",
+          "additionalProperties": false
         }
       },
       "title": "SchedulerConfig",

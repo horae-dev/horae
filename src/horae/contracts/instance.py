@@ -410,12 +410,39 @@ class CacheConfig(Contract):
     the oldest beyond this many (first in, first out: a hit does not make an entry recent)."""
 
 
-class SchedulerConfig(Contract):
-    """How pipelines with a `trigger` are started."""
+SchedulerMode = Literal["builtin", "external"]
+"""`builtin`: `horae serve` runs the pipelines' `trigger`s. `external`: it does not, and an
+external scheduler calls `horae run <pipeline>`."""
 
-    mode: Literal["builtin", "external"] = "builtin"
+MonitorKind = Literal["uptime-kuma", "healthchecks"]
+"""How a push monitor is pinged (schemas decision 49 F): `uptime-kuma` sets the push URL's
+`status` (`up` / `down`), `msg` and `ping` query parameters; `healthchecks` pings the URL
+itself for success and `<url>/fail` for a failure."""
+
+
+class PushMonitor(Contract):
+    """A push monitor pinged after every run of one pipeline (#39, schemas decision 49 F)."""
+
+    secret: SecretName
+    """The secret holding the push URL (it carries the monitor's token, so it is never written
+    in `horae.yaml`): resolved like any secret (`secrets.refs`, else `<secrets.dir>/<NAME>`).
+    `https://` to any host, `http://` only to the LAN (the `base_url` rule, decision 24)."""
+    kind: MonitorKind = "uptime-kuma"
+    """The monitor's push protocol."""
+
+
+class SchedulerConfig(Contract):
+    """How pipelines with a `trigger` are started, and the push monitors of their runs."""
+
+    mode: SchedulerMode = "builtin"
     """`builtin`: Horae's own cron. `external`: triggers are ignored and an external scheduler
-    (Coolify, systemd, cron) calls `horae run <pipeline>`."""
+    (Coolify, systemd, cron) calls `horae run <pipeline>`. The `HORAE_SCHEDULER` environment
+    variable, when set, overrides it."""
+    monitors: Annotated[dict[PipelineName, PushMonitor], Field(max_length=MAX_ITEMS)] = Field(
+        default_factory=dict
+    )
+    """Push monitors by pipeline name: pinged `up` or `down` after each run of the pipeline,
+    scheduled or `horae run` (not a dry run). A failed ping never fails the run."""
 
 
 class DailyBudget(Contract):

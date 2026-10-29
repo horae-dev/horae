@@ -11,6 +11,7 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
+from horae.config.cron import cron_problem
 from horae.config.documents import Problem, ProblemsError, YamlDocument, read_yaml, validate
 from horae.contracts.instance import InstanceConfig, LlmBackend, ModelAlias, PluginDefaults
 from horae.contracts.lockfile import Lockfile
@@ -52,6 +53,7 @@ def redaction_names(config: InstanceConfig, lock: Lockfile | None) -> tuple[str,
     for plugin in () if lock is None else lock.plugins.values():
         names.update(plugin.permissions.secrets)
     names.update(spec.secret for spec in config.models.values() if spec.secret)
+    names.update(monitor.secret for monitor in config.scheduler.monitors.values())
     return tuple(sorted(names))
 
 
@@ -285,12 +287,23 @@ def _cross_check(state: _Loaded) -> None:
                     value=False,
                 )
             )
+    for name in config.scheduler.monitors:
+        if name not in names:
+            state.problems.append(
+                config_doc.problem(
+                    ("scheduler", "monitors", name),
+                    f"push monitor for unknown pipeline {name!r}",
+                    value=False,
+                )
+            )
     for pipeline, doc in state.pipelines.values():
         zone = pipeline.trigger.timezone if pipeline.trigger else None
         if zone is not None and not _timezone_exists(zone):
             state.problems.append(
                 doc.problem(("trigger", "timezone"), f"unknown time zone {zone!r}")
             )
+        if pipeline.trigger is not None and (reason := cron_problem(pipeline.trigger.cron)):
+            state.problems.append(doc.problem(("trigger", "cron"), reason))
         for index, step in enumerate(pipeline.steps):
             if isinstance(step, LlmStep) and step.llm.model not in config.models:
                 known = ", ".join(sorted(config.models)) or "none"
@@ -340,6 +353,10 @@ def check_instance(root: Path, environ: Mapping[str, str] | None = None) -> Chec
             (spec.secret, state.config_doc, ("models", alias, "secret"))
             for alias, spec in state.config.models.items()
             if spec.secret is not None
+        ]
+        wanted += [
+            (monitor.secret, state.config_doc, ("scheduler", "monitors", name, "secret"))
+            for name, monitor in state.config.scheduler.monitors.items()
         ]
         if state.lock is not None and state.lock_doc is not None:
             wanted += [
