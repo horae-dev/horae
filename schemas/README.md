@@ -1412,8 +1412,12 @@ loosened later without breaking a valid file.
       pre-flight of decision 38 B may refuse it too) and reserves the most it can cost
       (`ModelBackends.worst_case`: the input bound at the input price, or at the cache write
       price for a provider backend that `may_write_cache`, plus `max_tokens` at the output
-      price: the bound `max_tokens` already keeps within the budget). Another `LlmBackend` (a
-      test fake) reserves the capped budget itself. Two runs of different pipelines
+      price: the bound `max_tokens` already keeps within the budget). **Amended by #113
+      (decision 42's amendment (#113, live run)):** the output part is `output_attempts ×
+      max_tokens` at the output price (a backend that may bill several outputs for one
+      call, `claude-cli`: 4; 1 for the others), and `max_tokens` divides the step's
+      remaining `tokens_out` and `usd` by `output_attempts` so it still fits. Another
+      `LlmBackend` (a test fake) reserves the capped budget itself. Two runs of different pipelines
       therefore never both spend the last of a ceiling (`tests/test_budgets.py` has a
       two-process test whose `day_spend` waits between the read and the reservation: it
       fails with a deferred transaction). Not the apply lock: an LLM call can take minutes
@@ -1479,7 +1483,11 @@ loosened later without breaking a valid file.
       cache write price (`cache_write_per_mtok`, else twice the input price) in both
       `max_tokens` and `worst_case`, so a settled call never exceeds its reservation; a
       backend without it that reports cache writes beyond the bound is flagged
-      `over_reservation` (and logged);
+      `over_reservation` (and logged). Likewise a `ProviderBackend` declares
+      `output_attempts` (default 1; `claude-cli` is 4, #113): `worst_case` reserves that
+      many outputs of `max_tokens` and `max_tokens` divides the step's budget by it; an
+      unusable declared value (not an `int` of at least 1, or a `bool`) is
+      `backend_unavailable`, a larger one is clamped to `MAX_OUTPUT_ATTEMPTS` (16);
     - **untrusted usage (decision 40 K)**: a backend's floored usage (input at least a
       quarter of the request bytes, output at least a quarter of the output bytes but at
       most `max_tokens`) and its conservative charge (`input_bound` of the payload sent plus
@@ -1599,7 +1607,9 @@ loosened later without breaking a valid file.
       a `#!` script whose interpreter is not on the fixed `PATH`, the message names the
       interpreter and says to point `command` at the native binary); `horae doctor` runs
       the same check (an error). Bumping the range needs the live test's output for the new
-      release in the bump PR's body and the version in `docs/security.md` T11;
+      release in the bump PR's body and the version in `docs/security.md` T11, and a
+      re-verified retry count of a truncated output (`OUTPUT_ATTEMPTS`, the amendment
+      below);
     - **the result (answer 5)**: stdout must be UTF-8 and one JSON object (strict parsing)
       with `type: "result"`. `is_error` (anything but `false`): `api_error_status` through the
       HTTP status table, `error_max_turns` → `output_invalid`, a result starting "Not logged
@@ -1640,6 +1650,55 @@ loosened later without breaking a valid file.
       accepted residual), **E** (the first live run with positive controls in the PR body is
       the merge gate) and **F** (`CLAUDE_CODE_MAX_OUTPUT_TOKENS`), pending the maintainer's
       review like the rest of this decision.
+    - **Amendment (#113, live run)**: the first live run against Claude Code 2.1.284 (the
+      `haiku` alias) found three things the fake did not show; the rules above are amended
+      as follows, and with them the whole live test passes (17 tests, every positive control
+      fired). (1) **Code fences.** With Horae's system prompt the model answers
+      ```` ```json ```` fenced JSON (also with thinking off), which the strict "one JSON
+      value" rule refused. A `result` that is **exactly one** enclosing Markdown code fence
+      (an optional `json` info string, any case, whitespace around it) around one JSON value
+      is now accepted (`claude_cli.unfenced`): the opening line exactly three backticks and
+      the info string (trailing spaces or tabs, LF or CRLF), the closing three backticks on
+      a line of their own at the end; prose before or after it, two fences, a fence inside
+      text, a one-line fence, `~~~` or four-backtick fences stay `output_invalid`. The
+      parser is linear string operations, no regular expression (a backtracking pattern
+      was quadratic on a whitespace-only result as large as the stdout cap, blocking the
+      event loop; review of #113). `SYSTEM_PREAMBLE` is unchanged (it is shared by
+      every backend and part of the LLM cache key). `--json-schema` (the CLI's structured
+      output) was considered and **rejected**: it works through an internal
+      `StructuredOutput` tool (`num_turns: 2`, `stop_reason: "tool_use"`), which breaks the
+      one-turn, no-tool invariants. (2) **Thinking.** The model thinks by default: an
+      `{"ok": true}` answer cost 126 output tokens (115 of them thinking) and, at a 64-token
+      limit, took a hidden second turn. `MAX_THINKING_TOKENS=0` joins the switches (B): 13
+      output tokens, `thinking_tokens: 0`, one turn, and `max_tokens` bounds the answer
+      itself (live-tested with a control: without the switch, the same call thinks). (3)
+      **The output limit.** An answer longer than `max_tokens` is not cut: Claude Code
+      retries the truncated output on its own up to 3 times, then exits 1 with `is_error`,
+      `subtype: "success"`, no `api_error_status`, `num_turns: 4` and `output_tokens` 4 ×
+      `max_tokens` (256 at 64). So one call can bill **4 outputs** of `max_tokens`: a
+      provider backend now declares `output_attempts` (1 when absent; an unusable declared
+      value is `backend_unavailable`, one above `MAX_OUTPUT_ATTEMPTS` is clamped to it;
+      `claude-cli`: `OUTPUT_ATTEMPTS = 4`), carried on `PreparedRequest` and
+      `RenderedRequest`; `worst_case` (decision 41) reserves `output_attempts × max_tokens`
+      output tokens, and `max_tokens` divides the step's remaining `tokens_out` and `usd` by
+      it so that the reservation still fits the step's budget (a `claude-cli` step with
+      `tokens_out: 2000` gets `max_tokens` 500; the alias' `max_output_tokens` caps each
+      output, not divided). So authors should size a step's `tokens_out` and `usd` for 4
+      outputs when its alias is `claude-cli`. The conservative charge and the stdout cap
+      cover 4 outputs too. On a success the bound stays `max_tokens` (`num_turns` must be 1:
+      one output). An `is_error` result with no HTTP status whose reported `output_tokens`
+      is at least `max_tokens`, and that shows the CLI's own retry or limit handling (more
+      than one turn or a `success` subtype; with neither it stays `host_error`), is now
+      `output_invalid` ("the output was truncated at the limit", on the reported count,
+      never the CLI's text); it was `host_error`. It is charged its reported usage, its
+      output at least `OUTPUT_ATTEMPTS × max_tokens` when it took more than one turn (the
+      CLI billed the retries even if a release reported only the last one). The live
+      output-limit test also checks the reported output is at most 4 × `max_tokens`. The
+      retry count is the CLI's behaviour, not a documented contract: bumping
+      `CLAUDE_CODE_VERSION_RANGE` must re-verify it live (and change `OUTPUT_ATTEMPTS` if a
+      release retries more or fewer times). The same run printed that `--restricted` and `--safe-mode` keep token
+      auth (a success) and `--bare` does not ("Not logged in"); none is adopted (B: a
+      separate decision).
 
 ### Provisional decisions (#53, pending maintainer review)
 

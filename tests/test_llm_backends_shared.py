@@ -182,6 +182,28 @@ def test_every_backend_of_the_suite_is_registered() -> None:
     assert set(FACTORIES) == {kind.name for kind in KINDS} | {CLI}
 
 
+# How many outputs of up to `max_tokens` one call of each built-in backend may bill
+# (`output_attempts`): `worst_case` reserves that many and `max_tokens` divides the step's
+# `tokens_out` by it. Only `claude-cli` retries a truncated output on its own (#113); a new
+# backend, or a change here, must be a deliberate decision (schemas decision 42).
+OUTPUT_ATTEMPTS = {"anthropic": 1, "openai-compatible": 1, "ollama": 1, "claude-cli": 4}
+
+
+def test_every_built_in_backend_declares_the_expected_output_attempts(
+    kind: Kind, secrets: SecretResolver
+) -> None:
+    assert set(OUTPUT_ATTEMPTS) == set(FACTORIES)
+    llm = backends(kind, secrets, kind.recorder("success"))
+    assert llm.prepare(request()).output_attempts == OUTPUT_ATTEMPTS[kind.name] == 1
+
+
+def test_claude_cli_declares_the_expected_output_attempts(
+    fake_claude: Fake, cli_secrets: SecretResolver
+) -> None:
+    llm = cli_backends(fake_claude, cli_secrets)
+    assert llm.prepare(request()).output_attempts == OUTPUT_ATTEMPTS[CLI] == 4
+
+
 # --- success and the outgoing request ---------------------------------------------------------
 
 
@@ -1363,7 +1385,8 @@ def test_claude_cli_max_tokens_is_sized_at_the_cache_write_price(
 ) -> None:
     llm = cli_backends(fake_claude, cli_secrets)
     rendered = llm.render(request(budget=Budget(usd=0.1, tokens_out=50000)))
-    expected = int((0.1 - rendered.input_bound * 6e-6) * 1e6 / 15)  # 2x input: may write cache
+    # 2x input: may write cache; 4 outputs: Claude Code retries a truncated one (#113).
+    expected = int((0.1 - rendered.input_bound * 6e-6) * 1e6 / 15 / 4)
     assert rendered.payload["max_tokens"] == expected < 50000
 
 

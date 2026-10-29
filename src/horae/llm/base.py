@@ -125,7 +125,11 @@ backends disable their SDK's own retries.
   that the input bound plus the output cannot exceed the remaining `usd` when the alias has
   a price. For a provider backend that may write a prompt cache (`may_write_cache`), every
   token of the input bound is priced as a cache write (`input_price`), in both `max_tokens`
-  and `worst_case`, so that a settled call never costs more than its reservation.
+  and `worst_case`, so that a settled call never costs more than its reservation. A provider
+  backend that may bill several outputs of up to `max_tokens` for one call (`output_attempts`,
+  see `output_attempts`; `claude-cli`'s own recovery from a truncated output, #113) has its
+  `worst_case` output at `output_attempts * max_tokens`, and `max_tokens` divides the
+  remaining `tokens_out` and `usd` by it, so the reservation still fits the budget.
 """
 
 import asyncio
@@ -236,7 +240,11 @@ class CompletionResult:
 
 
 class ProviderBackend(Protocol):
-    """One provider adapter. Makes one request per `send`, with no tools and no retry."""
+    """One provider adapter. Makes one request per `send`, with no tools and no retry.
+
+    A backend may also declare `output_attempts` (an `int`, read with `output_attempts`): how
+    many outputs of up to `max_tokens` one `send` may be billed (1 when absent; any other
+    value than an `int` of at least 1 makes the backend unavailable)."""
 
     @property
     def name(self) -> LlmBackendName: ...
@@ -294,6 +302,8 @@ class RenderedRequest:
     """The payload's `max_tokens`: the most output tokens the attempt can cost."""
     may_write_cache: bool = False
     """The provider backend's `may_write_cache` (the input bound is priced as cache writes)."""
+    output_attempts: int = 1
+    """The provider backend's `output_attempts` (`worst_case` reserves that many outputs)."""
     _body: bytes = field(default=b"", init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -444,6 +454,31 @@ def input_price(price: ModelPrice, *, may_write_cache: bool = False) -> float:
     return 2 * price.input_per_mtok
 
 
+MAX_OUTPUT_ATTEMPTS = 16
+"""The largest `output_attempts` taken from a backend (a larger integer is clamped to it)."""
+
+
+def output_attempts(backend: object) -> int:
+    """`backend.output_attempts`: how many outputs of up to `max_tokens` one call may be
+    billed (`claude-cli` recovers from a truncated output on its own: 4). 1 when the backend
+    declares none; an integer above `MAX_OUTPUT_ATTEMPTS` is clamped to it (it reserves at
+    least as much as declared would, up to the cap).
+
+    Raises `LlmError("backend_unavailable")` for any other declared value (0, negative, a
+    `bool`, not an `int`): a misconfigured backend fails closed instead of reserving one
+    output where it may bill several."""
+    if not hasattr(backend, "output_attempts"):
+        return 1
+    value = backend.output_attempts
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise LlmError(
+            "backend_unavailable",
+            f"backend declares an unusable output_attempts {repr(value)[:40]} (an integer "
+            "of at least 1)",
+        )
+    return min(value, MAX_OUTPUT_ATTEMPTS)
+
+
 def max_tokens(
     request: LlmRequest,
     price: ModelPrice | None,
@@ -451,15 +486,17 @@ def max_tokens(
     input_tokens: int = 0,
     cap: int | None = None,
     may_write_cache: bool = False,
+    attempts: int = 1,
 ) -> int:
-    """The `max_tokens` of an attempt (decision 38 B): its remaining `tokens_out`, capped by
-    the alias' `max_output_tokens`, and, with a price, lowered so that `input_tokens` (an
-    upper bound of the input, at `input_price`) plus the output stay within the remaining
-    `usd`.
+    """The `max_tokens` of an attempt (decision 38 B): its remaining `tokens_out` (divided by
+    the backend's `attempts`, `output_attempts`), capped by the alias' `max_output_tokens`,
+    and, with a price, lowered so that `input_tokens` (an upper bound of the input, at
+    `input_price`) plus `attempts` outputs stay within the remaining `usd`.
 
     Raises `LlmError("budget_exceeded")` when not one output token is affordable, so that no
     request is sent."""
-    limit = request.budget.tokens_out
+    attempts = max(1, attempts)
+    limit = request.budget.tokens_out // attempts
     if cap is not None:
         limit = min(limit, cap)
     if limit < 1:
@@ -474,7 +511,7 @@ def max_tokens(
                 "remaining usd",
             )
         if price.output_per_mtok > 0:
-            limit = min(limit, math.floor(left * 1_000_000 / price.output_per_mtok))
+            limit = min(limit, math.floor(left * 1_000_000 / price.output_per_mtok / attempts))
         if limit < 1:
             raise LlmError(
                 "budget_exceeded", "the step's remaining usd buys no output token after the input"
@@ -517,6 +554,8 @@ class PreparedRequest:
     skill_version: str
     input_bound: int
     may_write_cache: bool = False
+    output_attempts: int = 1
+    """The provider backend's `output_attempts`."""
     deid: Mapping[str, Any] | None = None
     """`LlmRequest.deidentified` (recorded as `summary.deid`)."""
 
@@ -624,6 +663,7 @@ class ModelBackends:
             skill_version=prompt.skill_version,
             input_bound=input_bound(backend.render(probe)),
             may_write_cache=getattr(backend, "may_write_cache", False) is True,
+            output_attempts=output_attempts(backend),
             deid=None if request.deidentified is None else dict(request.deidentified),
         )
 
@@ -635,6 +675,7 @@ class ModelBackends:
             input_tokens=prepared.input_bound,
             cap=prepared.spec.max_output_tokens,
             may_write_cache=prepared.may_write_cache,
+            attempts=prepared.output_attempts,
         )
 
     def render(
@@ -669,22 +710,23 @@ class ModelBackends:
             input_bound=prepared.input_bound,
             max_tokens=limit,
             may_write_cache=prepared.may_write_cache,
+            output_attempts=prepared.output_attempts,
         )
 
     def worst_case(self, rendered: RenderedRequest) -> Usage:
         """The most `rendered` can cost (the usage ledger's reservation, decision 41): every
         token of its input bound at `input_price` (the cache write price when its backend
-        `may_write_cache`) and every output token of its `max_tokens`: the bound that
-        `max_tokens` keeps within the attempt's `usd`. Cache reads cost less than input."""
+        `may_write_cache`) and every output token of its `max_tokens`, `output_attempts` times:
+        the bound that `max_tokens` keeps within the attempt's `usd`. Cache reads cost less
+        than input."""
         spec = self.models.get(rendered.alias)
         price = None if spec is None else spec.price
-        usage = cost(price, rendered.input_bound, rendered.max_tokens)
+        tokens_out = rendered.max_tokens * max(1, rendered.output_attempts)
+        usage = cost(price, rendered.input_bound, tokens_out)
         if price is None or not rendered.may_write_cache:
             return usage
         per_mtok = input_price(price, may_write_cache=True)
-        usd = (
-            rendered.input_bound * per_mtok + rendered.max_tokens * price.output_per_mtok
-        ) / 1_000_000
+        usd = (rendered.input_bound * per_mtok + tokens_out * price.output_per_mtok) / 1_000_000
         return usage.model_copy(update={"usd": usd})
 
     async def send(self, rendered: RenderedRequest) -> LlmResponse:
@@ -824,6 +866,7 @@ __all__ = [
     "INPUT_TOKEN_MARGIN",
     "INTENTS_KEY",
     "MAX_ERROR_CHARS",
+    "MAX_OUTPUT_ATTEMPTS",
     "SECRET_IN_REQUEST",
     "UNVALIDATED",
     "VALIDATION_MARGIN_S",
@@ -844,6 +887,7 @@ __all__ = [
     "input_bound",
     "input_price",
     "max_tokens",
+    "output_attempts",
     "production_validator",
     "redacted_error",
     "secrets_in",
