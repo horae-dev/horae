@@ -38,7 +38,16 @@ secrets:
   refs:
     ANTHROPIC_API_KEY: { file: anthropic_api_key }
     OPENROUTER_API_KEY: { env: OPENROUTER_KEY }
-scheduler: { mode: external }
+# `horae run` is called by Coolify Scheduled Tasks (`HORAE_SCHEDULER` overrides the mode). Each
+# run of `daily-brief` pings a push monitor whose URL (it carries a token) is a secret file.
+scheduler:
+  mode: external
+  monitors:
+    daily-brief: { secret: DAILY_BRIEF_PUSH_URL }
+    remind: { secret: REMIND_PUSH_URL, kind: healthchecks }
+  # Used by `horae serve` in builtin mode: one scheduled run at a time, skipped if 1 h late.
+  max_concurrent: 1
+  misfire_grace_s: 3600
 runs: { timeout_s: 1200 }
 # Daily LLM spend ceilings across runs, in the instance's time zone (decision 41).
 budgets:
