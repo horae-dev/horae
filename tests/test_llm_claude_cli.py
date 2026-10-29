@@ -10,6 +10,7 @@ import os
 import stat
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -29,13 +30,16 @@ from horae.llm.backends.claude_cli import (
     EMPTY_MCP,
     LLM_RUNS_DIR,
     MAX_SYSTEM_BYTES,
+    OUTPUT_ATTEMPTS,
     ClaudeCliBackend,
     argv,
     check,
     parse_version,
     script_hint,
+    unfenced,
     version_ok,
 )
+from horae.llm.base import output_attempts
 from horae.secrets import SecretResolver
 
 TOKEN = "sk-ant-oat01-synthetic-declared-token-0123456789"  # noqa: S105 (synthetic)
@@ -55,6 +59,7 @@ EXPECTED_KEYS = {
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
     "CLAUDE_CODE_DISABLE_CLAUDE_MDS",
     "CLAUDE_CODE_DISABLE_AUTO_MEMORY",
+    "MAX_THINKING_TOKENS",
     "GIT_CEILING_DIRECTORIES",
     "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
     "CLAUDE_CODE_OAUTH_TOKEN",
@@ -506,15 +511,18 @@ def test_a_timeout_kills_the_whole_group(fake: Fake, secrets: SecretResolver) ->
 
 
 def test_an_oversized_stdout_is_refused(fake: Fake, secrets: SecretResolver) -> None:
-    cap = response_cap(2000)  # the step's max_tokens sizes the cap, as for an HTTP body
-    assert cap == 1 << 20
+    # The step's max_tokens sizes the cap, as for an HTTP body, for each of the outputs
+    # Claude Code may write (it retries a truncated output by itself, #113).
+    cap = response_cap(OUTPUT_ATTEMPTS * 2000)
+    assert cap == 1 << 20  # 8000 tokens at 64 bytes a token: still the 1 MiB floor
+    assert response_cap(OUTPUT_ATTEMPTS * 8192) == 2 << 20
     fake.behave(mode="flood", chunks=cap // 65536 + 2)
     started = time.monotonic()
     error = fails(fake, secrets)
     assert error.kind == "output_invalid"
     assert f"more than {cap} bytes" in error.message
     assert error.usage is not None
-    assert error.usage.tokens_out == 2000
+    assert error.usage.tokens_out == OUTPUT_ATTEMPTS * 2000
     assert time.monotonic() - started < 10  # killed, not waited for
 
 
@@ -605,7 +613,9 @@ def test_not_logged_in_is_auth_failed_and_charges_nothing(
         ({"stop_reason": "max_tokens"}, "truncated"),
         ({"stop_reason": "model_context_window_exceeded"}, "truncated"),
         ({"stop_reason": "refusal"}, "refused"),
-        ({"result": '```json\n{"items": []}\n```'}, "not one JSON value"),
+        ({"result": 'Here it is:\n```json\n{"items": []}\n```'}, "not one JSON value"),
+        ({"result": '```json\n{"items": []}\n```\nDone.'}, "not one JSON value"),
+        ({"result": '```json\n{"a": 1}\n```\n```json\n{"b": 2}\n```'}, "not one JSON value"),
         ({"result": '{"a": NaN}'}, "not one JSON value"),
         ({"result": None}, "not one JSON value"),
     ],
@@ -648,9 +658,10 @@ def test_missing_or_unusable_usage_is_charged_conservatively(
 ) -> None:
     fake.behave(result=success(OUTPUT, usage=reported))
     result = run(fake, secrets)
-    assert result.usage.tokens_out == 2000
+    # The whole output budget, priced, for each output Claude Code may write (#113).
+    assert result.usage.tokens_out == OUTPUT_ATTEMPTS * 2000
     assert result.usage.tokens_in > 1000
-    assert result.usage.usd >= 2000 * 15.0 / 1_000_000  # the whole output budget, priced
+    assert result.usage.usd >= OUTPUT_ATTEMPTS * 2000 * 15.0 / 1_000_000
 
 
 def test_a_zero_usage_is_floored(fake: Fake, secrets: SecretResolver) -> None:
@@ -900,3 +911,134 @@ def test_managed_settings_are_found_by_name_only(
         claude_cli, "MANAGED_SETTINGS", (str(present), str(tmp_path / "managed-mcp.json"))
     )
     assert claude_cli.managed_settings() == [str(present)]
+
+
+# --- the live run's findings (#113) ----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("text", "body"),
+    [
+        ('```json\n{"ok": true}\n```', '{"ok": true}'),
+        ('```JSON\n{"ok": true}\n```', '{"ok": true}'),
+        ("```\n[1, 2]\n```", "[1, 2]"),
+        ('  \n```json  \r\n{"ok": true}\r\n```\n\n', '{"ok": true}'),
+        ('```json\n{"ok": true}```', '{"ok": true}'),
+        ('{"ok": true}', '{"ok": true}'),
+        ('Here:\n```json\n{"ok": true}\n```', 'Here:\n```json\n{"ok": true}\n```'),
+        ('```python\n{"ok": true}\n```', '```python\n{"ok": true}\n```'),
+        ('```json {"ok": true}```', '```json {"ok": true}```'),
+    ],
+)
+def test_unfenced_strips_exactly_one_enclosing_fence(text: str, body: str) -> None:
+    assert unfenced(text) == body
+
+
+def test_a_fenced_result_is_parsed(fake: Fake, secrets: SecretResolver) -> None:
+    """The model wraps its JSON in one Markdown fence with the backend's prompt (#113)."""
+    fake.behave(result=success("```json\n" + json.dumps(OUTPUT, indent=2) + "\n```\n"))
+    assert run(fake, secrets).output == OUTPUT
+
+
+@pytest.mark.parametrize(
+    "text", ["```json\n{}\n```\n```json\n{}\n```", "The answer ```json\n{}\n``` is it"]
+)
+def test_two_fences_or_text_with_a_fence_stay_invalid(
+    fake: Fake, secrets: SecretResolver, text: str
+) -> None:
+    fake.behave(result=success(text))
+    error = fails(fake, secrets)
+    assert error.kind == "output_invalid"
+    assert "not one JSON value" in error.message
+
+
+def test_extended_thinking_is_off(fake: Fake, secrets: SecretResolver) -> None:
+    run(fake, secrets)
+    [call] = fake.calls()
+    assert env_of(call)["MAX_THINKING_TOKENS"] == "0"
+
+
+def _truncated(output_tokens: Any, **overrides: Any) -> dict[str, Any]:
+    """The result Claude Code 2.1.284 gave after giving up on an output truncated at the
+    limit (seen live, #113): a `success` subtype, `is_error`, no HTTP status."""
+    usage = None if output_tokens is None else {"input_tokens": 900, "output_tokens": output_tokens}
+    data = {
+        "is_error": True,
+        "result": "API Error: the response exceeded the output token maximum.",
+        "stop_reason": "stop_sequence",
+        "num_turns": 4,
+        "usage": usage,
+        **overrides,
+    }
+    return success("", **data)
+
+
+def test_an_output_truncated_at_the_limit_is_output_invalid_with_its_usage(
+    fake: Fake, secrets: SecretResolver
+) -> None:
+    fake.behave(result=_truncated(256), exit=1)
+    error = fails(fake, secrets, completion(max_tokens=64))
+    assert error.kind == "output_invalid"
+    assert "truncated at the limit" in error.message
+    assert "API Error" not in error.message
+    assert error.usage is not None
+    assert error.usage.tokens_out == 256  # four outputs of 64: within OUTPUT_ATTEMPTS * 64
+    assert error.usage.tokens_out <= OUTPUT_ATTEMPTS * 64
+
+
+@pytest.mark.parametrize(
+    ("output_tokens", "overrides", "kind"),
+    [
+        (64, {}, "output_invalid"),  # exactly the limit
+        (63, {}, "host_error"),  # under it: not a truncation
+        (None, {}, "host_error"),  # no usage: no signal
+        (256, {"api_error_status": 429}, "rate_limited"),  # an HTTP status wins
+    ],
+)
+def test_the_truncation_signal_is_the_reported_output(
+    fake: Fake,
+    secrets: SecretResolver,
+    output_tokens: Any,
+    overrides: dict[str, Any],
+    kind: str,
+) -> None:
+    fake.behave(result=_truncated(output_tokens, **overrides), exit=1)
+    assert fails(fake, secrets, completion(max_tokens=64)).kind == kind
+
+
+def test_the_reservation_covers_every_output_attempt(fake: Fake, secrets: SecretResolver) -> None:
+    """Claude Code may bill `OUTPUT_ATTEMPTS` outputs for one call: `worst_case` reserves
+    them all, and `max_tokens` divides the step's budget so the reservation still fits it."""
+    assert backend(fake, secrets).output_attempts == OUTPUT_ATTEMPTS == 4
+    llm = ModelBackends(
+        models={"default": alias(fake)},
+        secrets=secrets,
+        factories=FACTORIES,
+        prompts=StaticPrompts(),
+    )
+    budget = Budget(usd=10.0, tokens_out=2000)
+    req = LlmRequest(
+        skill="pack/brief", model="default", input=INPUT, budget=budget, timeout_s=20.0, attempt=1
+    )
+    rendered = llm.render(req)
+    assert (rendered.output_attempts, rendered.max_tokens) == (4, 500)
+    worst = llm.worst_case(rendered)
+    assert worst.tokens_out == 2000
+    assert worst.usd <= budget.usd
+    rendered = llm.render(replace(req, budget=Budget(usd=0.03, tokens_out=2000)))
+    assert rendered.max_tokens < 500
+    assert llm.worst_case(rendered).usd <= 0.03
+    with pytest.raises(LlmError) as info:
+        llm.render(replace(req, budget=Budget(usd=10.0, tokens_out=3)))
+    assert info.value.kind == "budget_exceeded"
+
+
+@pytest.mark.parametrize(
+    ("value", "attempts"), [(4, 4), (1, 1), (0, 1), (17, 1), (True, 1), ("4", 1)]
+)
+def test_output_attempts_is_read_defensively(value: Any, attempts: int) -> None:
+    class Declared:
+        output_attempts = value
+
+    assert output_attempts(Declared()) == attempts
+    assert output_attempts(object()) == 1

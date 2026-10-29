@@ -1363,7 +1363,8 @@ def test_claude_cli_max_tokens_is_sized_at_the_cache_write_price(
 ) -> None:
     llm = cli_backends(fake_claude, cli_secrets)
     rendered = llm.render(request(budget=Budget(usd=0.1, tokens_out=50000)))
-    expected = int((0.1 - rendered.input_bound * 6e-6) * 1e6 / 15)  # 2x input: may write cache
+    # 2x input: may write cache; 4 outputs: Claude Code retries a truncated one (#113).
+    expected = int((0.1 - rendered.input_bound * 6e-6) * 1e6 / 15 / 4)
     assert rendered.payload["max_tokens"] == expected < 50000
 
 

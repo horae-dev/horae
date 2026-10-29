@@ -12,7 +12,9 @@ rules; in short:
 `{"argv", "stdin", "max_tokens"}`: `argv` the arguments after the executable, `stdin` what the
 process reads, `max_tokens` the step's output budget (passed as
 `CLAUDE_CODE_MAX_OUTPUT_TOKENS`, and used for the stdout cap, the usage floor and the
-conservative charge). The arguments are fixed but for the
+conservative charge; Claude Code retries a truncated output up to 3 times by itself, so one
+call may bill `OUTPUT_ATTEMPTS` outputs of `max_tokens`, which the reservation, the stdout cap
+and the conservative charge cover, #113). The arguments are fixed but for the
 model and the system prompt (`ARGV`): print mode, one JSON result, no built-in tool
 (`--tools ""`), only the empty MCP configuration (`--strict-mcp-config --mcp-config
 {"mcpServers":{}}`), no settings source (`--setting-sources ""`), no session persistence, no
@@ -28,22 +30,24 @@ executable resolved to an absolute path (`models.<alias>.command`, else `claude`
 `BASE_PATH`, never Horae's `PATH`), its symlinks resolved; **exactly** this environment, nothing
 inherited: `PATH` (`BASE_PATH`), `HOME` and `TMPDIR` (fresh empty per-call directories, mode
 0700), `LANG=C.UTF-8`, `TZ=UTC`, `ENV_SWITCHES` (no auto-update, telemetry or non-essential
-traffic, no `CLAUDE.md`, no auto memory), `GIT_CEILING_DIRECTORIES` (the workspace root, so no
-git repository above it is found), `CLAUDE_CODE_MAX_OUTPUT_TOKENS` (the step's `max_tokens`)
-and `CLAUDE_CODE_OAUTH_TOKEN`, the alias' declared `secret` (token mode, the only mode in v1;
-a `claude setup-token` token), revealed into the child's mapping only; the working directory
-an empty per-call directory (no `CLAUDE.md`, no project settings); umask 077; a new session
-(its own process group); the per-call directories removed afterwards (also on cancellation).
+traffic, no `CLAUDE.md`, no auto memory, no extended thinking), `GIT_CEILING_DIRECTORIES`
+(the workspace root, so no git repository above it is found), `CLAUDE_CODE_MAX_OUTPUT_TOKENS`
+(the step's `max_tokens`) and `CLAUDE_CODE_OAUTH_TOKEN`, the alias' declared `secret` (token
+mode, the only mode in v1; a `claude setup-token` token), revealed into the child's mapping
+only; the working directory an empty per-call directory (no `CLAUDE.md`, no project
+settings); umask 077; a new session (its own process group); the per-call directories
+removed afterwards (also on cancellation).
 The per-call directories live under a Horae-owned 0700 directory, `<state_dir>/llm-runs`
 (`LLM_RUNS_DIR`, wired by `horae.runner.open_ports`), not the system temporary directory
 (decision 42 C); a backend built without one (a test, `horae doctor`'s version check) falls
 back to a fresh private directory in the system temporary directory.
 
 **Bounds.** The step's timeout, then the group gets `SIGTERM`, 2 s later `SIGKILL`
-(`horae.plugins.host.transport.terminate`); stdout at most `_shared.response_cap(max_tokens)`
-bytes (1 to 8 MiB, else `output_invalid`, as an HTTP body, T33); stderr captured head and tail
-(64 KiB, drained for at most `DRAIN_S` after the exit) and redacted with every resolved secret
-(the token included) before it reaches an `LlmError`.
+(`horae.plugins.host.transport.terminate`); stdout at most
+`_shared.response_cap(OUTPUT_ATTEMPTS * max_tokens)` bytes (1 to 8 MiB, else `output_invalid`,
+as an HTTP body, T33); stderr captured head and tail (64 KiB, drained for at most `DRAIN_S`
+after the exit) and redacted with every resolved secret (the token included) before it
+reaches an `LlmError`.
 
 **The version is pinned** (`CLAUDE_CODE_VERSION_RANGE`): `<command> --version` runs once per
 backend (one per alias per run), in the same isolated environment without the token; a
@@ -56,12 +60,15 @@ output in the bump PR's body and the version in `docs/security.md` T11.
 
 **The result.** stdout must be UTF-8 and one JSON object (strict `_shared.parse`) with `type:
 "result"`. `is_error` maps to `LlmError` kinds (`api_error_status` through
-`_shared.STATUS_KINDS`, `error_max_turns` → `output_invalid`, "Not logged in" →
-`auth_failed`, anything else `host_error`); a non-zero exit without a result is `host_error`.
+`_shared.STATUS_KINDS`; with no status, reported `output_tokens` of at least `max_tokens` →
+`output_invalid`, the output truncated at the limit, #113; `error_max_turns` →
+`output_invalid`, "Not logged in" → `auth_failed`, anything else `host_error`); a non-zero
+exit without a result is `host_error`.
 A successful result must have `subtype: "success"`, `num_turns: 1`, no `permission_denials`,
 a stop reason other than `tool_use` / `max_tokens`, reported `output_tokens` no larger than
-`max_tokens`, and a `result` string that is one JSON value (no fence stripping; schema
-validation is #31's); otherwise `output_invalid` with the usage. Messages are Horae's (never
+`max_tokens` (one output: `num_turns` is 1), and a `result` string that is one JSON value,
+alone or in exactly one enclosing Markdown code fence (`unfenced`, #113; schema validation
+is #31's); otherwise `output_invalid` with the usage. Messages are Horae's (never
 the CLI's text).
 
 **Usage and cost.** Tokens from `usage` (`input_tokens`, `output_tokens`,
@@ -131,8 +138,15 @@ ENV_SWITCHES: Mapping[str, str] = {
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
     "CLAUDE_CODE_DISABLE_CLAUDE_MDS": "1",
     "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
+    "MAX_THINKING_TOKENS": "0",
 }
-"""Claude Code's own switches, set in every child environment (decision 42 B)."""
+"""Claude Code's own switches, set in every child environment (decision 42 B). No extended
+thinking (#113): a thinking model otherwise spends hidden output tokens, and can take a
+second turn, before its answer; `max_tokens` then bounds the answer itself."""
+OUTPUT_ATTEMPTS = 4
+"""How many outputs of up to `max_tokens` one call may be billed: Claude Code retries a
+truncated output on its own, up to 3 times (seen live on 2.1.284, #113), so the reservation
+(`ModelBackends.worst_case`), the conservative charge and the stdout cap cover 4."""
 MAX_OUTPUT_ENV = "CLAUDE_CODE_MAX_OUTPUT_TOKENS"
 """Where the step's `max_tokens` goes in a call's environment (decision 42 F)."""
 CEILING_ENV = "GIT_CEILING_DIRECTORIES"
@@ -166,8 +180,20 @@ DRAIN_S = 1.0
 """How long stdout, then stderr, may stay open after the process exited (a grandchild holding
 it)."""
 _POLL_S = 0.01
+_FENCED = re.compile(
+    r"\A\s*```(?:json)?[ \t]*\r?\n(?P<body>.*?)\s*```\s*\Z", re.DOTALL | re.IGNORECASE
+)
 _VERSION = re.compile(r"^(\d{1,6})\.(\d{1,6})\.(\d{1,6}) \(Claude Code\)\n?$")
 API = "claude-cli"
+
+
+def unfenced(text: str) -> str:
+    """The body of `text` when it is exactly one Markdown code fence (an optional `json` info
+    string, any case; whitespace around it), else `text` unchanged. The model wraps its JSON
+    in one (#113); the body must still be one JSON value, so prose around the fence, two
+    fences or a fence inside text stay invalid."""
+    match = _FENCED.match(text)
+    return text if match is None else match.group("body")
 
 
 def argv(model: str, system: str) -> list[str]:
@@ -472,6 +498,11 @@ def check(spec: ModelAlias) -> str | None:
     return None
 
 
+def _stdout_cap(max_tokens: int) -> int:
+    """The stdout cap of a call: `response_cap` of its `OUTPUT_ATTEMPTS` outputs."""
+    return response_cap(OUTPUT_ATTEMPTS * max_tokens)
+
+
 def _usd(value: object) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
@@ -505,6 +536,11 @@ class ClaudeCliBackend:
     def may_write_cache(self) -> bool:
         """`True`: Claude Code writes prompt caches by itself (decision 41)."""
         return True
+
+    @property
+    def output_attempts(self) -> int:
+        """`OUTPUT_ATTEMPTS`: Claude Code retries a truncated output on its own (#113)."""
+        return OUTPUT_ATTEMPTS
 
     def render(self, completion: Completion) -> dict[str, Any]:
         """The payload for `completion` (pure)."""
@@ -568,8 +604,9 @@ class ClaudeCliBackend:
 
     def conservative(self, payload: Mapping[str, Any], notional: float | None = None) -> Usage:
         """The charge when no usable usage was reported: the input bound and the whole
-        output budget (or the notional cost, when larger)."""
-        usage = cost(self._spec.price, input_bound(payload), int(payload["max_tokens"]))
+        output budget, `OUTPUT_ATTEMPTS` times (or the notional cost, when larger)."""
+        tokens_out = OUTPUT_ATTEMPTS * int(payload["max_tokens"])
+        usage = cost(self._spec.price, input_bound(payload), tokens_out)
         return self._with_notional(usage, notional)
 
     @staticmethod
@@ -607,7 +644,7 @@ class ClaudeCliBackend:
                     stdin=str(payload["stdin"]).encode("utf-8"),
                     timeout_s=timeout_s,
                     capture=capture,
-                    max_stdout=response_cap(max_tokens),
+                    max_stdout=_stdout_cap(max_tokens),
                 )
             finally:
                 env.clear()
@@ -622,7 +659,7 @@ class ClaudeCliBackend:
         if outcome.too_large:
             raise LlmError(
                 "output_invalid",
-                f"{API} wrote more than {response_cap(int(payload['max_tokens']))} bytes",
+                f"{API} wrote more than {_stdout_cap(int(payload['max_tokens']))} bytes",
                 stderr=stderr,
                 usage=self.conservative(payload),
             )
@@ -642,7 +679,7 @@ class ClaudeCliBackend:
             )
         usage = self._usage(data, payload)
         if data.get("is_error") is not False:
-            raise self._error(data, usage, stderr)
+            raise self._error(data, usage, stderr, at_limit=self._at_limit(data, payload))
         if outcome.returncode != 0:
             raise LlmError(
                 "host_error", f"{API} {exit_status(outcome.returncode)}", stderr=stderr, usage=usage
@@ -684,13 +721,22 @@ class ClaudeCliBackend:
             )
         return tokens > 0 or (_usd(data.get("total_cost_usd")) or 0) > 0
 
-    def _error(self, data: Mapping[str, Any], usage: Usage, stderr: str | None) -> LlmError:
+    def _error(
+        self, data: Mapping[str, Any], usage: Usage, stderr: str | None, *, at_limit: bool = False
+    ) -> LlmError:
         status = count(data.get("api_error_status"))
         subtype = token(data.get("subtype"))
         result = data.get("result")
         kind = "host_error"
         if status is not None:
             kind = STATUS_KINDS.get(status, "host_error")
+        elif at_limit:
+            return LlmError(
+                "output_invalid",
+                f"{API}: the output was truncated at the limit",
+                stderr=stderr,
+                usage=usage,
+            )
         elif subtype == "error_max_turns":
             kind = "output_invalid"
         elif isinstance(result, str) and result.startswith("Not logged in"):
@@ -704,6 +750,14 @@ class ClaudeCliBackend:
             stderr=stderr,
             usage=usage if self._spent(data) else None,
         )
+
+    @staticmethod
+    def _at_limit(data: Mapping[str, Any], payload: Mapping[str, Any]) -> bool:
+        """Whether a failed call reported at least `max_tokens` output tokens: Claude Code
+        gave up on an output truncated at the limit (after its own retries, #113)."""
+        reported = data.get("usage")
+        tokens_out = count(reported.get("output_tokens")) if isinstance(reported, dict) else None
+        return tokens_out is not None and tokens_out >= int(payload["max_tokens"])
 
     def _success(
         self,
@@ -734,7 +788,7 @@ class ClaudeCliBackend:
         if tokens_out is not None and tokens_out > int(payload["max_tokens"]):
             raise invalid("the reported output is over the max_tokens limit")
         result = data.get("result")
-        output = parse(result) if isinstance(result, str) else INVALID
+        output = parse(unfenced(result)) if isinstance(result, str) else INVALID
         if output is INVALID:
             raise invalid("the result is not one JSON value")
         return CompletionResult(output=output, usage=usage, stop_reason=stop)
@@ -764,6 +818,7 @@ __all__ = [
     "MAX_STDOUT_BYTES",
     "MAX_SYSTEM_BYTES",
     "MIN_VERSION",
+    "OUTPUT_ATTEMPTS",
     "PAYLOAD_KEYS",
     "TOKEN_ENV",
     "ClaudeCliBackend",
@@ -778,5 +833,6 @@ __all__ = [
     "resolve",
     "run",
     "script_hint",
+    "unfenced",
     "version_ok",
 ]
