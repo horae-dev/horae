@@ -1200,19 +1200,32 @@ class Store:
         status: StoreRunStatus | None = None,
         limit: int = 50,
         evals: bool = True,
+        before: tuple[datetime, str] | None = None,
     ) -> list[RunSummary]:
         """Runs, newest first, optionally filtered; `0 <= limit <= MAX_LIST_RUNS`.
-        `evals=False` leaves out the rows of live skill evals (`EVAL_PIPELINE_PREFIX`)."""
+        `evals=False` leaves out the rows of live skill evals (`EVAL_PIPELINE_PREFIX`).
+        `before=(started_at, id)` (a page cursor, #37) keeps only the runs listed after that
+        one in this order (older, or as old with a smaller id)."""
         if type(limit) is not int or not 0 <= limit <= MAX_LIST_RUNS:
             raise ValueError(f"limit must be an int between 0 and {MAX_LIST_RUNS}")
+        before_at, before_id = (None, None) if before is None else (_ts(before[0]), before[1])
         rows = self._conn.execute(
             "SELECT id, pipeline, status, dry_run, started_at, finished_at, tokens_in, "
             "tokens_out, cost_usd, pid, host, heartbeat_at, abandoned_at, error FROM runs "
             "WHERE (:pipeline IS NULL OR pipeline = :pipeline) "
             "AND (:status IS NULL OR status = :status) "
             "AND (:evals = 1 OR substr(pipeline, 1, 5) != 'eval:') "
+            "AND (:before_at IS NULL OR started_at < :before_at "
+            "OR (started_at = :before_at AND id < :before_id)) "
             "ORDER BY started_at DESC, id DESC LIMIT :limit",
-            {"pipeline": pipeline, "status": status, "limit": limit, "evals": int(evals)},
+            {
+                "pipeline": pipeline,
+                "status": status,
+                "limit": limit,
+                "evals": int(evals),
+                "before_at": before_at,
+                "before_id": before_id,
+            },
         ).fetchall()
         return [self._summary(row) for row in rows]
 

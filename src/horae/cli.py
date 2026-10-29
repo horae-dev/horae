@@ -10,7 +10,7 @@ import asyncio
 import re
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any
@@ -59,7 +59,7 @@ from horae.config import (
 from horae.contracts import InstanceConfig, RunRecord
 from horae.llm.deid import load_deidentifier
 from horae.replay import LockRegistry, ReplayResult, definition_for, replay
-from horae.runner import lock_is_free
+from horae.run_view import iso, run_json, stale_flags
 from horae.secrets import logs
 from horae.skills import DirectorySkills
 from horae.store import MAX_LIST_RUNS, RunSummary, Store, StoreError
@@ -206,10 +206,6 @@ class RunStatusFilter(StrEnum):
     undone = "undone"
 
 
-def _iso(value: datetime | None) -> str | None:
-    return None if value is None else value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
 def _duration(value: timedelta | None) -> str:
     if value is None:
         return "-"
@@ -236,27 +232,6 @@ def _reason(error: str | None) -> str:
     return text if len(text) <= MAX_ERROR_COLUMN else text[: MAX_ERROR_COLUMN - 1] + "…"
 
 
-def _run_json(run: RunSummary, stale: bool) -> dict[str, Any]:
-    duration = run.duration
-    return {
-        "id": run.id,
-        "pipeline": run.pipeline,
-        "status": run.status,
-        "stale": stale,
-        "dry_run": run.dry_run,
-        "abandoned": run.abandoned_at is not None,
-        "started_at": _iso(run.started_at),
-        "finished_at": _iso(run.finished_at),
-        "duration_s": None if duration is None else duration.total_seconds(),
-        "cost": {
-            "usd": run.cost.usd,
-            "tokens_in": run.cost.tokens_in,
-            "tokens_out": run.cost.tokens_out,
-        },
-        "error": run.error,
-    }
-
-
 def _run_row(run: RunSummary, stale: bool) -> list[str]:
     status = str(run.status)
     if stale:
@@ -269,7 +244,7 @@ def _run_row(run: RunSummary, stale: bool) -> list[str]:
         run.id,
         run.pipeline,
         status,
-        _iso(run.started_at) or "",
+        iso(run.started_at) or "",
         _duration(run.duration),
         f"${run.cost.usd:.4f}",
         f"{run.cost.tokens_in}/{run.cost.tokens_out}",
@@ -327,14 +302,12 @@ def _list_runs(
         raise io_failed(exc, path, store=path) from None
     # A `running` row whose pipeline lock is free has no live process: the next run of the
     # pipeline will abandon it. Checked without waiting and without creating anything.
-    stale = [
-        run.status == "running" and lock_is_free(state_dir, run.pipeline) is True for run in runs
-    ]
+    stale = stale_flags(state_dir, runs)
     if json_output:
         report = {
             "schema_version": RUNS_SCHEMA_VERSION,
             "instance": str(instance.resolve()),
-            "runs": [_run_json(run, s) for run, s in zip(runs, stale, strict=True)],
+            "runs": [run_json(run, s) for run, s in zip(runs, stale, strict=True)],
         }
         echo_json(report)
     elif not runs:
