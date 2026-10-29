@@ -94,7 +94,9 @@ from horae.engine.ports import LlmBackendName, LlmError
 from horae.llm.backends._shared import (
     INVALID,
     MAX_RESPONSE_BYTES,
+    REFUSAL_STOP_REASONS,
     STATUS_KINDS,
+    TRUNCATION_STOP_REASONS,
     count,
     floored,
     parse,
@@ -723,8 +725,10 @@ class ClaudeCliBackend:
         stop = token(data.get("stop_reason"))
         if stop == "tool_use":
             raise invalid("unexpected stop reason tool_use")
-        if stop == "max_tokens":
-            raise invalid("the output was truncated (max_tokens)")
+        if stop in REFUSAL_STOP_REASONS:
+            raise invalid(f"the model refused ({stop})")
+        if stop in TRUNCATION_STOP_REASONS:
+            raise invalid(f"the output was truncated ({stop})")
         reported = data.get("usage")
         tokens_out = count(reported.get("output_tokens")) if isinstance(reported, dict) else None
         if tokens_out is not None and tokens_out > int(payload["max_tokens"]):

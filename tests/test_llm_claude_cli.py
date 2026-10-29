@@ -603,6 +603,8 @@ def test_not_logged_in_is_auth_failed_and_charges_nothing(
         ({"permission_denials": [{"tool_name": "Bash"}]}, "asked for a tool"),
         ({"stop_reason": "tool_use"}, "tool_use"),
         ({"stop_reason": "max_tokens"}, "truncated"),
+        ({"stop_reason": "model_context_window_exceeded"}, "truncated"),
+        ({"stop_reason": "refusal"}, "refused"),
         ({"result": '```json\n{"items": []}\n```'}, "not one JSON value"),
         ({"result": '{"a": NaN}'}, "not one JSON value"),
         ({"result": None}, "not one JSON value"),
