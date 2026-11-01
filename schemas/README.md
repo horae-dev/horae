@@ -78,6 +78,7 @@ pydantic may change them; the drift test then fails in CI and the fix is to rege
 | Host (`permissions.network`) | lowercase DNS name; the last label starts with a letter, so **no IP literal** (dotted, decimal, hex or IPv6); `localhost` and `*.localhost` rejected; single-label names (`coach`, a Docker/Coolify service) allowed; no port, scheme or wildcard |
 | `http.post.url`, `runtime.url`, `homepage` | `https://` only; host as above; optional port 1–65535; no user info, fragment, backslash, whitespace or control characters |
 | `notify.push.link` | `https://` or `obsidian://`, then `[^\x00-\x20\x7f]+` |
+| `task.create.link` | `https://`, a non-empty authority without `@` (no user info), then optionally `/`, `?` or `#` and the rest; no whitespace, control character or backslash anywhere; at most 2048 characters (decision 52) |
 | Lockfile `repo` | `https://<host>/<segments>` with segments of `A-Z a-z 0-9 . _ -` (`.git` optional), no `.`/`..` segment, no port, user info, query or fragment, at most 512 characters |
 | Note path (intents) | relative POSIX path: no leading `/`, no `\`, no control characters, no empty segment, **no segment starting with `.`** (so no `.`, `..`, `.obsidian/` or hidden files) |
 | `permissions.paths` | normalised absolute POSIX path: no `.`/`..`/empty segment, no trailing `/`, not `/`, no `\` or control characters |
@@ -2879,3 +2880,64 @@ loosened later without breaking a valid file.
     - **Not done (follow-ups)**: `/act` (#38), the SSO-exemption test against the rendered
       template and the network that only the proxy shares (#41), `api.allowed_hosts` in
       `horae.yaml`; no ETag or conditional requests; no metrics endpoint.
+
+### Provisional decisions (#122, pending maintainer review)
+
+52. **`task.create` takes an optional `link` (#122).** A compatible v1 addition: one optional
+    field of `task.create` (`TaskCreate.link`, the `TaskLink` type), mirrored in `intent/v1.json`
+    and `run-record/v1.json`, and an optional `link_prefix` parameter on a `mode: tasks` `act`
+    entry; no store migration. It lets a task created from an external item (a pull request, a
+    calendar event) carry a clickable link, which the escaped title never can (decision 50).
+    - **A, the shape: `https://` only.** `^https://[^\x00-\x20\x7f/?#@\\]+([/?#][^\x00-\x20\x7f\\]*)?$`,
+      at most 2048 characters: the `notify.push` link (decision 7) restricted to `https`, with
+      a non-empty authority that holds no `@` (no user info, so no `https://good@evil` reading
+      as `good`), and no backslash anywhere (browsers read `\` as `/` in an `https` URL). No
+      `obsidian://`, unlike `notify.push`: a notification link opens the vault from a phone,
+      while a task link is written **into** a note, where an `obsidian://` URI is an action
+      (`new`, `open` with a command plugin) one click away, and the use case (an external
+      item) is a web page. `http://`, `javascript:`, `data:` and every other scheme are
+      refused by the schema. Loosening it later (another scheme) is compatible.
+    - **B, routing binds it (decision 30).** A `task.create` with a `link` is taken only by a
+      `mode: tasks` entry with a trusted `link_prefix` the link falls under, by the same rule
+      and the same code as `notify.push` (`_check_link_prefix`, `_link_under`: an `https://`
+      prefix with a host, no user info, query or fragment and a clean path ending in `/`;
+      same scheme, exactly the same netloc, a clean rest of path, own query and fragment
+      allowed). **Without `link_prefix`, a task with a link is never routed**
+      (`intent_unrouted`), as for `notify.push`: deny by default, so a pipeline names the
+      hosts its tasks may point at (`link_prefix: https://github.com/my-org/`). A task
+      without a link needs no prefix, so existing pipelines are unchanged. An `obsidian://`
+      or otherwise invalid `link_prefix` on a `tasks` entry, or a `link_prefix` on an `act`
+      entry of any other `mode`, is `params_invalid` (it used to be inert metadata there; no
+      pipeline used it).
+    - **C, the action guard.** A `task.create` `link` proposed by an LLM skill must be exactly
+      a URL of the viewed input, like a `notify.push` link (decision 46), on top of the
+      prefix; a refusal degrades the step. Source and transform proposals are not guarded
+      (first-party plugins, #52), so the prefix is what binds them.
+    - **D, no v2.** The field is optional and `additionalProperties: false` only ever refused
+      it: every v1 intent, run record and pipeline stays valid, and a v1 consumer that does not
+      know the field never receives it unless a pipeline opts in with `link_prefix` (an
+      applier built before this change would ignore it). Per "Versioning", that is a
+      compatible addition in `v1`.
+    - **E, the sink renders it inert.** The intent keeps the link exactly as proposed (routing
+      and the guard compare it as written). `horae_sdk.tasks.task_line` (and `task_line_for`)
+      writes it right after the escaped title and before the date fields, as
+      `[link](<destination>)`: a fixed label, never text from the title or the URL; the title
+      cannot open, close or fake a link (its brackets and parentheses are escaped, decision
+      50). `link_destination` percent-encodes (UTF-8) everything outside
+      `A-Z a-z 0-9 - . _ ~ : / ? # @ ! & ' * + , ; = %`: so `( ) [ ] < >`, backtick, `$`,
+      `"`, `{ } | ^` and every non-ASCII character (no signifier, bidi or zero-width
+      character reaches the line); a `%` that starts no escape becomes `%25` (no `%%`); the
+      `&` of an HTML entity becomes `%26` (Markdown decodes entities in a destination, and
+      `&#x2E;&#x2E;` would otherwise become `..` after routing checked the path); the second
+      `:` of `::` and `=` of `==` become `%3A` / `%3D` (no Dataview field, no highlight). It
+      is idempotent and decodes to the same URL. The ported Tasks and Dataview regexes see no
+      field in the link and the escaped title (property tests over a hostile alphabet and
+      arbitrary text). A `::` inside a bracketed IPv6 host would be encoded and break the
+      link: an accepted edge case. The core's dry-run diff shows the link as plain text
+      (`(link <url>)`, terminal-escaped).
+    - **F, the SDK.** `intents.task_create(..., link=None)` checks the same shape
+      (`tasks.is_task_link`); `horae-sdk` goes to 0.2.0 (not yet published; there is no
+      changelog file, the README's "Task links" section and this decision are the notes).
+    - **Not done (follow-ups)**: the Obsidian plugin's own Tasks writer must render the link
+      the same way (`link_destination`) before it may list `task.create` links as supported;
+      `task.update_status` takes no link.
