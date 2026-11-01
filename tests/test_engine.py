@@ -637,8 +637,22 @@ PR_LINK = REPOS + "app/pull/42#issuecomment-7"
         (REPOS, "https://code.example.org/acmeX/app", False),
         (REPOS, "https://code.example.org.evil.example/acme/app", False),
         (REPOS, "https://code.example.org:8443/acme/app", False),
-        (REPOS, "https://CODE.example.org/acme/app", False),
-        (REPOS, "https://[code.example.org/acme/app", False),  # urlsplit raises
+        # https authorities compare as DNS origins (decision 52 B); paths stay case-sensitive
+        (REPOS, "https://CODE.example.org/acme/app", True),
+        ("https://Code.Example.org/acme/", PR_LINK, True),
+        (REPOS, "https://code.example.org:443/acme/app", True),
+        ("https://code.example.org:443/acme/", PR_LINK, True),
+        (REPOS, "https://code.example.org./acme/app", True),
+        ("https://code.example.org./acme/", PR_LINK, True),
+        (REPOS, "https://code.example.org../acme/app", False),  # one trailing dot only
+        (REPOS, "https://code.example.org:444/acme/app", False),
+        (REPOS, "https://code.example.org:x/acme/app", False),  # not a port
+        (REPOS, "https://code.example.org/ACME/app", False),
+        ("https://github.com/my-org/", "https://GitHub.com/my-org/app/pull/1", True),
+        ("https://github.com/my-org/", "https://github.com:443/my-org/app/pull/1", True),
+        ("https://github.com/my-org/", "https://github.com./my-org/app/pull/1", True),
+        ("https://github.com/my-org/", "https://github.com/My-Org/app/pull/1", False),
+        ("https://github.com/My-Org/", "https://github.com/my-org/app/pull/1", False),
     ],
 )
 def test_task_links_need_a_trusted_prefix(
@@ -660,7 +674,9 @@ def test_task_links_need_a_trusted_prefix(
         else:
             assert record.status == "failed"
             assert _error_kind(record, step) == "intent_unrouted"
-            assert "evil" not in (record.steps[step].error.message or "")  # type: ignore[union-attr]
+            message = record.steps[step].error.message or ""  # type: ignore[union-attr]
+            assert "evil" not in message
+            assert ("task link not under a trusted link_prefix" in message) == bool(link)
             assert record.intents == []
 
 
@@ -733,7 +749,11 @@ LINK = VAULT + "Daily/2026-10-27"
         (NOTES, "https://notes.example.org.evil.example/notes/1", False),
         (NOTES, "https://notes.example.org@evil.example/notes/1", False),
         (NOTES, "https://notes.example.org:8443/notes/1", False),
-        (NOTES, "https://NOTES.example.org/notes/1", False),
+        (NOTES, "https://NOTES.example.org/notes/1", True),  # the same helper (decision 52 B)
+        (NOTES, "https://notes.example.org:443/notes/1", True),
+        (NOTES, "https://notes.example.org./notes/1", True),
+        (NOTES, "https://notes.example.org/Notes/1", False),
+        ("obsidian://Vault/Main/", LINK, False),  # an obsidian netloc stays exact
         (NOTES, "https://[notes.example.org/notes/1", False),  # urlsplit raises
     ],
 )

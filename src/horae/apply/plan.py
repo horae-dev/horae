@@ -277,7 +277,7 @@ def describe(intent: Intent) -> TaskChange | Notification | HttpCall | None:
         if intent.due is not None:
             line += f" (due {intent.due}{'' if intent.time is None else ' ' + intent.time})"
         if intent.link is not None:
-            line += f" (link {intent.link})"
+            line += f" (link <{intent.link}>)"
         return TaskChange(intent.fingerprint, "create", None, line)
     if isinstance(intent, TaskUpdateStatus):
         after = intent.status if intent.until is None else f"{intent.status} until {intent.until}"
