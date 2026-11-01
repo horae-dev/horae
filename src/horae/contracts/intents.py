@@ -10,9 +10,19 @@ target format treats specially, e.g. the Obsidian Tasks emoji signifiers (`📅`
 in a task title.
 """
 
+import re
+import unicodedata
 from typing import Annotated, Any, Literal, Self, get_args
 
-from pydantic import ConfigDict, Field, Strict, StringConstraints, TypeAdapter, model_validator
+from pydantic import (
+    AfterValidator,
+    ConfigDict,
+    Field,
+    Strict,
+    StringConstraints,
+    TypeAdapter,
+    model_validator,
+)
 
 from horae.contracts.types import (
     BlockId,
@@ -51,16 +61,63 @@ NotifyLink = Annotated[
 ]
 """An `https://` or `obsidian://` link, with no whitespace or control characters."""
 
+TASK_LINK_FORBIDDEN = (
+    r"\x00-\x20\x7f-\xa0\xad\u0600-\u0605\u061c\u06dd\u070f\u0890\u0891\u08e2\u1680"
+    r"\u180e\u2000-\u200f\u2028-\u202f\u205f-\u2064\u2066-\u206f\u3000\ufeff\ufff9-\ufffb"
+)
+"""A regex class body: the Basic Multilingual Plane characters of the Unicode categories `Cc`,
+`Cf`, `Zs`, `Zl` and `Zp` (Unicode 15), as escapes. The supplementary-plane format
+characters (tags `U+E0001`, `U+E0020`-`U+E007F`...) and lone surrogates cannot be written the
+same way in an ECMA-262, Rust and Python pattern: the model rejects them (`_check_task_link`)."""
+
+TASK_LINK_PATTERN = (
+    rf"^https://[^{TASK_LINK_FORBIDDEN}/?#@\\%\[\]]+([/?#][^{TASK_LINK_FORBIDDEN}\\]*)?$"
+)
+"""The JSON Schema `pattern` of a `TaskLink` (the SDK's `horae_sdk.tasks` holds a copy)."""
+
+_TASK_LINK_CATEGORIES = frozenset({"Cc", "Cf", "Zs", "Zl", "Zp", "Cs"})
+_IP_HEX = re.compile(r"0x[0-9a-f]*")
+
+
+def task_link_host_is_ip(host: str) -> bool:
+    """`host` (a link authority without its port) would be read by a browser as an IP
+    address: it ends in a number, as the WHATWG URL standard says (its last label, without
+    one trailing dot, after NFKC, is decimal digits or `0x` hex), so `127.0.0.1`, `127.1`,
+    `0x7f.1`, `2130706433` and their full-width spellings. Bracketed IPv6 never reaches here
+    (`[` is refused by the pattern)."""
+    name = unicodedata.normalize("NFKC", host).lower().replace("\u3002", ".")
+    labels = name.split(".")
+    if len(labels) > 1 and labels[-1] == "":
+        labels.pop()
+    last = labels[-1]
+    return (last.isascii() and last.isdigit()) or _IP_HEX.fullmatch(last) is not None
+
+
+def _check_task_link(link: str) -> str:
+    if any(unicodedata.category(char) in _TASK_LINK_CATEGORIES for char in link):
+        raise ValueError("a link may hold no control, format, separator or surrogate character")
+    authority = re.split(r"[/?#]", link[len("https://") :], maxsplit=1)[0]
+    host = authority.split(":", 1)[0]
+    if not host:
+        raise ValueError("a link needs a host")
+    if task_link_host_is_ip(host):
+        raise ValueError("a link host may not be an IP address")
+    return link
+
+
 TaskLink = Annotated[
     str,
     Strict(),
-    StringConstraints(
-        pattern=r"^https://[^\x00-\x20\x7f/?#@\\]+([/?#][^\x00-\x20\x7f\\]*)?$", max_length=2048
-    ),
+    StringConstraints(pattern=TASK_LINK_PATTERN, max_length=2048),
+    AfterValidator(_check_task_link),
 ]
 """An absolute `https://` link (the `NotifyLink` shape, `https` only), with a non-empty
-authority holding no user info (`@`), and no whitespace, control character or backslash
-anywhere (schemas decision 52)."""
+authority holding no user info (`@`), `%` or brackets, no backslash anywhere, and no character
+of the Unicode categories `Cc`, `Cf`, `Zs`, `Zl`, `Zp` (controls, format characters such as
+bidi and zero-width ones, spaces and separators) or lone surrogate anywhere. Its host is a
+name, never an IP literal (`task_link_host_is_ip`). The pattern checks all but the
+supplementary-plane format characters, lone surrogates and the IP rule, which only the model
+checks (schemas decision 52)."""
 
 
 class NoteCreate(Contract):

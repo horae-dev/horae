@@ -216,8 +216,20 @@ def _real_date(text: str) -> bool:
     return True
 
 
-_TASK_LINK = re.compile(r"https://[^\x00-\x20\x7f/?#@\\]+([/?#][^\x00-\x20\x7f\\]*)?")
+_LINK_FORBIDDEN = (
+    r"\x00-\x20\x7f-\xa0\xad\u0600-\u0605\u061c\u06dd\u070f\u0890\u0891\u08e2\u1680"
+    r"\u180e\u2000-\u200f\u2028-\u202f\u205f-\u2064\u2066-\u206f\u3000\ufeff\ufff9-\ufffb"
+)
+"""The Basic Multilingual Plane characters of the categories `Cc`, `Cf`, `Zs`, `Zl`, `Zp`,
+as escapes (a copy of the core's `TASK_LINK_FORBIDDEN`)."""
+_TASK_LINK = re.compile(rf"https://[^{_LINK_FORBIDDEN}/?#@\\%\[\]]+([/?#][^{_LINK_FORBIDDEN}\\]*)?")
+_LINK_CATEGORIES = frozenset({"Cc", "Cf", "Zs", "Zl", "Zp", "Cs"})
+_IP_HEX = re.compile(r"0x[0-9a-f]*")
 MAX_LINK = 2048
+MAX_DESTINATION = 4096
+"""The longest `link_destination` that `task_line` writes: a longer one (a link of mostly
+non-ASCII characters, each up to 12 characters once encoded) is left out of the line, so a
+task line stays well under a reader's size cap (plugin-obsidian analyses at most 16 KiB)."""
 LINK_LABEL = "link"
 """The fixed text of a task's rendered link: never taken from the title or the URL."""
 _LINK_SAFE = frozenset(
@@ -227,13 +239,30 @@ _HEX = frozenset("0123456789ABCDEFabcdef")
 _ENTITY = re.compile(r"&(#[0-9]+|#[xX][0-9A-Fa-f]+|[A-Za-z][A-Za-z0-9]*);")
 
 
+def _ip_host(host: str) -> bool:
+    """`host` ends in a number (WHATWG URL): a browser would read it as an IP address."""
+    name = unicodedata.normalize("NFKC", host).lower().replace("\u3002", ".")
+    labels = name.split(".")
+    if len(labels) > 1 and labels[-1] == "":
+        labels.pop()
+    last = labels[-1]
+    return (last.isascii() and last.isdigit()) or _IP_HEX.fullmatch(last) is not None
+
+
 def is_task_link(link: object) -> bool:
-    """`link` is a valid `task.create` link: an absolute `https://` URL of at most
-    `MAX_LINK` characters, a non-empty authority with no user info (`@`), and no whitespace,
-    control character or backslash (the core's `TaskLink`)."""
-    return (
+    """`link` is a valid `task.create` link (the core's `TaskLink`): an absolute `https://`
+    URL of at most `MAX_LINK` characters; a non-empty host that is a name, not an IP literal
+    (`127.0.0.1`, `[::1]`); no user info (`@`), `%` or brackets in the authority; no
+    backslash, and no control, format (bidi, zero-width), space or separator character or
+    lone surrogate anywhere."""
+    if not (
         isinstance(link, str) and len(link) <= MAX_LINK and _TASK_LINK.fullmatch(link) is not None
-    )
+    ):
+        return False
+    if any(unicodedata.category(char) in _LINK_CATEGORIES for char in link):
+        return False
+    host = re.split(r"[/?#]", link[len("https://") :], maxsplit=1)[0].split(":", 1)[0]
+    return bool(host) and not _ip_host(host)
 
 
 def link_destination(link: str) -> str:
@@ -252,9 +281,13 @@ def link_destination(link: str) -> str:
     - the second `:` of `::` and the second `=` of `==` become `%3A` / `%3D`, so no Dataview
       inline field or highlight pair is left (as in `escape_title`).
 
-    Idempotent: an encoded destination is unchanged."""
+    Idempotent: an encoded destination is unchanged. It percent-decodes to the same string as
+    `link` does (`unquote(link_destination(link)) == unquote(link)`)."""
     if not is_task_link(link):
-        raise ValueError("link must be an https:// URL without user info, whitespace or backslash")
+        raise ValueError(
+            "link must be an https:// URL with a host name (no IP), without user info, "
+            "whitespace, control or format character or backslash"
+        )
     pieces: list[str] = []
     for index, char in enumerate(link):
         last = pieces[-1][-1] if pieces else ""
@@ -289,7 +322,8 @@ def task_line(
     otherwise. The link is written right after the title as a Markdown link with the fixed
     text `LINK_LABEL` and the destination `link_destination(link)`: the title cannot open or
     close it (its brackets and parentheses are escaped), and Tasks reads it as part of the
-    description, never as a field (schemas decision 52)."""
+    description, never as a field (schemas decision 52). A destination longer than
+    `MAX_DESTINATION` characters is left out (the line is written without the link)."""
     due_text = due.isoformat() if isinstance(due, date) else due
     if due_text is not None and not _real_date(due_text):
         raise ValueError("due must be a real date, YYYY-MM-DD")
@@ -297,9 +331,10 @@ def task_line(
         due_text is None or not re.fullmatch(r"([01][0-9]|2[0-3]):[0-5][0-9]", time)
     ):
         raise ValueError("time must be HH:MM and requires due")
+    destination = None if link is None else link_destination(link)
     parts = [f"- [{'x' if done else ' '}]", escape_title(title)]
-    if link is not None:
-        parts.append(f"[{LINK_LABEL}]({link_destination(link)})")
+    if destination is not None and len(destination) <= MAX_DESTINATION:
+        parts.append(f"[{LINK_LABEL}]({destination})")
     if due_text is not None:
         parts.append(f"{DUE} {due_text}")
     if time is not None:
@@ -328,6 +363,7 @@ __all__ = [
     "DUE",
     "LINK_LABEL",
     "MARKDOWN",
+    "MAX_DESTINATION",
     "MAX_LINK",
     "MAX_TITLE",
     "REMINDER",

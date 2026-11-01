@@ -14,6 +14,8 @@ from horae_sdk import intents
 from horae_sdk.tasks import (
     LINK_LABEL,
     MARKDOWN,
+    MAX_DESTINATION,
+    MAX_LINK,
     SIGNIFIERS,
     UNTITLED,
     escape_title,
@@ -358,15 +360,36 @@ def test_a_task_line_renders_the_link_after_the_title() -> None:
         task_line_for({"type": "task.create", "title": "x", "link": 1})
 
 
+@pytest.mark.parametrize("char", ["\u754c", "\U0001f600"])  # 3 and 4 UTF-8 bytes
+def test_a_link_too_long_once_encoded_is_left_out(char: str) -> None:
+    base = "https://x.example/"
+    link = base + char * (MAX_LINK - len(base))  # 2030 characters, a valid link
+    assert len(link) == MAX_LINK
+    assert is_task_link(link)
+    assert len(link_destination(link)) > MAX_DESTINATION  # 9 or 12 characters each
+    # The line is written without the link: nothing of it, no error.
+    assert task_line("Review", link=link, due="2026-10-22") == f"- [ ] Review {DUE} 2026-10-22"
+    intent = intents.task_create("Review", key="x:1", link=link)
+    assert task_line_for(intent) == "- [ ] Review"
+    # Up to the cap, it is kept.
+    width = 3 * len(char.encode())
+    fits = base + char * ((MAX_DESTINATION - len(base)) // width)
+    assert len(link_destination(fits)) <= MAX_DESTINATION
+    assert task_line("x", link=fits) == f"- [ ] x [link]({link_destination(fits)})"
+    over = fits + char
+    assert len(link_destination(over)) > MAX_DESTINATION
+    assert task_line("x", link=over) == "- [ ] x"
+
+
 def test_a_link_destination_is_inert_and_the_same_url() -> None:
     assert link_destination(PR + "?q=is%3Aopen&x=1#top") == PR + "?q=is%3Aopen&x=1#top"
-    hostile = PR + '/(a)[b]<c>`d`$e${f}|^"x"\u00e9\U0001f4c5\u202e?q=a==b&amp;c&#x2E;::d%%e%zz'
+    hostile = PR + '/(a)[b]<c>`d`$e${f}|^"x"\u00e9\U0001f4c5?q=a==b&amp;c&#x2E;::d%%e%zz'
     encoded = link_destination(hostile)
     assert encoded == (
-        PR + "/%28a%29%5Bb%5D%3Cc%3E%60d%60%24e%24%7Bf%7D%7C%5E%22x%22%C3%A9%F0%9F%93%85%E2%80%AE"
+        PR + "/%28a%29%5Bb%5D%3Cc%3E%60d%60%24e%24%7Bf%7D%7C%5E%22x%22%C3%A9%F0%9F%93%85"
         "?q=a=%3Db%26amp;c%26#x2E;:%3Ad%25%25e%25zz"
     )
-    assert unquote(encoded) == unquote(hostile)  # the same URL once decoded
+    assert unquote(encoded) == unquote(hostile)  # percent-decodes to the same string
     assert link_destination(encoded) == encoded  # idempotent
 
 
