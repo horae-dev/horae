@@ -111,7 +111,8 @@ with `python3`; its end-to-end test pins the interpreter the same way.
 
 `horae_sdk.intents` builds the closed set: `note_create`, `note_append_section`,
 `note_replace_owned_block`, `task_create`, `task_update_status`, `notify_push`, `http_post`,
-plus `fingerprint(*parts)` for stable task identities (`task_create(title, key=...)`). Each
+plus `fingerprint(*parts)` for stable task identities (`task_create(title, key=...)`, with an
+optional `https://` `link=`, see [Task links](#task-links)). Each
 returns a `dict` checked against the contract's cheap rules (`IntentError`; dates must be real
 calendar dates); the core checks everything again.
 
@@ -170,6 +171,34 @@ the form the SDK writes (`&#x1F4C5;`, `&#x25;`, `&#x3D;`: uppercase hex, of a si
 `=`) are kept, and show as the character, never as markup. Any other reference (`&amp;`,
 lowercase `&#x1f4c5;`) has its `&` and `#` escaped and shows literally.
 
+### Task links
+
+`intents.task_create(title, key=..., link=...)` (SDK 0.2.0) attaches a link to the item the
+task comes from, e.g. a pull request. The link is an absolute `https://` URL of at most 2048
+characters with a host, no user info (`user@`), whitespace, control character or backslash
+(`tasks.is_task_link`, the core's `TaskLink`, schemas decision 52); `obsidian://` and every
+other scheme are refused. It is kept in the intent exactly as given, and the core routes it
+only to a `mode: tasks` entry whose trusted `link_prefix` it falls under (for example
+`link_prefix: https://github.com/my-org/`, with a clean path ending in `/`), as for
+`notify.push`; with no `link_prefix`, a task with a link is never routed. A link proposed by
+an LLM skill must also be a URL of the input the model was shown (the action guard).
+
+`tasks.task_line(title, link=...)` and `task_line_for(intent)` write it right after the
+escaped title, before the date fields, as a Markdown link with the fixed text `link`:
+
+```
+- [ ] Review PR 42 [link](https://github.com/my-org/app/pull/42) 📅 2026-10-22
+```
+
+The title cannot open, close or fake the link (its brackets and parentheses are escaped), and
+the destination is `tasks.link_destination(link)`, the same URL made inert in Markdown: the
+characters that would end or open a link or start other markup (`( ) [ ] < >`, backtick, `$`,
+`"`, `{ } | ^`) and every non-ASCII character are percent-encoded (UTF-8), a `%` that starts
+no escape becomes `%25`, the `&` of an HTML entity becomes `%26` (Markdown decodes entities in
+a destination, so `&#x2E;&#x2E;` could otherwise become `..` after routing checked the path),
+and the second `:` of `::` and `=` of `==` become `%3A` / `%3D`. The encoding is idempotent and
+decodes to the same URL. Tasks reads the link as part of the description, never as a field.
+
 ### Manual check in a real vault
 
 The tests port the Tasks plugin's own field regexes (emoji and Dataview formats, with the
@@ -192,6 +221,10 @@ Obsidian. Before a release that changes `horae_sdk.tasks`, check by hand:
    list it; `tags include #t` does not list it; the task's edit modal shows due 2030-01-01
    and no recurrence.
 4. With Dataview, `TASK WHERE due` shows the task with its 2030-01-01 date only.
+5. Task links: write `tasks.task_line("Review", link=LINK, due="2030-01-01")` for
+   `LINK = "https://example.org/a(b)/c::d?q=x==y&amp;z#f"`. The description shows one
+   clickable `link` that opens `https://example.org/a%28b%29/c:%3Ad?q=x=%3Dy%26amp;z#f`,
+   the task is still due 2030-01-01, and no inline field or highlight appears.
 
 Record the Obsidian, Tasks and Dataview versions checked in the release notes.
 

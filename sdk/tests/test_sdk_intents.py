@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from horae.contracts import INTENT_TYPES, Permissions
+from horae.contracts import INTENT_TYPES, Permissions, TaskCreate
 from horae.intents import validate_intents
 from horae_sdk import intents
 from horae_sdk.intents import IntentError
@@ -23,6 +23,9 @@ def every_intent() -> list[dict[str, Any]]:
         intents.note_replace_owned_block("horae-brief", "text", path="Daily/x.md"),
         intents.task_create(
             "Call the school", key="school:1", due=datetime.date(2026, 10, 22), time="08:30"
+        ),
+        intents.task_create(
+            "Review PR 42", key="github:pr:42", link="https://code.example.org/acme/pull/42#c-7"
         ),
         intents.task_update_status("school:1", "done"),
         intents.task_update_status(
@@ -98,6 +101,37 @@ def test_an_exact_fingerprint_never_looks_like_a_digested_one() -> None:
     assert "::" not in intents.fingerprint("a", "b", "c")
 
 
+BAD_TASK_LINKS: list[Any] = [
+    "http://code.example.org/acme/pull/42",
+    "javascript:alert(1)",
+    "data:text/html,x",
+    "obsidian://open?vault=Main",
+    "https://user@code.example.org/acme/",
+    "https://user:pw@code.example.org/acme/",
+    "https://code.example.org/a b",
+    "https://code.example.org\\@evil.example/",
+    "https:///acme",
+    "https://",
+    "https://code.example.org/" + "a" * 2030,
+    "https://code.example.org/a\nb",  # not last: Python jsonschema `$` (schemas README)
+    7,
+]
+
+
+def test_task_links_are_checked_like_the_core() -> None:
+    permissions = Permissions(intents=["task.create"])
+    for link in BAD_TASK_LINKS:
+        intent = {"type": "task.create", "title": "t", "fingerprint": "f", "link": link}
+        assert schema_errors("intents/task.create/v1.json", intent) != [], link
+        with pytest.raises(Exception, match="link"):
+            validate_intents([intent], permissions=permissions, source="sdk")
+    longest = "https://code.example.org/" + "a" * (2048 - 25)
+    built = intents.task_create("t", key="f", link=longest)
+    (typed,) = validate_intents([built], permissions=permissions, source="sdk")
+    assert isinstance(typed, TaskCreate)
+    assert typed.link == longest
+
+
 @pytest.mark.parametrize(
     ("build", "message"),
     [
@@ -132,6 +166,10 @@ def test_an_exact_fingerprint_never_looks_like_a_digested_one() -> None:
         (lambda: intents.notify_push("x", title="a\nb"), "title"),
         (lambda: intents.notify_push("x", link="javascript:alert(1)"), "link"),
         (lambda: intents.http_post("http://example.org", {}), "https"),
+        *[
+            (lambda link=link: intents.task_create("t", key="f", link=link), "link")
+            for link in BAD_TASK_LINKS
+        ],
     ],
 )
 def test_builders_refuse_what_the_core_would(build: Any, message: str) -> None:

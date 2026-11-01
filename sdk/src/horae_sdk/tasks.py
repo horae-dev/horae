@@ -216,18 +216,80 @@ def _real_date(text: str) -> bool:
     return True
 
 
+_TASK_LINK = re.compile(r"https://[^\x00-\x20\x7f/?#@\\]+([/?#][^\x00-\x20\x7f\\]*)?")
+MAX_LINK = 2048
+LINK_LABEL = "link"
+"""The fixed text of a task's rendered link: never taken from the title or the URL."""
+_LINK_SAFE = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~:/?#@!&'*+,;=%"
+)
+_HEX = frozenset("0123456789ABCDEFabcdef")
+_ENTITY = re.compile(r"&(#[0-9]+|#[xX][0-9A-Fa-f]+|[A-Za-z][A-Za-z0-9]*);")
+
+
+def is_task_link(link: object) -> bool:
+    """`link` is a valid `task.create` link: an absolute `https://` URL of at most
+    `MAX_LINK` characters, a non-empty authority with no user info (`@`), and no whitespace,
+    control character or backslash (the core's `TaskLink`)."""
+    return (
+        isinstance(link, str) and len(link) <= MAX_LINK and _TASK_LINK.fullmatch(link) is not None
+    )
+
+
+def link_destination(link: str) -> str:
+    """`link` (a valid task link, `ValueError` otherwise) as an inert Markdown link
+    destination, the same URL for a browser:
+
+    - every character outside the URL characters that are plain in a Markdown destination
+      (`A-Z a-z 0-9 - . _ ~ : / ? # @ ! & ' * + , ; = %`) is percent-encoded as UTF-8: the
+      parentheses, brackets and angle brackets that would end or open a link, a backtick (code
+      span), `$` (math), `"`, `{`, `}`, `|`, `^` and every non-ASCII character (so no Tasks
+      signifier, zero-width or bidi character reaches the line);
+    - a `%` not followed by two hex digits becomes `%25`, so no `%%` (an Obsidian comment);
+    - the `&` of an HTML entity (`&lt;`, `&#x2E;`) becomes `%26`: Markdown decodes entities in
+      a destination, which could otherwise change the path after routing checked it
+      (`&#x2E;&#x2E;` as `..`);
+    - the second `:` of `::` and the second `=` of `==` become `%3A` / `%3D`, so no Dataview
+      inline field or highlight pair is left (as in `escape_title`).
+
+    Idempotent: an encoded destination is unchanged."""
+    if not is_task_link(link):
+        raise ValueError("link must be an https:// URL without user info, whitespace or backslash")
+    pieces: list[str] = []
+    for index, char in enumerate(link):
+        last = pieces[-1][-1] if pieces else ""
+        following = link[index + 1 : index + 3]
+        if char == "%" and not (len(following) == 2 and set(following) <= _HEX):
+            piece = "%25"
+        elif char == "&" and _ENTITY.match(link, index):
+            piece = "%26"
+        elif char in ":=" and last == char:
+            piece = "%3A" if char == ":" else "%3D"
+        elif char in _LINK_SAFE:
+            piece = char
+        else:
+            piece = "".join(f"%{byte:02X}" for byte in char.encode("utf-8", "surrogatepass"))
+        pieces.append(piece)
+    return "".join(pieces)
+
+
 def task_line(
     title: str,
     *,
     due: str | date | None = None,
     time: str | None = None,
+    link: str | None = None,
     done: bool = False,
 ) -> str:
-    """One Obsidian Tasks line, `- [ ] <escaped title> 📅 <due> ⏰ <time>`, the title always
-    escaped (`escape_title`, idempotent: an already escaped title is unchanged).
+    """One Obsidian Tasks line, `- [ ] <escaped title> [link](<url>) 📅 <due> ⏰ <time>`, the
+    title always escaped (`escape_title`, idempotent: an already escaped title is unchanged).
 
-    `due` is a real date, `YYYY-MM-DD` (or a `date`), `time` `HH:MM` and requires `due` (the
-    `task.create` contract); `ValueError` otherwise."""
+    `due` is a real date, `YYYY-MM-DD` (or a `date`), `time` `HH:MM` and requires `due`, and
+    `link` a valid task link (`is_task_link`, the `task.create` contract); `ValueError`
+    otherwise. The link is written right after the title as a Markdown link with the fixed
+    text `LINK_LABEL` and the destination `link_destination(link)`: the title cannot open or
+    close it (its brackets and parentheses are escaped), and Tasks reads it as part of the
+    description, never as a field (schemas decision 52)."""
     due_text = due.isoformat() if isinstance(due, date) else due
     if due_text is not None and not _real_date(due_text):
         raise ValueError("due must be a real date, YYYY-MM-DD")
@@ -236,6 +298,8 @@ def task_line(
     ):
         raise ValueError("time must be HH:MM and requires due")
     parts = [f"- [{'x' if done else ' '}]", escape_title(title)]
+    if link is not None:
+        parts.append(f"[{LINK_LABEL}]({link_destination(link)})")
     if due_text is not None:
         parts.append(f"{DUE} {due_text}")
     if time is not None:
@@ -248,21 +312,30 @@ def task_line_for(intent: Mapping[str, object]) -> str:
     if intent.get("type") != "task.create":
         raise ValueError("not a task.create intent")
     title, due, time = intent.get("title"), intent.get("due"), intent.get("time")
+    link = intent.get("link")
     if not isinstance(title, str):
         raise ValueError("the intent has no title")
-    if not (due is None or isinstance(due, str)) or not (time is None or isinstance(time, str)):
-        raise ValueError("due and time must be strings")
-    return task_line(title, due=due, time=time)
+    if not (
+        (due is None or isinstance(due, str))
+        and (time is None or isinstance(time, str))
+        and (link is None or isinstance(link, str))
+    ):
+        raise ValueError("due, time and link must be strings")
+    return task_line(title, due=due, time=time, link=link)
 
 
 __all__ = [
     "DUE",
+    "LINK_LABEL",
     "MARKDOWN",
+    "MAX_LINK",
     "MAX_TITLE",
     "REMINDER",
     "SIGNIFIERS",
     "UNTITLED",
     "escape_title",
+    "is_task_link",
+    "link_destination",
     "plain_text",
     "task_line",
     "task_line_for",
