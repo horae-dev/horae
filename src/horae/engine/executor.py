@@ -42,7 +42,7 @@ and every other step `skipped`, when:
   the record's `context`. The same holds for an `llm` step's skill: a prompt or output
   schema (loaded through the `SkillSource`) holding a secret is `params_invalid`;
 - an `act` entry has no valid `mode`, or its binding parameters (or a `notify` entry's
-  `link_prefix`) are invalid (`params_invalid`, see below);
+  `link_prefix`, or a `mode: tasks` entry's) are invalid (`params_invalid`, see below);
 - the pipeline has more than `MAX_ITEMS` `collect` calls in all, or uses more than
   `MAX_ITEMS` plugins (`plan_too_large`: the run record could not hold them);
 - the pipeline has an `llm` step and no backend was given (`llm_unavailable`).
@@ -94,13 +94,17 @@ entry of a later step, which is recorded in `ProposedIntent.applied_by` (the ent
    `obsidian://vault/Main/`. Both are parsed with `urllib.parse.urlsplit`: the link must have
    the same scheme and exactly the same netloc, and its path must start with the prefix's
    path; the rest of the path may have no empty, `.` or `..` segment, backslash, or `%2e`,
-   `%2f`, `%5c` or `%25` (any case). The link may add its own query and fragment;
+   `%2f`, `%5c` or `%25` (any case). The link may add its own query and fragment. The same
+   rule binds a `task.create` `link` (schemas decision 52): it is taken only by a
+   `mode: tasks` entry with a trusted `link_prefix` it falls under, and that prefix must be
+   `https://` (a `link_prefix` on an entry of another `mode` is `params_invalid`); a
+   `task.create` without a link needs none;
 4. a `task.update_status` is routed only if its `task` fingerprint appears, as an exact string
    value, in the data collected so far in the run (`RunRecord.inputs`, and the current
    `collect` step's earlier sources and own output; for an `llm` step with a loaded skill,
    only its **viewed** input, what the model was shown): a proposer can change the status of
-   a task it was shown, not of one it guessed. `task.create` binds no target: its title is free
-   text.
+   a task it was shown, not of one it guessed. `task.create` binds no target (its title is free
+   text) beyond its optional `link` (rule 3).
 
 An intent that no entry takes fails the step (`intent_unrouted`), as does one that several
 entries take (`intent_ambiguous`): untrusted data can never pick a target outside the trusted
@@ -134,7 +138,7 @@ plugins, #52).
 | `create` | `note.create` | `path` (required) |
 | `append-section` | `note.append_section` | `path` (required) |
 | `replace-owned` | `note.replace_owned_block` | `path` (required) |
-| `tasks` | `task.create`, `task.update_status` | none (fingerprint check, rule 4) |
+| `tasks` | `task.create`, `task.update_status` | none (rule 4); optional `link_prefix` (rule 3) |
 | `post` | `http.post` | `url` (required) |
 
 A missing or unknown `mode`, a `mode` whose types the sink may not apply, or a missing or
@@ -260,7 +264,15 @@ from urllib.parse import urlsplit
 
 from pydantic import TypeAdapter, ValidationError
 
-from horae.contracts.intents import Intent, IntentType, NotifyLink, NotifyPush, TaskUpdateStatus
+from horae.contracts.intents import (
+    Intent,
+    IntentType,
+    NotifyLink,
+    NotifyPush,
+    TaskCreate,
+    TaskLink,
+    TaskUpdateStatus,
+)
 from horae.contracts.pipeline import (
     ActStep,
     Budget,
@@ -357,7 +369,9 @@ TARGET_FIELDS: dict[IntentType, str] = {
 
 _NOTIFY_TYPES: frozenset[IntentType] = frozenset({"notify.push"})
 _LINK: TypeAdapter[str] = TypeAdapter(NotifyLink)
+_TASK_LINK: TypeAdapter[str] = TypeAdapter(TaskLink)
 _LINK_SCHEMES = frozenset({"https", "obsidian"})
+_TASK_LINK_SCHEMES = frozenset({"https"})
 _UNSAFE_ESCAPES = ("%2e", "%2f", "%5c", "%25")
 _BINDING_TYPES: dict[str, TypeAdapter[str]] = {
     "path": TypeAdapter(NotePath),
@@ -559,6 +573,9 @@ class _Entry:
         if isinstance(intent, NotifyPush):
             prefix = self.binds.get("link_prefix")
             return intent.link is None or (prefix is not None and _link_under(intent.link, prefix))
+        if isinstance(intent, TaskCreate) and intent.link is not None:
+            prefix = self.binds.get("link_prefix")
+            return prefix is not None and _link_under(intent.link, prefix)
         bound = TARGET_FIELDS.get(intent.type)
         return bound is None or self.binds.get(bound) == getattr(intent, bound)
 
@@ -623,11 +640,11 @@ def _clean_path(path: str, *, prefix: bool) -> bool:
     return all(segment not in ("", ".", "..") for segment in segments)
 
 
-def _check_link_prefix(prefix: str) -> str:
-    """`prefix` if it is a safe `link_prefix`; `ValueError` otherwise."""
+def _check_link_prefix(prefix: str, schemes: frozenset[str] = _LINK_SCHEMES) -> str:
+    """`prefix` if it is a safe `link_prefix` with one of `schemes`; `ValueError` otherwise."""
     parts = urlsplit(prefix)
     if (
-        parts.scheme not in _LINK_SCHEMES
+        parts.scheme not in schemes
         or not parts.netloc
         or "@" in parts.netloc
         or "?" in prefix
@@ -678,6 +695,15 @@ def _entry_binding(
     if not isinstance(mode, str) or mode not in ACT_MODES:
         what = "a missing" if mode is None else "an unknown"
         raise ValueError(f"{ref}: {what} `mode` (one of {', '.join(sorted(ACT_MODES))})")
+    if "link_prefix" in params:
+        if mode != "tasks":
+            raise ValueError(f"{ref}: only a `mode: tasks` entry takes `link_prefix`")
+        try:
+            prefix = _TASK_LINK.validate_python(params["link_prefix"])
+            binds["link_prefix"] = _check_link_prefix(prefix, _TASK_LINK_SCHEMES)
+        except (ValidationError, ValueError):
+            message = "must be an https:// link with a clean path ending in /"
+            raise ValueError(f"{ref}: `link_prefix` {message}") from None
     types = ACT_MODES[mode]
     if not types <= allowed:
         raise ValueError(f"{ref}: plugin may not apply mode {mode} (permissions.intents)")

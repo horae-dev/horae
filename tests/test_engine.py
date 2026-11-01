@@ -15,7 +15,7 @@ import yaml
 from jsonschema import Draft202012Validator, FormatChecker
 from pydantic import ValidationError
 
-from horae.contracts import MAX_RUN_INTENTS, Pipeline, RunRecord, StepRecord
+from horae.contracts import MAX_RUN_INTENTS, Pipeline, RunRecord, StepRecord, TaskCreate
 from horae.contracts.run import ProposedIntent
 from horae.engine import (
     MAX_DEPTH,
@@ -556,7 +556,13 @@ TASKS = ("task.create", "task.update_status")
 FINGERPRINT = "calendar:3b1f0c"
 
 
-def _task_run(intents: list[Any], data: Any = None, *, by_source: bool = False) -> RunRecord:
+def _task_run(
+    intents: list[Any],
+    data: Any = None,
+    *,
+    by_source: bool = False,
+    entry: dict[str, Any] | None = None,
+) -> RunRecord:
     plugins = _flow_plugins([])
     plugins.add(_manifest("todo", TASKS, sinks=["todo.write"]))
     plugins.add(_manifest("skills", TASKS, skills=["skills/rank"]))
@@ -569,7 +575,7 @@ def _task_run(intents: list[Any], data: Any = None, *, by_source: bool = False) 
     steps: list[dict[str, Any]] = [
         {"collect": ["src.read", "src.more"]},
         {"llm": LLM},
-        {"act": [{"todo.write": {"mode": "tasks"}}]},
+        {"act": [{"todo.write": entry or {"mode": "tasks"}}]},
     ]
     llm = FakeLlm([llm_response(BRIEF, intents=None if by_source else intents)])
     return _run(_pipeline(*steps), plugins, llm)
@@ -610,6 +616,89 @@ def test_task_status_needs_a_collected_fingerprint(data: Any) -> None:
     assert FINGERPRINT not in (record.steps[1].error.message or "")  # type: ignore[union-attr]
     record = _task_run([done], data, by_source=True)
     assert _error_kind(record, 0) == "intent_unrouted"
+
+
+REPOS = "https://code.example.org/acme/"
+PR_LINK = REPOS + "app/pull/42#issuecomment-7"
+
+
+@pytest.mark.parametrize(
+    ("prefix", "link", "routed"),
+    [
+        (None, None, True),
+        (REPOS, None, True),
+        (None, PR_LINK, False),  # no link_prefix: a proposed task link is never routed
+        (REPOS, PR_LINK, True),
+        (REPOS, REPOS + "app/issues?q=is%3Aopen", True),  # own query
+        ("https://code.example.org/other/", PR_LINK, False),  # outside the prefix
+        (REPOS, "https://code.example.org/acme/../admin", False),
+        (REPOS, "https://code.example.org/acme/%2e%2e/admin", False),
+        (REPOS, "https://code.example.org/acme//x", False),
+        (REPOS, "https://code.example.org/acmeX/app", False),
+        (REPOS, "https://code.example.org.evil.example/acme/app", False),
+        (REPOS, "https://code.example.org:8443/acme/app", False),
+        (REPOS, "https://CODE.example.org/acme/app", False),
+        (REPOS, "https://[code.example.org/acme/app", False),  # urlsplit raises
+    ],
+)
+def test_task_links_need_a_trusted_prefix(
+    prefix: str | None, link: str | None, routed: bool
+) -> None:
+    create: dict[str, Any] = {"type": "task.create", "title": "Review PR 42", "fingerprint": "x:1"}
+    if link:
+        create["link"] = link
+    entry = {"mode": "tasks", **({"link_prefix": prefix} if prefix else {})}
+    # The link is in the viewed input (the action guard, #35): only the prefix decides here.
+    data = [{"id": FINGERPRINT, "url": link or ""}]
+    for by_source in (False, True):  # an LLM proposal and a source's: the same routing
+        record = _task_run([create], data, by_source=by_source, entry=entry)
+        step = 0 if by_source else 1
+        if routed:
+            assert record.status == "ok", record.error
+            assert record.intents[0].applied_by == "todo.write"
+            assert record.intents[0].intent == TaskCreate.model_validate(create)
+        else:
+            assert record.status == "failed"
+            assert _error_kind(record, step) == "intent_unrouted"
+            assert "evil" not in (record.steps[step].error.message or "")  # type: ignore[union-attr]
+            assert record.intents == []
+
+
+def test_an_llm_task_link_must_come_from_the_input() -> None:
+    create = {"type": "task.create", "title": "Review", "fingerprint": "x:1", "link": PR_LINK}
+    entry = {"mode": "tasks", "link_prefix": REPOS}
+    # Under the trusted prefix, but not in what the model was shown: the guard refuses it.
+    record = _task_run([create], [{"id": FINGERPRINT, "url": REPOS + "app/pull/41"}], entry=entry)
+    assert record.status == "degraded"
+    assert _error_kind(record, 1) == "guard_violation"
+    assert record.intents == []
+    (violation,) = record.violations
+    assert violation.detail.endswith("with a link not in the input in `link`")
+    assert "example" not in violation.detail
+    # A source's proposals are not guarded (first-party plugins, #52): only the prefix binds.
+    record = _task_run([create], [{"id": FINGERPRINT}], by_source=True, entry=entry)
+    assert record.status == "ok", record.error
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {"mode": "tasks", "link_prefix": "obsidian://vault/Main/"},  # task links are https only
+        {"mode": "tasks", "link_prefix": "http://code.example.org/acme/"},
+        {"mode": "tasks", "link_prefix": "https://code.example.org/acme"},  # no trailing /
+        {"mode": "tasks", "link_prefix": "https://code.example.org/"},  # no path
+        {"mode": "tasks", "link_prefix": "https://user@code.example.org/acme/"},
+        {"mode": "tasks", "link_prefix": "https://code.example.org/a/../acme/"},
+        {"mode": "tasks", "link_prefix": "https://code.example.org/acme/?x=/"},
+        {"mode": "tasks", "link_prefix": 7},
+        {"mode": "post", "url": "https://api.example.org/x", "link_prefix": REPOS},
+    ],
+)
+def test_invalid_task_link_prefix_is_a_plan_error(entry: dict[str, Any]) -> None:
+    record = _task_run([], entry=entry)
+    assert record.status == "failed"
+    assert _error_kind(record, 2) == "params_invalid"  # the act entry's step
+    assert "link_prefix" in (record.steps[2].error.message or "")  # type: ignore[union-attr]
 
 
 NOTES = "https://notes.example.org/notes/"
