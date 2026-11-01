@@ -257,6 +257,21 @@
           "default": null,
           "description": "Reminder time on the due date, `HH:MM` (24 h). Requires `due`.",
           "title": "Time"
+        },
+        "link": {
+          "anyOf": [
+            {
+              "maxLength": 2048,
+              "pattern": "^https://[^\\x00-\\x20\\x7f/?#@\\\\]+([/?#][^\\x00-\\x20\\x7f\\\\]*)?$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional `https://` link to the item the task comes from (no user info), routed only\nunder the `tasks` entry's trusted `link_prefix`.",
+          "title": "Link"
         }
       },
       "required": [

@@ -51,6 +51,17 @@ NotifyLink = Annotated[
 ]
 """An `https://` or `obsidian://` link, with no whitespace or control characters."""
 
+TaskLink = Annotated[
+    str,
+    Strict(),
+    StringConstraints(
+        pattern=r"^https://[^\x00-\x20\x7f/?#@\\]+([/?#][^\x00-\x20\x7f\\]*)?$", max_length=2048
+    ),
+]
+"""An absolute `https://` link (the `NotifyLink` shape, `https` only), with a non-empty
+authority holding no user info (`@`), and no whitespace, control character or backslash
+anywhere (schemas decision 52)."""
+
 
 class NoteCreate(Contract):
     """Create a note with the given content."""
@@ -105,6 +116,9 @@ class TaskCreate(Contract):
     """Due date (ISO 8601 `YYYY-MM-DD`)."""
     time: ClockTime | None = None
     """Reminder time on the due date, `HH:MM` (24 h). Requires `due`."""
+    link: TaskLink | None = None
+    """Optional `https://` link to the item the task comes from (no user info), routed only
+    under the `tasks` entry's trusted `link_prefix`."""
 
     @model_validator(mode="after")
     def _time_needs_due(self) -> Self:
