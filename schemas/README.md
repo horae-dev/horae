@@ -127,6 +127,11 @@ JSON Schema cannot express these; the models enforce them and the tests pin the 
   approximates IDNA2008 rather than implementing RFC 5892 exactly.
 - `instance` (`horae.yaml`): a bracketed IPv6 literal in `base_url` must parse as an IPv6
   address (the schema only checks its characters and, for `http`, the `fc`/`fd` prefix).
+- `task.create` `link` (decision 52 A): the host may not be an IP address (its last label is
+  a number, as WHATWG reads it, after NFKC), and no character may be a supplementary-plane
+  format character (tags `U+E0001`, `U+E0020`-`U+E007F`, ...) or a lone surrogate. The
+  pattern already refuses the Basic Multilingual Plane controls, format characters and
+  separators, bracketed IPv6 and `%` in the authority.
 
 ### Known validator differences
 
@@ -305,12 +310,16 @@ loosened later without breaking a valid file.
       falls under; without `link_prefix` a proposed link is never routed. A prefix is an
       `https://` or `obsidian://` link with a host, no user info, query or fragment, and a
       clean path that ends with `/` (e.g. `obsidian://vault/Main/`), else `params_invalid`.
-      Both are parsed (`urlsplit`), not compared as strings: same scheme, exactly the same
-      netloc, and a link path under the prefix path whose rest has no empty, `.` or `..`
-      segment, backslash, or `%2e` / `%2f` / `%5c` / `%25` (so no `/notes/../admin`, no
-      `host.evil` or `host@evil`). The link may add its own query and fragment;
+      Both are parsed (`urlsplit`), not compared as strings: same scheme, the same authority
+      (since decision 52 B, an `https` host compares case-insensitively, without one trailing
+      dot, with `:443` equal to no port; an `obsidian://` netloc exactly), and a link path
+      under the prefix path (case-sensitive) whose rest has no empty, `.` or `..` segment,
+      backslash, or `%2e` / `%2f` / `%5c` / `%25` (so no `/notes/../admin`, no `host.evil` or
+      `host@evil`). The link may add its own query and fragment;
     - a `task.update_status` is routed only if its `task` fingerprint appears as a string value
-      in the run's collected input; `task.create` binds no target;
+      in the run's collected input; `task.create` binds no target but its optional `link`,
+      which (decision 52) is routed only to a `mode: tasks` entry whose trusted `link_prefix`
+      it falls under, by the `notify.push` rule above;
     - two entries that may apply the same type to the same target make every such intent
       `intent_ambiguous`, by design: untrusted data never chooses between trusted entries;
     - the proposer's permissions are checked before routing (`intent_rejected` wins);
@@ -2888,10 +2897,22 @@ loosened later without breaking a valid file.
     and `run-record/v1.json`, and an optional `link_prefix` parameter on a `mode: tasks` `act`
     entry; no store migration. It lets a task created from an external item (a pull request, a
     calendar event) carry a clickable link, which the escaped title never can (decision 50).
-    - **A, the shape: `https://` only.** `^https://[^\x00-\x20\x7f/?#@\\]+([/?#][^\x00-\x20\x7f\\]*)?$`,
-      at most 2048 characters: the `notify.push` link (decision 7) restricted to `https`, with
-      a non-empty authority that holds no `@` (no user info, so no `https://good@evil` reading
-      as `good`), and no backslash anywhere (browsers read `\` as `/` in an `https` URL). No
+    - **A, the shape: `https://` only.** `^https://[^F/?#@\\%\[\]]+([/?#][^F\\]*)?$`,
+      at most 2048 characters, where `F` (`TASK_LINK_FORBIDDEN`, written as `\u` escapes) is
+      every Basic Multilingual Plane character of the Unicode categories `Cc`, `Cf`, `Zs`,
+      `Zl` and `Zp`: the `notify.push` link (decision 7) restricted to `https`, with a
+      non-empty authority that holds no `@` (no user info, so no `https://good@evil` reading
+      as `good`), `%` or brackets, and no backslash anywhere (browsers read `\` as `/` in an
+      `https` URL). No control, format (bidi, zero-width, soft hyphen), space or separator
+      character may appear anywhere, nor a lone surrogate: the model (`_check_task_link`) and
+      the SDK also check the categories with `unicodedata`, which covers the supplementary
+      planes (tag characters) that one ECMA-262, Rust and Python pattern cannot. **The host
+      is a name, never an IP literal**: bracketed IPv6 fails the pattern, and a host whose
+      last label (one trailing dot dropped, after NFKC) is decimal digits or `0x` hex is what a
+      browser reads as IPv4 (`127.0.0.1`, `127.1`, `0x7f.1`, `2130706433`, full-width digits),
+      refused by the model and the SDK (the use case is a named web host; a `link_prefix` on
+      an IP is refused the same way). The SDK keeps a copy of the pattern, and a shared test
+      checks it equals the core's and that both refuse every code point of those categories. No
       `obsidian://`, unlike `notify.push`: a notification link opens the vault from a phone,
       while a task link is written **into** a note, where an `obsidian://` URI is an action
       (`new`, `open` with a command plugin) one click away, and the use case (an external
@@ -2901,14 +2922,28 @@ loosened later without breaking a valid file.
       `mode: tasks` entry with a trusted `link_prefix` the link falls under, by the same rule
       and the same code as `notify.push` (`_check_link_prefix`, `_link_under`: an `https://`
       prefix with a host, no user info, query or fragment and a clean path ending in `/`;
-      same scheme, exactly the same netloc, a clean rest of path, own query and fragment
-      allowed). **Without `link_prefix`, a task with a link is never routed**
+      same scheme, the same authority, a clean rest of path, own query and fragment
+      allowed). The authority of an `https` link and prefix is compared as a DNS origin:
+      the host case-insensitively, one trailing dot ignored, an explicit `:443` equal to no
+      port, and no user info (`GitHub.com`, `github.com:443` and `github.com.` fall under
+      `https://github.com/my-org/`); the path stays case-sensitive (`/My-Org/` is not under
+      `/my-org/`), as do an `obsidian://` netloc (compared exactly) and the rest of the rule.
+      `_link_under` is shared, so this applies to `notify.push` `https` links too (decision
+      30 compared the netloc exactly; it only accepts more spellings of the same origin).
+      When a `tasks` entry would take the task but for its link, the `intent_unrouted`
+      message says `task link not under a trusted link_prefix` (a fixed text, no URL). **Without `link_prefix`, a task with a link is never routed**
       (`intent_unrouted`), as for `notify.push`: deny by default, so a pipeline names the
       hosts its tasks may point at (`link_prefix: https://github.com/my-org/`). A task
       without a link needs no prefix, so existing pipelines are unchanged. An `obsidian://`
       or otherwise invalid `link_prefix` on a `tasks` entry, or a `link_prefix` on an `act`
       entry of any other `mode`, is `params_invalid` (it used to be inert metadata there; no
-      pipeline used it).
+      pipeline used it). **Upgrading a source**: once a source (or skill) sends `link`,
+      every `mode: tasks` entry that receives its tasks needs a `link_prefix` covering those
+      links, or the step fails at run time with `intent_unrouted` (`horae doctor` does not
+      inspect `act` entries, and cannot know what a source will send). The entry's
+      parameters, `link_prefix` included, are recorded in the `act` step's output and passed
+      to the sink plugin as the `params` of its apply call (`SinkCall.params`), as for every
+      entry parameter: a Tasks sink must accept, and may ignore, `link_prefix`.
     - **C, the action guard.** A `task.create` `link` proposed by an LLM skill must be exactly
       a URL of the viewed input, like a `notify.push` link (decision 46), on top of the
       prefix; a refusal degrades the step. Source and transform proposals are not guarded
@@ -2930,11 +2965,15 @@ loosened later without breaking a valid file.
       `&` of an HTML entity becomes `%26` (Markdown decodes entities in a destination, and
       `&#x2E;&#x2E;` would otherwise become `..` after routing checked the path); the second
       `:` of `::` and `=` of `==` become `%3A` / `%3D` (no Dataview field, no highlight). It
-      is idempotent and decodes to the same URL. The ported Tasks and Dataview regexes see no
-      field in the link and the escaped title (property tests over a hostile alphabet and
-      arbitrary text). A `::` inside a bracketed IPv6 host would be encoded and break the
-      link: an accepted edge case. The core's dry-run diff shows the link as plain text
-      (`(link <url>)`, terminal-escaped).
+      is idempotent and percent-decodes to the same string as the link does. The ported
+      Tasks and Dataview regexes see no field in the link and the escaped title (property
+      tests over a hostile alphabet and arbitrary text). **A destination longer than 4096
+      characters is left out** (`MAX_DESTINATION`): a non-ASCII character takes up to 12
+      once encoded, so a 2048-character link could reach about 24 KiB, past
+      plugin-obsidian's 16 KiB analysis cap for a line; the line is then written without the
+      link, and nothing of it is returned or logged. The core's dry-run diff shows the link
+      as plain text in angle brackets (`(link <url>)`, terminal-escaped), so a `)` in the
+      URL cannot read as the end of the parenthesis.
     - **F, the SDK.** `intents.task_create(..., link=None)` checks the same shape
       (`tasks.is_task_link`); `horae-sdk` goes to 0.2.0 (not yet published; there is no
       changelog file, the README's "Task links" section and this decision are the notes).

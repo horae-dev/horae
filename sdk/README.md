@@ -175,13 +175,23 @@ lowercase `&#x1f4c5;`) has its `&` and `#` escaped and shows literally.
 
 `intents.task_create(title, key=..., link=...)` (SDK 0.2.0) attaches a link to the item the
 task comes from, e.g. a pull request. The link is an absolute `https://` URL of at most 2048
-characters with a host, no user info (`user@`), whitespace, control character or backslash
-(`tasks.is_task_link`, the core's `TaskLink`, schemas decision 52); `obsidian://` and every
-other scheme are refused. It is kept in the intent exactly as given, and the core routes it
+characters whose host is a name, never an IP address (`127.0.0.1`, `127.1`, `[::1]`), with no
+user info (`user@`), `%` or brackets in the authority, no backslash, and no control, format
+(bidi, zero-width), space or separator character (Unicode categories `Cc`, `Cf`, `Zs`, `Zl`,
+`Zp`) or lone surrogate anywhere (`tasks.is_task_link`, the core's `TaskLink`, schemas
+decision 52); `obsidian://` and every other scheme are refused. It is kept in the intent exactly as given, and the core routes it
 only to a `mode: tasks` entry whose trusted `link_prefix` it falls under (for example
 `link_prefix: https://github.com/my-org/`, with a clean path ending in `/`), as for
-`notify.push`; with no `link_prefix`, a task with a link is never routed. A link proposed by
-an LLM skill must also be a URL of the input the model was shown (the action guard).
+`notify.push`; with no `link_prefix`, a task with a link is never routed. The host is
+compared as a DNS origin (case-insensitively, one trailing dot ignored, `:443` equal to no
+port), the path case-sensitively. A link proposed by an LLM skill must also be a URL of the
+input the model was shown (the action guard).
+
+**Upgrading a source to send `link`.** Once a source sends `link`, every `mode: tasks` entry
+that receives its tasks needs a `link_prefix` covering those links, or the step fails at run
+time with `intent_unrouted` (`task link not under a trusted link_prefix`). Add the prefix to
+the pipelines before releasing the source. The entry's `link_prefix` reaches a Tasks sink in
+its apply call's `params`, like `mode`: a sink must accept it and may ignore it.
 
 `tasks.task_line(title, link=...)` and `task_line_for(intent)` write it right after the
 escaped title, before the date fields, as a Markdown link with the fixed text `link`:
@@ -197,7 +207,11 @@ characters that would end or open a link or start other markup (`( ) [ ] < >`, b
 no escape becomes `%25`, the `&` of an HTML entity becomes `%26` (Markdown decodes entities in
 a destination, so `&#x2E;&#x2E;` could otherwise become `..` after routing checked the path),
 and the second `:` of `::` and `=` of `==` become `%3A` / `%3D`. The encoding is idempotent and
-decodes to the same URL. Tasks reads the link as part of the description, never as a field.
+percent-decodes to the same string as the link does. Tasks reads the link as part of the
+description, never as a field. A destination longer than `tasks.MAX_DESTINATION` (4096)
+characters, possible for a link of mostly non-ASCII characters (up to 12 characters each once
+encoded), is left out: the line is written without the link, so it stays well under a reader's
+size cap (plugin-obsidian analyses at most 16 KiB).
 
 ### Manual check in a real vault
 
