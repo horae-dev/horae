@@ -93,6 +93,29 @@ when it listens on `0.0.0.0` or `::` without one, and logs each refused `Host` o
 container, change the port with `HORAE_PORT` rather than `--port` (the image's health check
 follows `HORAE_PORT`).
 
+**Action links** ([decision 53](schemas/README.md)). A `notify.push` may carry up to three
+buttons (`actions: [{label, kind: task.done | task.snooze, task, duration: 1h | 3h |
+tomorrow}]`, for tasks the run collected); when it is sent, the core mints for each a signed,
+single-use link `<http.public_url>/act/<token>`, valid 24 hours and bound to the task's
+current status, due date and snooze, and passes it to the notifier (ntfy renders it as an
+`http` button: one tap marks the task done or snoozes it). `GET /act/<token>` (a browser, a
+link preview) only shows a confirmation page; `POST` applies the change once, through the
+instance's `mode: tasks` sink, as a run of the reserved pipeline `_act`. To turn it on:
+
+- set the key, at least 32 bytes, in `<secrets.dir>/HORAE_ACT_KEY` (or the `HORAE_ACT_KEY`
+  environment variable): `openssl rand -base64 48`. Rotating it (a new value, then a restart)
+  invalidates every outstanding link. A shorter key stops `horae serve` from starting;
+- set `http.public_url` in `horae.yaml` (`https://horae.example.org`, no path) and add its
+  host to `HORAE_ALLOWED_HOSTS`;
+- have exactly one `act` entry with `mode: tasks` across the pipelines.
+
+Without the key `/act` answers 503 and notifications are sent without buttons. `/act/` is the
+only path the reverse proxy exempts from SSO. Requests are rate limited (10 a minute per
+client, 60 overall); behind Traefik and a Cloudflare tunnel, list the Docker network they
+share in `http.trusted_proxies` (e.g. `[172.18.0.0/16]`) and make Traefik trust cloudflared's
+`X-Forwarded-For` (`entryPoints.<name>.forwardedHeaders.trustedIPs`), or every phone shares
+one bucket; and turn off Traefik's access log for `/act` (it would log the tokens).
+
 An instance is **not relocatable** in v1: `horae.lock` holds the vault's absolute path and
 `plugins/` the absolute path of the interpreter that installed them. After copying or moving
 one, `horae doctor` reports the paths that no longer match (a lock path that does not exist,

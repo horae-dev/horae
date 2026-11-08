@@ -3,7 +3,9 @@
 - **Issue:** [#38](https://github.com/horae-dev/horae/issues/38) (Human-led, security, M3). Threats
   **T13, T14, T16** (and T15 with #41) in [docs/security.md](../security.md#b4-phone--act); asset
   A3; story updates in [§10](../security.md#10-story-updates-requested).
-- **Status:** Draft, for maintainer review. No code until the questions below are answered.
+- **Status:** Accepted: the maintainer accepted all ten recommendations (PR #115). Implemented
+  on the same branch; [schemas decision 53](../../schemas/README.md#decisions) records the
+  result and what the implementation decided beyond this note.
 - **Sources:** [PLAN §3.5](../PLAN.md#35-interfaces) (`/act/<signed-token>`, single use, 24 h, key
   from env), §4 (`plugin-ntfy` "Done" / "Snooze" buttons, `obsidian://` deep links), §7 (only
   `/act/` outside SSO), §9 ("a stolen `/act` token");
