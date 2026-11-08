@@ -57,9 +57,7 @@ def _sink() -> FixtureSink:
     return FixtureSink(files={INBOX: INBOX_BYTES})
 
 
-def _apply(
-    store: Store, run: RunRecord, sink: FixtureSink, *, save: bool = True, timezone: str = "UTC"
-) -> Any:
+def _apply(store: Store, run: RunRecord, sink: FixtureSink, *, save: bool = True) -> Any:
     store.begin_run(run.id, run.pipeline, run.started_at, dry_run=run.dry_run)
     sinks = StaticSinks(default=sink)
 
@@ -67,7 +65,7 @@ def _apply(
         return store.get_notification(key) is not None
 
     async def go() -> Any:
-        planned = await plan_changes(run, sinks, notified=notified, timezone=timezone)
+        planned = await plan_changes(run, sinks, notified=notified)
         return await apply_changes(run, planned, sinks, store, clock=_clock)
 
     result = asyncio.run(go())
@@ -265,49 +263,42 @@ def _keyed_at(
     )
 
 
-def test_a_keyed_notification_is_sent_once_a_day_across_runs(store: Store) -> None:
+def test_a_keyed_notification_is_sent_once_whatever_the_day_or_the_run(store: Store) -> None:
     sink = _sink()
     assert _apply(store, _keyed_at(6), sink).duplicates == ()
-    for hour in (7, 12, 22):
-        result = _apply(store, _keyed_at(hour), sink)
+    # Later the same day, and the next days: the key is the identity, there is no day scope.
+    for hour, day in ((7, 27), (12, 27), (22, 27), (6, 28), (6, 30)):
+        result = _apply(store, _keyed_at(hour, day=day), sink)
         assert result.duplicates == (0,)
         assert result.record.changes == []
     assert len(sink.sent) == 1
-    # Another key, the next local day: sent again.
+    # Another key is another notification.
     assert _apply(store, _keyed_at(6, key="other"), sink).duplicates == ()
-    assert _apply(store, _keyed_at(6, day=28), sink).duplicates == ()
-    assert len(sink.sent) == 3
-
-
-def test_a_keyed_notification_changes_with_the_local_day_not_the_utc_day(store: Store) -> None:
-    paris = "Europe/Paris"  # UTC+1 on 2026-10-27 (DST ended on the 25th)
-    sink = _sink()
-    # 22:00 and 23:00 UTC on the 27th are the 27th at 23:00 and the 28th at 00:00 in Paris.
-    late, after = _keyed_at(22), _keyed_at(23)
-    assert _apply(store, late, sink, timezone=paris).duplicates == ()
-    assert _apply(store, after, sink, timezone=paris).duplicates == ()
     assert len(sink.sent) == 2
-    # In UTC both are the 27th: one push (another notification key).
-    same = _keyed_at(22, key="utc"), _keyed_at(23, key="utc")
-    assert _apply(store, same[0], sink).duplicates == ()
-    assert _apply(store, same[1], sink).duplicates == (0,)
 
 
-def test_keyed_days_follow_the_instance_clock_across_dst_changes() -> None:
+def test_a_key_proposed_by_runs_either_side_of_midnight_is_sent_once(store: Store) -> None:
     from horae.apply import dedupe_key
 
-    def at(month: int, day: int, hour: int) -> str:
-        run = _keyed_at(hour, day, month)
-        return dedupe_key(run, 0, "Europe/Paris")
+    # 22:00 and 23:00 UTC on the 27th, and 00:30 on the 28th: any time zone's midnight is
+    # crossed by one of them, and the key (which carries its own day if it wants one) wins.
+    same = [
+        _keyed_at(h, day=d, key="rem:x:2026-10-27T23:30") for h, d in ((22, 27), (23, 27), (0, 28))
+    ]
+    assert len({dedupe_key(r, 0) for r in same}) == 1
+    sink = _sink()
+    assert _apply(store, same[0], sink).duplicates == ()
+    assert _apply(store, same[1], sink).duplicates == (0,)
+    assert _apply(store, same[2], sink).duplicates == (0,)
+    assert len(sink.sent) == 1
 
-    # Spring forward (2026-03-29, 23 h long): 22:00Z on the 28th is 23:00 Paris, 23:00Z is the 29th.
-    assert at(3, 28, 22) != at(3, 28, 23)
-    assert at(3, 28, 23) == at(3, 29, 20)
-    # Fall back (2026-10-25, 25 h long): 21:00Z on the 24th is 23:00 Paris, 22:00Z is the 25th;
-    # the 25th lasts until 23:00Z.
-    assert at(10, 24, 21) != at(10, 24, 22)
-    assert at(10, 24, 22) == at(10, 25, 21)
-    assert at(10, 25, 21) != at(10, 25, 23)
+
+def test_the_day_in_a_key_makes_a_new_notification(store: Store) -> None:
+    sink = _sink()
+    assert _apply(store, _keyed_at(6, key="digest:2026-10-27"), sink).duplicates == ()
+    assert _apply(store, _keyed_at(7, key="digest:2026-10-27"), sink).duplicates == (0,)
+    assert _apply(store, _keyed_at(6, day=28, key="digest:2026-10-28"), sink).duplicates == ()
+    assert len(sink.sent) == 2
 
 
 def test_a_keyed_notification_repeated_in_one_run_is_planned_as_a_duplicate(store: Store) -> None:
@@ -324,9 +315,8 @@ def test_a_notification_without_a_key_is_unchanged(store: Store) -> None:
 
     plain = _keyed_at(6, key=None)
     assert "key" not in plain.intents[0].intent.model_dump(exclude_none=True)
-    # Run-scoped: another run of the same day is a new key, and the key ignores the time zone.
+    # Run-scoped: another run of the same day is a new key.
     assert dedupe_key(plain, 0) != dedupe_key(_keyed_at(7, key=None), 0)
-    assert dedupe_key(plain, 0) == dedupe_key(plain, 0, "Europe/Paris")
     sink = _sink()
     assert _apply(store, plain, sink).duplicates == ()
     assert _apply(store, _keyed_at(7, key=None), sink).duplicates == ()

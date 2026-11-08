@@ -222,7 +222,6 @@ async def execute_run(
                     live.sinks,
                     notified=notified,
                     call_timeout_s=instance.config.plugin_defaults.call_timeout_s,
-                    timezone=instance.config.timezone,
                 )
             return record
 

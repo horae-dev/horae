@@ -3341,3 +3341,13 @@ loosened later without breaking a valid file.
       so upgrading re-sends nothing. `horae_sdk.intents.notify_push(..., key=None)` builds it.
     - **Follow-up.** plugin-ntfy keeps its own `dedupe: daily` derivation until its callers
       pass `key`; obsidian.reminders should set `key` to the reminder's stable id.
+    - **Amendment (follow-up to #137): the key is the identity.** The date component in A is
+      dropped. With `key`, the `dedupe_key` is the SHA-256 of (pipeline, routing entry, `key`)
+      and nothing else, so a lookback that crosses midnight no longer sends a key twice (the
+      run's local date was not the date the key carried). A proposer that wants "once a day"
+      puts the day in the key (`obsidian.reminders` already does: `rem:...:<date>T<time>`,
+      `digest:<date>`). The instance `timezone` no longer takes part in the key (it is no
+      longer passed to `plan_changes`). Retention: `notifications` rows are never pruned
+      (`prune_runs` keeps them, see docs/operations/retention-and-backups.md), so a repeat of
+      an old key is never resent; a keyed notification re-sent after an upgrade is possible
+      once, for keys recorded with the old day-scoped hash.

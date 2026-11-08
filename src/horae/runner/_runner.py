@@ -622,7 +622,6 @@ class Runner:
                     sinks,
                     notified=notified,
                     call_timeout_s=timeout_s,
-                    timezone=self.instance.config.timezone,
                 )
                 result = await apply_changes(
                     record,
