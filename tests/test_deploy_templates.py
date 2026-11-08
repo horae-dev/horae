@@ -100,8 +100,6 @@ SSO_PATHS = (
     "/outpost.goauthentik.io",
     *TRAVERSALS,
 )
-ACT_PATHS = ("/act/", "/act/token123")  # the plain compose override: PathPrefix(/act/)
-
 # Coolify: the /act/ router matches only the token route's shape (#38), 98 to 267 characters
 # of the URL-safe base64 alphabet, and nothing under it.
 ACT_ROUTE_SHAPE = "^/act/[A-Za-z0-9_-]{98,267}$"
@@ -409,18 +407,20 @@ def assert_only_act_bypasses_sso(
     # Structure: the /act/ router matches only `/act/` on the public host, with no middleware;
     # every other router has the SSO middleware or only redirects to https.
     act = routers[ACT]
-    assert act.rule == f"Host(`{FQDN}`) && PathPrefix(`/act/`)"
+    assert act.rule == f"Host(`{FQDN}`) && PathRegexp(`{ACT_ROUTE_SHAPE}`)"
+    # The path carries the link: no access-log line for this router.
+    assert labels[f"traefik.http.routers.{ACT}.observability.accessLogs"] == "false"
     assert act.middlewares == ()
     for router in routers.values():
         if router.name == ACT:
             continue
         assert SSO in router.middlewares or router.middlewares == ("redirect-to-https",), router
     # Behaviour: what each request reaches.
-    for path in SSO_PATHS:
+    for path in COOLIFY_SSO_PATHS:
         reached = route(routers, https_entrypoint, FQDN, path)
         assert reached is not None, path
         assert SSO in reached.middlewares, (path, reached)
-    for path in ACT_PATHS:
+    for path in COOLIFY_ACT_PATHS:
         reached = route(routers, https_entrypoint, FQDN, path)
         assert reached is not None, path
         assert reached.name == ACT, (path, reached)
@@ -431,7 +431,7 @@ def assert_only_act_bypasses_sso(
     # The SSO provider decides on what Traefik received, never on X-Forwarded-* from a client.
     assert labels[f"traefik.http.middlewares.{SSO}.forwardauth.trustForwardHeader"] == "false"
     for entrypoint in http_entrypoints:
-        for path in SSO_PATHS + ACT_PATHS:
+        for path in COOLIFY_SSO_PATHS + COOLIFY_ACT_PATHS:
             reached = route(routers, entrypoint, FQDN, path)
             assert (
                 reached is None

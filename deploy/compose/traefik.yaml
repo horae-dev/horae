@@ -1,11 +1,11 @@
-# Optional override: Horae behind an existing Traefik (v2 or v3) and an SSO forwardAuth
+# Optional override: Horae behind an existing Traefik v3 and an SSO forwardAuth
 # (#41, docs/operations/compose.md). Use it with the base file:
 #
 #   docker compose -f docker-compose.yaml -f traefik.yaml up -d
 #
 # Routing: the `horae` router (the whole host: `/runs`, `/healthz`, everything) goes through
-# the `horae-sso` forwardAuth middleware; `horae-act` (`PathPrefix(/act/)`, a higher priority)
-# is the only router without it. Horae joins HORAE_PROXY_NETWORK, a network shared ONLY with
+# the `horae-sso` forwardAuth middleware; `horae-act` (only the link's exact
+# shape, a higher priority, access log off: the path is the link) is the only router without it. Horae joins HORAE_PROXY_NETWORK, a network shared ONLY with
 # Traefik (create it yourself, see the guide): any container on Horae's networks can reach port
 # 8080 and send any Host (schemas decision 51 B, docs/security.md T15).
 # trustForwardHeader=false: the SSO provider sees the method, host and URI Traefik received,
@@ -33,9 +33,10 @@ services:
       - "traefik.http.routers.horae.tls.certresolver=${HORAE_TRAEFIK_CERTRESOLVER:-letsencrypt}"
       - "traefik.http.routers.horae.middlewares=horae-sso"
       - "traefik.http.routers.horae.service=horae"
-      - "traefik.http.routers.horae-act.rule=Host(`${HORAE_PUBLIC_HOST:?set HORAE_PUBLIC_HOST to the public host name}`) && PathPrefix(`/act/`)"
+      - "traefik.http.routers.horae-act.rule=Host(`${HORAE_PUBLIC_HOST:?set HORAE_PUBLIC_HOST to the public host name}`) && PathRegexp(`^/act/[A-Za-z0-9_-]{98,267}$$`)"
       - "traefik.http.routers.horae-act.entryPoints=${HORAE_TRAEFIK_ENTRYPOINT:-websecure}"
       - "traefik.http.routers.horae-act.priority=1000"
+      - "traefik.http.routers.horae-act.observability.accessLogs=false"
       - "traefik.http.routers.horae-act.tls=true"
       - "traefik.http.routers.horae-act.tls.certresolver=${HORAE_TRAEFIK_CERTRESOLVER:-letsencrypt}"
       - "traefik.http.routers.horae-act.service=horae"
