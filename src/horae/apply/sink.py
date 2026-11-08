@@ -149,7 +149,9 @@ class TaskChange:
     (`before` is `None` for a new task, or when the current state is not known)."""
 
     fingerprint: str
-    action: Literal["create", "update_status"]
+    action: Literal["create", "existing", "update", "update_status"]
+    """`existing` and `update` are a `task.create` whose fingerprint the task index already
+    knows (#138): unchanged, or with a new title, due date or time."""
     before: str | None
     after: str
 

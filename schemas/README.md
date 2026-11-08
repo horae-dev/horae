@@ -3341,3 +3341,19 @@ loosened later without breaking a valid file.
       so upgrading re-sends nothing. `horae_sdk.intents.notify_push(..., key=None)` builds it.
     - **Follow-up.** plugin-ntfy keeps its own `dedupe: daily` derivation until its callers
       pass `key`; obsidian.reminders should set `key` to the reminder's stable id.
+
+### Provisional decisions (#138, pending maintainer review)
+
+58. **A repeated `task.create` fingerprint is not re-created (#138).** No schema change.
+    - **A, plan.** `plan_changes(known_task=)` reads the task index (decision 54): a
+      `task.create` whose fingerprint the index knows (or an earlier intent of the same run
+      planned) is a `TaskChange` with action `existing` (title, due and time as indexed;
+      shown as unchanged) or `update` (title, due or time differ; `before` is the indexed
+      task). The sink is not asked; the planner never reopens anything.
+    - **B, apply.** Unchanged path: the intent still goes to the sink, the authority on the
+      vault (plugin-obsidian dedupes by `^h-` block id and may adopt or dismiss it). The index
+      is updated from its answer: an applied answer updates title, due and time and keeps the
+      status (a ticked task stays ticked); `changed: false` leaves the index alone, except
+      `adopted` (and not `dismissed`), which indexes the task as `todo` if unknown.
+    - **C, compatibility.** `TaskChange.action` gains `existing` and `update`; without
+      `known_task` every `task.create` stays `create`.

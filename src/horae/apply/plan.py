@@ -65,6 +65,7 @@ from horae.apply.sink import (
 from horae.contracts.intents import Intent, NotifyPush, TaskCreate, TaskUpdateStatus
 from horae.contracts.run import ProposedIntent, RunRecord
 from horae.engine.canonical import sha256_hex
+from horae.store import TaskEntry
 
 MAX_DIFF_BYTES = 1024 * 1024
 """Sides larger than this (1 MiB) get no diff (`too_large`)."""
@@ -288,16 +289,32 @@ def dedupe_key(record: RunRecord, index: int, timezone: str = "UTC") -> str:
     return sha256_hex({"pipeline": record.pipeline, **scope, **mine, "occurrence": occurrence})
 
 
-def describe(intent: Intent) -> TaskChange | Notification | HttpCall | None:
+def _task_line(title: str, due: object, time: str | None, link: str | None = None) -> str:
+    line = f"- [ ] {title}"
+    if due is not None:
+        line += f" (due {due}{'' if time is None else ' ' + time})"
+    if link is not None:
+        line += f" (link <{link}>)"
+    return line
+
+
+def describe(
+    intent: Intent, known: TaskEntry | None = None
+) -> TaskChange | Notification | HttpCall | None:
     """The change of a task, notification or HTTP intent, from the intent alone (`None` for a
-    note intent). The current state of a task is not known: `TaskChange.before` is `None`."""
+    note intent). The current state of a task is not known: `TaskChange.before` is `None`.
+
+    A `task.create` whose fingerprint is `known` (the task index, #138) is `existing` when its
+    title, due date and time are those of the index, else an `update` of them (`before` is the
+    indexed task). The core does not re-create it, and does not reopen it."""
     if isinstance(intent, TaskCreate):
-        line = f"- [ ] {intent.title}"
-        if intent.due is not None:
-            line += f" (due {intent.due}{'' if intent.time is None else ' ' + intent.time})"
-        if intent.link is not None:
-            line += f" (link <{intent.link}>)"
-        return TaskChange(intent.fingerprint, "create", None, line)
+        line = _task_line(intent.title, intent.due, intent.time, intent.link)
+        if known is None:
+            return TaskChange(intent.fingerprint, "create", None, line)
+        if (known.title, known.due, known.time) == (intent.title, intent.due, intent.time):
+            return TaskChange(intent.fingerprint, "existing", line, line)
+        before = _task_line(known.title, known.due, known.time)
+        return TaskChange(intent.fingerprint, "update", before, line)
     if isinstance(intent, TaskUpdateStatus):
         after = intent.status if intent.until is None else f"{intent.status} until {intent.until}"
         return TaskChange(intent.task, "update_status", None, after)
@@ -319,8 +336,13 @@ async def plan_changes(
     notified: Callable[[str], bool] | None = None,
     call_timeout_s: float | None = None,
     timezone: str = "UTC",
+    known_task: Callable[[str], TaskEntry | None] | None = None,
 ) -> ChangeSet:
     """Plan every routed intent of `record`; never applies anything.
+
+    `known_task(fingerprint)` reads the task index (#138): a `task.create` of a known task (or
+    repeated in the run) is planned `existing` or `update`, not `create`; apply still sends
+    it to the sink, which is the authority on the vault.
 
     Only `Sink.read` is called, for `note.*` intents, each bounded by `call_timeout_s`
     (`None`: unbounded; past it the intent is a `timeout` problem). `notified(key)` says
@@ -340,6 +362,9 @@ async def plan_changes(
     planned_keys: set[str] = set()
     """The dedupe keys of the notifications planned so far: a keyed notification repeated in one
     run is sent once (apply skips it), so the plan shows it as a duplicate."""
+    planned_tasks: dict[str, TaskEntry] = {}
+    """The tasks `task.create` intents planned so far: a fingerprint repeated in one run is
+    `existing` for its later occurrences."""
     pending: dict[tuple[int, str], tuple[bytes, int]] = {}
     """The bytes each (sink, note) is left with by the last planned intent, and that intent."""
     for index, proposed in enumerate(record.intents):
@@ -356,8 +381,21 @@ async def plan_changes(
             problems.append(Problem(index, tool, "no_sink", f"no sink serves {tool}"))
             continue
         intent = proposed.intent
-        described = describe(intent)
+        known = None
+        if isinstance(intent, TaskCreate):
+            known = planned_tasks.get(intent.fingerprint)
+            if known is None and known_task is not None:
+                known = known_task(intent.fingerprint)
+        described = describe(intent, known)
         if isinstance(described, TaskChange):
+            if isinstance(intent, TaskCreate):
+                planned_tasks[intent.fingerprint] = TaskEntry(
+                    fingerprint=intent.fingerprint,
+                    title=intent.title,
+                    status="todo" if known is None else known.status,
+                    due=intent.due,
+                    time=intent.time,
+                )
             tasks.append(TaskItem(index, tool, described))
             continue
         if isinstance(described, Notification):
