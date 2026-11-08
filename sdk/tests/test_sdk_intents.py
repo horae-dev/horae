@@ -32,7 +32,9 @@ def every_intent() -> list[dict[str, Any]]:
             "school:1", "snoozed", until=datetime.datetime(2026, 10, 23, 9, 0, tzinfo=UTC)
         ),
         intents.task_update_status("school:1", "snoozed", until="2026-10-24"),
-        intents.notify_push("Bins tonight", title="Reminder", link="obsidian://open?vault=v"),
+        intents.notify_push(
+            "Bins tonight", title="Reminder", link="obsidian://open?vault=v", key="bins:weekly"
+        ),
         intents.http_post("https://hooks.example.org/x", {"text": "hello", "n": 1}),
     ]
 
@@ -256,6 +258,8 @@ def test_task_links_are_checked_like_the_core() -> None:
         (lambda: intents.notify_push(""), "body"),
         (lambda: intents.notify_push("x", title="a\nb"), "title"),
         (lambda: intents.notify_push("x", link="javascript:alert(1)"), "link"),
+        (lambda: intents.notify_push("x", key="has space"), "key"),
+        (lambda: intents.notify_push("x", key=""), "key"),
         (lambda: intents.http_post("http://example.org", {}), "https"),
         *[
             (lambda link=link: intents.task_create("t", key="f", link=link), "link")

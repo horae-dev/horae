@@ -1,0 +1,6 @@
+{
+  "type": "notify.push",
+  "title": "Stand-up",
+  "body": "Stand-up in 10 minutes",
+  "key": "obsidian.reminder:standup"
+}

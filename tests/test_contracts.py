@@ -359,6 +359,10 @@ REJECTED: list[tuple[str, Mutation]] = [
     ("intents/notify.push", _set("body", value="x" * 4097)),
     ("intents/notify.push", _set("link", value="obsidian://")),
     ("intents/notify.push", _set("link", value="data:text/html,x")),
+    ("intents/notify.push", _set("key", value="")),
+    ("intents/notify.push", _set("key", value="has space")),
+    ("intents/notify.push", _set("key", value="x" * 129)),
+    ("intents/notify.push", _set("key", value=7)),
     # lockfile
     ("lockfile", _set(*GH, "repo", value="https://github.com/horae-dev/plugin-github?x=1")),
     ("lockfile", _set(*GH, "repo", value="https://github.com:22/horae-dev/plugin-github")),

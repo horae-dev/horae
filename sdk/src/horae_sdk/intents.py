@@ -250,10 +250,13 @@ def task_update_status(
     return intent
 
 
-def notify_push(body: str, *, title: str | None = None, link: str | None = None) -> Intent:
+def notify_push(
+    body: str, *, title: str | None = None, link: str | None = None, key: str | None = None
+) -> Intent:
     """`notify.push`: `body` (at most 4096 characters), an optional one-line `title` and an
     optional `https://` or `obsidian://` `link` (the core also checks it against the
-    pipeline's trusted `link_prefix`)."""
+    pipeline's trusted `link_prefix`). An optional stable `key` (`A-Za-z0-9._:-`, 1 to 128)
+    makes the core send this notification once per local day, however many runs propose it."""
     if not _matches(_ANY, body, MAX_BODY):
         raise IntentError(f"body must be 1 to {MAX_BODY} characters")
     intent: Intent = {"type": "notify.push", "body": body}
@@ -263,6 +266,10 @@ def notify_push(body: str, *, title: str | None = None, link: str | None = None)
         if not _matches(_LINK, link):
             raise IntentError("link must be an https:// or obsidian:// URL without whitespace")
         intent["link"] = link
+    if key is not None:
+        if not _matches(_FINGERPRINT, key):
+            raise IntentError("key must be 1 to 128 characters of A-Z a-z 0-9 . _ : -")
+        intent["key"] = key
     return intent
 
 

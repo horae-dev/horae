@@ -104,9 +104,9 @@ def test_a_notification_without_buttons_keeps_its_dedupe_key() -> None:
     record = _record([{"type": "notify.push", "title": "Brief", "body": "2 items today"}])
     index = next(i for i, p in enumerate(record.intents) if p.intent.type == "notify.push")
     proposed = record.intents[index]
-    # The key as it was computed before `actions` existed: the dump without the field.
+    # The key as it was computed before `actions` and `key` existed: the dump without them.
     intent = proposed.intent.model_dump(mode="json")
-    del intent["actions"]
+    del intent["actions"], intent["key"]
     old = sha256_hex(
         {
             "pipeline": record.pipeline,
