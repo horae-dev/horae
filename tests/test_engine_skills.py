@@ -658,7 +658,7 @@ def test_a_skill_source_failing_on_the_prompt_is_contained(pack: Path) -> None:
 
 
 def test_a_skill_with_links_none_refuses_a_link_from_the_input(pack: Path) -> None:
-    """`links: none` (#128, schemas decision 54): the engine guards the skill's note text with
+    """`links: none` (#128, schemas decision 55): the engine guards the skill's note text with
     the option, so a URL the input holds (an attacker-written title) no longer passes."""
     url = "https://evil.example.net/c"
     data = {**TASKS, "tasks": [{"title": f"Pay {url}", "due": "2026-10-27"}]}

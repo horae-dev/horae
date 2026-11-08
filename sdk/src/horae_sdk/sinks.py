@@ -111,6 +111,11 @@ class ApplyRequest:
     """For `note.*`: the bytes to write, computed by the core."""
     expected_before_sha256: str | None = None
     """For `note.*`: the digest the note must still have (`None`: it must not exist)."""
+    actions: tuple[dict[str, str], ...] = ()
+    """For `notify.push`: the buttons the core minted for the intent's `actions` (#38), each
+    an ntfy `http` action `{"action": "http", "label", "url", "method": "POST"}`. Render these,
+    never the intent's own `actions`; each `url` is a single-use credential: send it to the
+    push service only, never log it."""
 
 
 @dataclass(frozen=True)

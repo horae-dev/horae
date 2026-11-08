@@ -1,0 +1,138 @@
+# documentation: https://github.com/horae-dev/horae/blob/main/docs/operations/coolify.md
+# slogan: Horae, a predictable self-hosted personal agent (scheduler and read-only HTTP API).
+# category: automation
+# tags: horae,agent,assistant,scheduler,automation,obsidian
+# port: 8080
+#
+# Coolify "Docker Compose Empty" service template (#41). Install guide, prerequisites and what
+# to verify: docs/operations/coolify.md. The routers are the labels below (Coolify generates
+# none: the service has no domain), and SSO is a forwardAuth middleware that Traefik's dynamic
+# FILE configuration defines, named by HORAE_SSO_MIDDLEWARE, with the authentik outpost as a
+# file service (HORAE_SSO_OUTPOST_SERVICE). In short:
+#   - Horae stays on its resource's OWN network, the one Coolify creates for every resource and
+#     connects the proxy (`coolify-proxy`) to: only the proxy and this resource's containers
+#     are on it. No `traefik.docker.network`: Traefik uses the only network it shares with
+#     Horae. Every container on Horae's networks can call port 8080 WITHOUT SSO
+#     (docs/security.md T15, schemas decision 51 B): never add a network that other apps share
+#     (a server-wide `traefik-network`, or "Connect to predefined network").
+#   - secure by default: routers on the `https` entry point with TLS. The Cloudflare Tunnel
+#     layout of the reference server is an explicit opt-in (HORAE_TRAEFIK_ENTRYPOINT=http,
+#     HORAE_TRAEFIK_TLS=false), only while port 80 is not reachable from the Internet (only
+#     cloudflared reaches it).
+#   - prefer a Horae-only file middleware with `trustForwardHeader: false`; a shared one with
+#     `true` is safe only while no entry point carrying these routers trusts forwarded headers
+#     (no forwardedHeaders.trustedIPs / insecure). docs/operations/coolify.md.
+#   - leave the Domains of both services EMPTY: a domain makes Coolify generate routers of its
+#     own, without SSO (on the public host they still lose to the routers below, by priority;
+#     on any other host they are open). The public host is HORAE_PUBLIC_HOST.
+#   - turn OFF "Escape special characters in labels" (Edit Compose), or the labels' variables
+#     stay literal: no router matches, nothing is served (fails closed, nothing works)
+#   - every variable written ${VAR:?} is required: Coolify blocks the deployment until it is
+#     set. No text after `:?`: Coolify would store that text as the value.
+#   - a router naming a middleware the file configuration lacks is refused (fails closed)
+#   - HORAE_TRAEFIK_NAME (default `horae`) prefixes the router names: unique per Horae on the
+#     server. Two copies with the same name clash, and Traefik drops the clashing routers (fails
+#     closed, nothing served).
+#   - HORAE_TRAEFIK_CERTRESOLVER (optional, empty by default): the proxy's certificate resolver
+#     (`letsencrypt` on a default Coolify proxy) for the `https` mode; when set, every router
+#     gets `tls.certresolver`. Unset, the label falls back to `<name>[-act|-outpost].certresolver`,
+#     which Traefik ignores (an empty `tls.certresolver` would still turn TLS on).
+#
+# Routing (only `/act/` is exempt from SSO), all on HORAE_TRAEFIK_ENTRYPOINT:
+#   - `<name>`: Host(HORAE_PUBLIC_HOST), the whole host, through HORAE_SSO_MIDDLEWARE.
+#   - `<name>-act`: the same host and ONLY the token route's shape,
+#     PathRegexp(^/act/[A-Za-z0-9_-]{98,267}$) (`$$` is Compose's escape for `$`), no
+#     middleware, a higher priority, and no access log (the path carries the token).
+#     `/act/`, `/act/x`, `/act/<token>/x` stay behind SSO.
+#   - `<name>-outpost`: the same host and PathPrefix(/outpost.goauthentik.io/), to the SSO
+#     outpost (HORAE_SSO_OUTPOST_SERVICE), never to Horae: the sign-in callback.
+# Tested against the rendered file: tests/test_deploy_templates.py.
+
+# The image, in ONE place: the default tag is bumped here (docs/operations/container-image.md,
+# "Bumping the deploy templates"). Set HORAE_IMAGE_TAG to override it, `<tag>@sha256:<digest>`
+# to pin the digest too (docs/operations/coolify.md, Updates).
+x-horae-image: &horae-image "ghcr.io/horae-dev/horae:${HORAE_IMAGE_TAG:-sha-aadf1e0}"
+
+services:
+  # One-off: creates the example instance in a new, empty volume (`horae init`), then exits.
+  # An instance already there (horae.yaml present) is left alone; a non-empty volume without
+  # horae.yaml is refused by `horae init` (exit 3) and `horae` does not start.
+  horae-init:
+    image: *horae-image
+    entrypoint: ["sh", "-c"]
+    command: ["test -e /instance/horae.yaml || exec horae init /instance"]
+    # `restart: "no"` also keeps this one-off out of the stack's health (Coolify).
+    restart: "no"
+    user: "10001:10001"
+    read_only: true
+    # Nothing is ever executed from /tmp (the image's HOME and TMPDIR): noexec.
+    tmpfs:
+      - "/tmp:size=64m,noexec,nosuid,nodev"
+    pids_limit: 256
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
+    volumes:
+      - horae-instance:/instance
+
+  horae:
+    # Pinned tag (a `sha-<short>` of main, or a release `X.Y.Z` once there is one).
+    image: *horae-image
+    # The image's command (`horae serve`), user, tini (PID 1) and HEALTHCHECK (/healthz over
+    # loopback) are kept: no `command`, no `init`, no `healthcheck` here.
+    depends_on:
+      horae-init:
+        condition: service_completed_successfully
+    environment:
+      - HORAE_ALLOWED_HOSTS=${HORAE_PUBLIC_HOST:?} # the public host name (the tunnel's): anything else is 400 invalid_host
+      - HORAE_SCHEDULER=${HORAE_SCHEDULER:-external} # external: Coolify Scheduled Tasks run `horae run <pipeline>`
+      - HORAE_ANTHROPIC_API_KEY=${HORAE_ANTHROPIC_API_KEY:?} # read by horae.yaml secrets.refs {env: HORAE_ANTHROPIC_API_KEY}
+      - HORAE_MONITOR_DAILY_BRIEF_URL=${HORAE_MONITOR_DAILY_BRIEF_URL:?} # Uptime Kuma push URL of daily-brief (a secret)
+      - HORAE_MONITOR_REMIND_URL=${HORAE_MONITOR_REMIND_URL:?} # Uptime Kuma push URL of remind (a secret)
+    user: "10001:10001"
+    read_only: true
+    # Nothing is ever executed from /tmp (the image's HOME and TMPDIR): noexec.
+    tmpfs:
+      - "/tmp:size=64m,noexec,nosuid,nodev"
+    pids_limit: 256
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
+    # SIGTERM: in-progress runs are saved and pinged before exit (schemas decision 49 E2).
+    stop_grace_period: 30s
+    volumes:
+      - horae-instance:/instance
+    # No `ports` and no `networks`: the proxy reaches port 8080 on the resource's own network,
+    # which Coolify connects it to, and which no other app joins.
+    # Routers only, no middleware defined here: SSO is the file provider's middleware, named
+    # by HORAE_SSO_MIDDLEWARE (never empty: `:-` also replaces an empty value). Prefer one
+    # for Horae alone with `trustForwardHeader: false` (docs/operations/coolify.md).
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.services.${HORAE_TRAEFIK_NAME:-horae}.loadbalancer.server.port=8080"
+      - "traefik.http.routers.${HORAE_TRAEFIK_NAME:-horae}.rule=Host(`${HORAE_PUBLIC_HOST:?}`)"
+      - "traefik.http.routers.${HORAE_TRAEFIK_NAME:-horae}.entryPoints=${HORAE_TRAEFIK_ENTRYPOINT:-https}"
+      - "traefik.http.routers.${HORAE_TRAEFIK_NAME:-horae}.tls=${HORAE_TRAEFIK_TLS:-true}"
+      - "${HORAE_TRAEFIK_CERTRESOLVER:+traefik.http.routers.}${HORAE_TRAEFIK_NAME:-horae}${HORAE_TRAEFIK_CERTRESOLVER:+.tls}.certresolver=${HORAE_TRAEFIK_CERTRESOLVER:-}"
+      - "traefik.http.routers.${HORAE_TRAEFIK_NAME:-horae}.priority=900"
+      - "traefik.http.routers.${HORAE_TRAEFIK_NAME:-horae}.middlewares=${HORAE_SSO_MIDDLEWARE:-authentik@file}"
+      - "traefik.http.routers.${HORAE_TRAEFIK_NAME:-horae}.service=${HORAE_TRAEFIK_NAME:-horae}"
+      - "traefik.http.routers.${HORAE_TRAEFIK_NAME:-horae}-act.rule=Host(`${HORAE_PUBLIC_HOST:?}`) && PathRegexp(`^/act/[A-Za-z0-9_-]{98,267}$$`)"
+      - "traefik.http.routers.${HORAE_TRAEFIK_NAME:-horae}-act.entryPoints=${HORAE_TRAEFIK_ENTRYPOINT:-https}"
+      - "traefik.http.routers.${HORAE_TRAEFIK_NAME:-horae}-act.tls=${HORAE_TRAEFIK_TLS:-true}"
+      - "${HORAE_TRAEFIK_CERTRESOLVER:+traefik.http.routers.}${HORAE_TRAEFIK_NAME:-horae}-act${HORAE_TRAEFIK_CERTRESOLVER:+.tls}.certresolver=${HORAE_TRAEFIK_CERTRESOLVER:-}"
+      - "traefik.http.routers.${HORAE_TRAEFIK_NAME:-horae}-act.priority=1000"
+      - "traefik.http.routers.${HORAE_TRAEFIK_NAME:-horae}-act.service=${HORAE_TRAEFIK_NAME:-horae}"
+      - "traefik.http.routers.${HORAE_TRAEFIK_NAME:-horae}-act.observability.accessLogs=false"
+      - "traefik.http.routers.${HORAE_TRAEFIK_NAME:-horae}-outpost.rule=Host(`${HORAE_PUBLIC_HOST:?}`) && PathPrefix(`/outpost.goauthentik.io/`)"
+      - "traefik.http.routers.${HORAE_TRAEFIK_NAME:-horae}-outpost.entryPoints=${HORAE_TRAEFIK_ENTRYPOINT:-https}"
+      - "traefik.http.routers.${HORAE_TRAEFIK_NAME:-horae}-outpost.tls=${HORAE_TRAEFIK_TLS:-true}"
+      - "${HORAE_TRAEFIK_CERTRESOLVER:+traefik.http.routers.}${HORAE_TRAEFIK_NAME:-horae}-outpost${HORAE_TRAEFIK_CERTRESOLVER:+.tls}.certresolver=${HORAE_TRAEFIK_CERTRESOLVER:-}"
+      - "traefik.http.routers.${HORAE_TRAEFIK_NAME:-horae}-outpost.priority=1000"
+      - "traefik.http.routers.${HORAE_TRAEFIK_NAME:-horae}-outpost.service=${HORAE_SSO_OUTPOST_SERVICE:-sso@file}"
+
+# The instance volume. Coolify prefixes its name with the resource's UUID.
+volumes:
+  horae-instance:

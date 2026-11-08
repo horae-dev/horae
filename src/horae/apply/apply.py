@@ -49,9 +49,11 @@ run and `horae undo` can still revert what was written.
 
 import asyncio
 import hashlib
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
-from datetime import datetime
+import logging
+from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass, replace
+from datetime import date, datetime
+from typing import Protocol
 
 from horae.apply.notes import NoteIntent, note_after
 from horae.apply.plan import (
@@ -64,6 +66,7 @@ from horae.apply.plan import (
 )
 from horae.apply.sink import (
     MAX_NOTE_BYTES,
+    ActionLink,
     Sink,
     SinkCall,
     SinkError,
@@ -73,12 +76,24 @@ from horae.apply.sink import (
     sink_identity,
     take_violations,
 )
+from horae.contracts.intents import Intent, NotifyAction, NotifyPush, TaskCreate, TaskUpdateStatus
 from horae.contracts.run import AppliedChange, RunRecord, Violation
 from horae.contracts.types import MAX_ITEMS
 from horae.secrets.redact import current as current_redactor
-from horae.store import Store
+from horae.store import Store, StoreError, TaskEntry, UnknownTask
 
 _MAX_ERROR = 4096
+_log = logging.getLogger("horae.apply")
+
+
+class ActMinter(Protocol):
+    """Mints the `/act` links of a notification's buttons (#38, `horae.api.act.ActMinter`).
+
+    `mint` returns a link for each action it can mint, in order, and leaves out the others
+    (an unknown task, no key...); it never raises for one action. The URLs hold credentials:
+    they go to the notifier only, never to the journal, the record or a log."""
+
+    def mint(self, actions: Sequence[NotifyAction], store: Store) -> tuple[ActionLink, ...]: ...
 
 
 @dataclass(frozen=True)
@@ -175,9 +190,15 @@ async def apply_changes(
     *,
     clock: Callable[[], datetime],
     call_timeout_s: float | None = None,
+    minter: ActMinter | None = None,
+    timezone: str = "UTC",
 ) -> ApplyResult:
     """Journal and apply `changeset` (planned from `record`), in intent order; each sink call
     is bounded by `call_timeout_s` (`None`: unbounded).
+
+    A notification's `actions` (#38) are minted by `minter` just before it is sent (none
+    without one). Each applied task change also updates the store's task index (`_index_task`;
+    a snooze date is in `timezone`), which `/act` reads.
 
     Raises `ApplyRefused` for a dry, failed or undone run, a change set of another run, or a
     record that already has changes; `StoreError` (e.g. `RunNotRunning`) from the journal."""
@@ -214,6 +235,7 @@ async def apply_changes(
                 clock,
                 _Out(applied, duplicates, unchanged),
                 call_timeout_s,
+                _Extras(minter, timezone),
             )
         except _Stop as stop:
             failure = stop.failure
@@ -271,6 +293,95 @@ class _Out:
     unchanged: list[int]
 
 
+@dataclass(frozen=True)
+class _Extras:
+    minter: ActMinter | None = None
+    timezone: str = "UTC"
+
+
+def _mint(minter: ActMinter | None, intent: Intent, store: Store) -> tuple[ActionLink, ...]:
+    """The minted buttons of a notification (none when it has no `actions`, there is no
+    minter, or minting fails: the notification is then sent without them)."""
+    if minter is None or not isinstance(intent, NotifyPush) or not intent.actions:
+        return ()
+    try:
+        links = tuple(minter.mint(intent.actions, store))
+    except Exception as exc:
+        _log.warning("act: buttons not minted (%s); sent without them", type(exc).__name__)
+        return ()
+    return links
+
+
+def index_task(
+    store: Store, intent: Intent, *, tool: str, run_id: str, at: datetime, timezone: str
+) -> None:
+    """Update the store's task index after a task change was applied (#38): a `task.create`
+    inserts the task (`todo`), or updates the title, due date, time and source of a known one
+    and keeps its status (a re-proposed task is not reopened); a `task.update_status`
+    changes a known task's status (an unknown one is left out: the index holds the tasks the
+    core created). A store failure is logged (its type) and never fails the apply: the
+    change was applied."""
+    try:
+        if isinstance(intent, TaskCreate):
+            with store.transaction():
+                current = store.get_task(intent.fingerprint)
+                entry = TaskEntry(
+                    fingerprint=intent.fingerprint,
+                    title=intent.title,
+                    status="todo" if current is None else current.status,
+                    due=intent.due,
+                    time=intent.time,
+                    snoozed_until=None if current is None else current.snoozed_until,
+                    snooze_tz=None if current is None else current.snooze_tz,
+                    target=None if current is None else current.target,
+                    source=tool,
+                    run_id=run_id,
+                    recurring=False if current is None else current.recurring,
+                )
+                store.upsert_task(entry, at=at)
+        elif isinstance(intent, TaskUpdateStatus):
+            until = intent.until
+            dated = isinstance(until, date) and not isinstance(until, datetime)
+            store.set_task_status(
+                intent.task,
+                intent.status,
+                until=until,
+                tz=timezone if dated else None,
+                at=at,
+                run_id=run_id,
+            )
+    except UnknownTask:
+        return
+    except (StoreError, ValueError) as exc:
+        _log.warning("task index: not updated (%s)", type(exc).__name__)
+
+
+def _index_applied(
+    store: Store,
+    intent: Intent,
+    result: object,
+    tool: str,
+    run_id: str,
+    at: datetime,
+    timezone: str,
+) -> None:
+    """Keep the task index after an applied task change (`index_task`), unless the sink
+    answered that it changed nothing (`details.changed` is `false`, e.g. a recurring task
+    asked `done`, #38); a task the sink says repeats (`details.recurring`) is flagged."""
+    details = getattr(result, "details", None)
+    details = details if isinstance(details, dict) else {}
+    if details.get("recurring") and isinstance(intent, TaskUpdateStatus):
+        try:
+            store.set_task_recurring(intent.task, True, at=at)
+        except UnknownTask:
+            pass
+        except (StoreError, ValueError) as exc:
+            _log.warning("task index: not updated (%s)", type(exc).__name__)
+    if details.get("changed") is False:
+        return
+    index_task(store, intent, tool=tool, run_id=run_id, at=at, timezone=timezone)
+
+
 def _identity(sink: Sink, index: int, tool: str, known: dict[int, str | None]) -> str | None:
     if id(sink) not in known:
         try:
@@ -302,6 +413,7 @@ async def _apply_all(
     clock: Callable[[], datetime],
     out: _Out,
     timeout_s: float | None,
+    extras: _Extras,
 ) -> None:
     applied, duplicates, unchanged = out.applied, out.duplicates, out.unchanged
     pending: dict[tuple[int, str], bytes] = {}
@@ -329,6 +441,8 @@ async def _apply_all(
             record.input_hash,
             key,
         )
+        if isinstance(item, NotificationItem):
+            call = replace(call, actions=_mint(extras.minter, intent, store))
         before: bytes | None = None
         after: bytes | None = None
         expected: str | None = None
@@ -372,6 +486,8 @@ async def _apply_all(
                 store.record_notification(key, at=clock(), run_id=record.id)
             store.journal_mark_applied(entry.id, actual_after=actual)
         applied.append(AppliedChange(intent=index, target=target))
+        if isinstance(item, TaskItem):
+            _index_applied(store, intent, result, tool, record.id, clock(), extras.timezone)
         if isinstance(item, FileDiff):
             assert after is not None  # noqa: S101 - set for every note
             pending[(id(sink), item.path)] = after

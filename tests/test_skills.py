@@ -599,7 +599,7 @@ def test_directory_skills_from_an_installed_registry(tmp_path: Path) -> None:
     assert skill.version == "1.0.0"
 
 
-# --- the `links` option (#128, schemas decision 54) --------------------------------------------
+# --- the `links` option (#128, schemas decision 55) --------------------------------------------
 
 
 def test_links_option(plugin: Path) -> None:

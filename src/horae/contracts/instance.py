@@ -101,6 +101,23 @@ SecretFileName = Annotated[
 ]
 """A file name inside the secrets directory: one path segment, not starting with `.`."""
 
+CORE_SECRET_NAMES = frozenset({"HORAE_ACT_KEY"})
+"""The secrets the core itself reads (`horae.secrets.CORE_SECRETS`, #38): no `secrets.refs`
+entry and no `deidentification.vocabulary` may name their file or environment variable, so a
+plugin is never handed the core's key through a reference."""
+
+
+def _not_core_secret(value: str) -> str:
+    if value.upper() in CORE_SECRET_NAMES:
+        raise ValueError("names a secret only the core may read")
+    return value
+
+
+PublicEnvVarName = Annotated[EnvVarName, AfterValidator(_not_core_secret)]
+"""An `EnvVarName` that is not a core secret's (`CORE_SECRET_NAMES`, any case)."""
+PublicSecretFileName = Annotated[SecretFileName, AfterValidator(_not_core_secret)]
+"""A `SecretFileName` that is not a core secret's (`CORE_SECRET_NAMES`, any case)."""
+
 # --- backend endpoints -----------------------------------------------------------------------
 
 _OCTET = r"(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])"
@@ -321,13 +338,15 @@ class ModelAlias(Contract):
 class EnvSecretRef(Contract):
     """Read the secret from an environment variable."""
 
-    env: EnvVarName
+    env: PublicEnvVarName
+    """Not a core secret's variable (`HORAE_ACT_KEY`)."""
 
 
 class FileSecretRef(Contract):
     """Read the secret from a file in the secrets directory (Docker or Compose secrets)."""
 
-    file: SecretFileName
+    file: PublicSecretFileName
+    """Not a core secret's file (`HORAE_ACT_KEY`)."""
 
 
 SecretRef = EnvSecretRef | FileSecretRef
@@ -476,6 +495,69 @@ class SchedulerConfig(Contract):
     slot) before it is skipped and recorded instead of run (default 1 hour)."""
 
 
+PUBLIC_URL_PATTERN = rf"^https://{HOST}(:{_PORT})?$"
+"""`http.public_url`: an `https://` origin on a host name (no IP literal), an optional port, no
+path, query, fragment or user info."""
+
+
+def _default_port(value: str) -> str:
+    return value.removesuffix(":443")
+
+
+PublicUrl = Annotated[
+    str,
+    Strict(),
+    StringConstraints(pattern=PUBLIC_URL_PATTERN, max_length=300),
+    AfterValidator(_default_port),
+]
+"""Normalised: the default port `:443` is dropped, as a browser's `Origin` drops it."""
+
+
+MIN_PROXY_PREFIX = {4: 8, 6: 32}
+"""The shortest `trusted_proxies` prefix: /8 for IPv4, /32 for IPv6 (a wider one, `/0` above
+all, would trust any client's `X-Forwarded-For`)."""
+
+
+def _ip_network(value: str) -> str:
+    try:
+        network = ipaddress.ip_network(value, strict=True)
+    except ValueError:
+        raise ValueError("not an IP address or a CIDR network (no host bits set)") from None
+    if network.prefixlen < MIN_PROXY_PREFIX[network.version]:
+        shortest = MIN_PROXY_PREFIX[network.version]
+        raise ValueError(f"a trusted proxy network must be /{shortest} or narrower")
+    return str(network)
+
+
+IpNetwork = Annotated[
+    str,
+    Strict(),
+    StringConstraints(pattern=r"^[0-9a-fA-F:.]{2,45}(/[0-9]{1,3})?$", max_length=49),
+    AfterValidator(_ip_network),
+]
+"""An IP address or a CIDR network, e.g. `172.18.0.0/16` (normalised; host bits must be zero;
+at least /8 for IPv4, /32 for IPv6)."""
+
+MAX_TRUSTED_PROXIES = 16
+
+
+class HttpConfig(Contract):
+    """The public side of the HTTP API (`horae serve`, #37, #38)."""
+
+    public_url: PublicUrl | None = None
+    """The API's public origin behind the reverse proxy, e.g. `https://horae.example.org`: the
+    base of the `/act` links the core mints (never taken from a request's `Host`), and the
+    only `Origin` a `POST /act/...` may carry. Without it the core mints no links and
+    notifications are sent without buttons. Its host must also be an allowed host
+    (`HORAE_ALLOWED_HOSTS`)."""
+    trusted_proxies: Annotated[list[IpNetwork], Field(max_length=MAX_TRUSTED_PROXIES)] = Field(
+        default_factory=list
+    )
+    """The reverse proxies (addresses or networks) whose `X-Forwarded-For` header `/act`'s
+    rate limit trusts: the client is the right-most address of that header that is not one
+    of them. Empty (the default): the header is ignored and the client is the peer address."""
+
+
 class DailyBudget(Contract):
     """A ceiling on what LLM calls may spend in one day (schemas decision 41).
 
@@ -530,7 +612,7 @@ class BudgetsConfig(Contract):
 class DeidentificationConfig(Contract):
     """De-identification before a cloud model (#34, schemas decision 47)."""
 
-    vocabulary: SecretFileName | None = None
+    vocabulary: PublicSecretFileName | None = None
     """A file in `secrets.dir` (never in the instance repository: it holds personal data)
     listing known terms, one `class: term` per line (`person`, `email`, `phone` or `place`;
     `#` starts a comment), replaced by pseudonyms wherever they appear in a string or key
@@ -567,6 +649,8 @@ class InstanceConfig(Contract):
     """The LLM cache's expiry policy (#32)."""
     deidentification: DeidentificationConfig = Field(default_factory=DeidentificationConfig)
     """De-identification of declared fields before a cloud model (#34)."""
+    http: HttpConfig = Field(default_factory=HttpConfig)
+    """The HTTP API's public origin and trusted proxies (`/act` links, #38)."""
 
     def plugin_timeouts(self, plugin: str) -> PluginDefaults:
         """The effective timeouts of `plugin`: its own settings, else `plugin_defaults`."""

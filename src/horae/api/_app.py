@@ -29,9 +29,10 @@ binds to loopback by default.
 - **Headers**: `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`,
   `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`,
   `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY` on every response from the app
-  (uvicorn's own replies to a malformed request, before the app runs, have none); no CORS;
-  the OpenAPI document and the docs pages are disabled; no slash redirect (`/runs/` is
-  `404`, never a redirect).
+  (a response's own value wins: the `/act` pages set their own CSP, and the confirmation
+  page `Referrer-Policy: strict-origin`; uvicorn's own replies to a malformed request,
+  before the app runs, have none); no CORS; the OpenAPI document and the docs pages are
+  disabled; no slash redirect (`/runs/` is `404`, never a redirect).
 - **Host check (DNS rebinding)**: a request whose `Host` is not an allowed host is `400
   invalid_host` before any route runs (the host is never echoed in the response). Allowed:
   `localhost`, `127.0.0.1`, `::1` and the hosts `horae serve` is given (`--allowed-host`,
@@ -52,7 +53,7 @@ import re
 import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -65,6 +66,8 @@ from starlette.responses import Response
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from horae import __version__
+from horae.api.act import _page as act_page
+from horae.api.act._routes import ActSetup, act_response, add_act_routes, is_act_path
 from horae.apply.render import dumps
 from horae.run_view import RunStatusFilter, run_json, stale_flags
 from horae.scheduler import SchedulerState
@@ -301,6 +304,8 @@ class ApiContext:
     state_dir: Path
     scheduler_state: Callable[[], SchedulerState]
     allowed_hosts: frozenset[str] = frozenset()
+    act: ActSetup = field(default_factory=ActSetup)
+    """The `/act` links (#38): disabled (503) by default."""
 
 
 def _store_health(path: Path) -> tuple[dict[str, Any], bool]:
@@ -354,6 +359,10 @@ def create_app(context: ApiContext) -> FastAPI:
 
     @app.exception_handler(HTTPException)
     async def http_error(request: Request, exc: HTTPException) -> Response:
+        if exc.status_code == 404 and is_act_path(request.url.path):
+            # `/act`, `/act/`, `/act/<a>/<b>`, an encoded `/`...: the same page as every
+            # refused token (decision 54 K), never a hint of another route.
+            return act_response(act_page.NOT_VALID)
         # Horae's words for the status, never the exception's detail.
         kind, message = _HTTP_ERRORS.get(exc.status_code, ("http_error", "request refused"))
         response = _error(exc.status_code, kind, message)
@@ -380,6 +389,13 @@ def create_app(context: ApiContext) -> FastAPI:
         message = f"internal error ({type(exc).__name__})"
         del exc
         return _error(500, "internal", message)
+
+    # Only `/act/` is exempt from SSO at the proxy (#41), which routes on Traefik's cleaned path
+    # while this app matches the raw ASGI `path` (no dot-segment removal, no decoding beyond
+    # the server's). So for `/act/` (#38): no `{...:path}` converter route and no mount under
+    # `/act`, so that no `/act/...` request can ever reach a route outside it (for example
+    # `/act/../runs`; tests/test_api.py `test_traversals_out_of_act_are_404`).
+    add_act_routes(app, context.act)
 
     @app.get("/healthz")
     async def healthz() -> Response:

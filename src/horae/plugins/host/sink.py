@@ -12,7 +12,9 @@ only the core calls these, through `PluginHost.call_operation`, which accepts no
 
 - `<ns>.read` (`path`): `{"content": <base64> | null}`;
 - `<ns>.apply` (`tool`, `params`, `intent`, `run_id`, `index`, `input_hash`, `dedupe_key`,
-  `expected_before_sha256`, `content`): `{"target": str, "after_sha256": <hex> | null}`;
+  `expected_before_sha256`, `content`, and for a `notify.push` with minted buttons
+  `actions`: `[{"action": "http", "label", "url", "method": "POST"}]`, the core's signed
+  `/act` links, #38): `{"target": str, "after_sha256": <hex> | null}`;
 - `<ns>.restore` (`path`, `content`: `<base64>` or `null` to remove, `expected_sha256`): `{}`;
 - `<ns>.parent_exists` (`path`): `{"exists": bool}`;
 - `<ns>.identity` (no argument): `{"identity": str}`.
@@ -316,6 +318,10 @@ class McpSink:
             "expected_before_sha256": None,
             "content": None,
         }
+        if call.actions:
+            # The buttons the core minted (#38): only when there are some, so a notifier
+            # built before them is called exactly as before.
+            arguments["actions"] = [link.to_wire() for link in call.actions]
         if not isinstance(intent, NoteIntent):
             data = await self._op("apply", arguments)
             target = data.get("target")

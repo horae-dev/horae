@@ -30,7 +30,7 @@ from typing import Any
 
 from horae.secrets.redact import Redactor
 
-INTENT_TEXT_FIELDS = ("content", "heading", "title", "body")
+INTENT_TEXT_FIELDS = ("content", "heading", "title", "body", "actions")
 """The intent payload fields that are free text."""
 
 

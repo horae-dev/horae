@@ -1088,6 +1088,10 @@ LINKS = [
     "> - [ref]: Notes/Other.md",
     "www.example.org",
     "mailto:someone@example.org",
+    "[^1]: [b]: foo.md",
+    "- [^1]:   [^2]: [b]: foo.md",
+    "a@b.co",
+    "Write to first.last+tag@mail.example.org today",
 ]
 
 
@@ -1099,6 +1103,12 @@ def test_links_none_refuses_every_link(text: str) -> None:
     assert check_intents(note, shown=shown, source=SOURCE, links="none") == (
         f"{SOURCE} proposed note.create #0 with a link, and the skill allows none in `content`"
     )
+
+
+def test_links_none_keeps_plain_footnotes_and_at_signs() -> None:
+    text = "Text[^1] and @mention, 5 @ 3, a@b\n\n[^1]: a footnote [not a link"
+    note = _intents({"type": "note.create", "path": "a.md", "content": text})
+    assert check_intents(note, shown=None, source=SOURCE, links="none") is None
 
 
 def test_links_none_is_for_note_text_only() -> None:

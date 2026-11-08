@@ -10,7 +10,7 @@ a planned run (#22), `horae.apply.undo` reverts one, and `LocalFileSink` (provis
 #24) writes notes to a local vault.
 """
 
-from horae.apply.apply import ApplyFailure, ApplyRefused, ApplyResult, apply_changes
+from horae.apply.apply import ActMinter, ApplyFailure, ApplyRefused, ApplyResult, apply_changes
 from horae.apply.local import LocalFileSink, LocalSink
 from horae.apply.plan import (
     MAX_DIFF_BYTES,
@@ -31,6 +31,7 @@ from horae.apply.render import JSON_SCHEMA_VERSION, render_text, to_dict, to_jso
 from horae.apply.sink import (
     MAX_IDENTITY,
     MAX_NOTE_BYTES,
+    ActionLink,
     Applied,
     FileChange,
     HttpCall,
@@ -62,6 +63,8 @@ __all__ = [
     "MAX_DIFF_BYTES",
     "MAX_IDENTITY",
     "MAX_NOTE_BYTES",
+    "ActMinter",
+    "ActionLink",
     "Applied",
     "ApplyFailure",
     "ApplyRefused",

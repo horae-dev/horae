@@ -1,0 +1,1 @@
+{"type": "notify.push", "body": "x", "actions": [{"label": "a", "kind": "task.done", "task": "t1"}, {"label": "b", "kind": "task.done", "task": "t2"}, {"label": "c", "kind": "task.done", "task": "t3"}, {"label": "d", "kind": "task.done", "task": "t4"}]}

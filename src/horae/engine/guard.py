@@ -55,7 +55,7 @@ cache), after schema validation and before routing:
    wikilink `[[…]]` holding `://` or a refused scheme (internal wikilinks pass); an
    `obsidian:` URI not in the input set; and, in a note intent's `content`, a frontmatter
    block (a first non-blank line of three or more `-`).
-8. **Note structure** (every text field of a `note.*` intent, schemas decision 54). Obsidian,
+8. **Note structure** (every text field of a `note.*` intent, schemas decision 55). Obsidian,
    the Tasks and Dataview plugins and `horae.apply.notes` read a note's **source**, where a
    backslash escape or a character reference keeps them from matching, so these rules run on
    the text as written only (not its decoded views; `horae_sdk.tasks.escape_title` output
@@ -70,9 +70,9 @@ cache), after schema validation and before routing:
    `\\` or `/`, followed by a tag body that is not only ASCII digits: `#128` passes, `#todo`
    does not). Every rule but the checkbox is a substring search anywhere in the text, so
    prefixes, indentation and nesting cannot hide one.
-9. **`links: none`** (a skill option, decision 54): in that skill's `note.*` text, every link
+9. **`links: none`** (a skill option, decision 55): in that skill's `note.*` text, every link
    is refused, whatever the input holds: a URL (6), `](`, `][` and a line's leading
-   `[label]:` (not a footnote), on every view.
+   `[label]:` (also after a `[^note]:` prefix) and a bare email address, on every view.
 
 A refused scheme in prose (`data: three items`, colon then a space) is not a link in Markdown
 and passes. Every check runs on the text as written and on its HTML-entity-decoded forms (up
@@ -114,11 +114,12 @@ TEXT_FIELDS: Mapping[IntentType, tuple[str, ...]] = {
     "note.replace_owned_block": ("content",),
     "task.create": ("title", "fingerprint"),
     "task.update_status": (),
-    "notify.push": ("title", "body"),
+    "notify.push": ("title", "body", "actions"),
     "http.post": ("body",),
 }
 """The untrusted text fields of each intent type that the guard scans (a `notify.push` or
-`task.create` `link` is checked as a whole URL; targets bound by routing are not text)."""
+`task.create` `link` is checked as a whole URL; targets bound by routing are not text). Every
+string of a `notify.push`'s `actions` is scanned: the button labels, ignored by the core (#38)."""
 
 INERT_TAGS = frozenset(
     {"b", "i", "u", "s", "em", "strong", "code", "pre", "br", "hr", "p", "ul", "ol", "li"}
@@ -559,15 +560,29 @@ def note_problem(text: str) -> str | None:
     return None
 
 
+_EMAIL = re.compile(r"[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63})+")
+
+
+def _definition(line: str) -> bool:
+    """A `[label]:` reference definition at the start of `line` (after list and quote prefixes),
+    also behind footnote prefixes (`[^1]: [b]: foo.md`)."""
+    rest = line[_content_start(line) :] if line else line
+    while rest.startswith("[^"):
+        end = rest.find("]:")
+        if end == -1:
+            return False
+        rest = rest[end + 2 :].lstrip()
+    return rest.startswith("[") and "]:" in rest
+
+
 def _any_link(view: str) -> bool:
-    """Any link in `view` (module docstring, 9): a URL, `](`, `][` or a leading `[label]:`."""
+    """Any link in `view` (module docstring, 9): a URL, `](`, `][`, a leading `[label]:` or a
+    bare email address (bounded quantifiers: linear)."""
     if "](" in view or "][" in view or next(urls(view), None) is not None:
         return True
-    for line in view.split("\n"):
-        label = line[_content_start(line) :] if line else line
-        if label.startswith("[") and not label.startswith("[^") and "]:" in label:
-            return True
-    return False
+    if "@" in view and _EMAIL.search(view) is not None:
+        return True
+    return any(_definition(line) for line in view.split("\n"))
 
 
 class _Known:

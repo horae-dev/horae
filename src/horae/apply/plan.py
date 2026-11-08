@@ -248,10 +248,15 @@ def entry_params(record: RunRecord, proposed: ProposedIntent) -> dict[str, Any]:
 
 
 def _identity(record: RunRecord, proposed: ProposedIntent) -> dict[str, Any]:
+    intent = proposed.intent.model_dump(mode="json")
+    if intent.get("type") == "notify.push" and intent.get("actions") is None:
+        # `actions` (#38) is a later optional field: a notification without buttons keeps
+        # the key it had before the field existed, so an upgrade re-sends nothing.
+        del intent["actions"]
     return {
         "applied_by": proposed.applied_by,
         "params": entry_params(record, proposed),
-        "intent": proposed.intent.model_dump(mode="json"),
+        "intent": intent,
     }
 
 

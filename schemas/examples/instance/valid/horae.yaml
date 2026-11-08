@@ -59,3 +59,9 @@ cache: { ttl_s: 86400, max_entries: 500 }
 # De-identification before a cloud model (#34): known names, one `class: term` per line, in a
 # file of `secrets.dir` (personal data: never in the instance repository).
 deidentification: { vocabulary: deid_vocabulary }
+# The HTTP API behind the reverse proxy (#38): the base of the `/act` links in notification
+# buttons, and the proxies whose X-Forwarded-For the `/act` rate limit trusts (here the
+# Docker network shared by Traefik and cloudflared).
+http:
+  public_url: https://horae.example.org
+  trusted_proxies: [172.18.0.0/16]

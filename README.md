@@ -93,6 +93,36 @@ when it listens on `0.0.0.0` or `::` without one, and logs each refused `Host` o
 container, change the port with `HORAE_PORT` rather than `--port` (the image's health check
 follows `HORAE_PORT`).
 
+**Action links** ([decision 54](schemas/README.md)). A `notify.push` may carry up to three
+buttons (`actions: [{kind: task.done | task.snooze, task, duration: 1h | 3h | tomorrow}]`,
+for open tasks the run collected; a proposed `label` is ignored: the core labels the buttons
+`Done`, `Snooze 1h`, `Snooze 3h`, `Tomorrow`, and a recurring task gets no `Done`); when it
+is sent, the core mints for each a signed, single-use link `<http.public_url>/act/<token>`,
+valid 24 hours and bound to the task's current status, due date and snooze, and passes it to
+the notifier (ntfy renders it as an `http` button: one tap marks the task done or snoozes
+it). `GET /act/<token>` (a browser, a
+link preview) only shows a confirmation page; `POST` applies the change once, through the
+instance's `mode: tasks` sink, as a run of the reserved pipeline `_act`. To turn it on:
+
+- set the key, at least 32 bytes, in `<secrets.dir>/HORAE_ACT_KEY` (the environment variable
+  `HORAE_ACT_KEY` works too, but `horae doctor` warns: a plugin running as the same user can
+  read the core's environment): `openssl rand -base64 48`. Rotating it (a new value, then a restart)
+  invalidates every outstanding link. A shorter key stops `horae serve` from starting;
+- set `http.public_url` in `horae.yaml` (`https://horae.example.org`, no path) and add its
+  host to `HORAE_ALLOWED_HOSTS`;
+- have exactly one `act` entry with `mode: tasks` across the pipelines.
+
+Without the key `/act` answers 503 and notifications are sent without buttons. `/act/` is the
+only path the reverse proxy exempts from SSO (the #41 templates match the link's exact
+shape and turn Traefik's access log off for it). Requests are rate limited (10 a minute per
+client, an IPv6 client by its /64; 60 a minute overall for links whose signature verifies).
+In the reference deployment (Cloudflare tunnel, then Traefik) no entry point may trust
+forwarded headers ([operations/coolify.md](docs/operations/coolify.md#forwarded-headers)), so
+Traefik replaces `X-Forwarded-For` with cloudflared's address and every phone shares one
+bucket (still limited); `http.trusted_proxies` only helps behind a proxy chain that passes the
+client's address on safely.
+`http.trusted_proxies` takes networks of /8 (IPv4) or /32 (IPv6) at the widest.
+
 An instance is **not relocatable** in v1: `horae.lock` holds the vault's absolute path and
 `plugins/` the absolute path of the interpreter that installed them. After copying or moving
 one, `horae doctor` reports the paths that no longer match (a lock path that does not exist,
@@ -111,6 +141,31 @@ the lock, or run `horae init` in the new place.
 | 5 | locked: the pipeline is running, or another process is applying changes |
 | 70 | internal error (only its type is printed) |
 | 130 / 143 | `horae run` interrupted by SIGINT / SIGTERM |
+
+## Deployment
+
+The container image is `ghcr.io/horae-dev/horae`
+([docs/operations/container-image.md](docs/operations/container-image.md): tags, signatures,
+the runtime contract). Two ready deployments (#41), both on a named volume for `/instance`, with
+a read-only root filesystem and a one-off `horae init` on a new volume:
+
+- **Coolify** (the reference deployment, PLAN §7):
+  [`deploy/coolify/docker-compose.yaml`](deploy/coolify/docker-compose.yaml), a *Docker Compose
+  Empty* service with its own Traefik routers (on `https` by default, or behind a Cloudflare
+  Tunnel as an opt-in), an authentik forwardAuth middleware of Traefik's file configuration and
+  the resource's own network (shared only with Coolify's proxy); only `/act/` is exempt from SSO. Required variables block
+  the deployment until they are set; Scheduled Tasks run `horae run daily-brief` and `horae run
+  remind`, each with an Uptime Kuma push monitor. Guide (prerequisites, the tunnel's public host
+  name, what to verify on the server): [docs/operations/coolify.md](docs/operations/coolify.md).
+- **Plain Docker Compose**: [`deploy/compose/`](deploy/compose/), on `127.0.0.1` only, with an
+  optional Traefik and SSO override; built-in scheduler or host cron. Guide:
+  [docs/operations/compose.md](docs/operations/compose.md).
+
+Both pull `ghcr.io/horae-dev/horae` without credentials, which needs the GHCR package to be
+public: check first (the guides give the one-line check and the registry login otherwise).
+
+`tests/test_deploy_templates.py` checks the rendered files (routing, hardening, required
+variables).
 
 ## Examples
 
@@ -132,7 +187,7 @@ Setup, commands, conventions and the definition of done are in [AGENTS.md](AGENT
 
 ## CI
 
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every PR and push to `main`: lockfile check, ruff, mypy, pytest with coverage, gitleaks (history of the checked-out ref) and CodeQL (python, actions). The aggregate job **CI OK** (`ci-ok`) fails if any other job failed, was cancelled or skipped; mark it as the single required status check in branch protection.
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every PR and push to `main`: lockfile check, ruff, mypy, pytest with coverage, gitleaks (history of the checked-out ref), CodeQL (python, actions), the image build and smoke test, and `docker compose config` on the deploy templates (`deploy`). The aggregate job **CI OK** (`ci-ok`) fails if any other job failed, was cancelled or skipped; mark it as the single required status check in branch protection.
 
 - Python comes from `.python-version`, installed by uv itself (`UV_PYTHON_PREFERENCE=only-managed`, cached via setup-uv `cache-python`). uv is pinned to an exact version in the workflow (`UV_VERSION`) and `[tool.uv] required-version` in `pyproject.toml` sets the minimum for local use. `UV_LOCKED=1` makes every `uv` command fail if `uv.lock` is out of date.
 - The coverage gate is `fail_under` in `[tool.coverage.report]` of `pyproject.toml` (85); change it there.

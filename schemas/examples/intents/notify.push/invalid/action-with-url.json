@@ -1,0 +1,1 @@
+{"type": "notify.push", "body": "x", "actions": [{"label": "Open", "kind": "task.done", "task": "t1", "url": "https://evil.example.org/act/x"}]}

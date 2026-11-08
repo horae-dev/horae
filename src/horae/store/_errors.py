@@ -90,6 +90,13 @@ class UnknownTask(StoreError):
         self.fingerprint = fingerprint
 
 
+class ActTokenUsed(StoreError):
+    """An `/act` token's nonce is already consumed (#38): the token was used."""
+
+    def __init__(self) -> None:
+        super().__init__("the action link was already used")
+
+
 class UnknownJournalEntry(StoreError):
     """No journal entry with this id."""
 

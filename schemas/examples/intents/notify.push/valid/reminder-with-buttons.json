@@ -1,0 +1,1 @@
+{"type": "notify.push", "title": "Due today", "body": "Renew the passport", "actions": [{"label": "Done", "kind": "task.done", "task": "github:issue:123"}, {"label": "Snooze 1h", "kind": "task.snooze", "task": "github:issue:123", "duration": "1h"}, {"label": "Tomorrow", "kind": "task.snooze", "task": "github:issue:123", "duration": "tomorrow"}]}
