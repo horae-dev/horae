@@ -24,7 +24,14 @@ from horae.contracts.instance import (
 from horae.contracts.lockfile import Lockfile
 from horae.contracts.pipeline import LlmStep, Pipeline
 from horae.engine.canonical import sha256_hex
-from horae.secrets import CORE_SECRETS, Secret, SecretError, SecretResolver, redact
+from horae.secrets import (
+    CORE_SECRETS,
+    Secret,
+    SecretError,
+    SecretMissing,
+    SecretResolver,
+    redact,
+)
 
 CONFIG_FILE = "horae.yaml"
 LOCK_FILE = "horae.lock"
@@ -364,8 +371,13 @@ def _unresolved_optional(state: _Loaded, resolver: SecretResolver) -> list[Probl
                 resolver.resolve(name)
             except SecretError as exc:
                 loc = ("plugins", plugin, "permissions", "optional_secrets", index)
+                # not set: expected (`info`); set but unusable (too short, bad bytes,
+                # unreadable): the operator meant to give it, so `warning`. Never the value.
+                unset = isinstance(exc, SecretMissing)
                 message = f"optional {exc}; plugin {plugin} runs without it"
-                found.append(state.lock_doc.problem(loc, message, severity="info"))
+                found.append(
+                    state.lock_doc.problem(loc, message, severity="info" if unset else "warning")
+                )
     return found
 
 

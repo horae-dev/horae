@@ -198,6 +198,20 @@ def test_an_optional_secret_that_does_not_resolve_is_absent_and_the_plugin_start
     assert set(env) == BASE_KEYS | {"PROBE_TOKEN"} | _PLATFORM_ADDED
 
 
+def test_a_too_short_optional_secret_is_not_injected(tmp_path: Path) -> None:
+    resolver = SecretResolver(
+        {}, secrets_dir(tmp_path, PROBE_TOKEN=PROBE_TOKEN, PROBE_OPTIONAL="abc")
+    )
+
+    async def scenario() -> Any:
+        async with host(tmp_path, _optional_manifest(), resolver=resolver) as h:
+            return await _call(h, "probe.env")
+
+    env = _run(scenario()).data["env"]
+    assert "PROBE_OPTIONAL" not in env
+    assert "abc" not in str(env.values())
+
+
 def test_a_required_secret_still_fails_when_only_the_optional_one_resolves(
     tmp_path: Path,
 ) -> None:

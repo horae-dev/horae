@@ -391,3 +391,15 @@ def test_a_missing_required_secret_is_still_an_error_beside_an_optional_info(
     assert code == 1
     assert out.strip().splitlines()[-1] == "2 problems found"
     assert ": info: optional secret" in out
+
+
+def test_an_unusable_optional_secret_is_a_warning_and_never_shows_its_value(
+    with_secrets: Path,
+) -> None:
+    (with_secrets / "secrets" / "GITHUB_ENTERPRISE_TOKEN").write_text("short", encoding="utf-8")
+    _grant_optional(with_secrets, "GITHUB_ENTERPRISE_TOKEN")
+    code, out = _doctor("-i", str(with_secrets))
+    assert code == 0
+    assert ": warning: optional secret GITHUB_ENTERPRISE_TOKEN" in out
+    assert "too short" in out
+    assert "short\n" not in out.replace("too short", "")
