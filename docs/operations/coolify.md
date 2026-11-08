@@ -34,28 +34,34 @@ opt-in tunnel mode; its default is Traefik's `https` entry point):
 
 Only `horae` is in this template; the others are separate resources.
 
-## The layout: hand-written routers, file-provider SSO, a dedicated proxy network
+## The layout: hand-written routers, file-provider SSO, the resource's own network
 
 ```text
 default:  browser ──https──▶ Traefik, entry point `https` (:443, TLS)
 tunnel:   browser ──https──▶ Cloudflare (TLS ends) ──tunnel──▶ cloudflared ──http──▶ Traefik `http` (:80)
 
-  Traefik ──(HORAE_TRAEFIK_NETWORK: Horae and the proxy only)──▶
+  Traefik ──(the resource's own network: the proxy and this resource only)──▶
      ├─ <name>          Host(h)                                           → SSO middleware → Horae :8080
      ├─ <name>-act      Host(h) && PathPrefix(/act/)                      → Horae :8080 (no SSO)
      └─ <name>-outpost  Host(h) && PathPrefix(/outpost.goauthentik.io/)   → sso@file (authentik)
 ```
 
 - **Coolify generates no router for Horae.** The service has **no domain**: the routers are the
-  template's own labels (`traefik.enable=true`, `traefik.docker.network`, three routers and one
-  service), the way the other apps of the reference server are deployed.
+  template's own labels (`traefik.enable=true`, three routers and one service), the way the
+  other apps of the reference server are deployed (but not on their shared network:
+  [The network](#the-network)).
 - **Two transport modes.**
   - **Default, secure:** the routers are on Traefik's `https` entry point with `tls=true`
     (`HORAE_TRAEFIK_ENTRYPOINT=https`, `HORAE_TRAEFIK_TLS=true`). The certificate for
     `HORAE_PUBLIC_HOST` must come from the proxy: Coolify obtains certificates only for the
-    domains it manages, and this service has none. Provide it with an entry-point-level
-    certificate resolver, a certificate in the file configuration, or a Cloudflare origin
-    certificate (with Cloudflare proxying in *Full (strict)* mode).
+    domains it manages, and this service has none. The common case on Coolify: the proxy has a
+    `letsencrypt` certificate resolver (Coolify's default proxy configuration); set
+    `HORAE_TRAEFIK_CERTRESOLVER=letsencrypt` and every router of the template asks it for the
+    certificate (`tls.certresolver`; DNS for the host must point at the server and port 80 or
+    443 be reachable for the challenge, depending on the resolver). Otherwise: an
+    entry-point-level resolver, a certificate in the file configuration, or a Cloudflare
+    origin certificate (with Cloudflare proxying in *Full (strict)* mode).
+    `HORAE_TRAEFIK_CERTRESOLVER` stays empty in the tunnel mode.
   - **Tunnel, opt-in (the reference server):** a Cloudflare Tunnel delivers the traffic, TLS
     ends at Cloudflare, and `cloudflared` reaches Traefik over plain HTTP. Set
     `HORAE_TRAEFIK_ENTRYPOINT=http` and `HORAE_TRAEFIK_TLS=false`, **only while port 80 is not
@@ -118,66 +124,64 @@ tunnel:   browser ──https──▶ Cloudflare (TLS ends) ──tunnel──�
   Root filesystem read-only, a tmpfs on `/tmp`, every capability dropped, `no-new-privileges`,
   `stop_grace_period: 30s` (runs in progress are saved and their monitors pinged on SIGTERM;
   [decision 49](../../schemas/README.md#decisions) E2 asks for at least 20 s).
-- **No published port.** `horae` joins its resource's own network and the external network
-  Traefik reaches it on (`HORAE_TRAEFIK_NETWORK`, **required, no default**, also named in
-  `traefik.docker.network`), which must be shared only by Horae and the proxy; `horae-init`
-  joins only the resource's network.
+- **No published port, no network of its own.** Both services stay on the resource's own
+  network, which Coolify creates and connects the proxy to ([The network](#the-network)); no
+  `traefik.docker.network` label.
 - **Coolify writes every variable of the resource into one `.env` and injects it into every
   service** (`env_file: .env` on each, `serviceParser`), whatever the template's
   `environment:` lists. So `horae-init` receives the secrets too (the API key, the push URLs).
   It is the same image and user, runs only `horae init` on an empty volume and exits, so this
   does not widen what a compromise of Horae could read; but do not add services to this
   resource that should not see Horae's secrets.
-- `HORAE_ALLOWED_HOSTS` is `HORAE_PUBLIC_HOST`, the public host name users reach (required; one
-  name, the routers match it): any other `Host` gets `400 invalid_host`.
+- `HORAE_ALLOWED_HOSTS` is `HORAE_PUBLIC_HOST`, the public host name users reach (required).
+  **One host only**: the routers' `Host()` takes one name, so a second name (an alias, a
+  `www.`) is not served by these routers, and Horae answers it `400 invalid_host` if it reaches
+  Horae another way. Write a bare DNS name: no scheme, port, path, or a second name. A value
+  with a port makes `horae serve` refuse to start (a usage error) and the router match
+  nothing; two names make the router's rule invalid: either way nothing is served (fails
+  closed). At request time, any `Host` other than that name (another
+  name, a malformed or repeated header) gets `400 invalid_host` (fails closed). Upper case and
+  a port in the request's `Host` are **not** refused: Traefik's `Host()` matcher and Horae
+  both compare the name case-insensitively, without the port, so `HORAE.example.org:443` is
+  served as `horae.example.org`.
 - `HORAE_SCHEDULER=external` by default: Coolify's Scheduled Tasks run the pipelines.
 
-### The proxy network
+### The network
 
 Any container on a network with Horae can call port 8080 directly, **without SSO**, and send any
 `Host` (the API trusts its network: [decision 51](../../schemas/README.md#decisions) B; the
-Host check stops browsers, not neighbours). So `HORAE_TRAEFIK_NETWORK` is **required and has no
-default**: it must name a network that **only Horae and the Traefik proxy** join.
+Host check stops browsers, not neighbours). So Horae must be on no network that another app
+joins.
+
+**Horae stays on its resource's own network, and nothing else.** Coolify creates one network
+per resource (named after the resource's UUID) and **connects its proxy, `coolify-proxy`, to
+every resource's network** (read on the reference server: the proxy is attached to each
+resource's UUID network, plus `coolify`, `traefik-network` and the tunnel's network). So
+Horae's resource network already holds exactly the proxy and Horae's own containers (`horae`,
+and `horae-init` while it runs): Traefik reaches port 8080 there, and no other app does. The
+template therefore declares no network and no `traefik.docker.network`: Traefik uses the only
+network it shares with the container. If a provider-level default network is set
+(`--providers.docker.network`) and Horae is not on it, Traefik logs a warning and still uses
+the container's network.
+
+This is simpler than a hand-made network: no `docker network create`, no edit of the proxy's
+compose file (`/data/coolify/proxy/docker-compose.yml`, service `traefik`), nothing lost when
+Coolify recreates the proxy, and no variable to get wrong. Coolify maintains the connection,
+as it does for every resource with a domain.
 
 **Not a shared proxy network.** A server-wide `traefik-network` that every label-routed app
 joins (as on the reference server: authentik, ntfy, Uptime Kuma, media and download
-containers, ...) is **not acceptable for Horae**. Every one of those containers could read
-`/runs` and `/healthz` without signing in. A compromise of the least trusted app on the server
-(a torrent client, a media server parsing untrusted files) would reach Horae's API, with the
-SSO never consulted. The other apps may stay on that network; Horae does not join it.
+containers, ...) is **not acceptable for Horae**: every one of those containers could read
+`/runs` and `/healthz` without signing in, so a compromise of the least trusted app on the
+server (a torrent client, a media server parsing untrusted files) would reach Horae's API with
+the SSO never consulted. The other apps may stay on that network; **Horae does not join it**
+(no `networks:` entry, no `traefik.docker.network=traefik-network`).
 
-Create the dedicated network and let the proxy join it **through Coolify's proxy
-configuration**, so that it is still joined after the proxy restarts. A bare `docker network
-connect` is lost when Coolify recreates `coolify-proxy`.
-
-1. On the server: `docker network create horae-proxy`.
-2. In Coolify: *Servers → <server> → Proxy → Configuration*: the proxy's own compose file,
-   stored as `/data/coolify/proxy/docker-compose.yml` (Coolify docs, *Traefik overview*, "custom
-   proxy configuration"; Coolify source, `bootstrap/helpers/proxy.php`). Add the network to the
-   `coolify-proxy` service and declare it external:
-
-   ```yaml
-   services:
-     traefik:            # the proxy service as Coolify names it in that file
-       networks:
-         - coolify         # keep the networks that are already listed
-         - horae-proxy
-   networks:
-     coolify:
-       external: true
-     horae-proxy:
-       external: true
-   ```
-
-   Save and **restart the proxy** (a short interruption for every app on the server).
-3. Set `HORAE_TRAEFIK_NETWORK=horae-proxy` on the resource and deploy.
-4. Check: `docker network inspect horae-proxy --format '{{range .Containers}}{{.Name}} {{end}}'`
-   lists the proxy and the `horae` container only, after a proxy restart too.
-
-Keep **"Connect to predefined network"** off for this resource: it would also put Horae on
-the shared `coolify` network, next to every other resource. These network settings fail
-**open** for neighbours (everything keeps working, and the neighbours reach port 8080 without
-SSO): check them after every change.
+Keep **"Connect to predefined network"** off for this resource: it would also put Horae on the
+shared `coolify` network, next to every other resource (and, with two networks, Traefik could
+pick either one). These network settings fail **open** for neighbours (everything keeps
+working, and the neighbours reach port 8080 without SSO): check them after every change
+([Verify on the server](#verify-on-the-server)).
 
 ### Routing: only `/act/` is exempt from SSO
 
@@ -206,19 +210,23 @@ SSO): check them after every change.
 If something is misconfigured, the template **fails closed**: with label escaping on (below),
 the labels' variables stay literal (`Host(${HORAE_PUBLIC_HOST})` never matches, the entry point
 `${...}` does not exist): nothing is served. A middleware name the file provider does not
-define makes Traefik refuse the main router. The exceptions are the network settings (above)
-and a domain set on the service: they fail **open**.
+define makes Traefik refuse the main router. The exceptions are the network settings
+([The network](#the-network)) and a domain set on the service: they fail **open**.
 
 ### Forwarded headers
 
 **Requirement:** no entry point that carries Horae's routers trusts forwarded headers. Neither
 `http` nor `https` may set `forwardedHeaders.trustedIPs` or `forwardedHeaders.insecure` in
-Traefik's static configuration. Then Traefik **removes** every `X-Forwarded-*` header a peer
-sends (`cloudflared` in the tunnel mode, the client otherwise) and sets its own from the request
-it actually received, before any middleware runs. The reference server meets it.
+Traefik's static configuration. Traefik's documented behaviour for an untrusted peer is then to
+drop the `X-Forwarded-*` headers the peer sends (`cloudflared` in the tunnel mode, the client
+otherwise) and set its own from the request it actually received, before any middleware runs.
+Do not rely on that description alone: the spoofed `X-Forwarded-Uri` check of
+[Verify on the server](#verify-on-the-server) is **mandatory**. The reference server meets the
+requirement: the proxy's command line (`coolify-proxy`) sets no `forwardedHeaders` option, nor
+`encodedCharacters` or `sanitizePath`, so Traefik 3.7's defaults apply.
 
 - **Preferred: a Horae-only middleware with `trustForwardHeader: false`**
-  ([the YAML above](#the-layout-hand-written-routers-file-provider-sso-a-dedicated-proxy-network)).
+  ([the YAML above](#the-layout-hand-written-routers-file-provider-sso-the-resources-own-network)).
   authentik is then told the method, host and URI Traefik received, whatever the entry points
   trust. Our guidance for a forwardAuth the templates define by label is the same: the
   [alternative](#alternative-a-coolify-domain-and-a-label-defined-forwardauth) and
@@ -233,8 +241,27 @@ it actually received, before any middleware runs. The reference server meets it.
   app's host), and authentik would decide on that path instead. An unauthenticated-path rule,
   or another app's policy, would then let the request through to Horae.
 
-Check it on the server ([Verify on the server](#verify-on-the-server)) after every change to
-Traefik's static configuration.
+**Tunnel mode: the scheme authentik sees (to verify).** Behind the tunnel, Traefik receives
+plain `http` from `cloudflared`. A Horae-only middleware with `trustForwardHeader: false` tells
+authentik `X-Forwarded-Proto: http`, the scheme Traefik received, and authentik may then build
+its sign-in redirect (the `rd` back to Horae) as `http://...`, or reject a URL that does not
+match the provider's `https://` external host: sign-in loops or lands on `http://` (Cloudflare's
+*Always Use HTTPS* then redirects it, if on). In the tunnel mode, either:
+
+- keep the shared `authentik@file` with `trustForwardHeader: true`, **only** under the
+  requirement above (no `trustedIPs`, no `insecure`: verified on the reference server, whose
+  proxy sets no `forwardedHeaders` option), the setup the reference server's other apps sign
+  in with today; or
+- use the Horae-only middleware and make authentik build its URLs from the provider's
+  **external host** (`https://<public host>`, set in the Proxy Provider), not from the
+  forwarded scheme.
+
+Which of the two the reference server needs is **to verify** at the first deployment: sign in
+through the tunnel and check that the browser ends on `https://<public host>/...`. In the
+default `https` mode Traefik received TLS itself and the question does not arise.
+
+Check the requirement on the server ([Verify on the server](#verify-on-the-server)) after every
+change to Traefik's static configuration.
 
 ### Several Horae on one server
 
@@ -249,11 +276,11 @@ router that two containers define differently, so neither host is served (fails 
 When you want Coolify to issue the certificate (Traefik is the edge, no tunnel), the earlier
 variant of this template still works and is not shipped as a file: give the `horae` service a domain
 (`SERVICE_URL_HORAE_8080` in its environment, `HORAE_ALLOWED_HOSTS=${SERVICE_FQDN_HORAE}`),
-remove the `networks:` and the three routers above, and add a forwardAuth middleware by label
+remove the three routers above, and add a forwardAuth middleware by label
 (`traefik.http.middlewares.<name>-sso.forwardauth.address=...`,
 `...trustForwardHeader=false`), which Coolify adds to every router it generates for the domain,
 plus one `<name>-act` router (`Host(${SERVICE_FQDN_HORAE}) && PathPrefix(/act/)`, entry point
-`https`, `tls=true`, priority 1000). Horae then relies on the resource's own network, which
+`https`, `tls=true`, priority 1000). The network is the same: the resource's own, which
 Coolify connects to the proxy. The routing tests cover the shipped template only; [compose.md](compose.md)'s `traefik.yaml` is the tested label-defined forwardAuth.
 
 ## Install
@@ -265,15 +292,14 @@ Coolify connects to the proxy. The routing tests cover the shipped template only
    docs, *Traefik* forward auth). Domain-level mode works too.
 2. **The SSO middleware and outpost service** in Traefik's dynamic file configuration
    (`/data/coolify/proxy/dynamic/`, the YAML
-   [above](#the-layout-hand-written-routers-file-provider-sso-a-dedicated-proxy-network)):
+   [above](#the-layout-hand-written-routers-file-provider-sso-the-resources-own-network)):
    preferably `horae-authentik` with `trustForwardHeader: false`. The address is authentik's
    container on a network Traefik shares with it.
-3. **The dedicated proxy network** (required): `horae-proxy`, joined by the proxy through its
-   configuration in Coolify ([The proxy network](#the-proxy-network)).
-4. **Transport**, one of:
+3. **Transport**, one of:
    - **Default, `https`:** a certificate for the public host served by Traefik's `https` entry
-     point (an entry-point certificate resolver, a file-provided certificate, or a Cloudflare
-     origin certificate), and DNS for the host pointing at the server.
+     point (`HORAE_TRAEFIK_CERTRESOLVER=letsencrypt` with Coolify's default resolver, an
+     entry-point certificate resolver, a file-provided certificate, or a Cloudflare origin
+     certificate), and DNS for the host pointing at the server.
    - **Tunnel (opt-in):** in Cloudflare Zero Trust, *Networks → Tunnels → your tunnel → Public
      Hostname → Add*: the subdomain and domain of `HORAE_PUBLIC_HOST` (`horae.example.org`),
      *Service* **`HTTP`** and **URL `coolify-proxy:80`**. That is Traefik's `http` entry point,
@@ -299,7 +325,6 @@ Coolify connects to the proxy. The routing tests cover the shipped template only
    | Variable | Value |
    |---|---|
    | `HORAE_PUBLIC_HOST` | the public host name, e.g. `horae.example.org` (one name; it is also `HORAE_ALLOWED_HOSTS`) |
-   | `HORAE_TRAEFIK_NETWORK` | the network shared **only** by Horae and the proxy, e.g. `horae-proxy`; never a network other apps share |
    | `HORAE_ANTHROPIC_API_KEY` | the Anthropic API key (secret) |
    | `HORAE_MONITOR_DAILY_BRIEF_URL` | the Uptime Kuma push URL of `daily-brief` (secret) |
    | `HORAE_MONITOR_REMIND_URL` | the Uptime Kuma push URL of `remind` (secret) |
@@ -310,9 +335,19 @@ Coolify connects to the proxy. The routing tests cover the shipped template only
    |---|---|---|---|
    | `HORAE_TRAEFIK_ENTRYPOINT` | `https` | `http` | the entry point the routers are on |
    | `HORAE_TRAEFIK_TLS` | `true` | `false` | Cloudflare terminates TLS in the tunnel mode |
+   | `HORAE_TRAEFIK_CERTRESOLVER` | empty | empty | `https` mode: the proxy's certificate resolver (`letsencrypt` on Coolify's default proxy); set, every router gets `tls.certresolver` |
    | `HORAE_SSO_MIDDLEWARE` | `authentik@file` | | prefer `horae-authentik@file` (`trustForwardHeader: false`); empty means the default |
    | `HORAE_SSO_OUTPOST_SERVICE` | `sso@file` | | the authentik outpost service |
    | `HORAE_TRAEFIK_NAME` | `horae` | | prefix of the router and service names; unique per Horae on the server |
+
+   An optional variable set to an empty value is the same as unset: `HORAE_TRAEFIK_ENTRYPOINT`,
+   `HORAE_TRAEFIK_TLS`, `HORAE_TRAEFIK_NAME`, `HORAE_SSO_MIDDLEWARE` and
+   `HORAE_SSO_OUTPOST_SERVICE` fall back to their defaults (`:-`), and an empty
+   `HORAE_TRAEFIK_CERTRESOLVER` adds no `tls.certresolver` (the line then renders as a
+   `<name>.certresolver` label that Traefik ignores; an empty `tls.certresolver` would turn TLS
+   on and break the tunnel mode). The template writes that line with Compose's `${VAR:+...}`:
+   that Coolify hands it to Compose unchanged (with label escaping off) is **to verify**; if
+   it does not, delete the three `certresolver` lines.
    | `HORAE_SCHEDULER` | `external` | | or `builtin` |
    | `HORAE_IMAGE_TAG` | the template's | | see [Updates](#updates) |
 
@@ -332,22 +367,35 @@ the tunnel or the resource):
 - `https://horae.example.org/healthz` redirects to authentik's sign-in, then answers
   `{"status": "ok", ...}` and returns to an `https://` URL (not `http://`).
 - `https://horae.example.org/act/x` answers **without** sign-in (a `404` until #38 ships `/act/`).
-- `https://horae.example.org/act/../runs` (send it with `curl --path-as-is`) asks for sign-in.
-- A request for `/runs` with `-H 'X-Forwarded-Uri: /act/x'` still asks for sign-in.
+- Traversals out of `/act/` ask for sign-in, each sent with `curl --path-as-is` (without
+  following redirects, `-o /dev/null -w '%{http_code} %{redirect_url}\n'`): `/act/../runs`,
+  `/act/%2e%2e/runs`, `/act/..%2Fruns` and `//act/../runs`, on `https://horae.example.org`.
+  Each must answer the redirect to authentik, never Horae's `/runs` body.
+- **Mandatory:** a request for `/runs` with `-H 'X-Forwarded-Uri: /act/x'` (and one with
+  `-H 'X-Forwarded-Host: <another app's host>'`) still asks for sign-in, through the public
+  path (the tunnel in the tunnel mode).
+- **No other router above priority 1000 matches the host:** in Traefik's dashboard or API
+  (`/api/http/routers`), no router other than `<name>-act` and `<name>-outpost` has a priority
+  of 1000 or more and a rule that matches `HORAE_PUBLIC_HOST` (a catch-all `HostRegexp`, a
+  `PathPrefix` without `Host`, another app's router for a wildcard). Such a router would win
+  over Horae's and decide what the host serves.
 - **Forwarded headers:** Traefik's static configuration has no `forwardedHeaders.trustedIPs`
   and no `forwardedHeaders.insecure` on any entry point carrying Horae's routers (the
   `traefik` command or `traefik.yaml` in the proxy configuration), and `sanitizePath` is not
   set to `false`. Better, `HORAE_SSO_MIDDLEWARE` names a Horae-only middleware with
   `trustForwardHeader: false` ([Forwarded headers](#forwarded-headers)).
-- **The network:** `docker network inspect <HORAE_TRAEFIK_NETWORK>` lists only the proxy and
-  `horae`, also after restarting the proxy. From any other container (a neighbour on
-  `traefik-network`, say), `curl -m 5 http://<horae container>:8080/healthz` must fail.
+- **The network:** `docker inspect` of the `horae` container lists **one** network, the
+  resource's (named after its UUID); not `coolify`, not `traefik-network`.
+  `docker network inspect <that network> --format '{{range .Containers}}{{.Name}} {{end}}'`
+  lists only `coolify-proxy` and this resource's containers. From any other container (a
+  neighbour on `traefik-network`, say), `curl -m 5 http://<horae container>:8080/healthz` must
+  fail. If the container has more than one network, Traefik may pick the wrong one (a `502`,
+  fails closed) and a neighbour may share it: fix the network, do not add a label.
 - **Tunnel mode only:** from outside the server, `curl -m 5 http://<server public address>/`
   times out (port 80 is closed to the Internet), and `http://horae.example.org/` is redirected
   to `https://` by Cloudflare.
 - `docker inspect` of the `horae` container: the labels above, `traefik.enable=true`, **no**
-  `http-0-...` / `https-0-...` routers (no Coolify domain), the networks (the resource's and
-  `HORAE_TRAEFIK_NETWORK`; not `coolify`, not a shared `traefik-network`).
+  `http-0-...` / `https-0-...` routers (no Coolify domain), no `traefik.docker.network`.
 - Traefik's dashboard or API: the three routers `<name>@docker`, `<name>-act@docker`,
   `<name>-outpost@docker` on the chosen entry point, with no error; `<name>` uses the SSO
   middleware.
@@ -495,13 +543,14 @@ a copy with the container stopped; never a plain file copy while it runs).
 
 | Symptom | Cause |
 |---|---|
-| Deploy button blocked, variables highlighted | a required variable is empty: set it (`HORAE_TRAEFIK_NETWORK` included) |
+| Deploy button blocked, variables highlighted | a required variable is empty: set it |
 | Every request: `400 {"kind": "invalid_host", ...}` | the request's `Host` is not `HORAE_PUBLIC_HOST`: the tunnel's public host name differs, or the tunnel rewrites the *HTTP Host Header*. The log names each refused host once |
-| Cloudflare `404` / Traefik `404` for the host | label escaping still on (no router matches), `HORAE_TRAEFIK_ENTRYPOINT` differs from the entry point the traffic reaches (tunnel mode: the tunnel's service is `HTTP` to port 80, and the variables are `http` / `false`), or the proxy is not on `HORAE_TRAEFIK_NETWORK` (Traefik logs it cannot reach the container) |
-| Certificate warning on the default `https` mode | no certificate for the public host on Traefik's `https` entry point: Coolify issues none for a service without a domain ([the layout](#the-layout-hand-written-routers-file-provider-sso-a-dedicated-proxy-network)) |
+| Cloudflare `404` / Traefik `404` for the host | label escaping still on (no router matches), `HORAE_TRAEFIK_ENTRYPOINT` differs from the entry point the traffic reaches (tunnel mode: the tunnel's service is `HTTP` to port 80, and the variables are `http` / `false`), or the proxy is not on the resource's network (Traefik logs it cannot reach the container: a `502`) |
+| Certificate warning on the default `https` mode | no certificate for the public host on Traefik's `https` entry point: Coolify issues none for a service without a domain; set `HORAE_TRAEFIK_CERTRESOLVER` (`letsencrypt`) ([the layout](#the-layout-hand-written-routers-file-provider-sso-the-resources-own-network)) |
 | `/act/...` works, everything else `404` | Traefik refused the main router: `HORAE_SSO_MIDDLEWARE` names a middleware its file configuration does not define (Traefik's log says so) |
 | Every request fails (`500`) or is never redirected to sign-in | authentik is unreachable from Traefik at the shared middleware's address |
 | Sign-in loops, or the callback is `404` | the outpost router is missing or `HORAE_SSO_OUTPOST_SERVICE` is wrong: `/outpost.goauthentik.io/` must reach authentik |
+| Tunnel mode: sign-in returns to `http://...`, or loops | authentik built the URL from the forwarded scheme (`http`, what Traefik received from `cloudflared`): [Forwarded headers](#forwarded-headers), the tunnel-mode note |
 | `horae` never starts, `horae-init` exited 3 | the volume is not empty but holds no `horae.yaml`: `horae init` refuses it |
 | `horae` restarts, log says a configuration error | `horae.yaml` is invalid (`docker exec ... horae doctor`), or `HORAE_SCHEDULER` is not `builtin`/`external` |
 | Unhealthy, `/healthz` `503` | the store cannot be read, or the built-in scheduler stopped (see the log) |
@@ -521,9 +570,15 @@ entry point; apps routed by hand-written labels (`traefik.enable=true`,
 `authentik@file`, an outpost router to `sso@file`); authentik, ntfy and Uptime Kuma as other
 resources.
 
-The template keeps two things stricter than that server: the proxy network is required with
-no default and must be shared only by Horae and the proxy (not `traefik-network`), and the
-transport defaults to `https` with TLS, the tunnel being an opt-in.
+Also read from it (read-only `docker inspect`): the proxy container `coolify-proxy` is the
+compose service `traefik` of `/data/coolify/proxy/docker-compose.yml` (project
+`coolify-proxy`); its command line sets no `encodedCharacters`, `sanitizePath` or
+`forwardedHeaders` options (Traefik 3.7 defaults); and Coolify connects it to every resource's
+own network (besides `coolify`, `traefik-network` and the tunnel's network).
+
+The template keeps two things stricter than that server: Horae stays on its resource's own
+network and does not join `traefik-network`, and the transport defaults to `https` with TLS,
+the tunnel being an opt-in.
 
 Verified without that server: the rendered template's routing and settings in both modes with
 that file configuration (`tests/test_deploy_templates.py`), `docker compose config` (CI job `deploy`),
@@ -531,13 +586,16 @@ and the template's services run by plain Docker Compose against an image built f
 (healthy; `horae run` through `docker exec`). **Not verified yet**, for the maintainer on the
 real server ([the checklist](#verify-on-the-server)): the deployment and its health status,
 the blocking of required variables in the UI, the escape toggle, that Coolify adds no router of
-its own and keeps `traefik.enable=true` for a service without a domain, the dedicated network
-joined next to the resource's own and the proxy still on it after a restart (the proxy
-configuration edit), the Horae-only middleware with `trustForwardHeader: false`, port 80
-closed to the Internet in the tunnel mode, the authentik forward auth and its callback through the
-outpost router end to end (and the redirect back to `https://`), a spoofed `X-Forwarded-Uri`
-through the tunnel, Scheduled Tasks in a two-container stack (and their timeout), and the YAML
-anchor (`x-horae-image`) read by Coolify's parser.
+its own and keeps `traefik.enable=true` for a service without a domain, that the `horae`
+container is on its resource's network alone and Traefik reaches it there without
+`traefik.docker.network`, the scheme authentik sees in the tunnel mode (the shared
+`trustForwardHeader: true` middleware or the Horae-only one with the provider's external host),
+port 80 closed to the Internet in the tunnel mode, the authentik forward auth and its callback
+through the outpost router end to end (and the redirect back to `https://`), the encoded
+traversals and a spoofed `X-Forwarded-Uri` through the tunnel, no other router above priority
+1000 on the host, `HORAE_TRAEFIK_CERTRESOLVER` (`${VAR:+...}`) passed through by Coolify,
+Scheduled Tasks in a two-container stack (and their timeout), and the YAML anchor
+(`x-horae-image`) read by Coolify's parser.
 
 ## Sources
 

@@ -2890,8 +2890,8 @@ loosened later without breaking a valid file.
       or conditional requests; no metrics endpoint. Done in #41: the SSO-exemption test
       against the rendered templates (`tests/test_deploy_templates.py`, docs/security.md
       T15) and the network of B: plain compose, one shared only with Traefik; the Coolify
-      template, `HORAE_TRAEFIK_NETWORK`, required with no default, a network of Horae and the
-      proxy alone (never a shared `traefik-network`; docs/operations/coolify.md, "The proxy
+      template, the resource's own network, which Coolify connects the proxy to and no other
+      app joins (never a shared `traefik-network`; docs/operations/coolify.md, "The
       network").
 
 ### Provisional decisions (#122, pending maintainer review)

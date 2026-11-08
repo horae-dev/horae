@@ -9,11 +9,12 @@
 # none: the service has no domain), and SSO is a forwardAuth middleware that Traefik's dynamic
 # FILE configuration defines, named by HORAE_SSO_MIDDLEWARE, with the authentik outpost as a
 # file service (HORAE_SSO_OUTPOST_SERVICE). In short:
-#   - HORAE_TRAEFIK_NETWORK is REQUIRED, no default: a network shared ONLY by Horae and the
-#     Traefik proxy (`docker network create horae-proxy`, joined by `coolify-proxy` through
-#     the proxy's configuration in Coolify). Every container on Horae's networks can call port
-#     8080 WITHOUT SSO (docs/security.md T15, schemas decision 51 B): never a network that
-#     other apps share (such as a server-wide `traefik-network`).
+#   - Horae stays on its resource's OWN network, the one Coolify creates for every resource and
+#     connects the proxy (`coolify-proxy`) to: only the proxy and this resource's containers
+#     are on it. No `traefik.docker.network`: Traefik uses the only network it shares with
+#     Horae. Every container on Horae's networks can call port 8080 WITHOUT SSO
+#     (docs/security.md T15, schemas decision 51 B): never add a network that other apps share
+#     (a server-wide `traefik-network`, or "Connect to predefined network").
 #   - secure by default: routers on the `https` entry point with TLS. The Cloudflare Tunnel
 #     layout of the reference server is an explicit opt-in (HORAE_TRAEFIK_ENTRYPOINT=http,
 #     HORAE_TRAEFIK_TLS=false), only while port 80 is not reachable from the Internet (only
@@ -32,6 +33,10 @@
 #   - HORAE_TRAEFIK_NAME (default `horae`) prefixes the router names: unique per Horae on the
 #     server. Two copies with the same name clash, and Traefik drops the clashing routers (fails
 #     closed, nothing served).
+#   - HORAE_TRAEFIK_CERTRESOLVER (optional, empty by default): the proxy's certificate resolver
+#     (`letsencrypt` on a default Coolify proxy) for the `https` mode; when set, every router
+#     gets `tls.certresolver`. Unset, the label falls back to `<name>[-act|-outpost].certresolver`,
+#     which Traefik ignores (an empty `tls.certresolver` would still turn TLS on).
 #
 # Routing (only `/act/` is exempt from SSO), all on HORAE_TRAEFIK_ENTRYPOINT:
 #   - `<name>`: Host(HORAE_PUBLIC_HOST), the whole host, through HORAE_SSO_MIDDLEWARE.
@@ -96,41 +101,34 @@ services:
     stop_grace_period: 30s
     volumes:
       - horae-instance:/instance
-    # No `ports`: the proxy reaches port 8080 on HORAE_TRAEFIK_NETWORK, shared only with it.
-    # `default` is this resource's own network (Coolify adds its per-resource network too).
-    networks:
-      - default
-      - proxy
+    # No `ports` and no `networks`: the proxy reaches port 8080 on the resource's own network,
+    # which Coolify connects it to, and which no other app joins.
     # Routers only, no middleware defined here: SSO is the file provider's middleware, named
     # by HORAE_SSO_MIDDLEWARE (never empty: `:-` also replaces an empty value). Prefer one
     # for Horae alone with `trustForwardHeader: false` (docs/operations/coolify.md).
     labels:
       - "traefik.enable=true"
-      - "traefik.docker.network=${HORAE_TRAEFIK_NETWORK:?}"
       - "traefik.http.services.${HORAE_TRAEFIK_NAME:-horae}.loadbalancer.server.port=8080"
       - "traefik.http.routers.${HORAE_TRAEFIK_NAME:-horae}.rule=Host(`${HORAE_PUBLIC_HOST:?}`)"
       - "traefik.http.routers.${HORAE_TRAEFIK_NAME:-horae}.entryPoints=${HORAE_TRAEFIK_ENTRYPOINT:-https}"
       - "traefik.http.routers.${HORAE_TRAEFIK_NAME:-horae}.tls=${HORAE_TRAEFIK_TLS:-true}"
+      - "${HORAE_TRAEFIK_CERTRESOLVER:+traefik.http.routers.}${HORAE_TRAEFIK_NAME:-horae}${HORAE_TRAEFIK_CERTRESOLVER:+.tls}.certresolver=${HORAE_TRAEFIK_CERTRESOLVER:-}"
       - "traefik.http.routers.${HORAE_TRAEFIK_NAME:-horae}.priority=900"
       - "traefik.http.routers.${HORAE_TRAEFIK_NAME:-horae}.middlewares=${HORAE_SSO_MIDDLEWARE:-authentik@file}"
       - "traefik.http.routers.${HORAE_TRAEFIK_NAME:-horae}.service=${HORAE_TRAEFIK_NAME:-horae}"
       - "traefik.http.routers.${HORAE_TRAEFIK_NAME:-horae}-act.rule=Host(`${HORAE_PUBLIC_HOST:?}`) && PathPrefix(`/act/`)"
       - "traefik.http.routers.${HORAE_TRAEFIK_NAME:-horae}-act.entryPoints=${HORAE_TRAEFIK_ENTRYPOINT:-https}"
       - "traefik.http.routers.${HORAE_TRAEFIK_NAME:-horae}-act.tls=${HORAE_TRAEFIK_TLS:-true}"
+      - "${HORAE_TRAEFIK_CERTRESOLVER:+traefik.http.routers.}${HORAE_TRAEFIK_NAME:-horae}-act${HORAE_TRAEFIK_CERTRESOLVER:+.tls}.certresolver=${HORAE_TRAEFIK_CERTRESOLVER:-}"
       - "traefik.http.routers.${HORAE_TRAEFIK_NAME:-horae}-act.priority=1000"
       - "traefik.http.routers.${HORAE_TRAEFIK_NAME:-horae}-act.service=${HORAE_TRAEFIK_NAME:-horae}"
       - "traefik.http.routers.${HORAE_TRAEFIK_NAME:-horae}-outpost.rule=Host(`${HORAE_PUBLIC_HOST:?}`) && PathPrefix(`/outpost.goauthentik.io/`)"
       - "traefik.http.routers.${HORAE_TRAEFIK_NAME:-horae}-outpost.entryPoints=${HORAE_TRAEFIK_ENTRYPOINT:-https}"
       - "traefik.http.routers.${HORAE_TRAEFIK_NAME:-horae}-outpost.tls=${HORAE_TRAEFIK_TLS:-true}"
+      - "${HORAE_TRAEFIK_CERTRESOLVER:+traefik.http.routers.}${HORAE_TRAEFIK_NAME:-horae}-outpost${HORAE_TRAEFIK_CERTRESOLVER:+.tls}.certresolver=${HORAE_TRAEFIK_CERTRESOLVER:-}"
       - "traefik.http.routers.${HORAE_TRAEFIK_NAME:-horae}-outpost.priority=1000"
       - "traefik.http.routers.${HORAE_TRAEFIK_NAME:-horae}-outpost.service=${HORAE_SSO_OUTPOST_SERVICE:-sso@file}"
 
-# The network Traefik reaches Horae on, created outside this resource and shared ONLY by Horae
-# and the proxy. Coolify prefixes the volume's name with the resource's UUID.
-networks:
-  proxy:
-    external: true
-    name: "${HORAE_TRAEFIK_NETWORK:?}"
-
+# The instance volume. Coolify prefixes its name with the resource's UUID.
 volumes:
   horae-instance:

@@ -2,14 +2,15 @@
 """The Coolify template and the plain compose files (#41, docs/security.md T15).
 
 The files are rendered here without Docker: parsed, then the operator's settings substituted as
-Compose does (`${VAR}`, `:-`, `-`, `:?`, `?`, `$$`).
+Compose does (`${VAR}`, `:-`, `-`, `:?`, `?`, `:+`, `+`, `$$`).
 
 The Coolify template is tested in both of its modes: the secure default (routers on Traefik's
 `https` entry point, with TLS) and the reference deployment's opt-in tunnel mode (a Cloudflare
 Tunnel reaches the `http` entry point, TLS ended by Cloudflare). Either way the routers are the
-template's own labels (Coolify generates none: the service has no domain), Horae joins a proxy
-network that has no default, and SSO is a forwardAuth middleware and an outpost service that
-Traefik's dynamic file configuration defines (`authentik@file`, `sso@file`), referenced by name.
+template's own labels (Coolify generates none: the service has no domain), Horae stays on its
+resource's own network (Coolify connects the proxy to it; no other app joins it), and SSO is a
+forwardAuth middleware and an outpost service that Traefik's dynamic file configuration defines
+(`authentik@file`, `sso@file`), referenced by name.
 Requests are routed with Traefik's rules: a router naming a middleware that no provider defines
 is refused; among the matching routers of the entry point, the one of highest priority (an
 explicit `priority`, else the length of the rule) wins, after the entry point's
@@ -64,15 +65,12 @@ FILE_SERVICES = {FILE_OUTPOST: "http://authentik-server:9000/outpost.goauthentik
 
 COOLIFY_REQUIRED = {
     "HORAE_PUBLIC_HOST",
-    "HORAE_TRAEFIK_NETWORK",
     "HORAE_ANTHROPIC_API_KEY",
     "HORAE_MONITOR_DAILY_BRIEF_URL",
     "HORAE_MONITOR_REMIND_URL",
 }
-PROXY_NETWORK = "horae-proxy"  # shared only by Horae and the proxy
 COOLIFY_ENV = {
     "HORAE_PUBLIC_HOST": FQDN,
-    "HORAE_TRAEFIK_NETWORK": PROXY_NETWORK,
     "HORAE_ANTHROPIC_API_KEY": "synthetic-anthropic-key-for-tests",
     "HORAE_MONITOR_DAILY_BRIEF_URL": "https://kuma.example.test/api/push/synthetic1",
     "HORAE_MONITOR_REMIND_URL": "https://kuma.example.test/api/push/synthetic2",
@@ -114,7 +112,7 @@ class MissingVariable(Exception):
     """A required variable (`:?` or `?`) is unset (or empty, for `:?`), as Compose refuses."""
 
 
-_VAR = re.compile(r"\$\$|\$\{([A-Za-z_][A-Za-z0-9_]*)(?:(:-|-|:\?|\?)([^}]*))?\}")
+_VAR = re.compile(r"\$\$|\$\{([A-Za-z_][A-Za-z0-9_]*)(?:(:-|-|:\?|\?|:\+|\+)([^}]*))?\}")
 
 
 def interpolate(value: str, env: Mapping[str, str]) -> str:
@@ -127,6 +125,10 @@ def interpolate(value: str, env: Mapping[str, str]) -> str:
             return current if current else rest
         if operator == "-":
             return rest if current is None else current
+        if operator == ":+":
+            return rest if current else ""
+        if operator == "+":
+            return "" if current is None else rest
         if operator == ":?" and not current:
             raise MissingVariable(name)
         if operator == "?" and current is None:
@@ -609,23 +611,96 @@ def test_coolify_allowed_hosts_are_the_public_host() -> None:
     assert env["HORAE_SCHEDULER"] == "external"
 
 
-def test_coolify_publishes_no_port_and_joins_only_the_dedicated_proxy_network() -> None:
+def test_coolify_publishes_no_port_and_stays_on_its_resource_network() -> None:
+    # Coolify puts every resource on a network of its own and connects the proxy to it: only
+    # the proxy and this resource's containers are on it. The template adds no network (a
+    # shared one, such as a server-wide `traefik-network`, would let every app on it reach
+    # port 8080 without SSO) and names none for Traefik, which then uses the only network it
+    # shares with Horae.
     data = load(COOLIFY)
     for name, service in data["services"].items():
         assert "ports" not in service, name
         assert "network_mode" not in service, name
-    assert "networks" not in data["services"]["horae-init"]  # its own network only
-    # No default network: a shared one (a server-wide `traefik-network`) would let every app
-    # on it reach port 8080 without SSO, so the operator names the dedicated one.
-    assert data["networks"]["proxy"] == {"external": True, "name": "${HORAE_TRAEFIK_NETWORK:?}"}
-    labels = labels_of(data["services"]["horae"])
-    assert labels["traefik.docker.network"] == "${HORAE_TRAEFIK_NETWORK:?}"
-    body = [line for line in COOLIFY.read_text(encoding="utf-8").splitlines() if "#" not in line]
+        assert "networks" not in service, name
+    assert "networks" not in data
+    text = COOLIFY.read_text(encoding="utf-8")
+    body = [line for line in text.splitlines() if not line.lstrip().startswith("#")]
     assert not any("traefik-network" in line for line in body)
-    rendered, labels = coolify_rendered()
-    assert rendered["services"]["horae"]["networks"] == ["default", "proxy"]
-    assert rendered["networks"] == {"proxy": {"external": True, "name": PROXY_NETWORK}}
-    assert labels["traefik.docker.network"] == PROXY_NETWORK
+    assert not any(re.search(r"\bexternal\s*:\s*true", line) for line in body)
+    assert "HORAE_TRAEFIK_NETWORK" not in text
+    for env in (COOLIFY_ENV, {**COOLIFY_ENV, **TUNNEL}):
+        rendered, labels = coolify_rendered(env)
+        assert "traefik.docker.network" not in labels
+        assert "networks" not in rendered
+        assert all("networks" not in service for service in rendered["services"].values())
+
+
+@pytest.mark.parametrize("mode", sorted(MODES))
+def test_coolify_a_cert_resolver_is_added_to_every_router_only_when_set(mode: str) -> None:
+    entrypoint, _, settings = MODES[mode]
+    routers = (NAME, f"{NAME}-act", f"{NAME}-outpost")
+    # Unset or empty: no `tls.certresolver` (even an empty one would turn TLS on, and break
+    # the tunnel mode); the line falls back to a label Traefik ignores.
+    for value in (None, ""):
+        env = {**COOLIFY_ENV, **settings}
+        if value is not None:
+            env["HORAE_TRAEFIK_CERTRESOLVER"] = value
+        _, labels = coolify_rendered(env)
+        assert not any("certresolver" in key for key in labels if key.startswith("traefik."))
+        assert {key for key in labels if "certresolver" in key} == {
+            f"{name}.certresolver" for name in routers
+        }
+        assert all(labels[f"{name}.certresolver"] == "" for name in routers)
+    # Set: every router of the template gets it, and the routing is unchanged.
+    _, labels = coolify_rendered(
+        {**COOLIFY_ENV, **settings, "HORAE_TRAEFIK_CERTRESOLVER": "letsencrypt"}
+    )
+    for name in routers:
+        assert labels[f"traefik.http.routers.{name}.tls.certresolver"] == "letsencrypt"
+    assert not any(
+        key.endswith(".certresolver") and not key.startswith("traefik.") for key in labels
+    )
+    assert_coolify_only_act_is_exempt(labels, entrypoint=entrypoint)
+
+
+def test_coolify_a_cert_resolver_keeps_the_router_names_unique() -> None:
+    env = {**COOLIFY_ENV, "HORAE_TRAEFIK_NAME": "horae-two", "HORAE_TRAEFIK_CERTRESOLVER": "le"}
+    _, labels = coolify_rendered(env)
+    assert _traefik_names(labels) == {
+        ("routers", "horae-two"),
+        ("routers", "horae-two-act"),
+        ("routers", "horae-two-outpost"),
+        ("services", "horae-two"),
+    }
+    assert labels["traefik.http.routers.horae-two-act.tls.certresolver"] == "le"
+
+
+@pytest.mark.parametrize(
+    ("variable", "default"),
+    [
+        ("HORAE_TRAEFIK_ENTRYPOINT", "https"),
+        ("HORAE_TRAEFIK_TLS", "true"),
+        ("HORAE_TRAEFIK_NAME", NAME),
+    ],
+)
+def test_coolify_an_empty_optional_setting_falls_back_to_its_default(
+    variable: str, default: str
+) -> None:
+    # Coolify lists a variable with an empty value once it is added: `:-` treats that as unset.
+    _, empty = coolify_rendered({**COOLIFY_ENV, variable: ""})
+    _, unset = coolify_rendered(COOLIFY_ENV)
+    assert empty == unset
+    routers = routers_of(empty)
+    assert set(routers) == {NAME, f"{NAME}-act", f"{NAME}-outpost"}
+    assert all(router.entrypoints == ("https",) for router in routers.values())
+    assert {value for key, value in empty.items() if key.endswith(".tls")} == {"true"}
+    assert_coolify_only_act_is_exempt(empty)
+    rendered = {
+        "HORAE_TRAEFIK_ENTRYPOINT": empty[f"traefik.http.routers.{NAME}.entryPoints"],
+        "HORAE_TRAEFIK_TLS": empty[f"traefik.http.routers.{NAME}.tls"],
+        "HORAE_TRAEFIK_NAME": empty[f"traefik.http.routers.{NAME}.service"],
+    }
+    assert rendered[variable] == default
 
 
 def _traefik_names(labels: Mapping[str, str]) -> set[tuple[str, str]]:

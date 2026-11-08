@@ -241,14 +241,14 @@ jobs:
         working-directory: deploy/coolify
         env:
           HORAE_PUBLIC_HOST: horae.example.test
-          HORAE_TRAEFIK_NETWORK: horae-proxy
           HORAE_ANTHROPIC_API_KEY: placeholder-not-a-key
           HORAE_MONITOR_DAILY_BRIEF_URL: https://kuma.example.test/api/push/placeholder1
           HORAE_MONITOR_REMIND_URL: https://kuma.example.test/api/push/placeholder2
         run: |
           set -euo pipefail
           docker compose -f docker-compose.yaml config --quiet
-          for name in HORAE_PUBLIC_HOST HORAE_TRAEFIK_NETWORK HORAE_ANTHROPIC_API_KEY \
+          HORAE_TRAEFIK_CERTRESOLVER=letsencrypt docker compose -f docker-compose.yaml config --quiet
+          for name in HORAE_PUBLIC_HOST HORAE_ANTHROPIC_API_KEY \
                       HORAE_MONITOR_DAILY_BRIEF_URL HORAE_MONITOR_REMIND_URL; do
             if env -u "${name}" docker compose -f docker-compose.yaml config --quiet 2> "${RUNNER_TEMP}/err.txt"; then
               echo "::error::rendered without ${name}"
