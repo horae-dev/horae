@@ -3349,11 +3349,14 @@ loosened later without breaking a valid file.
       `task.create` whose fingerprint the index knows (or an earlier intent of the same run
       planned) is a `TaskChange` with action `existing` (title, due and time as indexed;
       shown as unchanged) or `update` (title, due or time differ; `before` is the indexed
-      task). The sink is not asked; the planner never reopens anything.
+      task). The planner never reopens anything. `update` is what the upstream intent says,
+      not a promise: the diff reads "changed upstream; not applied unless the sink rewrites
+      the task", because a sink may keep its line (plugin-obsidian does: `changed: false`).
     - **B, apply.** Unchanged path: the intent still goes to the sink, the authority on the
       vault (plugin-obsidian dedupes by `^h-` block id and may adopt or dismiss it). The index
       is updated from its answer: an applied answer updates title, due and time and keeps the
-      status (a ticked task stays ticked); `changed: false` leaves the index alone, except
+      status (a ticked task stays ticked); `changed: false` leaves the index alone (so an `update` the sink declines is planned again
+      next run), except
       `adopted` (and not `dismissed`), which indexes the task as `todo` if unknown.
     - **C, compatibility.** `TaskChange.action` gains `existing` and `update`; without
       `known_task` every `task.create` stays `create`.

@@ -69,6 +69,7 @@ def test_a_changed_due_is_planned_as_an_update(tmp_path: Path) -> None:
         assert change.action == "update"
         assert change.before == "- [ ] Old task (due 2026-10-28)"
         assert change.after == "- [ ] Old task! (due 2026-11-02)"
+        assert "not applied unless the sink rewrites" in render_text(plan)
 
 
 def test_a_closed_task_is_not_reopened(tmp_path: Path) -> None:
