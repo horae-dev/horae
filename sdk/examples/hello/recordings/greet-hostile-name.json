@@ -1,0 +1,18 @@
+{
+  "tool": "hello.greet",
+  "params": {
+    "name": "Eve 📅 2020-01-01 🔁 every day #urgent"
+  },
+  "expect": {
+    "data": {
+      "greeting": "Hello, Eve 📅 2020-01-01 🔁 every day #urgent!"
+    },
+    "intents": [
+      {
+        "type": "task.create",
+        "title": "Greet Eve &#x1F4C5; 2020-01-01 &#x1F501; every day \\#urgent back",
+        "fingerprint": "hello:Eve---2020-01-01---every-day--urgent::8bc71eff010ce15b"
+      }
+    ]
+  }
+}

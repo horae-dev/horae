@@ -1,7 +1,7 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": ["config:recommended", "helpers:pinGitHubActionDigests"],
-  "enabledManagers": ["pep621", "github-actions", "pre-commit", "pyenv"],
+  "enabledManagers": ["pep621", "github-actions", "pre-commit", "pyenv", "dockerfile", "custom.regex"],
   "pre-commit": { "enabled": true },
   "minimumReleaseAge": "7 days",
   "internalChecksFilter": "strict",
@@ -9,8 +9,8 @@
   "customManagers": [
     {
       "customType": "regex",
-      "description": "Tool versions pinned in the CI workflow (gitleaks, uv)",
-      "managerFilePatterns": ["/^\\.github/workflows/ci\\.yml$/"],
+      "description": "Tool versions pinned in workflow env vars (gitleaks, uv, cosign): a `# renovate:` comment line followed by NAME_VERSION: x.y.z (no leading v). A gitleaks bump also needs GITLEAKS_SHA256 updated by hand; until then the checksum step fails closed.",
+      "managerFilePatterns": ["/^\\.github/workflows/(ci|image)\\.yml$/"],
       "matchStrings": [
         "# renovate: datasource=(?<datasource>[a-z-]+) depName=(?<depName>[^\\s]+)\\n\\s*[A-Z_]+_VERSION: (?<currentValue>[\\w.-]+)"
       ],
@@ -20,7 +20,14 @@
   "packageRules": [
     {
       "groupName": "ruff",
+      "minimumReleaseAge": "7 days",
       "matchPackageNames": ["ruff"]
+    },
+    {
+      "description": "The uv of CI (UV_VERSION) and of the image build (UV_IMAGE) move together",
+      "groupName": "uv",
+      "minimumReleaseAge": "7 days",
+      "matchPackageNames": ["astral-sh/uv", "ghcr.io/astral-sh/uv"]
     }
   ]
 }

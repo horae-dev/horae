@@ -1,0 +1,18 @@
+{
+  "tool": "hello.shout",
+  "input": {
+    "subject": "📅 2020-01-01 🔁 every day #t [[x]] %%c%% ==h=="
+  },
+  "expect": {
+    "data": {
+      "subject": "📅 2020-01-01 🔁 EVERY DAY #T [[X]] %%C%% ==H=="
+    },
+    "intents": [
+      {
+        "type": "task.create",
+        "title": "Reply to &#x1F4C5; 2020-01-01 &#x1F501; every day \\#t \\[\\[x\\]\\] \\%&#x25;c\\%&#x25; \\=&#x3D;h\\=&#x3D;",
+        "fingerprint": "hello:reply:--2020-01-01---every-day--t---x-----c-----h--::417b4f46c96482f3"
+      }
+    ]
+  }
+}

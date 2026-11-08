@@ -121,3 +121,12 @@ and bodies stay untrusted text that appliers treat as data.
 46](../../schemas/README.md#decisions)) checks the LLM's text instead, so every URL in it is an
 exact string of the viewed input, no embed or script link is ever proposed, and a skill's
 per-type limits hold; a violation degrades the whole step. Plugin proposals are left to #52.
+
+### Amendment (2026-11-01, #122)
+
+`task.create` takes an optional `https://` `link` ([schemas decision
+52](../../schemas/README.md#decisions)), so the trusted bindings of the #17 amendment gain one:
+like a notification `link`, a task `link` is routed only to a `mode: tasks` entry
+whose trusted `link_prefix` it falls under (no prefix, no route), and an LLM-proposed link must
+be a URL of the viewed input. The host is a name, never an IP literal; the sink writes the link
+inert, after the escaped title, with a fixed label.

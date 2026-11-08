@@ -33,6 +33,7 @@ from horae.contracts.intents import (
     NotifyLink,
     NotifyPush,
     TaskCreate,
+    TaskLink,
     TaskUpdateStatus,
     intent_adapter,
 )
@@ -178,6 +179,7 @@ __all__ = [
     "StepError",
     "StepRecord",
     "TaskCreate",
+    "TaskLink",
     "TaskUpdateStatus",
     "Timestamp",
     "ToolCall",

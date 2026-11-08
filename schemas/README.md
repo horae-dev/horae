@@ -78,6 +78,7 @@ pydantic may change them; the drift test then fails in CI and the fix is to rege
 | Host (`permissions.network`) | lowercase DNS name; the last label starts with a letter, so **no IP literal** (dotted, decimal, hex or IPv6); `localhost` and `*.localhost` rejected; single-label names (`coach`, a Docker/Coolify service) allowed; no port, scheme or wildcard |
 | `http.post.url`, `runtime.url`, `homepage` | `https://` only; host as above; optional port 1–65535; no user info, fragment, backslash, whitespace or control characters |
 | `notify.push.link` | `https://` or `obsidian://`, then `[^\x00-\x20\x7f]+` |
+| `task.create.link` | `https://`, a non-empty authority without `@` (no user info), then optionally `/`, `?` or `#` and the rest; no whitespace, control character or backslash anywhere; at most 2048 characters (decision 52) |
 | Lockfile `repo` | `https://<host>/<segments>` with segments of `A-Z a-z 0-9 . _ -` (`.git` optional), no `.`/`..` segment, no port, user info, query or fragment, at most 512 characters |
 | Note path (intents) | relative POSIX path: no leading `/`, no `\`, no control characters, no empty segment, **no segment starting with `.`** (so no `.`, `..`, `.obsidian/` or hidden files) |
 | `permissions.paths` | normalised absolute POSIX path: no `.`/`..`/empty segment, no trailing `/`, not `/`, no `\` or control characters |
@@ -126,6 +127,11 @@ JSON Schema cannot express these; the models enforce them and the tests pin the 
   approximates IDNA2008 rather than implementing RFC 5892 exactly.
 - `instance` (`horae.yaml`): a bracketed IPv6 literal in `base_url` must parse as an IPv6
   address (the schema only checks its characters and, for `http`, the `fc`/`fd` prefix).
+- `task.create` `link` (decision 52 A): the host may not be an IP address (its last label is
+  a number, as WHATWG reads it, after NFKC), and no character may be a supplementary-plane
+  format character (tags `U+E0001`, `U+E0020`-`U+E007F`, ...) or a lone surrogate. The
+  pattern already refuses the Basic Multilingual Plane controls, format characters and
+  separators, bracketed IPv6 and `%` in the authority.
 
 ### Known validator differences
 
@@ -304,12 +310,16 @@ loosened later without breaking a valid file.
       falls under; without `link_prefix` a proposed link is never routed. A prefix is an
       `https://` or `obsidian://` link with a host, no user info, query or fragment, and a
       clean path that ends with `/` (e.g. `obsidian://vault/Main/`), else `params_invalid`.
-      Both are parsed (`urlsplit`), not compared as strings: same scheme, exactly the same
-      netloc, and a link path under the prefix path whose rest has no empty, `.` or `..`
-      segment, backslash, or `%2e` / `%2f` / `%5c` / `%25` (so no `/notes/../admin`, no
-      `host.evil` or `host@evil`). The link may add its own query and fragment;
+      Both are parsed (`urlsplit`), not compared as strings: same scheme, the same authority
+      (since decision 52 B, an `https` host compares case-insensitively, without one trailing
+      dot, with `:443` equal to no port; an `obsidian://` netloc exactly), and a link path
+      under the prefix path (case-sensitive) whose rest has no empty, `.` or `..` segment,
+      backslash, or `%2e` / `%2f` / `%5c` / `%25` (so no `/notes/../admin`, no `host.evil` or
+      `host@evil`). The link may add its own query and fragment;
     - a `task.update_status` is routed only if its `task` fingerprint appears as a string value
-      in the run's collected input; `task.create` binds no target;
+      in the run's collected input; `task.create` binds no target but its optional `link`,
+      which (decision 52) is routed only to a `mode: tasks` entry whose trusted `link_prefix`
+      it falls under, by the `notify.push` rule above;
     - two entries that may apply the same type to the same target make every such intent
       `intent_ambiguous`, by design: untrusted data never chooses between trusted entries;
     - the proposer's permissions are checked before routing (`intent_rejected` wins);
@@ -2551,3 +2561,422 @@ loosened later without breaking a valid file.
     - **follow-ups**: `budget_from`; a `--repair` live mode that exercises the repair retry;
       `horae eval --all` over every installed skill; a JSON Schema for the eval report
       (`schemas/eval-report/v1.json`); a real `pack-daily-brief` repository with its cases.
+
+### Provisional decisions (#39, pending maintainer review)
+
+49. **The built-in scheduler, external triggers and push monitors (#39).** Numbering: 48 is
+    #36's; #38 and #42 may be adding decisions in parallel, so this number may move when they
+    merge. Compatible v1 additions to the instance contract (`scheduler.monitors`,
+    `scheduler.max_concurrent`, `scheduler.misfire_grace_s`), one new runtime dependency
+    (`cronsim`) and one command (`horae serve`); no store migration.
+    - **A, cron library: `cronsim`** (`>=2.7,<3`, pinned in `uv.lock`). Pure Python, no
+      dependency, typed (`py.typed`), about 1,200 lines with its `explain` module, maintained by the author of
+      Healthchecks.io, where it evaluates every check's schedule, so its daylight-saving
+      behaviour is exercised in production. `croniter` was considered: larger, and it went
+      through an end-of-life notice and a change of maintainers; APScheduler is a whole
+      scheduler with its own job store and executors, more than needed (Horae has its run
+      lock and store). `cronsim` also validates the fields (`horae.config.cron.cron_problem`): an
+      expression the contract's shape accepts but that cannot fire (`0 0 30 2 *`, `61 * * *
+      *`) is a loader problem at `trigger.cron` (also in `horae doctor`).
+    - **B, time zone.** A trigger is evaluated in its own `timezone`, else `horae.yaml`
+      `timezone` (decision 13; UTC when neither is set); fire times are stored and reported
+      in UTC. Daylight saving follows Debian cron, as `cronsim` implements it: a time in the
+      skipped hour fires once at the first instant after the gap, a time in the repeated hour
+      fires once (its first occurrence), and an expression whose hour field is `*` fires at
+      every real occurrence (`tests/test_scheduler.py`, Europe/Paris in March and October).
+    - **C, mode.** `scheduler.mode` (`builtin` by default) is overridden by the
+      `HORAE_SCHEDULER` environment variable when it is set and not blank: `builtin` or
+      `external`, matched without regard to case (`External` is `external`), anything else
+      a configuration error (`horae serve` exits 1, `horae doctor` reports it). In `external`
+      mode `horae serve` fires nothing (an external scheduler runs `horae run <pipeline>`,
+      which is unaffected by the mode); the process still runs, for the HTTP API of #37.
+    - **D, missed runs and overlap.** Missed fire times are **skipped**, never caught up: on
+      start each pipeline waits for its first fire time after now, and a loop that wakes late
+      (a suspended host) runs the fire time it waited for once, then the first one after
+      now. The push monitor is what reports a missed run. A fire time while the pipeline's
+      previous scheduled run is still running or waiting for a slot, or whose run finds the
+      per-pipeline `flock` held (a manual `horae run`: `PipelineLocked`; a scheduled run
+      takes the same lock as any run, decision 31), is **skipped and recorded**: a warning
+      log line and the pipeline's `skipped` / `last_skip` / `last_skip_reason` (`running`,
+      `locked`) in the scheduler state. A skipped fire time pings no monitor and writes no
+      run row (the run in progress pings and records its own). A clock stepped back never
+      fires the same fire time twice (the next one is after both the last one fired and now).
+    - **D2, misfire grace.** A fire time that would start more than
+      `scheduler.misfire_grace_s` late (default 3600, 1 s to 7 days), after a suspended host
+      or while waiting for a slot (D3), is skipped and recorded (`last_skip_reason:
+      misfire`), not run: a run long after its time is more surprising than a missed one,
+      which the monitor reports.
+    - **D3, concurrency.** Scheduled runs are **serialised by default**:
+      `scheduler.max_concurrent` (1 to 16, default 1) runs at most at once. A fire time that
+      finds no free slot waits, first in first out (state `waiting`), and starts when a run
+      ends, unless it is then past its misfire grace (D2); a stop drops the waiting fire
+      times. Interaction with the apply lock (decision 34): whatever `max_concurrent` is, two
+      applies never overlap, since every run's apply holds the instance-wide apply lock and
+      waits for it at most `APPLY_LOCK_WAIT_S` (30 s) before it fails `apply_locked` with
+      nothing applied. With `max_concurrent: 1` scheduled runs never wait on each other's
+      applies (only on a manual `horae run` or `horae undo`); with more, runs proceed side by
+      side and their applies queue on the lock, so a long apply can make another run fail
+      `apply_locked`. Runs side by side share the store (SQLite in WAL mode, decision 36).
+    - **D4, isolation.** A pipeline whose next fire time cannot be computed (an unknown time
+      zone, a date out of range; the loader refuses what it can, but `0 0 29 2 *` is valid
+      and rare) logs an error naming the pipeline and the exception's type only, shows no
+      `next_fire`, and retries after 1 min, doubling up to 1 h; the other pipelines and the
+      runs in progress carry on.
+    - **E, the process: `horae serve`.** The long-running entry point of a container (the
+      name #37's HTTP API will share: one process). It runs `horae.scheduler.Scheduler`,
+      whose `state()` (`SchedulerState`: `mode`, `active`, `started_at`, `max_concurrent`,
+      and per pipeline `cron`, `timezone`, `next_fire`, `last_fire`, `last_outcome`,
+      `last_run_id`, `last_ping` (`ok`, `failed`, `skipped`, `none`: no monitor), `running`,
+      `waiting`, `skipped`, `last_skip`, `last_skip_reason`; `to_dict()` is JSON-ready, times
+      as `...Z`) is what `/healthz` will report. The state lives in memory: the skip counts
+      and `last_*` fields start afresh on restart (persisting them is a follow-up). Scheduled
+      runs run in the process, exactly as `horae run` runs them; a crashed run is logged with
+      its run id and `internal error (<type>)`, never the exception's message. The instance
+      is **loaded once**: a change to `horae.yaml`, a pipeline or the lock needs a restart.
+      `horae serve` has no `--json` (it is a process, not a report; `horae cache purge`
+      has none either). The wall clock is re-read at least every 30 s while waiting, so a
+      clock step or a suspend delays a fire time by at most that much.
+    - **E2, shutdown.** The first SIGTERM or SIGINT stops every loop, drops the fire times
+      waiting for a slot and cancels the runs in progress; a cancelled run stops as `horae
+      run` does on SIGTERM (partial record saved `failed`; an apply in progress finished
+      first and saved with its real status). The run is then **reported with the status it
+      was saved with** (status and run id from the saved record, its monitor pinged
+      accordingly: an apply that finished is `ok` and `up`); a run stopped before any record
+      was saved is recorded `cancelled` (keeping its run id, if it began) and pings
+      **nothing**: the monitor's own heartbeat window reports it. `horae run` follows the
+      same rule for an interrupted run, and bounds that ping to 2 s. The command then exits
+      **0** (a requested stop is the normal end of a server, unlike an interrupted `horae
+      run`). A **second** signal stops waiting for the reports and pings (each up to 10 s):
+      the runs are still awaited so that their records are saved (bounded by the runner's 5 s
+      grace period, or for an apply by its sink calls' `call_timeout_s`), then the command
+      exits 128 + that signal (130, 143), so a forced stop is visible. A container should be
+      given **at least 20 s** to stop (compose `stop_grace_period: 20s`; Docker's default is
+      10 s), more when applies are long.
+    - **F, push monitors.** `scheduler.monitors.<pipeline>: {secret, kind}`: the push URL
+      is a **secret** (it carries the monitor's token), resolved like any other (decision 25)
+      and added to the secrets the instance names, so it is primed for redaction (decision
+      43) and checked by `horae doctor`; a monitor for an unknown pipeline is a loader
+      problem. `kind: uptime-kuma` (default) sets the `status` (`up` / `down`), `msg` (the
+      outcome word) and `ping` (the run's duration in ms) query parameters; `kind:
+      healthchecks` pings the URL for success and `<url>/fail` for a failure. `up` is a run
+      `ok`, `noop` or `degraded` (a `degraded` run is up, as its exit code is 0); everything
+      else is `down` (failed, timeout, lost, crashed, and a run that could not begin: plugins
+      not matching the lock, a store, lock or I/O problem, the error kind as the message).
+      Pinged after every run of the pipeline, scheduled or `horae run`, never for a dry run,
+      a locked pipeline, or a run stopped before any record was saved (E2). `horae doctor`
+      resolves the secret and checks it is a valid push URL with the ping's own validator,
+      never echoing the value. The network rules are the
+      LLM backends' (decisions 24, 40): the URL must be a `BackendUrl` (`https://` anywhere,
+      `http://` only to loopback, private or single-label hosts, re-checked at connect time
+      by `LanOnlyNetwork`), one `GET`, no retry, no redirect, `trust_env=False`, 10 s for the
+      whole exchange, the body bounded at 64 KiB and unused. A failure (timeout, refused,
+      non-2xx, unresolvable secret, invalid URL) is one warning in Horae's words, never the
+      URL, response or exception message, and **never changes the run's outcome or exit
+      code**; the `--json` document of `horae run` is unchanged.
+    - **Not done (follow-ups)**: skipped fire times and the `last_*` state are not persisted
+      (lost on restart; a store table would need a migration); no reload of a changed
+      instance without a restart; no catch-up option; no `/start` ping
+      (Healthchecks) to measure durations on the monitor side; the push URL with Uptime
+      Kuma's default query (`?status=up&msg=OK&ping=`) is redacted as a whole, so the
+      rewritten URL is never logged by design rather than by redaction.
+
+### Provisional decisions (#42, pending maintainer review)
+
+50. **The plugin SDK: Tasks-safe task titles and fingerprints (#42, review findings).**
+    Numbering: 49 is #39's, on its unmerged branch, so this takes 50. The SDK (`sdk/`,
+    `horae-sdk`) is not a contract of the core, but its escaping is the T02 control
+    ([`docs/security.md`](../docs/security.md)), so its rules are recorded here:
+    - **(A) the intent's title is the Tasks-safe form.** `horae_sdk.intents.task_create`
+      escapes the title (`horae_sdk.tasks.escape_title`), as the acceptance criterion of #42
+      asks ("intent builders escape"), and the 500-character cut of the `Title` contract
+      happens **after** escaping. Sinks writing Tasks syntax still use `tasks.task_line` /
+      `task_line_for`, which escape again (idempotent: unchanged). A sink for another target
+      shows `tasks.plain_text(title)`, for plain-text display only (renamed from
+      `unescape_title`; never fed to a Markdown or Tasks target, and not an exact inverse).
+      **Follow-up:** escape at the sink only and keep the plain title in the intent (the
+      intent would then carry what the source said, and each sink would escape for its own
+      syntax);
+    - **(B) builders are total on the title.** A title with nothing printable left after
+      escaping (only zero-width, bidi, controls or whitespace) becomes `(untitled)`
+      (`tasks.UNTITLED`, escaped), so one hostile item never aborts a whole `collect`;
+    - **(C) escaping rules.** Signifiers become uppercase-hex character references;
+      Markdown and Obsidian punctuation gets a backslash; every rule that looks back looks
+      at the last piece **written**, not the last character read (`\::` gave a literal `::`).
+      `::` keeps a backslash on its second colon. The second `%` of `%%` and `=` of `==`
+      become `&#x25;` / `&#x3D;`: comments and highlights are Obsidian extensions, not
+      CommonMark, nothing documents that a backslash neutralises them, and a reference leaves
+      no `%%` / `==` in the line even for a parser that drops backslashes first (a reference
+      is decoded only when rendering, after the syntax is parsed). Autolinks: the `:` of a
+      URL scheme (a run of `A-Z a-z 0-9 + . -` holding a letter, followed by a non-space) and
+      the `.` of a `www.` prefix get a backslash, so `https://`, `obsidian://`,
+      `javascript:` and `www.` are not autolinked (`10:30` and `Re: x` are left alone; a bare
+      e-mail address is not changed). The cut never separates a combining mark, a variation
+      selector or an emoji modifier from its character; it is not a full grapheme
+      segmentation (no dependency for it): a regional-indicator flag may be split;
+    - **(D) idempotence trade-offs** (no behaviour change): a backslash escape already in the
+      title and a reference in the SDK's own form (uppercase hex, of a signifier, `%` or `=`)
+      pass through and render as that character; any other reference (`&amp;`, lowercase
+      hex) has its `&` escaped and renders literally;
+    - **(E) verification.** `sdk/tests/test_sdk_tasks.py` ports the Tasks plugin's emoji and
+      Dataview field regexes (with the optional U+FE0F), its tag regex and the Obsidian
+      constructs, checks that they see every field of a hostile title and none of its
+      escaped form, and a Hypothesis property over a hostile alphabet checks that no `::`,
+      `%%`, `==` or raw signifier survives. Obsidian itself is not run in CI:
+      `sdk/README.md` ("Manual check in a real vault") is the checklist for a release that
+      changes `horae_sdk.tasks`;
+    - **(F) fingerprints.** `intents.fingerprint(*parts)` keeps the readable form (parts
+      joined with `:`, other characters as `-`) when it is exact (every part non-empty and in
+      `A-Z a-z 0-9 . _ -`, at most 128 characters), so clean fingerprints and the recordings
+      using them are stable. Otherwise the readable form is lossy and attacker-collidable
+      (`a:b` / `a-b`, `Re: x!` / `Re: x?`), so it is cut to 110 characters and followed by
+      `::` and 16 hex digits of the SHA-256 of the parts as a JSON array. An exact form never
+      holds `::`, so the two shapes cannot collide. `task_create`'s fingerprint parameter is
+      `key` (it shadowed the function);
+    - **(G) protocol limits in the SDK.** A result with more than 256 intents
+      (`horae.intents.MAX_INTENTS`) or a message over `MAX_MESSAGE_BYTES` minus
+      `MESSAGE_MARGIN` is refused by the SDK before sending (a tool error, or a sink
+      operation's `output_too_large`), with a plugin-side message; content from the core
+      that is not base64 is `output_invalid`, the kind of the core's own sinks; an undeclared
+      intent type is echoed cut to 40 characters;
+    - **(H) the test harness.** Record mode (`HORAE_SDK_RECORD=1`, `record=True`) is refused
+      when `CI` or `GITHUB_ACTIONS` is set, names each rewritten file on stderr, writes
+      atomically and never through a symbolic link; `replay` works inside a running event
+      loop (`areplay`, `areplay_all`); `check` refuses unknown `expect` keys;
+    - **(I) release.** `release-sdk.yml` refuses a tag whose commit is not on main
+      (`git merge-base --is-ancestor`), the `pypi` environment must be restricted to `sdk-v*`
+      tags with required reviewers, and the build backend is pinned (`hatchling==1.32.4`,
+      bumped by Renovate). PyPI attestations are **not** produced: `uv publish` 0.13.6
+      uploads existing `.publish.attestation` files but does not create them (follow-up: a
+      Sigstore signing step). Coverage is gated at 85% for the core (`src/horae`) and the SDK
+      separately, and the sdist no longer ships the tests (they need the core).
+
+### Provisional decisions (#37, pending maintainer review)
+
+51. **The HTTP API: `/healthz` and the read-only `/runs` (#37).** Three new runtime
+    dependencies (`fastapi`, `uvicorn` and an explicit `starlette>=1.9,<2`, pinned in
+    `uv.lock`, all older than the 7-day minimum release age), new options of `horae serve`
+    (`--host`, `--port`, `--allowed-host`), one optional argument of `Store.list_runs`
+    (`before`, a page cursor) and one of `Store.open` (`immutable`, E); no contract change, no
+    store migration.
+    - **A, one process, one event loop.** The API is a FastAPI application served by
+      uvicorn's programmatic `Server` inside `horae serve`, in the scheduler's event loop
+      (`horae.api`): `/healthz` reads the live `Scheduler.state()`, and there is one process
+      to supervise. Horae binds the socket itself before anything starts (a port in use or a
+      bad host is a configuration error, exit 1, `bind_failed`, Horae's message), and
+      uvicorn's own signal handlers, log configuration, access log, `Server` header,
+      proxy-header rewriting and lifespan are off: the redacting log record factory
+      (decision 43) stays in place, and request logging is the proxy's job. FastAPI is
+      imported by `horae serve` only. `/runs` and `/runs/{id}` are synchronous and run in
+      the shared worker thread pool, so a store read never blocks the scheduler's loop.
+      `/healthz` is asynchronous: its store check runs in a small executor of its own (two
+      threads), so a pool busy with slow `/runs` requests never fails the health check and
+      SQLite never runs on the loop; it reads `Scheduler.state()` on the event loop, the
+      scheduler's own, so the snapshot never interleaves with the scheduler changing it (no
+      worker thread reads the scheduler).
+    - **B, binding.** `--host` (`HORAE_HOST`, default `127.0.0.1`) and `--port`
+      (`HORAE_PORT`, default 8080). The container image sets `HORAE_HOST=0.0.0.0` so that the
+      reverse proxy (Coolify's Traefik) can reach it on the container network; the port is
+      `EXPOSE`d, never meant to be published. `HORAE_HOST=::` listens on IPv6 only
+      (`IPV6_V6ONLY`), so the image's IPv4 loopback `HEALTHCHECK` then fails: use `0.0.0.0`
+      or override the check. **The API has no authentication of its own:** SSO is the
+      proxy's middleware (PLAN §7, #41: only `/act/` is exempt; `/runs` and `/healthz`
+      require SSO). It must never be exposed without that proxy. **The Docker network is
+      trusted:** a neighbour container on it can reach port 8080 directly and send any `Host`
+      it likes (the Host check of G2 is a defence against browsers, not against
+      neighbours), so #41's template must put Horae on a network shared only with the proxy.
+    - **C, `/healthz`.** `200` when the store opens read-only at this Horae's schema version
+      **and** the scheduler is active (`SchedulerState.active`) or its mode is `external`;
+      `503` otherwise (also while `horae serve` stops). Body: `schema_version` (1),
+      `status` (`ok` / `unavailable`), `version`, `store` (`status` `ok` / `error`, `reason`
+      `missing` / `schema_too_old` / `schema_too_new` / `unreadable` or `null`,
+      `schema_version`) and `scheduler` (`SchedulerState.to_dict()`, decision 49 E). No path,
+      no configuration value beyond the scheduler state, no exception text. `horae serve`
+      creates and migrates the store once at start, so a new instance is healthy before its
+      first run (a failure there is a warning; `/healthz` then says `error`). The body stays
+      this detailed (pipelines, cron expressions, fire times, outcomes): it is behind SSO
+      (#41), and keeping neighbours off the network is #41's job (B), so a reduced
+      unauthenticated body is not needed. Behind the SSO proxy an external monitor needs its
+      own way in (a proxy rule for the monitor, or Uptime Kuma on the same network): an
+      operator choice, not Horae's (#41).
+    - **D, `/runs`.** `GET /runs` lists runs newest first (start time, then id) as `horae
+      runs --json` shows them (`horae.run_view.run_json`, shared with the CLI: id, pipeline,
+      status, `stale`, dry run, abandoned, times, duration, cost, error; never the run
+      record, `pid` or `host`). **Keyset pagination**: `limit` (1 to 100, default 20) and an
+      opaque `cursor` (`next_cursor` of the previous page, `null` on the last), stable while
+      runs are added (a new run never shifts a page, unlike an offset); runs that share a
+      start time stay in id order across pages, and a cursor is a position, so it still
+      works when its run has been pruned. Only the exact cursor shape the API writes is
+      accepted (canonical base64url of `[<UTC isoformat time>, <run id>]`); anything else,
+      a time that would overflow included, is `400`, never `500`. Filters `pipeline` and
+      `status`, which takes the same values as `horae runs --status`
+      (`run_view.RunStatusFilter`: `running`, `ok`, `noop`, `degraded`, `failed`, `undone`;
+      `stale` is a flag computed from the locks after the query, not a status, in either);
+      live skill evals (`eval:<skill>`) only with `all=true` or their own `pipeline`, as in
+      the CLI. `GET /runs/{id}` is one run, the same object (`404` when unknown); it stays
+      (a link to one run is what the dashboard and #38's messages need). Bad parameters are
+      `400 invalid_request` naming the parameter, never echoing its value. Only `GET` routes
+      exist (`405` otherwise); no slash redirect (`/runs/` is `404`).
+    - **E, read-only store access.** Each request opens the store with
+      `Store.open(read_only=True, immutable=False)` (decision 36): no migration, no WAL
+      switch, `query_only`, and always plain `mode=ro`, a WAL reader with SQLite's locks and
+      the shared `-shm`. The CLI's one-shot reads (`horae runs`) keep `immutable=True`, which
+      opens the database `immutable` when there is no `-wal` file and so creates nothing. The
+      API cannot: it reads in the scheduler's process, where a run's store writes and, on
+      close, checkpoints into the main file at any moment, and an `immutable` connection
+      takes no lock and trusts the file not to change, so such a read could be torn (the
+      size of the WAL is no bound: a closing writer checkpoints whatever it holds). With
+      plain `mode=ro` a reader never blocks the writes and sees only committed data, tested
+      with a write transaction open and with a writer thread that checkpoints on every close
+      while the API reads. The cost: a read with no writer active may leave an empty `-wal`
+      and a 32 KiB `-shm` (the database file's permissions, no data); the next writer's
+      close removes them (tested).
+    - **F, no secrets in responses.** Every body, errors included, is redacted as data
+      (`scrub_data`: strings, keys, numbers) and then as text with the process registry
+      (decision 43), which `horae serve` primes with every secret the instance names; the
+      store already redacts what it writes, so this is the second line. Error bodies are
+      Horae's (`{schema_version, error: {kind, message}}`): an internal error shows its
+      exception type only, a validation error the parameter's name only.
+    - **G, headers and surface.** Every response from the app: `Cache-Control: no-store`,
+      `X-Content-Type-Options: nosniff`, `Content-Security-Policy: default-src 'none';
+      frame-ancestors 'none'`, `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY`,
+      `Content-Type: application/json` (uvicorn's own `400` for a request it cannot parse
+      never reaches the app and has none). No CORS (no `Access-Control-*` header; a
+      preflight is `405`). The OpenAPI document and the docs pages are **disabled**, on
+      every interface (not only off loopback): the API is three routes, documented here and
+      in the README, and a schema endpoint would be one more thing to keep behind SSO.
+    - **G2, Host check (DNS rebinding; added after the security review of this branch).**
+      With the default loopback bind, a web page could point its own name at 127.0.0.1 and
+      read `/runs` and `/healthz` from the user's browser (same origin for the page). So a
+      request whose `Host` is not an allowed host is refused before any route runs: `400`,
+      `{kind: invalid_host, message: "host not allowed (see HORAE_ALLOWED_HOSTS)"}`, the host
+      never echoed, with the security headers. Always allowed: `localhost`, `127.0.0.1`,
+      `::1` (any port; the container's `HEALTHCHECK` and a local client). Also allowed: each
+      `--allowed-host` (`HORAE_ALLOWED_HOSTS`, space-separated): the proxy's public hostname,
+      which Traefik forwards as `Host`; and the bind address itself when it is not a
+      wildcard. An allowed host is a DNS name (`_` allowed too: Docker service names) or an
+      IP address, compared exactly after lower-casing and dropping a trailing dot: no
+      wildcard, no port, no sub-domain matching (a bad value is a usage error, exit 2). A
+      missing, malformed or repeated `Host` is refused. **A wrong `Host` is visible, not
+      refused at start**: the loopback `HEALTHCHECK` stays green while every proxied request
+      is refused, so `horae serve` logs a warning at start when it listens on a wildcard
+      (`0.0.0.0`, `::`) with no allowed host, naming `HORAE_ALLOWED_HOSTS`, and logs each
+      refused `Host` value once (warning, `horae.api`; `ascii()`-escaped so no control or
+      bidi character reaches the log, truncated to 64 characters, at most 32 distinct values
+      then one line saying it stops, through the redacting record factory). It warns rather
+      than refuses to start: a wildcard bind with loopback clients only is a valid setup.
+      Allowed hosts are set on the command line (and the environment) only, not in
+      `horae.yaml`: it is a property of the deployment, like `--host`, and needs no contract
+      change; an `api.allowed_hosts` key is a follow-up if instance repos want it.
+    - **H, shutdown.** The first SIGTERM / SIGINT stops the scheduler (decision 49 E2) and
+      asks the server to stop: it closes its socket and waits up to 5 s for requests in
+      progress. The command exits 0 once both have stopped; a second signal also forces the
+      server. A server that ends on its own stops the scheduler and exits 70.
+    - **I, container.** The image's default command is `horae serve` (it was `--help`; it
+      stays `serve`), and its `HEALTHCHECK` asks `/healthz` over loopback with the standard
+      library (`python -c`, `urllib`, no proxy): no curl or wget in the image. The check
+      follows `HORAE_PORT`, not a `--port` flag: change the port with `HORAE_PORT` (a `serve
+      --port N` command leaves the check asking 8080 and the container unhealthy). A
+      container running another command (`init`, `doctor`, `run`) reports unhealthy, which
+      is harmless for a one-off; one with `HORAE_HOST` set to `::` or to a non-loopback
+      address other than `0.0.0.0` must override the check. `scripts/smoke-image.sh` checks
+      that `horae serve` becomes healthy with the image's own check, serves `/runs`, warns
+      about `HORAE_ALLOWED_HOSTS` and exits 0 on `docker stop`; under emulation (QEMU) it
+      waits longer (`SMOKE_SERVE_WAIT_S`, `SMOKE_PROBE_TIMEOUT_S`, `SMOKE_STOP_S`).
+    - **J, dependencies.** `starlette` is a direct dependency with its own range
+      (`>=1.9,<2`): the API relies on Starlette's handler behaviour (exception handlers,
+      middleware order, `redirect_slashes`), so a change of major version must be a
+      deliberate bump, not a side effect of a FastAPI update.
+    - **Not done (follow-ups)**: `/act` (#38), the SSO-exemption test against the rendered
+      template and the network that only the proxy shares (#41), `api.allowed_hosts` in
+      `horae.yaml`; no ETag or conditional requests; no metrics endpoint.
+
+### Provisional decisions (#122, pending maintainer review)
+
+52. **`task.create` takes an optional `link` (#122).** A compatible v1 addition: one optional
+    field of `task.create` (`TaskCreate.link`, the `TaskLink` type), mirrored in `intent/v1.json`
+    and `run-record/v1.json`, and an optional `link_prefix` parameter on a `mode: tasks` `act`
+    entry; no store migration. It lets a task created from an external item (a pull request, a
+    calendar event) carry a clickable link, which the escaped title never can (decision 50).
+    - **A, the shape: `https://` only.** `^https://[^F/?#@\\%\[\]]+([/?#][^F\\]*)?$`,
+      at most 2048 characters, where `F` (`TASK_LINK_FORBIDDEN`, written as `\u` escapes) is
+      every Basic Multilingual Plane character of the Unicode categories `Cc`, `Cf`, `Zs`,
+      `Zl` and `Zp`: the `notify.push` link (decision 7) restricted to `https`, with a
+      non-empty authority that holds no `@` (no user info, so no `https://good@evil` reading
+      as `good`), `%` or brackets, and no backslash anywhere (browsers read `\` as `/` in an
+      `https` URL). No control, format (bidi, zero-width, soft hyphen), space or separator
+      character may appear anywhere, nor a lone surrogate: the model (`_check_task_link`) and
+      the SDK also check the categories with `unicodedata`, which covers the supplementary
+      planes (tag characters) that one ECMA-262, Rust and Python pattern cannot. **The host
+      is a name, never an IP literal**: bracketed IPv6 fails the pattern, and a host whose
+      last label (one trailing dot dropped, after NFKC) is decimal digits or `0x` hex is what a
+      browser reads as IPv4 (`127.0.0.1`, `127.1`, `0x7f.1`, `2130706433`, full-width digits),
+      refused by the model and the SDK (the use case is a named web host; a `link_prefix` on
+      an IP is refused the same way). The SDK keeps a copy of the pattern, and a shared test
+      checks it equals the core's and that both refuse every code point of those categories. No
+      `obsidian://`, unlike `notify.push`: a notification link opens the vault from a phone,
+      while a task link is written **into** a note, where an `obsidian://` URI is an action
+      (`new`, `open` with a command plugin) one click away, and the use case (an external
+      item) is a web page. `http://`, `javascript:`, `data:` and every other scheme are
+      refused by the schema. Loosening it later (another scheme) is compatible.
+    - **B, routing binds it (decision 30).** A `task.create` with a `link` is taken only by a
+      `mode: tasks` entry with a trusted `link_prefix` the link falls under, by the same rule
+      and the same code as `notify.push` (`_check_link_prefix`, `_link_under`: an `https://`
+      prefix with a host, no user info, query or fragment and a clean path ending in `/`;
+      same scheme, the same authority, a clean rest of path, own query and fragment
+      allowed). The authority of an `https` link and prefix is compared as a DNS origin:
+      the host case-insensitively, one trailing dot ignored, an explicit `:443` equal to no
+      port, and no user info (`GitHub.com`, `github.com:443` and `github.com.` fall under
+      `https://github.com/my-org/`); the path stays case-sensitive (`/My-Org/` is not under
+      `/my-org/`), as do an `obsidian://` netloc (compared exactly) and the rest of the rule.
+      `_link_under` is shared, so this applies to `notify.push` `https` links too (decision
+      30 compared the netloc exactly; it only accepts more spellings of the same origin).
+      When a `tasks` entry would take the task but for its link, the `intent_unrouted`
+      message says `task link not under a trusted link_prefix` (a fixed text, no URL). **Without `link_prefix`, a task with a link is never routed**
+      (`intent_unrouted`), as for `notify.push`: deny by default, so a pipeline names the
+      hosts its tasks may point at (`link_prefix: https://github.com/my-org/`). A task
+      without a link needs no prefix, so existing pipelines are unchanged. An `obsidian://`
+      or otherwise invalid `link_prefix` on a `tasks` entry, or a `link_prefix` on an `act`
+      entry of any other `mode`, is `params_invalid` (it used to be inert metadata there; no
+      pipeline used it). **Upgrading a source**: once a source (or skill) sends `link`,
+      every `mode: tasks` entry that receives its tasks needs a `link_prefix` covering those
+      links, or the step fails at run time with `intent_unrouted` (`horae doctor` does not
+      inspect `act` entries, and cannot know what a source will send). The entry's
+      parameters, `link_prefix` included, are recorded in the `act` step's output and passed
+      to the sink plugin as the `params` of its apply call (`SinkCall.params`), as for every
+      entry parameter: a Tasks sink must accept, and may ignore, `link_prefix`.
+    - **C, the action guard.** A `task.create` `link` proposed by an LLM skill must be exactly
+      a URL of the viewed input, like a `notify.push` link (decision 46), on top of the
+      prefix; a refusal degrades the step. Source and transform proposals are not guarded
+      (first-party plugins, #52), so the prefix is what binds them.
+    - **D, no v2.** The field is optional and `additionalProperties: false` only ever refused
+      it: every v1 intent, run record and pipeline stays valid, and a v1 consumer that does not
+      know the field never receives it unless a pipeline opts in with `link_prefix` (an
+      applier built before this change would ignore it). Per "Versioning", that is a
+      compatible addition in `v1`.
+    - **E, the sink renders it inert.** The intent keeps the link exactly as proposed (routing
+      and the guard compare it as written). `horae_sdk.tasks.task_line` (and `task_line_for`)
+      writes it right after the escaped title and before the date fields, as
+      `[link](<destination>)`: a fixed label, never text from the title or the URL; the title
+      cannot open, close or fake a link (its brackets and parentheses are escaped, decision
+      50). `link_destination` percent-encodes (UTF-8) everything outside
+      `A-Z a-z 0-9 - . _ ~ : / ? # @ ! & ' * + , ; = %`: so `( ) [ ] < >`, backtick, `$`,
+      `"`, `{ } | ^` and every non-ASCII character (no signifier, bidi or zero-width
+      character reaches the line); a `%` that starts no escape becomes `%25` (no `%%`); the
+      `&` of an HTML entity becomes `%26` (Markdown decodes entities in a destination, and
+      `&#x2E;&#x2E;` would otherwise become `..` after routing checked the path); the second
+      `:` of `::` and `=` of `==` become `%3A` / `%3D` (no Dataview field, no highlight). It
+      is idempotent and percent-decodes to the same string as the link does. The ported
+      Tasks and Dataview regexes see no field in the link and the escaped title (property
+      tests over a hostile alphabet and arbitrary text). **A destination longer than 4096
+      characters is left out** (`MAX_DESTINATION`): a non-ASCII character takes up to 12
+      once encoded, so a 2048-character link could reach about 24 KiB, past
+      plugin-obsidian's 16 KiB analysis cap for a line; the line is then written without the
+      link, and nothing of it is returned or logged. The core's dry-run diff shows the link
+      as plain text in angle brackets (`(link <url>)`, terminal-escaped), so a `)` in the
+      URL cannot read as the end of the parenthesis.
+    - **F, the SDK.** `intents.task_create(..., link=None)` checks the same shape
+      (`tasks.is_task_link`); `horae-sdk` goes to 0.2.0 (not yet published; there is no
+      changelog file, the README's "Task links" section and this decision are the notes).
+    - **Not done (follow-ups)**: the Obsidian plugin's own Tasks writer must render the link
+      the same way (`link_destination`) before it may list `task.create` links as supported;
+      `task.update_status` takes no link.

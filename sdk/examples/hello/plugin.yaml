@@ -1,0 +1,21 @@
+# Written by plugin.manifest(command=["python3", "hello_plugin.py"], license="Apache-2.0").
+# The host needs an absolute interpreter that has horae-sdk and an absolute script path: pin
+# them when installing (sdk/README.md, "The command"), as the end-to-end test does.
+name: hello
+version: 0.1.0
+horae: '>=0'
+description: Greets someone and proposes tasks to greet them back and to reply.
+license: Apache-2.0
+provides:
+  sources:
+  - hello.greet
+  transforms:
+  - hello.shout
+permissions:
+  intents:
+  - task.create
+runtime:
+  protocol: mcp-stdio
+  command:
+  - python3
+  - hello_plugin.py

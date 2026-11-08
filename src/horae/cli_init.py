@@ -210,6 +210,21 @@ def _create_new(parent: Path, parent_fd: int, name: str, directory: Path, lock: 
     return files
 
 
+def _fresh_listdir(fd: int) -> list[str]:
+    """The entries of the directory `fd` refers to, read through a new open file description.
+
+    Listing a reused descriptor again is not enough: btrfs (OrbStack volumes, Synology, Fedora)
+    only returns the entries that existed when the directory was opened, so an entry created
+    since (the hidden build directory, or one that appeared meanwhile) would be missed.
+    Re-opening `.` relative to `fd` reads the same directory (not whatever its path now names),
+    which keeps the race check honest."""
+    fresh = os.open(".", _DIR_FLAGS, dir_fd=fd)
+    try:
+        return os.listdir(fresh)
+    finally:
+        os.close(fresh)
+
+
 def _fill_empty(root: Path, target_fd: int, directory: Path, lock: Any) -> list[str]:
     """An existing empty target: built in a hidden directory inside it, whose entries are
     renamed up into it (the target itself is kept)."""
@@ -221,7 +236,7 @@ def _fill_empty(root: Path, target_fd: int, directory: Path, lock: Any) -> list[
         hidden_fd = os.open(hidden, _DIR_FLAGS, dir_fd=target_fd)
         try:
             entries = sorted(os.listdir(hidden_fd))
-            if set(os.listdir(target_fd)) != {hidden}:
+            if set(_fresh_listdir(target_fd)) != {hidden}:
                 raise _not_empty(directory)  # something appeared meanwhile
             for entry in entries:
                 os.rename(entry, entry, src_dir_fd=hidden_fd, dst_dir_fd=target_fd)
