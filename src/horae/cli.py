@@ -132,6 +132,7 @@ def _report(instance: Path, json_output: bool) -> int:
         problems.extend(instance_problems(result.instance))
     ok = not any(problem.severity == "error" for problem in problems)
     warnings = sum(problem.severity == "warning" for problem in problems)
+    infos = sum(problem.severity == "info" for problem in problems)
     if json_output:
         report = {
             "schema_version": REPORT_SCHEMA_VERSION,
@@ -152,7 +153,7 @@ def _report(instance: Path, json_output: bool) -> int:
                 + (f" ({_plural(warnings, 'warning')})" if warnings else "")
             )
         else:
-            echo(_plural(len(problems) - warnings, "problem") + " found")
+            echo(_plural(len(problems) - warnings - infos, "problem") + " found")
     return EXIT_OK if ok else EXIT_PROBLEMS
 
 

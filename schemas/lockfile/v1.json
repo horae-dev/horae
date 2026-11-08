@@ -108,7 +108,7 @@
           "uniqueItems": true
         },
         "secrets": {
-          "description": "Secrets injected (only) into this plugin's environment.",
+          "description": "Secrets injected (only) into this plugin's environment. Each must resolve, or the\nplugin does not start (`secret_missing`).",
           "items": {
             "maxLength": 128,
             "not": {
@@ -119,6 +119,21 @@
           },
           "maxItems": 256,
           "title": "Secrets",
+          "type": "array",
+          "uniqueItems": true
+        },
+        "optional_secrets": {
+          "description": "Secrets injected like `secrets` when they resolve; one that does not is left out of the\nenvironment and the plugin still starts. Granted by `horae.lock` like any secret. Not\nalso in `secrets`.",
+          "items": {
+            "maxLength": 128,
+            "not": {
+              "pattern": "^(HORAE(_|$)|LD_|DYLD_|PYTHON|PATH$|HOME$)"
+            },
+            "pattern": "^[A-Z][A-Z0-9_]*$",
+            "type": "string"
+          },
+          "maxItems": 256,
+          "title": "Optional Secrets",
           "type": "array",
           "uniqueItems": true
         },

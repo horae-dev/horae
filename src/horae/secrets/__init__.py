@@ -153,9 +153,10 @@ class SecretError(Exception):
 
 
 class SecretMissing(SecretError):
-    """A core secret (`SecretResolver.resolve_core`) is set nowhere: neither its file nor its
-    environment variable exists. Any other problem (too short, unreadable) is a plain
-    `SecretError`."""
+    """A secret is set nowhere: its file does not exist or its environment variable is not set
+    (`SecretResolver.resolve_core`: neither of the two). Any other problem (too short, bad
+    bytes, unreadable) is a plain `SecretError`, so that `horae doctor` can tell an optional
+    plugin secret that is not set (`info`) from one that is set but unusable (`warning`)."""
 
 
 CORE_SECRETS = CORE_SECRET_NAMES
@@ -283,7 +284,10 @@ class SecretResolver:
             raise SecretError(shown, "not a core secret")
         path = self._directory / name
         if os.path.lexists(path):
-            secret = self._from_file(name, path)
+            try:
+                secret = self._from_file(name, path)
+            except SecretMissing as exc:  # a dangling link: set, but unusable
+                raise SecretError(name, exc.reason) from None
         elif name in self._environ:
             secret = self._from_env(name, name)
         else:
@@ -312,7 +316,7 @@ class SecretResolver:
 
     def _from_env(self, name: str, variable: str) -> Secret:
         if variable not in self._environ:
-            raise SecretError(name, f"environment variable {variable} is not set")
+            raise SecretMissing(name, f"environment variable {variable} is not set")
         value = _strip_newline(self._environ[variable])
         problem = _problem(value)
         if problem is not None:
@@ -343,7 +347,7 @@ class SecretResolver:
         try:
             fd = os.open(path, _OPEN_FLAGS)
         except FileNotFoundError:
-            reason = "does not exist"
+            raise SecretMissing(name, f"file {path} does not exist") from None
         except OSError as exc:
             reason = f"cannot be read ({exc.strerror})"
         if reason is not None:

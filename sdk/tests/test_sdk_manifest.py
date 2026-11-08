@@ -84,6 +84,10 @@ def test_a_full_manifest_is_valid() -> None:
         ({"permissions": Permissions(network=["Example.org"])}, "network"),
         ({"permissions": Permissions(secrets=["lower"])}, "secrets"),
         ({"permissions": Permissions(secrets=["HORAE_KEY"])}, "reserved"),
+        ({"permissions": Permissions(optional_secrets=["lower"])}, "optional_secrets"),
+        ({"permissions": Permissions(optional_secrets=["HORAE_KEY"])}, "reserved"),
+        ({"permissions": Permissions(optional_secrets=["A_B", "A_B"])}, "twice"),
+        ({"permissions": Permissions(secrets=["A_B"], optional_secrets=["A_B"])}, "both"),
         ({"permissions": Permissions(read=["relative/path"])}, "paths.read"),
         ({"permissions": Permissions(write=["/a/../b"])}, "paths.write"),
         ({"permissions": Permissions(intents="note.create")}, "not a string"),
@@ -96,6 +100,23 @@ def test_mistakes_are_refused(changes: dict[str, Any], message: str) -> None:
     arguments: dict[str, Any] = {"name": "ok", "version": "0.1.0", "provides": {}, **changes}
     with pytest.raises(ManifestError, match=message):
         manifest(**arguments)
+
+
+def test_optional_secrets_round_trip_through_the_manifest(tmp_path: Path) -> None:
+    permissions = Permissions(secrets=["EXAMPLE_TOKEN"], optional_secrets=["EXAMPLE_OTHER"])
+    data = manifest(name="opt", version="0.1.0", provides={}, permissions=permissions)
+    assert data["permissions"] == {
+        "secrets": ["EXAMPLE_TOKEN"],
+        "optional_secrets": ["EXAMPLE_OTHER"],
+    }
+    model = accepted(data)
+    assert model.permissions.optional_secrets == ["EXAMPLE_OTHER"]
+    write_manifest(tmp_path / "plugin.yaml", data)
+    again = validate(read_yaml(tmp_path / "plugin.yaml"), PluginManifest)
+    assert again.permissions.secrets == ["EXAMPLE_TOKEN"]
+    assert again.permissions.optional_secrets == ["EXAMPLE_OTHER"]
+    bare = manifest(name="opt", version="0.1.0", provides={})
+    assert "optional_secrets" not in bare["permissions"]
 
 
 def test_plugin_registration_rules() -> None:

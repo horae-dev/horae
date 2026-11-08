@@ -3292,3 +3292,30 @@ loosened later without breaking a valid file.
       a skill whose prompt asks for task checkboxes, tags or wikilinks in a note now
       degrades its step; tasks belong in `task.create` intents (escaped by the sink,
       decision 50).
+56. **Optional plugin secrets, `permissions.optional_secrets` (#136).** Provisional. A
+    declared secret had to resolve or the plugin did not start, so a plugin with several
+    credentials of which a user needs one (plugin-calendar's `CALENDAR_*`, plugin-github's two
+    tokens, a per-entry ntfy token) needed placeholder values.
+    - **A, the form.** A parallel list, `permissions.optional_secrets`, beside `secrets`, same
+      name rules (`SecretName`, at most 256, unique), default empty. Chosen over
+      `secrets: [NAME, {name: NAME2, optional: true}]` because `secrets` stays a list of
+      names, so every v1 manifest and `horae.lock` stays valid and every reader of `secrets`
+      (the lock, the SDK, the redaction priming) keeps meaning "required". It applies to
+      both `plugin.yaml` and `horae.lock` (one `Permissions` model). A name in both lists is
+      refused (pydantic only: JSON Schema cannot say it).
+    - **B, permissions.** An optional secret is a permission like any other: `horae.lock` must
+      grant it in `optional_secrets` (`_exceeds` compares both lists; a grant as a required
+      secret does not cover an optional request, and the locked list is the one in force).
+    - **C, the host.** Required secrets resolve as before (missing: `secret_missing`, the
+      plugin does not start). An optional secret is resolved at start; if it does not resolve
+      (no file or variable, too short, unreadable: any `SecretError`) it is simply absent from
+      the child environment, and the plugin reports `secret_missing` itself when a call needs
+      it. Both lists are checked against the environment deny list. When the host opens, it
+      resolves optional secrets with the others, so redaction covers those that resolve.
+    - **D, `horae doctor`.** Each unresolved optional secret is an `info` problem (a new
+      `severity` value, beside `error` and `warning`), at the lock's `optional_secrets` entry,
+      never failing the check; `ok` is true and the exit code 0. A required one stays an error.
+      A too-short optional secret is also only `info` (its message says why).
+    - **E, compatibility.** Additive: an optional field with a default. Older cores reading a
+      manifest with `optional_secrets` refuse it (`additionalProperties: false`), as for any
+      new field.
