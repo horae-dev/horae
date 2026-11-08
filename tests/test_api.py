@@ -423,9 +423,15 @@ def test_traversals_out_of_act_are_404(
     _seed(store_path, 1)
     app = create_app(ApiContext(store_path, store_path.parent, state))
     status, body = _raw_get(app, path, raw_path)
-    assert status == 404, path
-    assert json.loads(body)["error"]["kind"] == "not_found"
     assert b"run-00" not in body
+    if path.startswith("/act/"):
+        # Under `/act` (#38): the `/act` page, 404, or 503 for a single segment that reaches
+        # `/act/{token}` while `/act` is off here (no key); never another route.
+        assert status in {404, 503}, path
+        assert body.startswith(b"<!doctype html>")
+    else:
+        assert status == 404, path
+        assert json.loads(body)["error"]["kind"] == "not_found"
     assert _raw_get(app, "/runs", b"/runs")[0] == 200  # the control: /runs itself answers
 
 

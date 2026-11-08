@@ -95,11 +95,12 @@ TEXT_FIELDS: Mapping[IntentType, tuple[str, ...]] = {
     "note.replace_owned_block": ("content",),
     "task.create": ("title", "fingerprint"),
     "task.update_status": (),
-    "notify.push": ("title", "body"),
+    "notify.push": ("title", "body", "actions"),
     "http.post": ("body",),
 }
 """The untrusted text fields of each intent type that the guard scans (a `notify.push` or
-`task.create` `link` is checked as a whole URL; targets bound by routing are not text)."""
+`task.create` `link` is checked as a whole URL; targets bound by routing are not text). Every
+string of a `notify.push`'s `actions` is scanned: the button labels, ignored by the core (#38)."""
 
 INERT_TAGS = frozenset(
     {"b", "i", "u", "s", "em", "strong", "code", "pre", "br", "hr", "p", "ul", "ol", "li"}

@@ -3008,3 +3008,203 @@ loosened later without breaking a valid file.
       detect a second fingerprint mapping to the same id and **fail closed** (refuse) rather
       than overwrite. A non-string or invalid fingerprint is a `ValueError`.
     - **D, the SDK version.** `horae-sdk` is 0.3.0.
+
+### Decisions (#38, design note and maintainer answers on #115)
+
+54. **Signed single-use action links, `/act/<token>` (#38, the design note
+    [docs/design/0038-act-links.md](../docs/design/0038-act-links.md) and the maintainer's
+    answers on PR #115: all ten recommendations accepted).** A compatible v1 addition to the
+    intent contract (`notify.push.actions`) and to `horae.yaml` (`http`), store migration 8,
+    one core secret (`HORAE_ACT_KEY`), two routes. A tap on a notification button changes
+    **one task** in **one predefined way**, once, within 24 h, without SSO: the token is the
+    only credential.
+    - **A, what a link can do.** A closed set of kinds, never an intent document:
+      `task.done` (`task.update_status {status: done}`) and `task.snooze` (`{status: snoozed,
+      until}`, `until` computed by the core when the button is pressed: `1h`, `3h`, or
+      `tomorrow` at 09:00 in the instance time zone). `notify.push`, `http.post` and
+      `note.*` can never be reached. Adding a kind is a core change (ADR 0002).
+    - **B, the contract.** `notify.push` gains an optional `actions`: 1 to 3 (ntfy's limit)
+      `{kind, task, duration?, label?}`; `task` a fingerprint, `duration` required for
+      `task.snooze` and only there. The proposer never writes a URL, nor the button's text:
+      **`label` is deprecated and ignored** (still accepted, one line of at most 64 characters,
+      so proposals written with it stay valid; review decision 2 on PR #115): the core labels
+      each button from its kind and duration (`horae.api.act.BUTTON_LABELS`: `Done`, `Snooze
+      1h`, `Snooze 3h`, `Tomorrow`), so a button cannot say something other than what its link
+      does. Like a `task.update_status` target, every button's `task` must appear in the data
+      the run collected (rule 4 of `horae.engine.executor`, maintainer decision 2), and the
+      action guard scans the labels of an LLM proposal. A notification without `actions` keeps
+      the `dedupe_key` it had before the field existed (the field is left out of the key when
+      absent), so an upgrade re-sends nothing.
+    - **C, minting.** Only the core holds the key. When the apply phase sends a `notify.push`
+      with `actions`, `horae.api.act.LinkMinter` mints one link per action whose task is in
+      the store's task index and open (an unknown, `done` or `cancelled` task's button is
+      left out; so is a `task.done` button for a **recurring** task, a snooze stays allowed,
+      review decision 3: whether a task repeats comes from the index's `recurring` flag and
+      from the run's collected data, any object with a boolean `recurring` naming the
+      fingerprint in `fingerprint`, `source_fingerprint`, `task` or `key`, e.g.
+      `obsidian.open_tasks`, which also updates the flag) and passes them to the
+      notifier with the call: `SinkCall.actions`, sent to an MCP notifier's `<ns>.apply` as
+      `actions: [{"action": "http", "label", "url", "method": "POST"}]` (ntfy `http`
+      actions, so plugin-ntfy#4 can forward them as they are; `horae_sdk.ApplyRequest.actions`
+      in the SDK), only when there are some. A notifier renders these, never the intent's
+      own `actions`, and treats each URL as a credential (sent to the push service only,
+      never logged). The URL is `http.public_url` + `/act/` + the token: the base comes from
+      `horae.yaml` only, never from a request's `Host` or `X-Forwarded-Host` (normalised: a `:443` in
+      `http.public_url` is dropped, as a browser's `Origin` drops it). Without the key,
+      `http.public_url` or a route (F) whose plugin may apply `task.update_status` (the
+      runner checks `route_permitted` as `horae serve` does), nothing is minted and the notification is sent
+      without buttons (logged once per process). Daily-note links are a follow-up
+      (maintainer decision 3).
+    - **D, the token** (`horae.api.act._token`, maintainer decision 4: a signed payload, not a
+      server-side row). One base64url segment without padding, `payload || tag`:
+      `ver(1) kid(4) kind(1) exp(8, Unix s, big-endian) nonce(16) state(8) dur(1) fp_len(1)
+      fingerprint(1..128)`, `tag = HMAC-SHA256(key, "horae-act/v1\0" || payload)` (32
+      bytes, not truncated); 73 to 200 bytes, 98 to 267 characters
+      (`^[A-Za-z0-9_-]{98,267}$`). `state` is the first 8 bytes of SHA-256 over the task's
+      `(status, due, snoozed_until)` at mint time (maintainer decision 10). It carries no
+      secret, URL or title; it is signed, not encrypted (whoever sees the link can read the
+      fingerprint). Decoding is strict and total: one spelling per token (re-encoding must
+      give the same string), the tag checked with `hmac.compare_digest` before any field,
+      then the version, key id, a known kind, a duration that fits it, the fingerprint's
+      length and alphabet; a string that is not even well-formed pays for one MAC over a
+      buffer of the maximum payload size, so the work barely depends on which check failed
+      (best effort: the store lookups after the MAC still differ).
+    - **E, the key** (maintainer decision 8). A dedicated secret, `HORAE_ACT_KEY`, at least
+      32 bytes (`openssl rand -base64 48`), read by `SecretResolver.resolve_core`: the file
+      `<secrets.dir>/HORAE_ACT_KEY`, else the environment variable of that name. `HORAE_*`
+      is reserved for the core (`SecretName`), so no `secrets.refs` entry, plugin or child
+      environment can name it; it is remembered for redaction like every secret and primed
+      by `Instance.prime_redaction`. Key id `HMAC-SHA256(key, "horae-act/kid")[:4]`. One key
+      at a time, **no grace window**: rotating it (new value, restart) refuses every
+      outstanding token. Missing: `/act` answers 503 and notifications go out without
+      buttons. Set but unusable (shorter than 32 bytes, unreadable): `horae serve` refuses to
+      start (`config_invalid`) and `horae doctor` reports an error; set without `http.public_url` or a route, `horae doctor` warns; read from the
+      environment rather than the file, `horae doctor` warns too (a same-uid plugin can read
+      the core's environment through `/proc`: prefer the file). No `secrets.refs` `env` /
+      `file` and no `deidentification.vocabulary` may name a core secret's variable or file
+      (`CORE_SECRETS`, any case: the contract refuses it), so no reference can hand the key to
+      a plugin.
+    - **F, the route.** The change is applied by the instance's one `mode: tasks` `act` entry
+      (its tool and parameters as written; one with a template is not used), as decision 30
+      routes a `task.update_status`; zero or several distinct entries, or a plugin that may
+      not apply `task.update_status` (checked by `horae serve` with the plugin registry): no
+      route, `/act` is 503. Each `POST` opens the instance's sinks (the plugin host) for that
+      call.
+    - **G, single use** (store migration 8, maintainer decision 7). Table `act_consumed`
+      (`nonce` primary key, `kid`, `expires_at`, `consumed_at`, `run_id`, `outcome`: `pending`, `applied`, `not_changed`, `stale`, `failed`). `POST`: verify; take the apply lock (decision
+      34 D6, at most 3 s, else **503 and the token stays usable**) and the `_act` pipeline
+      lock, recovering an `_act` run a dead process left `running`; refuse a used token or
+      an unknown task (404, nothing written); open the sinks (unreachable: 503, nothing
+      written); begin a run of the **reserved pipeline `_act`**; if the task's state is not
+      the token's, consume it `stale` (nothing applied, the run `failed` with
+      `target_changed`); else, **in one transaction**, insert the nonce (`pending`; a
+      primary-key conflict means used) and journal the `task.update_status` the core built
+      (never from the request), commit, then `Sink.apply` (bounded by
+      `plugin_defaults.call_timeout_s`), then mark the entry applied and the outcome
+      `applied`, update the task index and end the run `ok`. **A sink that answers it
+      changed nothing** (`details.changed: false`; plugin-obsidian answers so, with
+      `details.recurring`, for a recurring task asked `done`): the entry is marked applied
+      (the sink answered), the outcome is `not_changed`, the task index is **not** updated (a
+      `details.recurring` flags the task recurring) and the run ends `noop` (review decision
+      3); the apply phase of a run leaves the index alone the same way. A sink failure or
+      timeout uses the token up (`failed`, single attempt). A crash after the commit leaves the token used
+      and the change journalled "maybe applied": at most once, never twice. `_act` runs are
+      bare rows (no run record: `PipelineName` forbids `_` and they have no definition or
+      steps; the runs table's CHECK now allows them, like `eval:` rows), visible in `horae
+      runs`; their journal entry names the task and the sink, their `act_consumed` row the
+      outcome (the `ref` of the logs is SHA-256 of its nonce). Used-token rows are kept 24 h 05
+      min (`MAX_AHEAD_S` = `ACT_RETENTION_S`) after their token expired, so a clock stepped back
+      by less than that cannot make a used token usable again; then they are deleted (one
+      bounded `DELETE` per `POST`, and by `prune_runs`).
+    - **H, expiry and clocks.** `exp = mint + 24 h`, refused when `now >= exp`, and refused
+      when `exp > now + 24 h 05 min` (a clock that jumped forward at mint, or a bug). Minting
+      and checking share a host and a clock: no skew leeway.
+    - **I, staleness.** `POST` recomputes `state` from the task index; any change of status,
+      due date or snooze (task done meanwhile, snoozed again, due date moved) makes the link
+      stale (409, consumed). A re-collection that leaves the three fields unchanged (a new
+      title) does not. **The task index is now kept by the apply phase**
+      (`horae.apply.index_task`, needed for this decision: nothing wrote it before): an
+      applied `task.create` inserts its task (`todo`), or updates the title, due date, time
+      and source of a known one without reopening it; an applied `task.update_status`
+      changes a known task (a date `until` in the instance time zone), unless the sink
+      answered `changed: false`; a store failure there is logged and never fails the apply.
+      Migration 8 adds `tasks.recurring` (0 or 1, default 0).
+    - **J, `GET` shows, `POST` applies** (maintainer decisions 1 and 5). `GET` verifies and
+      reads the store read-only: it writes nothing (no nonce, run, lock or log line with the
+      token), so link previews, prefetchers and scanners leave the token usable; it shows
+      the action and the task's **title** (escaped, at most 120 characters) and **due date**,
+      nothing else (never the fingerprint, note or time), with one `<form method="post">`
+      button, or "task changed" (409, no button). `HEAD` is 405. A ntfy `http` button
+      `POST`s in one tap (the native client sends no `Origin`); a `view` link opens the page.
+      **Origin check on `POST`**: an `Origin` header, when present, must be
+      `http.public_url`'s origin (one header only; `null` is refused), and `Sec-Fetch-Site`,
+      when present, must be `same-origin` or `none`; otherwise the 404 page, nothing consumed.
+      **The confirmation page has `Referrer-Policy: strict-origin`** (review finding 1): under
+      `no-referrer` a browser sends `Origin: null` with the form's `POST`, so its button was
+      refused; `strict-origin` sends only the origin, never the path, so the token does not
+      leave in a `Referer` (tested by submitting the rendered form as a browser does). No cookie is set
+      or read. Every `/act` response: `Content-Security-Policy: default-src 'none';
+      style-src 'sha256-<inline style>'; form-action 'self'; frame-ancestors 'none';
+      base-uri 'none'`, `Cache-Control: no-store`, `Referrer-Policy: no-referrer` (the confirmation page: `strict-origin`),
+      `X-Content-Type-Options: nosniff`, `X-Robots-Tag: noindex, nofollow`, `X-Frame-Options:
+      DENY`; no script, external asset or Open Graph tag.
+    - **K, failures.** Every refusal of a token (malformed, truncated, oversized, forged,
+      another key, expired, too far ahead, used, unknown task, a cross-origin `POST`, and any
+      other path under `/act`) is **the same 404 page** with the same headers. Distinct
+      answers only where they say nothing about the token: 429 (rate limit), 503 (no key, no
+      route, apply lock busy, sinks unreachable). After a consume the holder of a valid
+      token gets the outcome: 200 applied, 200 "Not changed" (`not_changed`; "tick it in
+      Obsidian" for a recurring task), 409 stale, 502 failed (after a timeout: the change "may
+      not have been applied"), 500 when something failed after the consume (the page says the
+      change may have been applied, never "not available").
+    - **L, rate limit** (maintainer decision 9, review decision 4; constants). In process, for
+      `GET` and `POST`: a token bucket per client (10 a minute, burst 5), taken before any
+      decoding or store access, and a global one (60 a minute, burst 60), taken only for a
+      token whose MAC verified (checked before any store access, a few microseconds), so
+      invalid tokens never block valid ones; 429 with `Retry-After`. A request whose token is
+      refused costs its client 3 in all (the client's bucket may go into debt down to minus its
+      burst); the global bucket never goes into debt. **A client** is an IPv4 address or the
+      **/64** of an IPv6 address (rotating addresses inside a /64 gets no new bucket). At most
+      4096 client buckets (LRU). One process (`horae serve`); several workers
+      would each have their own. **The client address** is the peer, unless the peer is in
+      `horae.yaml` `http.trusted_proxies`: then the right-most `X-Forwarded-For` address that
+      is not itself a trusted proxy (a generalisation of the note's "last hop", identical with
+      one proxy; it serves the reference deployment, below). Without trusted proxies the
+      header is ignored. A `trusted_proxies` entry is at least /8 (IPv4) or /32 (IPv6): a
+      wider one (`/0` above all) would trust any client's header. **Reference deployment, Cloudflare tunnel then Traefik (#41):** no entry point
+      carrying Horae's routers may trust forwarded headers (`forwardedHeaders.trustedIPs`,
+      `insecure`; docs/operations/coolify.md, forwarded headers), so Traefik replaces
+      `X-Forwarded-For` with cloudflared's address and every request shares cloudflared's
+      bucket (still limited, never unlimited). `http.trusted_proxies` is for a chain whose
+      proxies may pass the client's address on.
+    - **M, routing and SSO** (#41 tests the rendered Traefik template). Exactly `/act/{token}`
+      (one path segment; no path converter, no mount or prefix router under `/act`), so `%2F`,
+      `..` or a trailing segment can never reach `/runs` or `/healthz` through the prefix the
+      proxy exempts from SSO; every other 404 under `/act` is the same page. #41's exemption
+      should match the token's exact shape, `PathRegexp(`^/act/[A-Za-z0-9_-]{98,267}$`)`,
+      rather than `PathPrefix(`/act`)`. The routes read
+      no SSO or forwarded-user header. The `Host` check of decision 51 G2 still applies:
+      `http.public_url`'s host must be an allowed host (`horae serve` warns otherwise).
+    - **N, logs.** No access log (decision 51 A). One line per `/act` request
+      (`horae.api.act`): `act <method> <kind> <ref> <outcome>`, `ref` the first 8 hex digits
+      of SHA-256(nonce), for a token whose tag verified; an unverified string is `act <method>
+      invalid len=<n>`. Never the token, the URL or the task. The operator guide (#41) must
+      turn off Traefik's access log for the `/act` router or drop its path: Traefik logs
+      paths before Horae sees them; the token also reaches cloudflared's logs (at `debug`)
+      and Cloudflare's own request logs for the zone.
+    - **O, imports.** `horae.api` loads its names lazily (PEP 562) so the runner can import
+      `horae.api.act` (key, token, minting) without loading FastAPI; the routes are loaded by
+      `horae.api._app` only.
+    - **P, the review of PR #115** (the maintainer: "go with what's good for the project").
+      1, the confirmation page's `Referrer-Policy: strict-origin` (J); 2, the core labels the
+      buttons (B); 3, recurring tasks and `not_changed` (C, G, I); 4, the rate limit's /64
+      clients and MAC-verified global bucket (L); 5, this decision renumbered from 53 (53 is
+      #127's); 6, no reference to a core secret, and `horae doctor`'s warning (E); 7, the
+      narrowest `trusted_proxies` (L); 8, `:443` dropped from `http.public_url` (C); 9, the
+      runner checks the route's plugin (C); 10, the used-token retention (G); 11 and 12, the
+      timeout and after-consume pages (K); 13, no button for a closed task (C).
+    - **Not done (follow-ups)**: rendering `actions` as ntfy buttons (plugin-ntfy#4) and
+      their iOS behaviour (#72, #65); daily-note links (decision 3); the SSO-exemption test
+      against the rendered template and the Traefik access-log setting (#41); an SDK intent
+      builder for `actions` (the field is plain JSON meanwhile); showing the buttons in the
+      dry-run diff.

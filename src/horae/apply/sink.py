@@ -111,6 +111,26 @@ class SinkCall:
     """The run's `input_hash`."""
     dedupe_key: str | None = None
     """For `notify.push`: the notification's deduplication key (`horae.apply.dedupe_key`)."""
+    actions: "tuple[ActionLink, ...]" = ()
+    """For `notify.push`: the buttons the core minted for the intent's `actions` (#38), in
+    order; a proposed action the core could not mint is left out (the notification is sent
+    without it). A notifier renders these, never the intent's own `actions`."""
+
+
+@dataclass(frozen=True)
+class ActionLink:
+    """A notification button the core minted (#38): one tap `POST`s `url`, a signed
+    single-use `/act` link (its token is a credential: a notifier passes it to the push
+    service only, and never logs it). ntfy renders it as an `http` action."""
+
+    label: str
+    url: str
+    method: Literal["POST"] = "POST"
+
+    def to_wire(self) -> dict[str, str]:
+        """The button as the MCP sink operation `<ns>.apply` receives it (`actions`): an
+        ntfy `http` action."""
+        return {"action": "http", "label": self.label, "url": self.url, "method": self.method}
 
 
 @dataclass(frozen=True)

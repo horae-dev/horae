@@ -12,7 +12,10 @@ run`). In both modes it also serves the HTTP API (#37, schemas decision 51, `hor
 the same event loop: `GET /healthz` (store and `Scheduler.state()`), `GET /runs`, `GET
 /runs/<id>`, read-only and without authentication of its own, on `--host:--port`
 (`HORAE_HOST`, `HORAE_PORT`; `127.0.0.1:8080` by default; the image sets `0.0.0.0` for the
-reverse proxy, whose SSO middleware guards it). The store is created and migrated once at
+reverse proxy, whose SSO middleware guards it), and the signed single-use action links
+`GET` / `POST /act/<token>` (#38, schemas decision 54: on with a usable `HORAE_ACT_KEY`,
+`horae.yaml` `http.public_url` and one `mode: tasks` entry, else 503; a key set but shorter
+than 32 bytes refuses to start, `config_invalid`). The store is created and migrated once at
 start, so `/healthz` reports it from the first request.
 
 **Stopping.** The first SIGTERM or SIGINT stops the scheduler and the HTTP server (which
@@ -77,6 +80,7 @@ from horae.store import Store, StoreError
 
 if TYPE_CHECKING:  # imported when serving only: the other commands never load FastAPI
     from horae.api import ApiServer
+    from horae.api.act._routes import ActSetup
 
 logger = logging.getLogger("horae.scheduler")
 api_logger = logging.getLogger("horae.api")
@@ -257,6 +261,58 @@ def prepare_store(instance: Instance) -> None:
         del exc
 
 
+def build_act(instance: Instance, hosts: frozenset[str]) -> "tuple[ActSetup, str]":
+    """The `/act` links' setup (#38, schemas decision 54) and a line saying whether they are
+    on. On only with a usable `HORAE_ACT_KEY`, `http.public_url` and one `mode: tasks` entry
+    whose plugin may apply `task.update_status`; otherwise every `/act` request is 503 (and
+    the runs send notifications without buttons). A key that is set but unusable (shorter
+    than 32 bytes, unreadable) refuses to start: `CommandFailed(config_invalid)`."""
+    from horae.api.act import ActKeyError, load_act_key, route_permitted, tasks_route
+    from horae.api.act._limit import parse_networks
+    from horae.api.act._mint import installed_intents
+    from horae.api.act._routes import ActSetup
+    from horae.api.act._service import ActService
+    from horae.cli_host import host_sinks
+
+    config = instance.config
+    trusted = parse_networks(config.http.trusted_proxies)
+    public_url = config.http.public_url
+    try:
+        key = load_act_key(instance.secret_resolver())
+    except ActKeyError as exc:
+        raise CommandFailed(EXIT_PROBLEMS, "config_invalid", str(exc)) from None
+    route = tasks_route(instance.pipelines)
+
+    intents_of = installed_intents(instance)
+    reason = None
+    if key is None:
+        reason = "HORAE_ACT_KEY is not set"
+    elif public_url is None:
+        reason = "horae.yaml http.public_url is not set"
+    elif route is None:
+        reason = "no single `mode: tasks` act entry applies the changes"
+    elif not route_permitted(route, intents_of):
+        reason = f"the plugin of {route.tool} may not apply task.update_status"
+    if reason is not None or key is None or public_url is None or route is None:
+        return ActSetup(None, public_url, trusted_proxies=trusted), f"/act links off ({reason})"
+    host = public_url.split("://", 1)[1].split(":", 1)[0]
+    if host not in hosts:
+        logger.warning(
+            "api: http.public_url's host is not an allowed host: /act requests through the "
+            "proxy are refused (400) until HORAE_ALLOWED_HOSTS (or --allowed-host) names it"
+        )
+    service = ActService(
+        key,
+        instance.store_path,
+        instance.state_dir,
+        route,
+        lambda: host_sinks(instance),
+        timezone=config.timezone,
+        call_timeout_s=config.plugin_defaults.call_timeout_s,
+    )
+    return ActSetup(service, public_url, trusted_proxies=trusted), "/act links on"
+
+
 def build_api(
     instance: Instance,
     scheduler: Scheduler,
@@ -268,7 +324,15 @@ def build_api(
     accepting the `Host` values `allowed_hosts` besides loopback (`CommandFailed(usage)` for
     one that is not a DNS name or an IP address). A bind address other than a wildcard
     (`0.0.0.0`, `::`) is accepted as a `Host` too."""
-    from horae.api import ApiContext, BindError, allowed_host, bind, build_server, create_app
+    from horae.api import (
+        DEFAULT_ALLOWED_HOSTS,
+        ApiContext,
+        BindError,
+        allowed_host,
+        bind,
+        build_server,
+        create_app,
+    )
 
     extra = [*allowed_hosts]
     if host not in WILDCARD_HOSTS:
@@ -277,11 +341,13 @@ def build_api(
         hosts = frozenset(allowed_host(value) for value in extra)
     except ValueError as exc:
         raise CommandFailed(EXIT_USAGE, "usage", f"--allowed-host: {exc}") from None
+    act, status = build_act(instance, DEFAULT_ALLOWED_HOSTS | hosts)
     try:
         sock = bind(host, port)
     except BindError as exc:
         raise CommandFailed(EXIT_PROBLEMS, "bind_failed", str(exc)) from None
-    context = ApiContext(instance.store_path, instance.state_dir, scheduler.state, hosts)
+    context = ApiContext(instance.store_path, instance.state_dir, scheduler.state, hosts, act)
+    echo(f"horae serve: {status}", err=True)
     return build_server(create_app(context), sock)
 
 
@@ -410,6 +476,7 @@ def serve(
 __all__ = [
     "DEFAULT_HOST",
     "DEFAULT_PORT",
+    "build_act",
     "build_api",
     "build_scheduler",
     "prepare_store",

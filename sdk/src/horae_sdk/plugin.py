@@ -329,6 +329,7 @@ class Plugin:
             index: int | None = None,
             input_hash: str | None = None,
             dedupe_key: str | None = None,
+            actions: list[dict[str, Any]] | None = None,
         ) -> CallToolResult:
             """Apply one intent routed to this sink."""
 
@@ -348,6 +349,7 @@ class Plugin:
                     dedupe_key,
                     decode(content),
                     expected_before_sha256,
+                    _actions(actions),
                 )
                 applied = await _maybe_await(sink.apply(request))
                 if not isinstance(applied, Applied):
@@ -407,6 +409,28 @@ def _wire_size(data: Any, intents: list[dict[str, Any]], *, structured: bool) ->
     return len(payload.encode("utf-8", "surrogatepass")) + len(
         _compact(intents).encode("utf-8", "surrogatepass")
     )
+
+
+_ACTION_KEYS = ("action", "label", "url", "method")
+
+
+def _actions(value: Any) -> tuple[dict[str, str], ...]:
+    """The minted buttons the core sent (#38): each an object of the four string keys of an
+    ntfy `http` action; anything else is refused (`output_invalid`)."""
+    if value is None:
+        return ()
+    if not isinstance(value, list) or len(value) > 3:
+        raise SinkError("output_invalid", "actions is not a list of at most 3 buttons")
+    buttons: list[dict[str, str]] = []
+    for item in value:
+        if (
+            not isinstance(item, dict)
+            or set(item) != set(_ACTION_KEYS)
+            or not all(isinstance(item[key], str) for key in _ACTION_KEYS)
+        ):
+            raise SinkError("output_invalid", "an action is not an http button")
+        buttons.append({key: item[key] for key in _ACTION_KEYS})
+    return tuple(buttons)
 
 
 async def _read(sink: Sink, paths: dict[str, Any], path: str) -> dict[str, Any]:

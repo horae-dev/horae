@@ -7,6 +7,7 @@ See ADR 0006. The schema is created and upgraded by numbered SQL migrations ship
 """
 
 from horae.store._errors import (
+    ActTokenUsed,
     InvalidRow,
     JournalTooLarge,
     MigrationError,
@@ -26,6 +27,9 @@ from horae.store._errors import (
 )
 from horae.store._schema import SCHEMA_VERSION, Migration, load_migrations, migrate
 from horae.store._store import (
+    ACT_OUTCOMES,
+    ACT_PIPELINE,
+    ACT_RETENTION_S,
     DEFAULT_BUSY_TIMEOUT_MS,
     EVAL_PIPELINE_PREFIX,
     HEARTBEAT_BUSY_TIMEOUT_MS,
@@ -46,6 +50,9 @@ from horae.store._store import (
 )
 
 __all__ = [
+    "ACT_OUTCOMES",
+    "ACT_PIPELINE",
+    "ACT_RETENTION_S",
     "DEFAULT_BUSY_TIMEOUT_MS",
     "EVAL_PIPELINE_PREFIX",
     "HEARTBEAT_BUSY_TIMEOUT_MS",
@@ -53,6 +60,7 @@ __all__ = [
     "MAX_LIST_RUNS",
     "MAX_NESTING",
     "SCHEMA_VERSION",
+    "ActTokenUsed",
     "CacheEntry",
     "DaySpend",
     "InvalidRow",

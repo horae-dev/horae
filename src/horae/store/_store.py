@@ -93,6 +93,7 @@ from horae.contracts.types import (
 from horae.engine.ports import PreviousLlm
 from horae.secrets.redact import current as current_redactor
 from horae.store._errors import (
+    ActTokenUsed,
     InvalidRow,
     JournalTooLarge,
     PipelineBusy,
@@ -123,6 +124,16 @@ EVAL_PIPELINE_PREFIX = "eval:"
 """The pipeline of a live skill eval's run row (`eval:<skill>`, schemas decision 48 J): a
 pipeline name never holds `:`, so an eval row never collides with a pipeline's; `horae runs`
 hides these rows unless `--all`."""
+
+ACT_PIPELINE = "_act"
+"""The reserved pipeline of the `/act` runs (#38, schemas decision 54): a pipeline name never
+starts with `_`; such a row never gets a run record (migration 8)."""
+ActOutcome = Literal["pending", "applied", "not_changed", "stale", "failed"]
+ACT_OUTCOMES: frozenset[str] = frozenset({"pending", "applied", "not_changed", "stale", "failed"})
+ACT_RETENTION_S = 24 * 3600 + 300
+"""How long a used `/act` token's row is kept after the token expired: the token's furthest
+accepted expiry (`horae.api.act.MAX_AHEAD_S`, 24 h 05 min), so a clock stepped back by less
+than that cannot make a used token usable again."""
 
 DEFAULT_BUSY_TIMEOUT_MS = 5000
 HEARTBEAT_BUSY_TIMEOUT_MS = 100
@@ -415,6 +426,9 @@ class TaskEntry(Contract):
     """The plugin call that proposed it, e.g. `calendar.events`."""
     run_id: RunId | None = None
     """The run that last wrote it."""
+    recurring: bool = False
+    """The task repeats (Obsidian Tasks `🔁`), as the collected data or the sink said (#38):
+    no `/act` button closes it (a recurring task is ticked in Obsidian)."""
 
     @model_validator(mode="after")
     def _consistent(self) -> Self:
@@ -1044,7 +1058,7 @@ class Store:
         self,
         run_id: str,
         *,
-        status: Literal["ok", "failed"],
+        status: Literal["ok", "noop", "failed"],
         at: datetime,
         cost: Usage,
         error: str | None = None,
@@ -1300,6 +1314,12 @@ class Store:
                 (_ts(older_than),),
             )
             pruned = cur.rowcount
+            # Consumed `/act` nonces of tokens that expired `ACT_RETENTION_S` before
+            # `older_than` (#38): long refused by their expiry already.
+            self._conn.execute(
+                "DELETE FROM act_consumed WHERE expires_at < ?",
+                (int(older_than.timestamp()) - ACT_RETENTION_S,),
+            )
             self._conn.execute(
                 "DELETE FROM blobs WHERE NOT EXISTS "
                 "(SELECT 1 FROM journal WHERE journal.before_sha256 = blobs.sha256) "
@@ -1681,14 +1701,14 @@ class Store:
             self._write_flags(task.run_id, details)
             self._conn.execute(
                 "INSERT INTO tasks (fingerprint, title, status, due, time, snoozed_until, "
-                "snooze_tz, wake_at, target, source, run_id, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "snooze_tz, wake_at, target, source, run_id, created_at, updated_at, recurring) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT (fingerprint) DO UPDATE SET title = excluded.title, "
                 "status = excluded.status, due = excluded.due, time = excluded.time, "
                 "snoozed_until = excluded.snoozed_until, snooze_tz = excluded.snooze_tz, "
                 "wake_at = excluded.wake_at, target = excluded.target, "
                 "source = excluded.source, run_id = excluded.run_id, "
-                "updated_at = excluded.updated_at",
+                "updated_at = excluded.updated_at, recurring = excluded.recurring",
                 (
                     task.fingerprint,
                     title,
@@ -1703,6 +1723,7 @@ class Store:
                     task.run_id,
                     stamp,
                     stamp,
+                    int(task.recurring),
                 ),
             )
 
@@ -1735,6 +1756,20 @@ class Store:
             if cur.rowcount != 1:
                 raise UnknownTask(fingerprint)
 
+    @_api
+    def set_task_recurring(self, fingerprint: str, recurring: bool, *, at: datetime) -> None:
+        """Record whether a task repeats (#38: the collected data or the sink said so).
+        Raises `UnknownTask`."""
+        if type(recurring) is not bool:
+            raise ValueError("recurring is a bool")
+        with self.transaction():
+            cur = self._conn.execute(
+                "UPDATE tasks SET recurring = ?, updated_at = ? WHERE fingerprint = ?",
+                (int(recurring), _ts(at), fingerprint),
+            )
+            if cur.rowcount != 1:
+                raise UnknownTask(fingerprint)
+
     @staticmethod
     def _task(row: tuple[Any, ...]) -> TaskEntry:
         return TaskEntry.model_validate(
@@ -1749,6 +1784,7 @@ class Store:
                 "target": row[7],
                 "source": row[8],
                 "run_id": row[9],
+                "recurring": bool(row[10]),
             }
         )
 
@@ -1756,7 +1792,7 @@ class Store:
     def get_task(self, fingerprint: str) -> TaskEntry | None:
         row = self._conn.execute(
             "SELECT fingerprint, title, status, due, time, snoozed_until, snooze_tz, target, "
-            "source, run_id FROM tasks WHERE fingerprint = ?",
+            "source, run_id, recurring FROM tasks WHERE fingerprint = ?",
             (fingerprint,),
         ).fetchone()
         return None if row is None else self._task(row)
@@ -1766,7 +1802,7 @@ class Store:
         """Tasks by due date (undated last), then fingerprint."""
         rows = self._conn.execute(
             "SELECT fingerprint, title, status, due, time, snoozed_until, snooze_tz, target, "
-            "source, run_id FROM tasks WHERE (:status IS NULL OR status = :status) "
+            "source, run_id, recurring FROM tasks WHERE (:status IS NULL OR status = :status) "
             "ORDER BY due IS NULL, due, fingerprint",
             {"status": status},
         ).fetchall()
@@ -1777,11 +1813,82 @@ class Store:
         """Snoozed tasks whose wake time is at or before `now`, earliest first."""
         rows = self._conn.execute(
             "SELECT fingerprint, title, status, due, time, snoozed_until, snooze_tz, target, "
-            "source, run_id FROM tasks WHERE status = 'snoozed' AND wake_at <= ? "
+            "source, run_id, recurring FROM tasks WHERE status = 'snoozed' AND wake_at <= ? "
             "ORDER BY wake_at, fingerprint",
             (_ts(now),),
         ).fetchall()
         return [self._task(row) for row in rows]
+
+    # --- /act links (#38, schemas decision 54) ------------------------------------------------
+
+    @staticmethod
+    def _act_args(nonce: bytes, outcome: str | None = None) -> None:
+        if type(nonce) is not bytes or len(nonce) != 16:
+            raise ValueError("an /act nonce is 16 bytes")
+        if outcome is not None and outcome not in ACT_OUTCOMES:
+            raise ValueError(f"unknown /act outcome {outcome!r}")
+
+    @_api
+    def act_consume(
+        self,
+        nonce: bytes,
+        *,
+        kid: bytes,
+        expires_at: int,
+        at: datetime,
+        run_id: str | None,
+        outcome: ActOutcome,
+    ) -> None:
+        """Record that the `/act` token with `nonce` is used (its key id `kid`, its expiry
+        `expires_at` in Unix seconds), by run `run_id`. Raises `ActTokenUsed` when it already
+        is (the row is left alone), `UnknownRun`. Call it inside the transaction that
+        journals the token's change, so the two are committed together."""
+        self._act_args(nonce, outcome)
+        if type(kid) is not bytes or len(kid) != 4:
+            raise ValueError("an /act key id is 4 bytes")
+        if type(expires_at) is not int or expires_at < 0:
+            raise ValueError("an /act expiry is a non-negative int")
+        with self.transaction():
+            self._require_run(run_id)
+            cur = self._conn.execute(
+                "INSERT INTO act_consumed (nonce, kid, expires_at, consumed_at, run_id, outcome) "
+                "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (nonce) DO NOTHING",
+                (nonce, kid, expires_at, _ts(at), run_id, outcome),
+            )
+            if cur.rowcount != 1:
+                raise ActTokenUsed()
+
+    @_api
+    def act_outcome(self, nonce: bytes) -> str | None:
+        """The outcome of the used `/act` token with `nonce`, `None` when it is not used."""
+        self._act_args(nonce)
+        row = self._conn.execute(
+            "SELECT outcome FROM act_consumed WHERE nonce = ?", (nonce,)
+        ).fetchone()
+        return None if row is None else str(row[0])
+
+    @_api
+    def act_set_outcome(self, nonce: bytes, outcome: ActOutcome) -> None:
+        """Set the outcome of a used `/act` token (`ValueError` for an unknown nonce)."""
+        self._act_args(nonce, outcome)
+        with self.transaction():
+            cur = self._conn.execute(
+                "UPDATE act_consumed SET outcome = ? WHERE nonce = ?", (outcome, nonce)
+            )
+            if cur.rowcount != 1:
+                raise ValueError("no such /act nonce")
+
+    @_api
+    def act_purge(self, expired_before: int, *, limit: int = 1000) -> int:
+        """Delete at most `limit` used-token rows whose token expired before `expired_before`
+        (Unix seconds); how many. Safe: their expiry already refuses those tokens."""
+        with self.transaction():
+            cur = self._conn.execute(
+                "DELETE FROM act_consumed WHERE nonce IN (SELECT nonce FROM act_consumed "
+                "WHERE expires_at < ? ORDER BY expires_at LIMIT ?)",
+                (expired_before, limit),
+            )
+        return cur.rowcount
 
     # --- notification state ----------------------------------------------------------------
 
