@@ -115,6 +115,11 @@ docker compose -f docker-compose.yaml -f traefik.yaml up -d
   forwardAuth middleware, and `horae-act` (`PathPrefix(/act/)`, priority 1000) without it. Only
   `/act/` is exempt from SSO (`tests/test_deploy_templates.py`). Keep the entry point's
   `sanitizePath` on (Traefik's default), so that `/act/../runs` is routed as `/runs`.
+  This override keeps `PathPrefix(/act/)` so that it works on Traefik v2 too. On Traefik v3,
+  prefer the Coolify template's stricter rule, `PathRegexp(`^/act/[A-Za-z0-9_-]{98,267}$`)`
+  (`$$` in a compose file), and turn off the access log of `horae-act`
+  (`traefik.http.routers.horae-act.observability.accessLogs=false`): the path carries the
+  link ([coolify.md](coolify.md#routing-only-act-is-exempt-from-sso)).
 - `trustForwardHeader=false` on `horae-sso`: the SSO provider decides on what Traefik received,
   never on `X-Forwarded-*` headers a client sent (a spoofed `X-Forwarded-Uri` could make it
   decide on another path than the one routed), even if your entry point trusts an upstream

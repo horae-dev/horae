@@ -42,7 +42,7 @@ tunnel:   browser ──https──▶ Cloudflare (TLS ends) ──tunnel──�
 
   Traefik ──(the resource's own network: the proxy and this resource only)──▶
      ├─ <name>          Host(h)                                           → SSO middleware → Horae :8080
-     ├─ <name>-act      Host(h) && PathPrefix(/act/)                      → Horae :8080 (no SSO)
+     ├─ <name>-act      Host(h) && PathRegexp(^/act/<link>$)               → Horae :8080 (no SSO, no access log)
      └─ <name>-outpost  Host(h) && PathPrefix(/outpost.goauthentik.io/)   → sso@file (authentik)
 ```
 
@@ -188,9 +188,14 @@ working, and the neighbours reach port 8080 without SSO): check them after every
 - `<name>` (`HORAE_TRAEFIK_NAME`, default `horae`): `Host(<public host>)`, the whole host
   (`/`, `/runs`, `/runs/<id>`, `/healthz`, `/act` without the slash), through the shared SSO
   middleware; priority 900.
-- `<name>-act`: `Host(<public host>) && PathPrefix(/act/)`, **no middleware**, priority 1000.
-  The `/act/` links (#38) are signed, single-use and only confirmed by a `POST`: they are
-  designed to work without SSO (T14, T16).
+- `<name>-act`: `Host(<public host>) && PathRegexp(`^/act/[A-Za-z0-9_-]{98,267}$`)`, **no
+  middleware**, priority 1000. It matches **only the shape of an `/act/` link** (#38): one path
+  segment of 98 to 267 characters of the URL-safe base64 alphabet, nothing before or after
+  (the file writes `$$`, Compose's escape for `$`). `/act/`, `/act/x`, `/act/<link>/x`,
+  `/act/<link>.json`, a shorter or longer segment, and every traversal stay on `<name>`,
+  behind SSO. The links are signed, single-use and only confirmed by a `POST`: they are
+  designed to work without SSO (T14, T16). `PathRegexp` is Traefik v3 syntax (the reference
+  proxy is v3.7).
 - `<name>-outpost`: `Host(<public host>) && PathPrefix(/outpost.goauthentik.io/)` to the
   outpost service (`sso@file`), priority 1000. It never reaches Horae.
 - The priorities are explicit: if a domain is ever set on the service by mistake, the routers
@@ -203,6 +208,16 @@ working, and the neighbours reach port 8080 without SSO): check them after every
   `/outpost.goauthentik.io/../runs` are `/runs` for the router and go through SSO. Horae itself
   never cleans a path: such a request reaching it raw is a `404`, never `/runs`
   (`tests/test_api.py`, `test_traversals_out_of_act_are_404`).
+- **The link is in the URL, so it is in access logs.** Every hop that logs request paths sees
+  the `/act/` link: Traefik's access log, `cloudflared` (it logs requests at `debug` level),
+  and Cloudflare's own request logs and analytics (Logpush, Security Events, Trace) in the
+  tunnel mode. The template turns Traefik's access log off **for the `<name>-act` router only**
+  (`observability.accessLogs=false`, a router option of Traefik v3); the other routers keep
+  theirs. The alternative is global: Traefik's access-log field filtering can drop the path
+  for every router (`accessLog.fields.names.RequestPath=drop`, and `RequestLine` likewise),
+  not for one router. Keep `cloudflared` below `debug`, and treat Cloudflare's logs of the host
+  as holding live links until they expire. A logged link is still single-use and needs a
+  `POST` to act; whoever reads the log before the user does could use it.
 - `tests/test_deploy_templates.py` renders the template, routes requests through its routers
   with the file provider's middleware and service, and checks the criterion of #41; CI also
   runs `docker compose config` on it.
@@ -279,8 +294,8 @@ variant of this template still works and is not shipped as a file: give the `hor
 remove the three routers above, and add a forwardAuth middleware by label
 (`traefik.http.middlewares.<name>-sso.forwardauth.address=...`,
 `...trustForwardHeader=false`), which Coolify adds to every router it generates for the domain,
-plus one `<name>-act` router (`Host(${SERVICE_FQDN_HORAE}) && PathPrefix(/act/)`, entry point
-`https`, `tls=true`, priority 1000). The network is the same: the resource's own, which
+plus one `<name>-act` router (`Host(${SERVICE_FQDN_HORAE}) && PathRegexp(...)`, the same
+link shape as above, entry point `https`, `tls=true`, priority 1000, no access log). The network is the same: the resource's own, which
 Coolify connects to the proxy. The routing tests cover the shipped template only; [compose.md](compose.md)'s `traefik.yaml` is the tested label-defined forwardAuth.
 
 ## Install
@@ -366,7 +381,14 @@ the tunnel or the resource):
 
 - `https://horae.example.org/healthz` redirects to authentik's sign-in, then answers
   `{"status": "ok", ...}` and returns to an `https://` URL (not `http://`).
-- `https://horae.example.org/act/x` answers **without** sign-in (a `404` until #38 ships `/act/`).
+- `https://horae.example.org/act/<a 100-character [A-Za-z0-9_-] string>` answers **without**
+  sign-in (a `404` until #38 ships `/act/`); `/act/`, `/act/x` and `/act/<that string>/x` ask
+  for sign-in.
+- **Access logs:** after such a request, Traefik's access log (if on: the proxy's
+  `--accesslog` options) has **no** line for it, while a request to `/healthz` is logged
+  (`observability.accessLogs=false` on `<name>-act` accepted by the proxy; Traefik's log shows
+  no label error for the container). `cloudflared` does not run at `debug` level. Know which
+  Cloudflare logs of the zone hold request paths (and who can read them).
 - Traversals out of `/act/` ask for sign-in, each sent with `curl --path-as-is` (without
   following redirects, `-o /dev/null -w '%{http_code} %{redirect_url}\n'`): `/act/../runs`,
   `/act/%2e%2e/runs`, `/act/..%2Fruns` and `//act/../runs`, on `https://horae.example.org`.
@@ -593,7 +615,8 @@ container is on its resource's network alone and Traefik reaches it there withou
 port 80 closed to the Internet in the tunnel mode, the authentik forward auth and its callback
 through the outpost router end to end (and the redirect back to `https://`), the encoded
 traversals and a spoofed `X-Forwarded-Uri` through the tunnel, no other router above priority
-1000 on the host, `HORAE_TRAEFIK_CERTRESOLVER` (`${VAR:+...}`) passed through by Coolify,
+1000 on the host, the `PathRegexp` `/act/` router and its disabled access log on the real
+proxy, `HORAE_TRAEFIK_CERTRESOLVER` (`${VAR:+...}`) passed through by Coolify,
 Scheduled Tasks in a two-container stack (and their timeout), and the YAML anchor
 (`x-horae-image`) read by Coolify's parser.
 

@@ -100,7 +100,34 @@ SSO_PATHS = (
     "/outpost.goauthentik.io",
     *TRAVERSALS,
 )
-ACT_PATHS = ("/act/", "/act/token123")
+ACT_PATHS = ("/act/", "/act/token123")  # the plain compose override: PathPrefix(/act/)
+
+# Coolify: the /act/ router matches only the token route's shape (#38), 98 to 267 characters
+# of the URL-safe base64 alphabet, and nothing under it.
+ACT_ROUTE_SHAPE = "^/act/[A-Za-z0-9_-]{98,267}$"
+LINK_ID = "Ab3_-" * 20  # 100 characters
+COOLIFY_ACT_PATHS = (
+    f"/act/{LINK_ID}",
+    f"/act/{'x' * 98}",
+    f"/act/{'Z_-9' * 66}xyz",  # 267
+    f"/act/{LINK_ID}?confirm=1",
+)
+COOLIFY_SSO_PATHS = (
+    *SSO_PATHS,
+    "/act/",
+    "/act/x",
+    "/act/token123",
+    f"/act/{'x' * 97}",
+    f"/act/{'x' * 268}",
+    f"/act/{LINK_ID}/",
+    f"/act/{LINK_ID}/x",
+    f"/act/{LINK_ID}.json",
+    f"/act/{LINK_ID[:-1]}%2F",
+    f"/act/{LINK_ID[:-1]}=",
+    f"/act/{LINK_ID}/../../runs",
+    f"/act/../act/{LINK_ID}/x",
+    f"/ACT/{LINK_ID}",
+)
 OUTPOST_PATHS = (
     "/outpost.goauthentik.io/start?rd=https%3A%2F%2Fhorae.example.test%2Fruns",
     "/outpost.goauthentik.io/callback?code=x",
@@ -249,11 +276,13 @@ def routers_of(labels: Mapping[str, str]) -> dict[str, Router]:
     return routers
 
 
-_MATCHER = re.compile(r"(Host|PathPrefix)\(`([^`]*)`\)")
+_MATCHER = re.compile(r"(Host|PathPrefix|PathRegexp)\(`([^`]*)`\)")
 
 
 def rule_matches(rule: str, host: str, path: str) -> bool:
-    """Traefik rule matching, for the matchers these files use (`Host`, `PathPrefix`, `&&`)."""
+    """Traefik rule matching, for the matchers these files use (`Host`, `PathPrefix`,
+    `PathRegexp`, `&&`). `PathRegexp` is a Go regexp searched in the (cleaned) path; the
+    patterns here are anchored and use no syntax where Python's `re` differs."""
     path = path.split("?", 1)[0]
     for part in rule.split(" && "):
         match = _MATCHER.fullmatch(part.strip())
@@ -262,6 +291,8 @@ def rule_matches(rule: str, host: str, path: str) -> bool:
         if kind == "Host" and host.lower() != arg.lower():
             return False
         if kind == "PathPrefix" and not path.startswith(arg):
+            return False
+        if kind == "PathRegexp" and not re.search(arg, path):
             return False
     return True
 
@@ -429,9 +460,10 @@ def assert_coolify_only_act_is_exempt(
     assert main.rule == f"Host(`{host}`)"
     assert main.middlewares == (sso,)
     assert main.service == name
-    assert act.rule == f"Host(`{host}`) && PathPrefix(`/act/`)"
+    assert act.rule == f"Host(`{host}`) && PathRegexp(`{ACT_ROUTE_SHAPE}`)"
     assert act.middlewares == ()
     assert act.service == name
+    assert act.priority == 1000
     assert out.rule == f"Host(`{host}`) && PathPrefix(`/outpost.goauthentik.io/`)"
     assert out.service == outpost
     assert act.priority > main.priority
@@ -441,12 +473,12 @@ def assert_coolify_only_act_is_exempt(
         if router.service == name and sso not in router.middlewares:
             assert router.name == act.name, router
     # Behaviour: what each request reaches.
-    for path in SSO_PATHS:
+    for path in COOLIFY_SSO_PATHS:
         reached = route(routers, entrypoint, host, path, middlewares=middlewares)
         assert reached is not None, path
         assert reached.service == name, (path, reached)
         assert sso in reached.middlewares, (path, reached)
-    for path in ACT_PATHS:
+    for path in COOLIFY_ACT_PATHS:
         reached = route(routers, entrypoint, host, path, middlewares=middlewares)
         assert reached is not None, path
         assert reached.name == act.name, (path, reached)
@@ -470,6 +502,23 @@ def test_coolify_only_act_is_exempt_from_sso(mode: str) -> None:
             assert value == tls, key
 
 
+def test_coolify_the_act_router_matches_only_the_link_shape_and_logs_nothing() -> None:
+    _, labels = coolify_rendered()
+    act = f"traefik.http.routers.{NAME}-act"
+    # `$$` in the file is Compose's escape: the label holds one `$`, the regexp's anchor.
+    assert labels[f"{act}.rule"] == f"Host(`{FQDN}`) && PathRegexp(`{ACT_ROUTE_SHAPE}`)"
+    assert "PathPrefix(`/act" not in COOLIFY.read_text(encoding="utf-8")
+    # The path carries the link's secret part: no access-log line for this router.
+    assert labels[f"{act}.observability.accessLogs"] == "false"
+    routers = routers_of(labels)
+    for path in COOLIFY_ACT_PATHS:
+        assert route(routers, "https", FQDN, path) == routers[f"{NAME}-act"], path
+    for path in ("/act/", "/act/x", f"/act/{LINK_ID}/x", "/act/../runs", f"/act/{'x' * 268}"):
+        reached = route(routers, "https", FQDN, path)
+        assert reached is not None, path
+        assert reached.name == NAME, (path, reached)
+
+
 def test_coolify_is_secure_by_default() -> None:
     # Without settings: the `https` entry point with TLS; plain http is an explicit opt-in.
     text = COOLIFY.read_text(encoding="utf-8")
@@ -485,7 +534,7 @@ def test_coolify_nothing_is_routed_on_another_entrypoint_or_host(mode: str) -> N
     other = "http" if entrypoint == "https" else "https"
     _, labels = coolify_rendered({**COOLIFY_ENV, **settings})
     routers = routers_of(labels)
-    for path in SSO_PATHS + ACT_PATHS + OUTPOST_PATHS:
+    for path in COOLIFY_SSO_PATHS + COOLIFY_ACT_PATHS + OUTPOST_PATHS:
         assert route(routers, other, FQDN, path) is None, path
         assert route(routers, entrypoint, "other.example.test", path) is None, path
 
@@ -536,7 +585,7 @@ def test_coolify_a_missing_shared_middleware_fails_closed() -> None:
     # gone): Traefik refuses the main router; only /act/ and the outpost path are served.
     _, labels = coolify_rendered({**COOLIFY_ENV, "HORAE_SSO_MIDDLEWARE": "typo@file"})
     routers = routers_of(labels)
-    for path in SSO_PATHS:
+    for path in COOLIFY_SSO_PATHS:
         reached = route(routers, "https", FQDN, path, middlewares=set(FILE_MIDDLEWARES))
         assert reached is None or reached.service != NAME, (path, reached)
 
@@ -549,7 +598,7 @@ def test_coolify_with_escaped_labels_nothing_is_served() -> None:
     assert routers
     for router in routers.values():
         assert "${HORAE_PUBLIC_HOST" in router.rule, router
-    for path in SSO_PATHS + ACT_PATHS + OUTPOST_PATHS:
+    for path in COOLIFY_SSO_PATHS + COOLIFY_ACT_PATHS + OUTPOST_PATHS:
         for entrypoint in ("http", "https"):
             assert route(routers, entrypoint, FQDN, path) is None, path
 
@@ -570,7 +619,7 @@ def test_coolify_a_domain_set_by_mistake_does_not_bypass_sso_on_the_public_host(
     assert generated
     assert all(r.priority < routers[NAME].priority for r in generated)
     middlewares = provided_middlewares(labels)
-    for path in SSO_PATHS:
+    for path in COOLIFY_SSO_PATHS:
         reached = route(routers, entrypoint, FQDN, path, middlewares=middlewares)
         assert reached is not None, path
         assert FILE_SSO in reached.middlewares, (path, reached)
@@ -747,7 +796,7 @@ def test_coolify_two_horae_with_the_same_name_fail_closed() -> None:
     routers = routers_of(_merge_like_traefik(first_labels, second_labels))
     assert not routers  # every router differs by its host: all dropped
     for host in (FQDN, second):
-        for path in SSO_PATHS + ACT_PATHS:
+        for path in COOLIFY_SSO_PATHS + COOLIFY_ACT_PATHS:
             assert route(routers, "https", host, path) is None, (host, path)
 
 
