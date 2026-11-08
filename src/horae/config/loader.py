@@ -58,7 +58,7 @@ def redaction_names(config: InstanceConfig, lock: Lockfile | None) -> tuple[str,
     grants its plugins and the model aliases' `secret` (for redaction, #53)."""
     names = set(config.secrets.refs)
     for plugin in () if lock is None else lock.plugins.values():
-        names.update(plugin.permissions.secrets)
+        names.update(plugin.permissions.all_secrets)
     names.update(spec.secret for spec in config.models.values() if spec.secret)
     names.update(monitor.secret for monitor in config.scheduler.monitors.values())
     return tuple(sorted(names))
@@ -349,7 +349,24 @@ class CheckResult:
 
     @property
     def ok(self) -> bool:
-        return not self.problems
+        return not any(problem.severity == "error" for problem in self.problems)
+
+
+def _unresolved_optional(state: _Loaded, resolver: SecretResolver) -> list[Problem]:
+    """An `info` for each optional secret a locked plugin may be given that does not resolve:
+    the plugin starts without it and says so itself if a call needs it (schemas decision 56)."""
+    found: list[Problem] = []
+    if state.lock is None or state.lock_doc is None:
+        return found
+    for plugin, entry in state.lock.plugins.items():
+        for index, name in enumerate(entry.permissions.optional_secrets):
+            try:
+                resolver.resolve(name)
+            except SecretError as exc:
+                loc = ("plugins", plugin, "permissions", "optional_secrets", index)
+                message = f"optional {exc}; plugin {plugin} runs without it"
+                found.append(state.lock_doc.problem(loc, message, severity="info"))
+    return found
 
 
 def check_instance(root: Path, environ: Mapping[str, str] | None = None) -> CheckResult:
@@ -380,6 +397,7 @@ def check_instance(root: Path, environ: Mapping[str, str] | None = None) -> Chec
                 for plugin, entry in state.lock.plugins.items()
                 for index, name in enumerate(entry.permissions.secrets)
             ]
+        problems += _unresolved_optional(state, resolver)
         for name, doc, loc in wanted:
             try:
                 secret = resolver.resolve(name)

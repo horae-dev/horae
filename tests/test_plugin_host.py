@@ -164,6 +164,78 @@ def test_a_missing_secret_fails_the_call_before_spawn(tmp_path: Path) -> None:
     _run(scenario())
 
 
+def _optional_manifest() -> dict[str, Any]:
+    return probe_manifest(
+        permissions={"secrets": ["PROBE_TOKEN"], "optional_secrets": ["PROBE_OPTIONAL"]}
+    )
+
+
+def test_an_optional_secret_that_resolves_is_injected_and_redacted(tmp_path: Path) -> None:
+    value = "sentinel-value-for-optional"
+    resolver = SecretResolver(
+        {}, secrets_dir(tmp_path, PROBE_TOKEN=PROBE_TOKEN, PROBE_OPTIONAL=value)
+    )
+
+    async def scenario() -> Any:
+        async with host(tmp_path, _optional_manifest(), resolver=resolver) as h:
+            return await _call(h, "probe.env")
+
+    result = _run(scenario())
+    env, digests = result.data["env"], result.data["sha256"]
+    assert set(env) == BASE_KEYS | {"PROBE_TOKEN", "PROBE_OPTIONAL"} | _PLATFORM_ADDED
+    assert digests["PROBE_OPTIONAL"] == hashlib.sha256(value.encode()).hexdigest()
+    assert env["PROBE_OPTIONAL"] == "[REDACTED:PROBE_OPTIONAL]"
+
+
+def test_an_optional_secret_that_does_not_resolve_is_absent_and_the_plugin_starts(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> Any:
+        async with host(tmp_path, _optional_manifest()) as h:
+            return await _call(h, "probe.env")
+
+    env = _run(scenario()).data["env"]
+    assert set(env) == BASE_KEYS | {"PROBE_TOKEN"} | _PLATFORM_ADDED
+
+
+def test_a_required_secret_still_fails_when_only_the_optional_one_resolves(
+    tmp_path: Path,
+) -> None:
+    resolver = SecretResolver({}, secrets_dir(tmp_path, PROBE_OPTIONAL="sentinel-value-for-opt"))
+
+    async def scenario() -> None:
+        async with host(tmp_path, _optional_manifest(), resolver=resolver) as h:
+            error = await _error(h, "probe.env")
+            assert error.kind == "secret_missing"
+            assert "PROBE_TOKEN" in error.message
+
+    _run(scenario())
+
+
+def test_a_resolvable_optional_secret_is_primed_for_redaction_before_any_start(
+    tmp_path: Path,
+) -> None:
+    resolver = SecretResolver(
+        {}, secrets_dir(tmp_path, PROBE_OPTIONAL="sentinel-value-for-optional")
+    )
+
+    async def scenario() -> None:
+        async with host(tmp_path, _optional_manifest(), resolver=resolver) as h:
+            assert [s.name for s in h.secrets.resolved()] == ["PROBE_OPTIONAL"]
+
+    _run(scenario())
+
+
+def test_an_optional_secret_on_the_deny_list_is_refused_before_spawn(tmp_path: Path) -> None:
+    manifest = probe_manifest(permissions={"optional_secrets": ["NODE_OPTIONS"]})
+
+    async def scenario() -> None:
+        async with host(tmp_path, manifest) as h:
+            assert (await _error(h, "probe.env")).kind == "env_unsafe"
+
+    _run(scenario())
+
+
 def test_no_shell_arguments_are_passed_verbatim(tmp_path: Path) -> None:
     hostile = ["$(touch pwned)", "; touch pwned", "| cat", "`id`", "a b"]
     manifest = probe_manifest()

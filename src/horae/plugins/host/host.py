@@ -146,7 +146,7 @@ class InstalledPlugin:
 def _exceeds(asked: Permissions, approved: Permissions) -> list[str]:
     extra = [
         f"{field}: {', '.join(sorted(set(getattr(asked, field)) - set(getattr(approved, field))))}"
-        for field in ("network", "secrets", "intents")
+        for field in ("network", "secrets", "optional_secrets", "intents")
         if not set(getattr(asked, field)) <= set(getattr(approved, field))
     ]
     for access in ("read", "write"):
@@ -337,7 +337,7 @@ class PluginHost:
         names = {
             name
             for plugin in self.registry.plugins()
-            for name in plugin.manifest.permissions.secrets
+            for name in plugin.manifest.permissions.all_secrets
         }
         names.update(self.secrets.referenced())
         for name in sorted(names):
@@ -578,14 +578,19 @@ class PluginHost:
         if not isinstance(runtime, StdioRuntime):
             what = "no runtime" if runtime is None else f"runtime {runtime.protocol}"
             raise PluginCallError("runtime_unsupported", f"plugin {name} has {what}")
-        declared = list(manifest.permissions.secrets)
-        check_names(name, declared)
+        permissions = manifest.permissions
+        check_names(name, permissions.all_secrets)
         values: dict[str, Secret] = {}
-        for secret in declared:
+        for secret in permissions.secrets:
             try:
                 values[secret] = self.secrets.resolve(secret)
             except SecretError as error:
                 raise PluginCallError("secret_missing", str(error)) from None
+        for secret in permissions.optional_secrets:
+            try:
+                values[secret] = self.secrets.resolve(secret)
+            except SecretError:
+                continue  # absent from the environment: the plugin says so if a call needs it
         argv = resolve_command(list(runtime.command), entry.installed.root)
         if self._run_dir is None or self._group is None:  # pragma: no cover (checked in _call)
             raise PluginCallError("host_error", "the plugin host is not open")

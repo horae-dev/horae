@@ -78,8 +78,9 @@ class Problem:
     line: int | None
     column: int | None
     message: str
-    severity: Literal["error", "warning"] = field(default="error", compare=False)
-    """`warning`: reported by `horae doctor` but not a problem (it does not fail the check)."""
+    severity: Literal["error", "warning", "info"] = field(default="error", compare=False)
+    """`warning` and `info`: reported by `horae doctor` but not a problem (they do not fail the
+    check); `info` is for a state that is expected, such as an optional secret not set."""
 
     def __str__(self) -> str:
         where = self.file
@@ -87,8 +88,8 @@ class Problem:
             where += f":{self.line}"
             if self.column is not None:
                 where += f":{self.column}"
-        if self.severity == "warning":
-            return f"{where}: warning: {self.message}"
+        if self.severity != "error":
+            return f"{where}: {self.severity}: {self.message}"
         return f"{where}: {self.message}"
 
     def sort_key(self) -> tuple[str, int, int, str]:
@@ -143,10 +144,17 @@ class YamlDocument:
                 return self.positions[key]
             key = key[:-1]
 
-    def problem(self, loc: Sequence[str | int], message: str, *, value: bool = True) -> Problem:
+    def problem(
+        self,
+        loc: Sequence[str | int],
+        message: str,
+        *,
+        value: bool = True,
+        severity: Literal["error", "warning", "info"] = "error",
+    ) -> Problem:
         """A problem at the value of `loc` (or at its key, if not `value`)."""
         pos = self.position(loc, value=value)
-        return Problem(str(self.path), pos.line, pos.column, message)
+        return Problem(str(self.path), pos.line, pos.column, message, severity)
 
     def key_text(self, loc: Sequence[str | int]) -> str:
         """The last key of `loc` as it may be shown: quoted, or `<key at line N>`."""
