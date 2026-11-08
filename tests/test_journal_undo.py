@@ -312,7 +312,6 @@ def test_keyed_days_follow_the_instance_clock_across_dst_changes() -> None:
 
 def test_a_keyed_notification_repeated_in_one_run_is_planned_as_a_duplicate(store: Store) -> None:
     run = _record([KEYED, {**KEYED, "body": "Another text"}], id="run-twice")
-    store.begin_run(run.id, run.pipeline, run.started_at, dry_run=run.dry_run)
     sinks = StaticSinks(default=_sink())
     planned = asyncio.run(plan_changes(run, sinks, notified=lambda _key: False))
     assert [n.duplicate for n in planned.notifications] == [False, True]
