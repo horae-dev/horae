@@ -3,6 +3,7 @@
 any response, the security headers. Driven in process (`TestClient`); the real server bind
 and the shutdown with the scheduler are in `test_api_server.py`."""
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -368,6 +369,64 @@ def test_a_trailing_slash_is_404_not_a_redirect(client: TestClient) -> None:
         assert response.status_code == 404, path
         assert "location" not in response.headers
         assert response.json()["error"]["kind"] == "not_found"
+
+
+def _raw_get(app: Any, path: str, raw_path: bytes) -> tuple[int, bytes]:
+    """One `GET` as raw ASGI, the path exactly as given (httpx would normalise it)."""
+    messages: list[dict[str, Any]] = []
+
+    async def receive() -> dict[str, Any]:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: dict[str, Any]) -> None:
+        messages.append(message)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": path,
+        "raw_path": raw_path,
+        "root_path": "",
+        "query_string": b"",
+        "headers": [(b"host", b"localhost")],
+        "client": ("127.0.0.1", 50000),
+        "server": ("127.0.0.1", 8080),
+    }
+    asyncio.run(app(scope, receive, send))
+    start = next(m for m in messages if m["type"] == "http.response.start")
+    body = b"".join(m.get("body", b"") for m in messages if m["type"] == "http.response.body")
+    return start["status"], body
+
+
+@pytest.mark.parametrize(
+    ("path", "raw_path"),
+    [
+        # As uvicorn hands them over: `path` percent-decoded, `raw_path` as sent.
+        ("/act/../runs", b"/act/../runs"),
+        ("/act/../runs", b"/act/%2e%2e/runs"),
+        ("/act/../runs", b"/act/..%2Fruns"),
+        ("//act/../runs", b"//act/../runs"),
+        # And undecoded, in case a server ever passes them through.
+        ("/act/%2e%2e/runs", b"/act/%2e%2e/runs"),
+        ("/act/..%2Fruns", b"/act/..%2Fruns"),
+    ],
+)
+def test_traversals_out_of_act_are_404(
+    root: Path, store_path: Path, state: State, path: str, raw_path: bytes
+) -> None:
+    # The proxy exempts `/act/` from SSO (#41): a path that starts with `/act/` must never be
+    # served by another route, whatever dot segments it holds (Traefik cleans the path before
+    # routing; this is the app's half: it never cleans it).
+    _seed(store_path, 1)
+    app = create_app(ApiContext(store_path, store_path.parent, state))
+    status, body = _raw_get(app, path, raw_path)
+    assert status == 404, path
+    assert json.loads(body)["error"]["kind"] == "not_found"
+    assert b"run-00" not in body
+    assert _raw_get(app, "/runs", b"/runs")[0] == 200  # the control: /runs itself answers
 
 
 def test_the_status_filter_accepts_what_horae_runs_accepts(

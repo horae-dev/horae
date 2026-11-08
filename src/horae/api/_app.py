@@ -381,6 +381,11 @@ def create_app(context: ApiContext) -> FastAPI:
         del exc
         return _error(500, "internal", message)
 
+    # Only `/act/` is exempt from SSO at the proxy (#41), which routes on Traefik's cleaned path
+    # while this app matches the raw ASGI `path` (no dot-segment removal, no decoding beyond
+    # the server's). So for `/act/` (#38): no `{...:path}` converter route and no mount under
+    # `/act`, so that no `/act/...` request can ever reach a route outside it (for example
+    # `/act/../runs`; tests/test_api.py `test_traversals_out_of_act_are_404`).
     @app.get("/healthz")
     async def healthz() -> Response:
         # Asynchronous: the store check runs in `/healthz`'s own executor (never on the loop,
