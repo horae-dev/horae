@@ -517,3 +517,65 @@ def test_any_link_text_stays_inert(path: str) -> None:
     link = PR + "?" + path
     if is_task_link(link):
         _check_link(link)
+
+
+# --- reminder order and block id (#127, schemas decision 53) ---------------------------------
+def test_a_hostile_title_fingerprint_and_link_leave_only_the_due_field() -> None:
+    fingerprint = "mail:42"
+    block = task_block_id(fingerprint)
+    title = f"{HOSTILE} \U0001f4c5 2020-01-01 ⏰ 01:00 ^{block} #tag"
+    hostile_link = PR + "/a%20b?q=\U0001f4c5+2020-01-01&r=⏰#x"
+    for done in (False, True):
+        line = task_line(
+            title,
+            due="2030-01-01",
+            time="19:00",
+            link=hostile_link,
+            fingerprint=fingerprint,
+            done=done,
+        )
+        assert line.startswith("- [x] " if done else "- [ ] ")
+        # the ported scan (trailing fields, as Tasks reads them) sees the real due date only
+        assert tasks_trailing_fields(line) == ["due"]
+        assert tasks_fields(_LINK.sub("[link](x)", line)) == ["emoji due"]
+        assert line.endswith(f"{REMINDER} 19:00 {DUE} 2030-01-01 ^{block}")
+        # the block-id pattern matches the real id, at the end, and nothing the title holds
+        assert [m.group(0) for m in re.finditer(r"(?<!\\)\^h-[0-9a-f]{12}", line)] == [f"^{block}"]
+        assert re.search(rf"\s\^{block}$", line)
+        assert line.count(DUE) == 1
+        assert line.count(REMINDER) == 1
+    # without a due date or a reminder, the title still cannot end in a field or a hashtag
+    bare = task_line(title, link=hostile_link, fingerprint=fingerprint)
+    assert tasks_trailing_fields(bare) == []
+    assert tasks_fields(_LINK.sub("[link](x)", bare)) == []
+    assert re.search(r"\\#tag", bare)
+
+
+def test_task_line_for_checks_the_fingerprint_it_turns_into_a_block_id() -> None:
+    base = {"type": "task.create", "title": "x"}
+    for bad in (42, None, b"a:1", ["a:1"], "", "a b", "é:1", "a/b", "a\nb", "x" * 129):
+        with pytest.raises(ValueError, match="fingerprint"):
+            task_line_for({**base, "fingerprint": bad}, block_id=True)
+    # without block_id the fingerprint is not read at all
+    assert task_line_for({**base, "fingerprint": 42}) == "- [ ] x"
+    done = task_line_for({**base, "fingerprint": "a:1"}, block_id=True)
+    assert done == f"- [ ] x ^{task_block_id('a:1')}"
+
+
+def test_a_done_task_keeps_its_block_id_last() -> None:
+    block = task_block_id("a:1")
+    line = task_line_for(
+        {
+            "type": "task.create",
+            "title": "Pay",
+            "fingerprint": "a:1",
+            "due": "2026-10-22",
+            "time": "19:00",
+        },
+        block_id=True,
+    )
+    assert line == f"- [ ] Pay {REMINDER} 19:00 {DUE} 2026-10-22 ^{block}"
+    assert task_line("Pay", due="2026-10-22", time="19:00", fingerprint="a:1", done=True) == (
+        f"- [x] Pay {REMINDER} 19:00 {DUE} 2026-10-22 ^{block}"
+    )
+    assert tasks_trailing_fields(line.replace("[ ]", "[x]")) == ["due"]

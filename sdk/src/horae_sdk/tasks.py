@@ -308,7 +308,8 @@ def link_destination(link: str) -> str:
 
 
 BLOCK_ID_PREFIX = "h-"
-"""The prefix of the block id `task_block_id` gives (Horae's, so no user block id collides)."""
+"""The prefix of the block id `task_block_id` gives (Horae's, so unlikely to collide with a
+user's block ids)."""
 BLOCK_ID_HEX = 12
 """How many hex digits of the fingerprint's SHA-256 the block id keeps (48 bits)."""
 _FINGERPRINT = re.compile(r"[A-Za-z0-9._:-]{1,128}")
@@ -319,8 +320,11 @@ def task_block_id(fingerprint: str) -> str:
     `h-` and the first 12 hex digits of the SHA-256 of `fingerprint` (UTF-8), e.g.
     `h-3f2a9c01b7de`. The line ends with it as `^h-3f2a9c01b7de`: Obsidian hides it in reading
     view, Tasks ignores it, and it survives edits to the text. It is a one-way digest: a
-    reader keeps its own index from block id to fingerprint. `fingerprint` must be a
-    `task.create` fingerprint (`^[A-Za-z0-9._:-]{1,128}$`); `ValueError` otherwise."""
+    reader keeps its own index from block id to fingerprint. 48 bits can collide (about 2e-5 at
+    100,000 tasks, negligible but not zero): that index must detect a second fingerprint
+    mapping to the same id and fail closed (refuse) rather than overwrite the first.
+    `fingerprint` must be a `task.create` fingerprint (`^[A-Za-z0-9._:-]{1,128}$`);
+    `ValueError` otherwise."""
     if not isinstance(fingerprint, str) or not _FINGERPRINT.fullmatch(fingerprint):  # type: ignore[redundant-expr]
         raise ValueError("fingerprint must match ^[A-Za-z0-9._:-]{1,128}$")
     digest = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()
