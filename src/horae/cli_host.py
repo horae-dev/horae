@@ -416,6 +416,32 @@ def _validator_problems(instance: Instance) -> list[Problem]:
     return [Problem(CONFIG_FILE, None, None, f"llm validator: {problem}")]
 
 
+def _act_problems(instance: Instance) -> list[Problem]:
+    """The `/act` links (#38, schemas decision 53 C): an error for a `HORAE_ACT_KEY` that is
+    set but unusable (shorter than 32 bytes, unreadable: `horae serve` refuses to start); a
+    warning when the key is set but links cannot be minted (no `http.public_url`, no single
+    `mode: tasks` entry): notifications are then sent without buttons."""
+    from horae.api.act import ActKeyError, load_act_key, tasks_route
+
+    try:
+        key = load_act_key(instance.secret_resolver())
+    except ActKeyError as exc:
+        return [Problem(CONFIG_FILE, None, None, f"/act: {exc}")]
+    if key is None:
+        return []
+    problems: list[Problem] = []
+    if instance.config.http.public_url is None:
+        message = "/act: HORAE_ACT_KEY is set but http.public_url is not: no button is minted"
+        problems.append(Problem(CONFIG_FILE, None, None, message, severity="warning"))
+    if tasks_route(instance.pipelines) is None:
+        message = (
+            "/act: HORAE_ACT_KEY is set but no single `mode: tasks` act entry (without "
+            "templates) applies the changes: no button is minted"
+        )
+        problems.append(Problem(CONFIG_FILE, None, None, message, severity="warning"))
+    return problems
+
+
 def instance_problems(instance: Instance) -> list[Problem]:
     """What `horae doctor` checks beyond the configuration (`check_instance`): the lock's
     paths exist, the instance's own `vault/` is the one the lock writes to, each model alias
@@ -424,12 +450,14 @@ def instance_problems(instance: Instance) -> list[Problem]:
     when the instance has a `plugins/` directory, the plugins are installed as the lock
     pins them (`check_plugins`), each command (its interpreter) exists and is executable,
     and every skill an `llm` step uses loads (`horae.skills.load_skill`); with an `llm` step,
-    the output validator's worker runs (`horae.llm.validate.worker_problem`)."""
+    the output validator's worker runs (`horae.llm.validate.worker_problem`); the `/act`
+    key, when set, is usable (`_act_problems`)."""
     problems = (
         _path_problems(instance)
         + _backend_problems(instance)
         + _budget_problems(instance)
         + _deid_problems(instance)
+        + _act_problems(instance)
     )
     problems.extend(_validator_problems(instance))
     if plugins_dir(instance.root).is_dir():

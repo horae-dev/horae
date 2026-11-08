@@ -253,6 +253,40 @@ def test_a_notifier_answers_not_supported_for_notes_and_reports_failures() -> No
     assert plugin.provides() == {"notifiers": ["push.send"]}
 
 
+class Buttons(Notifier):
+    def identity(self, paths: Paths) -> str:
+        return "push:test"
+
+    def apply(self, request: ApplyRequest) -> Any:
+        return Applied("push:test", details={"buttons": [dict(a) for a in request.actions]})
+
+
+def test_a_notifier_receives_the_buttons_the_core_minted() -> None:
+    # #38: the core sends its signed `/act` links as ntfy `http` actions; a notifier renders
+    # these, never the intent's own `actions`.
+    plugin = Plugin("push", permissions=Permissions(intents=["notify.push"]))
+    plugin.add(Buttons(["push.send"]))
+    paths: dict[str, list[str]] = {"read": [], "write": []}
+    intent = {"type": "notify.push", "body": "hi"}
+    button = {
+        "action": "http",
+        "label": "Done",
+        "url": "https://horae.example.org/act/AAAA",
+        "method": "POST",
+    }
+    sent = run(
+        operation(plugin, "push.apply", {"paths": paths, "intent": intent, "actions": [button]})
+    )
+    assert sent["details"] == {"buttons": [button]}
+    plain = run(operation(plugin, "push.apply", {"paths": paths, "intent": intent}))
+    assert plain["details"] == {"buttons": []}
+    for bad in ([{"label": "x"}], [{**button, "extra": "y"}], [{**button, "url": 1}], [button] * 4):
+        refused = run(
+            operation(plugin, "push.apply", {"paths": paths, "intent": intent, "actions": bad})
+        )
+        assert refused["error"]["kind"] == "output_invalid"
+
+
 def test_sink_definitions_and_errors_are_checked() -> None:
     for tools in ([], ["nodot"], ["a.x", "b.y"]):
         with pytest.raises(ValueError, match="sink"):

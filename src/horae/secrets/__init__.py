@@ -152,6 +152,18 @@ class SecretError(Exception):
         self.reason = reason
 
 
+class SecretMissing(SecretError):
+    """A core secret (`SecretResolver.resolve_core`) is set nowhere: neither its file nor its
+    environment variable exists. Any other problem (too short, unreadable) is a plain
+    `SecretError`."""
+
+
+CORE_SECRETS = frozenset({"HORAE_ACT_KEY"})
+"""The secrets the core itself reads (`SecretResolver.resolve_core`). Their names start with
+`HORAE_`, which `SecretName` reserves for the core, so no `secrets.refs` entry and no plugin can
+name them: `HORAE_ACT_KEY` is the HMAC key of the `/act` links (#38, schemas decision 53)."""
+
+
 _SECRET_NAME: TypeAdapter[str] = TypeAdapter(SecretName)
 
 
@@ -257,6 +269,27 @@ class SecretResolver:
         redact.remember(secret)
         return secret
 
+    def resolve_core(self, name: str) -> Secret:
+        """The core secret `name` (one of `CORE_SECRETS`): the file of that name in the
+        secrets directory when it exists, else the environment variable of that name (the
+        core's own `HORAE_*` namespace, never a plugin's). `SecretMissing` when neither is
+        set, `SecretError` for any other problem (too short, unreadable, not a core secret).
+        Remembered for redaction like any secret."""
+        if name not in CORE_SECRETS:
+            shown = safe_excerpt(str(name))
+            del name
+            raise SecretError(shown, "not a core secret")
+        path = self._directory / name
+        if os.path.lexists(path):
+            secret = self._from_file(name, path)
+        elif name in self._environ:
+            secret = self._from_env(name, name)
+        else:
+            raise SecretMissing(name, f"neither file {path} nor environment variable {name} is set")
+        self._resolved[name] = secret
+        redact.remember(secret)
+        return secret
+
     def read_file(self, file_name: str) -> bytes:
         """The bytes of the private file `file_name` of the secrets directory (e.g. the
         de-identification vocabulary, #34), read with the same checks as a secret file: one
@@ -334,11 +367,13 @@ class SecretResolver:
 
 
 __all__ = [
+    "CORE_SECRETS",
     "MAX_SECRET_BYTES",
     "MIN_SECRET_BYTES",
     "REDACTED",
     "Secret",
     "SecretError",
+    "SecretMissing",
     "SecretResolver",
     "safe_excerpt",
 ]

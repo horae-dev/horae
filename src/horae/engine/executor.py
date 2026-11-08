@@ -105,7 +105,8 @@ entry of a later step, which is recorded in `ProposedIntent.applied_by` (the ent
    take a `task.create` but for its link, the `intent_unrouted` message says
    `task link not under a trusted link_prefix` (a fixed text: no link is echoed);
 4. a `task.update_status` is routed only if its `task` fingerprint appears, as an exact string
-   value, in the data collected so far in the run (`RunRecord.inputs`, and the current
+   value, in the data collected so far in the run (so is a `notify.push` with buttons,
+   `actions`: the `task` of each, #38) (`RunRecord.inputs`, and the current
    `collect` step's earlier sources and own output; for an `llm` step with a loaded skill,
    only its **viewed** input, what the model was shown): a proposer can change the status of
    a task it was shown, not of one it guessed. `task.create` binds no target (its title is free
@@ -1094,16 +1095,28 @@ def fill_target(payload: Any, binds: Mapping[str, Any]) -> Any:
     return {**payload, name: binds[name]}
 
 
+def _task_targets(intent: Intent) -> tuple[str, ...]:
+    """The task fingerprints `intent` acts on: a `task.update_status` target, and the `task`
+    of each button of a `notify.push` (#38), which changes that task when pressed."""
+    if isinstance(intent, TaskUpdateStatus):
+        return (intent.task,)
+    if isinstance(intent, NotifyPush) and intent.actions:
+        return tuple(action.task for action in intent.actions)
+    return ()
+
+
 def check_task_fingerprints(typed: Sequence[Intent], shown: Sequence[Any]) -> list[int]:
-    """The positions in `typed` of the `task.update_status` intents whose `task` fingerprint
-    is not, as an exact string value, in `shown` (what the proposer was shown; rule 4 of the
-    module docstring): a proposer can change the status of a task it was shown, not of one it
-    guessed. Shared by the engine (`_Run.propose`) and the skill eval judge (decision 48)."""
-    updates = [(i, it) for i, it in enumerate(typed) if isinstance(it, TaskUpdateStatus)]
-    if not updates:
+    """The positions in `typed` of the `task.update_status` intents, and of the `notify.push`
+    intents with buttons (`actions`, #38), whose task fingerprints are not all, as exact
+    string values, in `shown` (what the proposer was shown; rule 4 of the module docstring):
+    a proposer can change the status of a task it was shown, not of one it guessed. Shared by
+    the engine (`_Run.propose`) and the skill eval judge (decision 48)."""
+    targets = [(i, _task_targets(it)) for i, it in enumerate(typed)]
+    targets = [(i, tasks) for i, tasks in targets if tasks]
+    if not targets:
         return []
     known = _strings(*shown)
-    return [position for position, intent in updates if intent.task not in known]
+    return [position for position, tasks in targets if not set(tasks) <= known]
 
 
 def _violations(raw: object) -> tuple[Violation, ...]:

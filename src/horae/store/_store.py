@@ -93,6 +93,7 @@ from horae.contracts.types import (
 from horae.engine.ports import PreviousLlm
 from horae.secrets.redact import current as current_redactor
 from horae.store._errors import (
+    ActTokenUsed,
     InvalidRow,
     JournalTooLarge,
     PipelineBusy,
@@ -123,6 +124,12 @@ EVAL_PIPELINE_PREFIX = "eval:"
 """The pipeline of a live skill eval's run row (`eval:<skill>`, schemas decision 48 J): a
 pipeline name never holds `:`, so an eval row never collides with a pipeline's; `horae runs`
 hides these rows unless `--all`."""
+
+ACT_PIPELINE = "_act"
+"""The reserved pipeline of the `/act` runs (#38, schemas decision 53): a pipeline name never
+starts with `_`; such a row never gets a run record (migration 8)."""
+ActOutcome = Literal["pending", "applied", "stale", "failed"]
+ACT_OUTCOMES: frozenset[str] = frozenset({"pending", "applied", "stale", "failed"})
 
 DEFAULT_BUSY_TIMEOUT_MS = 5000
 HEARTBEAT_BUSY_TIMEOUT_MS = 100
@@ -1300,6 +1307,12 @@ class Store:
                 (_ts(older_than),),
             )
             pruned = cur.rowcount
+            # Consumed `/act` nonces of tokens that expired before `older_than` (#38): long
+            # refused by their expiry already.
+            self._conn.execute(
+                "DELETE FROM act_consumed WHERE expires_at < ?",
+                (int(older_than.timestamp()),),
+            )
             self._conn.execute(
                 "DELETE FROM blobs WHERE NOT EXISTS "
                 "(SELECT 1 FROM journal WHERE journal.before_sha256 = blobs.sha256) "
@@ -1782,6 +1795,77 @@ class Store:
             (_ts(now),),
         ).fetchall()
         return [self._task(row) for row in rows]
+
+    # --- /act links (#38, schemas decision 53) ------------------------------------------------
+
+    @staticmethod
+    def _act_args(nonce: bytes, outcome: str | None = None) -> None:
+        if type(nonce) is not bytes or len(nonce) != 16:
+            raise ValueError("an /act nonce is 16 bytes")
+        if outcome is not None and outcome not in ACT_OUTCOMES:
+            raise ValueError(f"unknown /act outcome {outcome!r}")
+
+    @_api
+    def act_consume(
+        self,
+        nonce: bytes,
+        *,
+        kid: bytes,
+        expires_at: int,
+        at: datetime,
+        run_id: str | None,
+        outcome: ActOutcome,
+    ) -> None:
+        """Record that the `/act` token with `nonce` is used (its key id `kid`, its expiry
+        `expires_at` in Unix seconds), by run `run_id`. Raises `ActTokenUsed` when it already
+        is (the row is left alone), `UnknownRun`. Call it inside the transaction that
+        journals the token's change, so the two are committed together."""
+        self._act_args(nonce, outcome)
+        if type(kid) is not bytes or len(kid) != 4:
+            raise ValueError("an /act key id is 4 bytes")
+        if type(expires_at) is not int or expires_at < 0:
+            raise ValueError("an /act expiry is a non-negative int")
+        with self.transaction():
+            self._require_run(run_id)
+            cur = self._conn.execute(
+                "INSERT INTO act_consumed (nonce, kid, expires_at, consumed_at, run_id, outcome) "
+                "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (nonce) DO NOTHING",
+                (nonce, kid, expires_at, _ts(at), run_id, outcome),
+            )
+            if cur.rowcount != 1:
+                raise ActTokenUsed()
+
+    @_api
+    def act_outcome(self, nonce: bytes) -> str | None:
+        """The outcome of the used `/act` token with `nonce`, `None` when it is not used."""
+        self._act_args(nonce)
+        row = self._conn.execute(
+            "SELECT outcome FROM act_consumed WHERE nonce = ?", (nonce,)
+        ).fetchone()
+        return None if row is None else str(row[0])
+
+    @_api
+    def act_set_outcome(self, nonce: bytes, outcome: ActOutcome) -> None:
+        """Set the outcome of a used `/act` token (`ValueError` for an unknown nonce)."""
+        self._act_args(nonce, outcome)
+        with self.transaction():
+            cur = self._conn.execute(
+                "UPDATE act_consumed SET outcome = ? WHERE nonce = ?", (outcome, nonce)
+            )
+            if cur.rowcount != 1:
+                raise ValueError("no such /act nonce")
+
+    @_api
+    def act_purge(self, expired_before: int, *, limit: int = 1000) -> int:
+        """Delete at most `limit` used-token rows whose token expired before `expired_before`
+        (Unix seconds); how many. Safe: their expiry already refuses those tokens."""
+        with self.transaction():
+            cur = self._conn.execute(
+                "DELETE FROM act_consumed WHERE nonce IN (SELECT nonce FROM act_consumed "
+                "WHERE expires_at < ? ORDER BY expires_at LIMIT ?)",
+                (expired_before, limit),
+            )
+        return cur.rowcount
 
     # --- notification state ----------------------------------------------------------------
 

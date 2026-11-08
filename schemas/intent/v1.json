@@ -142,6 +142,84 @@
       "title": "NoteReplaceOwnedBlock",
       "type": "object"
     },
+    "NotifyAction": {
+      "additionalProperties": false,
+      "description": "A notification button that changes one task once, through a signed `/act` link the\ncore mints when it sends the notification (#38). The proposer names the task and the\nkind; it never sees or writes a URL.",
+      "else": {
+        "properties": {
+          "duration": {
+            "type": "null"
+          }
+        }
+      },
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "task.snooze"
+          }
+        }
+      },
+      "properties": {
+        "label": {
+          "description": "The button text (untrusted data, shown as is).",
+          "maxLength": 64,
+          "pattern": "^[^\\x00-\\x1f\\x7f]+$",
+          "title": "Label",
+          "type": "string"
+        },
+        "kind": {
+          "description": "What the button does.",
+          "enum": [
+            "task.done",
+            "task.snooze"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "task": {
+          "description": "The task's fingerprint: like a `task.update_status` target, it must appear in the data\nthe run collected (rule 4 of `horae.engine.executor`).",
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9._:-]{1,128}$",
+          "title": "Task",
+          "type": "string"
+        },
+        "duration": {
+          "anyOf": [
+            {
+              "enum": [
+                "1h",
+                "3h",
+                "tomorrow"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "For `task.snooze` only (and then required).",
+          "title": "Duration"
+        }
+      },
+      "required": [
+        "label",
+        "kind",
+        "task"
+      ],
+      "then": {
+        "properties": {
+          "duration": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "duration"
+        ]
+      },
+      "title": "NotifyAction",
+      "type": "object"
+    },
     "NotifyPush": {
       "additionalProperties": false,
       "description": "Send a push notification.",
@@ -187,6 +265,24 @@
           "default": null,
           "description": "Optional `https://` or `obsidian://` link opened when the notification is tapped.",
           "title": "Link"
+        },
+        "actions": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/NotifyAction"
+              },
+              "maxItems": 3,
+              "minItems": 1,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional buttons (at most 3), each changing one task once through `/act` (#38). The\ncore mints their links when it sends the notification; without the `/act` key or\n`http.public_url` the notification is sent without them.",
+          "title": "Actions"
         }
       },
       "required": [

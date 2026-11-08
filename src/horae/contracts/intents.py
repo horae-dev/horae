@@ -210,6 +210,54 @@ class TaskUpdateStatus(Contract):
         return self
 
 
+ActKind = Literal["task.done", "task.snooze"]
+"""What a notification button does to its task, through `/act` (#38, schemas decision 53):
+`task.done` applies `task.update_status {status: done}`, `task.snooze` applies `{status:
+snoozed, until}` with `until` computed by the core when the button is pressed."""
+
+SnoozeDuration = Literal["1h", "3h", "tomorrow"]
+"""How long a `task.snooze` button snoozes: one hour, three hours, or until 09:00 tomorrow
+in the instance time zone, from the moment it is pressed."""
+
+ActionLabel = Annotated[
+    str, Strict(), StringConstraints(pattern=r"^[^\x00-\x1f\x7f]+$", max_length=64)
+]
+"""A button label: one line, at most 64 characters, no control character."""
+
+MAX_NOTIFY_ACTIONS = 3
+"""The most buttons on one notification (ntfy's limit)."""
+
+
+class NotifyAction(Contract):
+    """A notification button that changes one task once, through a signed `/act` link the
+    core mints when it sends the notification (#38). The proposer names the task and the
+    kind; it never sees or writes a URL."""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "if": {"properties": {"kind": {"const": "task.snooze"}}},
+            "then": {"required": ["duration"], "properties": {"duration": {"type": "string"}}},
+            "else": {"properties": {"duration": {"type": "null"}}},
+        }
+    )
+
+    label: ActionLabel
+    """The button text (untrusted data, shown as is)."""
+    kind: ActKind
+    """What the button does."""
+    task: Fingerprint
+    """The task's fingerprint: like a `task.update_status` target, it must appear in the data
+    the run collected (rule 4 of `horae.engine.executor`)."""
+    duration: SnoozeDuration | None = None
+    """For `task.snooze` only (and then required)."""
+
+    @model_validator(mode="after")
+    def _duration_iff_snooze(self) -> Self:
+        if (self.kind == "task.snooze") != (self.duration is not None):
+            raise ValueError("`duration` is required for `task.snooze` and only allowed there")
+        return self
+
+
 class NotifyPush(Contract):
     """Send a push notification."""
 
@@ -220,6 +268,12 @@ class NotifyPush(Contract):
     """Notification text, at most 4096 characters."""
     link: NotifyLink | None = None
     """Optional `https://` or `obsidian://` link opened when the notification is tapped."""
+    actions: (
+        Annotated[list[NotifyAction], Field(min_length=1, max_length=MAX_NOTIFY_ACTIONS)] | None
+    ) = None
+    """Optional buttons (at most 3), each changing one task once through `/act` (#38). The
+    core mints their links when it sends the notification; without the `/act` key or
+    `http.public_url` the notification is sent without them."""
 
 
 class HttpPost(Contract):

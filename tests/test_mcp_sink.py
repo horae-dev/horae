@@ -205,6 +205,30 @@ def test_apply_passes_other_intents_through() -> None:
     assert (applied.target, applied.details) == ("notes.write", {})
 
 
+def test_minted_buttons_reach_the_notifier_as_ntfy_http_actions() -> None:
+    # #38: the core's minted `/act` links, only when there are some (a notifier built before
+    # them is called exactly as before).
+    from dataclasses import replace
+
+    from horae.apply import ActionLink
+
+    scripted = ScriptedHost(apply=lambda _t, a: {"target": "ntfy"})
+    sink = _sink(scripted)
+    notify = NotifyPush(type="notify.push", body="hi")
+    asyncio.run(sink.apply(_call(notify), expected_before_sha256=None))
+    assert "actions" not in scripted.calls[-1][2]
+    links = (ActionLink("Done", "https://horae.example.org/act/AAAA"),)
+    asyncio.run(sink.apply(replace(_call(notify), actions=links), expected_before_sha256=None))
+    assert scripted.calls[-1][2]["actions"] == [
+        {
+            "action": "http",
+            "label": "Done",
+            "url": "https://horae.example.org/act/AAAA",
+            "method": "POST",
+        }
+    ]
+
+
 def test_restore_and_parent_exists() -> None:
     scripted = ScriptedHost(
         restore=lambda _t, a: {}, parent_exists=lambda _t, a: {"exists": a["path"] == NOTE}

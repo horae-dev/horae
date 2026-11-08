@@ -476,6 +476,48 @@ class SchedulerConfig(Contract):
     slot) before it is skipped and recorded instead of run (default 1 hour)."""
 
 
+PUBLIC_URL_PATTERN = rf"^https://{HOST}(:{_PORT})?$"
+"""`http.public_url`: an `https://` origin on a host name (no IP literal), an optional port, no
+path, query, fragment or user info."""
+
+PublicUrl = Annotated[str, Strict(), StringConstraints(pattern=PUBLIC_URL_PATTERN, max_length=300)]
+
+
+def _ip_network(value: str) -> str:
+    try:
+        return str(ipaddress.ip_network(value, strict=True))
+    except ValueError:
+        raise ValueError("not an IP address or a CIDR network (no host bits set)") from None
+
+
+IpNetwork = Annotated[
+    str,
+    Strict(),
+    StringConstraints(pattern=r"^[0-9a-fA-F:.]{2,45}(/[0-9]{1,3})?$", max_length=49),
+    AfterValidator(_ip_network),
+]
+"""An IP address or a CIDR network, e.g. `172.18.0.0/16` (normalised; host bits must be zero)."""
+
+MAX_TRUSTED_PROXIES = 16
+
+
+class HttpConfig(Contract):
+    """The public side of the HTTP API (`horae serve`, #37, #38)."""
+
+    public_url: PublicUrl | None = None
+    """The API's public origin behind the reverse proxy, e.g. `https://horae.example.org`: the
+    base of the `/act` links the core mints (never taken from a request's `Host`), and the
+    only `Origin` a `POST /act/...` may carry. Without it the core mints no links and
+    notifications are sent without buttons. Its host must also be an allowed host
+    (`HORAE_ALLOWED_HOSTS`)."""
+    trusted_proxies: Annotated[list[IpNetwork], Field(max_length=MAX_TRUSTED_PROXIES)] = Field(
+        default_factory=list
+    )
+    """The reverse proxies (addresses or networks) whose `X-Forwarded-For` header `/act`'s
+    rate limit trusts: the client is the right-most address of that header that is not one
+    of them. Empty (the default): the header is ignored and the client is the peer address."""
+
+
 class DailyBudget(Contract):
     """A ceiling on what LLM calls may spend in one day (schemas decision 41).
 
@@ -567,6 +609,8 @@ class InstanceConfig(Contract):
     """The LLM cache's expiry policy (#32)."""
     deidentification: DeidentificationConfig = Field(default_factory=DeidentificationConfig)
     """De-identification of declared fields before a cloud model (#34)."""
+    http: HttpConfig = Field(default_factory=HttpConfig)
+    """The HTTP API's public origin and trusted proxies (`/act` links, #38)."""
 
     def plugin_timeouts(self, plugin: str) -> PluginDefaults:
         """The effective timeouts of `plugin`: its own settings, else `plugin_defaults`."""

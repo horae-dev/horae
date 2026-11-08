@@ -24,7 +24,7 @@ from horae.contracts.instance import (
 from horae.contracts.lockfile import Lockfile
 from horae.contracts.pipeline import LlmStep, Pipeline
 from horae.engine.canonical import sha256_hex
-from horae.secrets import Secret, SecretError, SecretResolver, redact
+from horae.secrets import CORE_SECRETS, Secret, SecretError, SecretResolver, redact
 
 CONFIG_FILE = "horae.yaml"
 LOCK_FILE = "horae.lock"
@@ -131,8 +131,15 @@ class Instance:
         that the process registry (`horae.secrets.redact`) knows them before anything is
         run, stored, logged or printed (#53, schemas decision 43 A). A secret that cannot
         be resolved is skipped: what needs it fails later with its own error. The values
-        are never sent anywhere; only redaction uses them."""
-        redact.prime(self.secret_resolver(), self.redaction_names())
+        are never sent anywhere; only redaction uses them. The core's own secrets
+        (`CORE_SECRETS`: the `/act` key) are resolved too, when set."""
+        resolver = self.secret_resolver()
+        redact.prime(resolver, self.redaction_names())
+        for name in sorted(CORE_SECRETS):  # the core's own (`HORAE_ACT_KEY`, #38)
+            try:
+                resolver.resolve_core(name)
+            except SecretError:
+                continue  # unset or unusable: what needs it reports it
 
     def plugin_timeouts(self, plugin: str) -> PluginDefaults:
         """The effective startup and call timeouts of `plugin` (for the plugin host)."""

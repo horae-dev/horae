@@ -29,7 +29,8 @@
 5. **Apply** (#22, provisional): when the run is not a dry run, finished `ok`, `noop` or
    `degraded` within its timeout, and `Ports.sinks` is set, its routed intents are planned
    (`horae.apply.plan_changes`, with the notifications already sent) and applied
-   (`horae.apply.apply_changes`: journal first, then the sink, then mark applied) while the
+   (`horae.apply.apply_changes`: journal first, then the sink, then mark applied; a
+   notification's buttons are minted as `/act` links, #38, `horae.api.act.act_minter`) while the
    run's row is still `running`, holding the instance's apply lock
    (`<state_dir>/locks/_apply.lock`, also held by `horae undo`; waited for at most
    `APPLY_LOCK_WAIT_S`, else the run fails `apply_locked` with nothing applied) and with the
@@ -104,7 +105,8 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-from horae.apply import SinkRegistry, apply_changes, plan_changes
+from horae.api.act import act_minter
+from horae.apply import ActMinter, SinkRegistry, apply_changes, plan_changes
 from horae.config import Instance
 from horae.contracts import (
     ActStep,
@@ -117,6 +119,7 @@ from horae.contracts import (
     StepRecord,
     Usage,
 )
+from horae.contracts.intents import NotifyPush
 from horae.contracts.run import StepKind
 from horae.engine import (
     LlmBackend,
@@ -618,7 +621,14 @@ class Runner:
                     record, sinks, notified=notified, call_timeout_s=timeout_s
                 )
                 result = await apply_changes(
-                    record, planned, sinks, self.store, clock=self.clock, call_timeout_s=timeout_s
+                    record,
+                    planned,
+                    sinks,
+                    self.store,
+                    clock=self.clock,
+                    call_timeout_s=timeout_s,
+                    minter=self._minter(record),
+                    timezone=self.instance.config.timezone,
                 )
         except RunNotRunning:
             state.settled = True
@@ -632,6 +642,14 @@ class Runner:
             state.settled = True
             raise RunLost(state.run_id)
         return result.record
+
+    def _minter(self, record: RunRecord) -> ActMinter | None:
+        """The `/act` link minter (#38), only for a run with a notification that has buttons
+        (`None` without `http.public_url`, a route or a usable `HORAE_ACT_KEY`: those
+        notifications are then sent without buttons)."""
+        if not any(isinstance(p.intent, NotifyPush) and p.intent.actions for p in record.intents):
+            return None
+        return act_minter(self.instance, clock=self.clock)
 
     def _ledger_llm(self, pipeline: Pipeline, run_id: str) -> LlmBackend | None:
         """The run's LLM backend behind the daily budgets and the usage ledger (#33)."""
