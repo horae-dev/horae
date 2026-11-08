@@ -4,6 +4,8 @@ __pycache__/
 .env
 .env.*
 !.env.example
+# Secret files of the plain compose deployment (docs/operations/compose.md)
+deploy/compose/secrets/
 dist/
 build/
 *.egg-info/

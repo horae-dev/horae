@@ -2886,9 +2886,13 @@ loosened later without breaking a valid file.
       (`>=1.9,<2`): the API relies on Starlette's handler behaviour (exception handlers,
       middleware order, `redirect_slashes`), so a change of major version must be a
       deliberate bump, not a side effect of a FastAPI update.
-    - **Not done (follow-ups)**: `/act` (#38), the SSO-exemption test against the rendered
-      template and the network that only the proxy shares (#41), `api.allowed_hosts` in
-      `horae.yaml`; no ETag or conditional requests; no metrics endpoint.
+    - **Not done (follow-ups)**: `/act` (#38), `api.allowed_hosts` in `horae.yaml`; no ETag
+      or conditional requests; no metrics endpoint. Done in #41: the SSO-exemption test
+      against the rendered templates (`tests/test_deploy_templates.py`, docs/security.md
+      T15) and the network of B: plain compose, one shared only with Traefik; the Coolify
+      template, the resource's own network, which Coolify connects the proxy to and no other
+      app joins (never a shared `traefik-network`; docs/operations/coolify.md, "The
+      network").
 
 ### Provisional decisions (#122, pending maintainer review)
 
@@ -3167,12 +3171,12 @@ loosened later without breaking a valid file.
       is not itself a trusted proxy (a generalisation of the note's "last hop", identical with
       one proxy; it serves the reference deployment, below). Without trusted proxies the
       header is ignored. A `trusted_proxies` entry is at least /8 (IPv4) or /32 (IPv6): a
-      wider one (`/0` above all) would trust any client's header. **Reference deployment, Cloudflare tunnel then Traefik:** Traefik
-      must trust cloudflared's `X-Forwarded-For` (`entryPoints.<name>.forwardedHeaders.
-      trustedIPs` = cloudflared's address), and `http.trusted_proxies` must list the Docker
-      network Traefik and cloudflared share (e.g. `172.18.0.0/16`); then each phone has its
-      own bucket. Without the Traefik setting every request shares cloudflared's bucket
-      (still limited, never unlimited).
+      wider one (`/0` above all) would trust any client's header. **Reference deployment, Cloudflare tunnel then Traefik (#41):** no entry point
+      carrying Horae's routers may trust forwarded headers (`forwardedHeaders.trustedIPs`,
+      `insecure`; docs/operations/coolify.md, forwarded headers), so Traefik replaces
+      `X-Forwarded-For` with cloudflared's address and every request shares cloudflared's
+      bucket (still limited, never unlimited). `http.trusted_proxies` is for a chain whose
+      proxies may pass the client's address on.
     - **M, routing and SSO** (#41 tests the rendered Traefik template). Exactly `/act/{token}`
       (one path segment; no path converter, no mount or prefix router under `/act`), so `%2F`,
       `..` or a trailing segment can never reach `/runs` or `/healthz` through the prefix the

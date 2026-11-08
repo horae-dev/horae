@@ -113,11 +113,14 @@ instance's `mode: tasks` sink, as a run of the reserved pipeline `_act`. To turn
 - have exactly one `act` entry with `mode: tasks` across the pipelines.
 
 Without the key `/act` answers 503 and notifications are sent without buttons. `/act/` is the
-only path the reverse proxy exempts from SSO. Requests are rate limited (10 a minute per
-client, an IPv6 client by its /64; 60 a minute overall for links whose signature verifies); behind Traefik and a Cloudflare tunnel, list the Docker network they
-share in `http.trusted_proxies` (e.g. `[172.18.0.0/16]`) and make Traefik trust cloudflared's
-`X-Forwarded-For` (`entryPoints.<name>.forwardedHeaders.trustedIPs`), or every phone shares
-one bucket; and turn off Traefik's access log for `/act` (it would log the tokens).
+only path the reverse proxy exempts from SSO (the #41 templates match the link's exact
+shape and turn Traefik's access log off for it). Requests are rate limited (10 a minute per
+client, an IPv6 client by its /64; 60 a minute overall for links whose signature verifies).
+In the reference deployment (Cloudflare tunnel, then Traefik) no entry point may trust
+forwarded headers ([operations/coolify.md](docs/operations/coolify.md#forwarded-headers)), so
+Traefik replaces `X-Forwarded-For` with cloudflared's address and every phone shares one
+bucket (still limited); `http.trusted_proxies` only helps behind a proxy chain that passes the
+client's address on safely.
 `http.trusted_proxies` takes networks of /8 (IPv4) or /32 (IPv6) at the widest.
 
 An instance is **not relocatable** in v1: `horae.lock` holds the vault's absolute path and
@@ -139,6 +142,31 @@ the lock, or run `horae init` in the new place.
 | 70 | internal error (only its type is printed) |
 | 130 / 143 | `horae run` interrupted by SIGINT / SIGTERM |
 
+## Deployment
+
+The container image is `ghcr.io/horae-dev/horae`
+([docs/operations/container-image.md](docs/operations/container-image.md): tags, signatures,
+the runtime contract). Two ready deployments (#41), both on a named volume for `/instance`, with
+a read-only root filesystem and a one-off `horae init` on a new volume:
+
+- **Coolify** (the reference deployment, PLAN §7):
+  [`deploy/coolify/docker-compose.yaml`](deploy/coolify/docker-compose.yaml), a *Docker Compose
+  Empty* service with its own Traefik routers (on `https` by default, or behind a Cloudflare
+  Tunnel as an opt-in), an authentik forwardAuth middleware of Traefik's file configuration and
+  the resource's own network (shared only with Coolify's proxy); only `/act/` is exempt from SSO. Required variables block
+  the deployment until they are set; Scheduled Tasks run `horae run daily-brief` and `horae run
+  remind`, each with an Uptime Kuma push monitor. Guide (prerequisites, the tunnel's public host
+  name, what to verify on the server): [docs/operations/coolify.md](docs/operations/coolify.md).
+- **Plain Docker Compose**: [`deploy/compose/`](deploy/compose/), on `127.0.0.1` only, with an
+  optional Traefik and SSO override; built-in scheduler or host cron. Guide:
+  [docs/operations/compose.md](docs/operations/compose.md).
+
+Both pull `ghcr.io/horae-dev/horae` without credentials, which needs the GHCR package to be
+public: check first (the guides give the one-line check and the registry login otherwise).
+
+`tests/test_deploy_templates.py` checks the rendered files (routing, hardening, required
+variables).
+
 ## Examples
 
 - [`examples/walking-skeleton`](examples/walking-skeleton/): the M1 walking skeleton, an
@@ -159,7 +187,7 @@ Setup, commands, conventions and the definition of done are in [AGENTS.md](AGENT
 
 ## CI
 
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every PR and push to `main`: lockfile check, ruff, mypy, pytest with coverage, gitleaks (history of the checked-out ref) and CodeQL (python, actions). The aggregate job **CI OK** (`ci-ok`) fails if any other job failed, was cancelled or skipped; mark it as the single required status check in branch protection.
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every PR and push to `main`: lockfile check, ruff, mypy, pytest with coverage, gitleaks (history of the checked-out ref), CodeQL (python, actions), the image build and smoke test, and `docker compose config` on the deploy templates (`deploy`). The aggregate job **CI OK** (`ci-ok`) fails if any other job failed, was cancelled or skipped; mark it as the single required status check in branch protection.
 
 - Python comes from `.python-version`, installed by uv itself (`UV_PYTHON_PREFERENCE=only-managed`, cached via setup-uv `cache-python`). uv is pinned to an exact version in the workflow (`UV_VERSION`) and `[tool.uv] required-version` in `pyproject.toml` sets the minimum for local use. `UV_LOCKED=1` makes every `uv` command fail if `uv.lock` is out of date.
 - The coverage gate is `fail_under` in `[tool.coverage.report]` of `pyproject.toml` (85); change it there.
