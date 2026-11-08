@@ -100,7 +100,7 @@ TEXT_FIELDS: Mapping[IntentType, tuple[str, ...]] = {
 }
 """The untrusted text fields of each intent type that the guard scans (a `notify.push` or
 `task.create` `link` is checked as a whole URL; targets bound by routing are not text). Every
-string of a `notify.push`'s `actions` is scanned: the button labels (#38)."""
+string of a `notify.push`'s `actions` is scanned: the button labels, ignored by the core (#38)."""
 
 INERT_TAGS = frozenset(
     {"b", "i", "u", "s", "em", "strong", "code", "pre", "br", "hr", "p", "ul", "ol", "li"}

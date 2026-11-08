@@ -10,8 +10,12 @@
 -- 2. `act_consumed`: the nonce of every token that was used, inserted in the transaction that
 --    journals its change, before the sink applies it (a primary-key conflict means "already
 --    used"). `outcome` is `pending` until the sink answered (a crash leaves it so: at most
---    once), then `applied` or `failed`; `stale` when the task changed since the link was
---    minted (nothing applied). Rows are deleted an hour after the token expired.
+--    once), then `applied`, `not_changed` (the sink answered that it changed nothing, e.g. a
+--    recurring task to tick in Obsidian) or `failed`; `stale` when the task changed since the
+--    link was minted (nothing applied). Rows are kept 24 h 05 min after the token expired
+--    (`ACT_RETENTION_S`: a clock stepped back cannot make a used token usable again).
+-- 3. `tasks.recurring`: the task repeats (Obsidian Tasks), as the collected data or the sink
+--    said; no button closes a recurring task.
 
 CREATE TABLE runs_new (
     id           TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 128),
@@ -69,9 +73,12 @@ CREATE TABLE act_consumed (
     expires_at  INTEGER NOT NULL,
     consumed_at TEXT NOT NULL,
     run_id      TEXT REFERENCES runs (id) ON DELETE SET NULL,
-    outcome     TEXT NOT NULL CHECK (outcome IN ('pending', 'applied', 'stale', 'failed'))
+    outcome     TEXT NOT NULL
+                CHECK (outcome IN ('pending', 'applied', 'not_changed', 'stale', 'failed'))
 ) STRICT;
 
 CREATE INDEX act_consumed_expires ON act_consumed (expires_at);
+
+ALTER TABLE tasks ADD COLUMN recurring INTEGER NOT NULL DEFAULT 0 CHECK (recurring IN (0, 1));
 
 PRAGMA user_version = 8;

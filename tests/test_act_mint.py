@@ -18,6 +18,7 @@ from act_fixtures import KEY_VALUE, PUBLIC, Clock, key
 from apply_fixtures import PIPELINE, RUN_ID, START, plugins, run_pipeline
 from horae.api.act import ActRoute, LinkMinter, act_minter, tasks_route, verify
 from horae.api.act import _mint as mint_module
+from horae.api.act._mint import BUTTON_LABELS, collected_recurrence
 from horae.api.act._service import ActService
 from horae.apply import ActionLink, StaticSinks, apply_changes, plan_changes
 from horae.apply.plan import dedupe_key
@@ -188,7 +189,7 @@ def test_the_core_mints_the_buttons_and_passes_them_to_the_notifier(tmp_path: Pa
         task = store.get_task(FP)
     assert task is not None
     (call,) = _notifications(sink)
-    assert [link.label for link in call.actions] == ["Done", "In 1 hour"]
+    assert [link.label for link in call.actions] == ["Done", "Snooze 1h"]  # the core's
     for link, button in zip(call.actions, BUTTONS, strict=True):
         assert isinstance(link, ActionLink)
         assert link.method == "POST"
@@ -202,7 +203,7 @@ def test_the_core_mints_the_buttons_and_passes_them_to_the_notifier(tmp_path: Pa
         )
         assert link.to_wire() == {
             "action": "http",
-            "label": button["label"],
+            "label": BUTTON_LABELS[(button["kind"], button.get("duration"))],
             "url": link.url,
             "method": "POST",
         }
@@ -260,6 +261,105 @@ def test_a_failing_minter_never_fails_the_notification(
     assert KEY_VALUE not in caplog.text
 
 
+def test_a_lying_label_never_reaches_the_notifier(tmp_path: Path) -> None:
+    lying = [
+        {"label": "Snooze 1h", "kind": "task.done", "task": FP},
+        {"label": "Done", "kind": "task.snooze", "task": FP, "duration": "tomorrow"},
+    ]
+    sink = FixtureSink()
+    minter = LinkMinter(key(), PUBLIC, clock=lambda: START)
+    with Store.open(tmp_path / "s.db") as store:
+        _apply(store, _record([TASK_CREATE, {**NOTIFY, "actions": lying}]), sink, minter)
+    (call,) = _notifications(sink)
+    wire = [link.to_wire() for link in call.actions]
+    assert [button["label"] for button in wire] == ["Done", "Tomorrow"]
+    for link, button in zip(call.actions, lying, strict=True):
+        parsed = verify(key(), link.url.rsplit("/", 1)[1], int(START.timestamp()))
+        assert parsed is not None
+        assert BUTTON_LABELS[(parsed.kind, parsed.duration)] == link.label
+        assert parsed.kind == button["kind"]
+    # A proposal may leave the label out (the field is deprecated and ignored).
+    assert NotifyAction(kind="task.done", task=FP).label is None
+
+
+def test_no_button_for_a_closed_task(tmp_path: Path) -> None:
+    sink = FixtureSink()
+    minter = LinkMinter(key(), PUBLIC, clock=lambda: START)
+    with Store.open(tmp_path / "s.db") as store:
+        for status in ("done", "cancelled"):
+            store.upsert_task(TaskEntry(fingerprint=FP, title="Old", status=status), at=START)
+            assert minter.mint([NotifyAction(kind="task.done", task=FP)], store) == ()
+            snooze = NotifyAction(kind="task.snooze", task=FP, duration="1h")
+            assert minter.mint([snooze], store) == ()
+        store.upsert_task(
+            TaskEntry(
+                fingerprint=FP,
+                title="Old",
+                status="snoozed",
+                snoozed_until=dt.date(2026, 11, 2),
+                snooze_tz="UTC",
+            ),
+            at=START,
+        )
+        assert len(minter.mint([NotifyAction(kind="task.done", task=FP)], store)) == 1
+    del sink
+
+
+def test_no_done_button_for_a_recurring_task(tmp_path: Path) -> None:
+    done = NotifyAction(kind="task.done", task=FP)
+    snooze = NotifyAction(kind="task.snooze", task=FP, duration="3h")
+    with Store.open(tmp_path / "s.db") as store:
+        store.upsert_task(TaskEntry(fingerprint=FP, title="Water", status="todo"), at=START)
+        # From the index (a sink said so earlier).
+        store.set_task_recurring(FP, True, at=START)
+        minter = LinkMinter(key(), PUBLIC, clock=lambda: START)
+        assert [link.label for link in minter.mint([done, snooze], store)] == ["Snooze 3h"]
+        # From the run's collected data (obsidian.open_tasks), which also updates the index.
+        store.set_task_recurring(FP, False, at=START)
+        collected = [{"tasks": [{"key": "k1", "source_fingerprint": FP, "recurring": True}]}]
+        minter = LinkMinter(key(), PUBLIC, lambda: START, collected_recurrence(collected))
+        assert [link.label for link in minter.mint([done, snooze], store)] == ["Snooze 3h"]
+        task = store.get_task(FP)
+        assert task is not None
+        assert task.recurring is True
+        # The collected data saying it no longer repeats clears the flag.
+        collected = [{"tasks": [{"source_fingerprint": FP, "recurring": False}]}]
+        minter = LinkMinter(key(), PUBLIC, lambda: START, collected_recurrence(collected))
+        assert [link.label for link in minter.mint([done], store)] == ["Done"]
+
+
+def test_collected_recurrence_fails_safe() -> None:
+    data = [
+        {"fingerprint": "a", "recurring": False},
+        {"items": [{"task": "a", "recurring": True}, {"key": "b", "recurring": "yes"}]},
+        {"source_fingerprint": "c", "recurring": False},
+    ]
+    assert collected_recurrence(data) == {"a": True, "c": False}
+    assert collected_recurrence(None) == {}
+
+
+def test_a_sink_that_changes_nothing_leaves_the_index_alone_in_a_run(tmp_path: Path) -> None:
+    from horae.apply import Applied
+
+    class Recurring(FixtureSink):
+        async def apply(self, call: Any, *, expected_before_sha256: str | None) -> Applied:
+            await super().apply(call, expected_before_sha256=expected_before_sha256)
+            if call.intent.type == "task.update_status":
+                details = {"changed": False, "recurring": "tick in Obsidian"}
+                return Applied(call.intent.task, details=details)
+            return Applied(call.tool)
+
+    with Store.open(tmp_path / "s.db") as store:
+        store.upsert_task(TaskEntry(fingerprint=FP, title="Water", status="todo"), at=START)
+        update = {"type": "task.update_status", "task": FP, "status": "done"}
+        result = _apply(store, _record([update]), Recurring())
+        assert result.failure is None
+        task = store.get_task(FP)
+        assert task is not None
+        assert task.status == "todo"
+        assert task.recurring is True
+
+
 # --- the minter's conditions ----------------------------------------------------------------
 
 
@@ -274,6 +374,10 @@ def _instance(tmp_path: Path, *, http: dict[str, Any] | None = None, **extra: An
         pipelines=pipelines,
         lock=Lockfile(schema_version=1),
     )
+
+
+def _may_apply(tool: str) -> frozenset[str]:
+    return frozenset({"task.create", "task.update_status"})
 
 
 def _set_key(tmp_path: Path, value: str = KEY_VALUE) -> None:
@@ -292,24 +396,42 @@ def test_the_minter_needs_a_public_url_a_key_and_a_route(
 ) -> None:
     caplog.set_level(logging.WARNING)
     http = {"public_url": PUBLIC}
-    assert act_minter(_instance(tmp_path)) is None  # links not configured: silent
-    assert act_minter(_instance(tmp_path, http=http)) is None
+    ok = _may_apply
+    assert act_minter(_instance(tmp_path), intents_of=ok) is None  # not configured: silent
+    assert act_minter(_instance(tmp_path, http=http), intents_of=ok) is None
     assert "HORAE_ACT_KEY is not set" in caplog.text
     _set_key(tmp_path, "short-key-value")
-    assert act_minter(_instance(tmp_path, http=http)) is None
+    assert act_minter(_instance(tmp_path, http=http), intents_of=ok) is None
     assert "too short" in caplog.text
     assert "short-key-value" not in caplog.text
     _set_key(tmp_path)
-    minter = act_minter(_instance(tmp_path, http=http))
+    minter = act_minter(_instance(tmp_path, http=http), intents_of=ok)
     assert isinstance(minter, LinkMinter)
     assert minter.public_url == PUBLIC
     assert minter.key.kid == key().kid
 
 
+def test_the_runner_checks_the_route_like_serve(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING)
+    _set_key(tmp_path)
+    http = {"public_url": PUBLIC}
+    # The installed plugins (none here) cannot apply task.update_status: no buttons.
+    assert act_minter(_instance(tmp_path, http=http)) is None
+    assert "may not apply task.update_status" in caplog.text
+
+    def notifier_only(tool: str) -> frozenset[str]:
+        return frozenset({"notify.push"})
+
+    assert act_minter(_instance(tmp_path, http=http), intents_of=notifier_only) is None
+    assert act_minter(_instance(tmp_path, http=http), intents_of=_may_apply) is not None
+
+
 def test_the_reasons_are_logged_once(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     caplog.set_level(logging.WARNING)
     for _ in range(3):
-        act_minter(_instance(tmp_path, http={"public_url": PUBLIC}))
+        act_minter(_instance(tmp_path, http={"public_url": PUBLIC}), intents_of=_may_apply)
     assert caplog.text.count("HORAE_ACT_KEY is not set") == 1
 
 
@@ -452,3 +574,64 @@ def test_the_runner_and_the_cli_load_no_web_framework() -> None:
         "assert 'fastapi' not in sys.modules, 'fastapi loaded'\n"
     )
     subprocess.run([sys.executable, "-c", code], check=True)  # noqa: S603 (this interpreter)
+
+
+def test_doctor_warns_when_the_key_comes_from_the_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from horae.cli_host import _act_problems
+
+    monkeypatch.setenv("HORAE_ACT_KEY", KEY_VALUE)
+    http = {"public_url": PUBLIC}
+    (warning,) = _act_problems(_instance(tmp_path, http=http))
+    assert warning.severity == "warning"
+    assert "comes from the environment" in warning.message
+    assert KEY_VALUE not in warning.message
+    _set_key(tmp_path)  # the file wins: no warning
+    assert _act_problems(_instance(tmp_path, http=http)) == []
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"secrets": {"refs": {"NTFY_TOKEN": {"env": "HORAE_ACT_KEY"}}}},
+        {"secrets": {"refs": {"NTFY_TOKEN": {"env": "horae_act_key"}}}},
+        {"secrets": {"refs": {"NTFY_TOKEN": {"file": "HORAE_ACT_KEY"}}}},
+        {"deidentification": {"vocabulary": "HORAE_ACT_KEY"}},
+    ],
+)
+def test_no_reference_may_name_a_core_secret(config: dict[str, Any]) -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="only the core may read"):
+        InstanceConfig.model_validate(config)
+
+
+def test_other_references_are_still_accepted() -> None:
+    config = InstanceConfig.model_validate(
+        {
+            "secrets": {"refs": {"NTFY_TOKEN": {"env": "NTFY_TOKEN"}, "B": {"file": "b.txt"}}},
+            "deidentification": {"vocabulary": "vocabulary.txt"},
+        }
+    )
+    assert config.deidentification.vocabulary == "vocabulary.txt"
+
+
+@pytest.mark.parametrize("network", ["0.0.0.0/0", "10.0.0.0/7", "::/0", "2001:db8::/31"])
+def test_a_trusted_proxy_network_cannot_be_too_wide(network: str) -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="or narrower"):
+        InstanceConfig.model_validate({"http": {"trusted_proxies": [network]}})
+
+
+def test_narrow_trusted_proxy_networks_are_accepted() -> None:
+    nets = ["10.0.0.0/8", "172.18.0.0/16", "172.18.0.4", "2001:db8::/32", "fd00::1"]
+    config = InstanceConfig.model_validate({"http": {"trusted_proxies": nets}})
+    assert config.http.trusted_proxies == [
+        "10.0.0.0/8",
+        "172.18.0.0/16",
+        "172.18.0.4/32",
+        "2001:db8::/32",
+        "fd00::1/128",
+    ]

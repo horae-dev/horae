@@ -1,13 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """The `/act` rate limit (#38, schemas decision 54 H; maintainer decision 9).
 
-In process, before any decoding or store access, for `GET` and `POST`: a token bucket **per
-client IP** (`PER_IP_PER_MIN` requests a minute, a burst of `PER_IP_BURST`) and a **global**
-one (`GLOBAL_PER_MIN` a minute, the same burst), both answered `429` with `Retry-After`. Each
-request costs 1 up front; a request whose token turns out invalid costs `INVALID_COST` in all
-(`charge` takes the rest, and a bucket may go into debt down to minus its burst, so the next
-requests wait). The per-IP table is an LRU of at most `MAX_CLIENTS` entries. Constants, not
-configuration (maintainer decision 9).
+In process, for `GET` and `POST`: a token bucket **per client** (`PER_IP_PER_MIN` requests a
+minute, a burst of `PER_IP_BURST`), taken before any decoding, and a **global** one
+(`GLOBAL_PER_MIN` a minute, a burst of `GLOBAL_BURST`), taken only for a token whose MAC
+verified (a check of a few microseconds that reads no store), so a flood of invalid tokens,
+from however many addresses, never blocks a valid one. Both answer `429` with `Retry-After`.
+Each request costs its client 1 up front; a request whose token is refused costs its client
+`INVALID_COST` in all (`charge` takes the rest, and the client's bucket may go into debt down
+to minus its burst, so its next requests wait). The global bucket never goes into debt. The
+per-client table is an LRU of at most `MAX_CLIENTS` entries. Constants, not configuration
+(maintainer decision 9).
+
+**The client** (`limit_key`) is an IPv4 address, or the **/64** of an IPv6 address: one
+subscriber usually holds a whole /64, so rotating addresses inside it gets no new bucket.
 
 **The client IP** (`client_ip`) is the peer address, unless the peer is one of
 `horae.yaml` `http.trusted_proxies`: then it is the right-most address of `X-Forwarded-For`
@@ -46,7 +52,7 @@ class _Bucket:
 
 
 class RateLimiter:
-    """Two token buckets per request: the client's and the global one (thread-safe)."""
+    """A token bucket per client and a global one (thread-safe; see the module docstring)."""
 
     def __init__(
         self,
@@ -85,33 +91,36 @@ class RateLimiter:
         self._refill(bucket, self._ip_rate, self._ip_burst, now)
         return bucket
 
+    @staticmethod
+    def _wait(bucket: _Bucket, rate: float) -> int:
+        return max(1, math.ceil((1 - bucket.tokens) / rate))
+
     def acquire(self, client: str) -> int | None:
-        """Take one request for `client`; `None` when allowed, else the seconds to wait
-        (`Retry-After`). A refused request takes nothing."""
+        """Take one request from `client`'s bucket; `None` when allowed, else the seconds to
+        wait (`Retry-After`). A refused request takes nothing."""
         with self._lock:
-            now = self._clock()
-            mine = self._client(client, now)
-            self._refill(self._global, self._global_rate, self._global_burst, now)
-            if mine.tokens >= 1 and self._global.tokens >= 1:
+            mine = self._client(client, self._clock())
+            if mine.tokens >= 1:
                 mine.tokens -= 1
+                return None
+            return self._wait(mine, self._ip_rate)
+
+    def acquire_global(self) -> int | None:
+        """Take one request from the global bucket (a token whose MAC verified); `None` when
+        allowed, else the seconds to wait. A refused request takes nothing."""
+        with self._lock:
+            self._refill(self._global, self._global_rate, self._global_burst, self._clock())
+            if self._global.tokens >= 1:
                 self._global.tokens -= 1
                 return None
-            waits = [
-                (1 - bucket.tokens) / rate
-                for bucket, rate in ((mine, self._ip_rate), (self._global, self._global_rate))
-                if bucket.tokens < 1
-            ]
-            return max(1, math.ceil(max(waits)))
+            return self._wait(self._global, self._global_rate)
 
     def charge(self, client: str, cost: float) -> None:
-        """Take `cost` more from `client` and the global bucket (an invalid token), down to
-        minus their burst at most."""
+        """Take `cost` more from `client`'s bucket (a refused token), down to minus its burst
+        at most. The global bucket is never charged this way."""
         with self._lock:
-            now = self._clock()
-            mine = self._client(client, now)
-            self._refill(self._global, self._global_rate, self._global_burst, now)
+            mine = self._client(client, self._clock())
             mine.tokens = max(-self._ip_burst, mine.tokens - cost)
-            self._global.tokens = max(-self._global_burst, self._global.tokens - cost)
 
 
 def parse_networks(values: Iterable[str]) -> tuple[IpNetwork, ...]:
@@ -138,6 +147,18 @@ def _trusted(
     address: ipaddress.IPv4Address | ipaddress.IPv6Address | None, nets: Sequence[IpNetwork]
 ) -> bool:
     return address is not None and any(address in net for net in nets)
+
+
+def limit_key(client: str) -> str:
+    """The rate-limit bucket of a client address (`client_ip`): an IPv4 address as is, an
+    IPv6 address as its /64 (`2001:db8:1:2::/64`), anything else (an unknown peer) as is."""
+    try:
+        address = ipaddress.ip_address(client)
+    except ValueError:
+        return client
+    if isinstance(address, ipaddress.IPv6Address):
+        return str(ipaddress.IPv6Network((address, 64), strict=False))
+    return str(address)
 
 
 def client_ip(peer: str | None, forwarded: Sequence[str], trusted: Sequence[IpNetwork]) -> str:
@@ -168,5 +189,6 @@ __all__ = [
     "PER_IP_PER_MIN",
     "RateLimiter",
     "client_ip",
+    "limit_key",
     "parse_networks",
 ]

@@ -17,7 +17,7 @@ This package's `__init__` imports no web framework: the runner mints links with 
 """
 
 from horae.api.act._key import ACT_KEY_NAME, MIN_KEY_BYTES, ActKey, ActKeyError, load_act_key
-from horae.api.act._mint import LinkMinter, act_minter
+from horae.api.act._mint import BUTTON_LABELS, LinkMinter, act_minter
 from horae.api.act._route import ActRoute, route_permitted, tasks_route
 from horae.api.act._token import (
     MAX_AHEAD_S,
@@ -31,6 +31,7 @@ from horae.api.act._token import (
 
 __all__ = [
     "ACT_KEY_NAME",
+    "BUTTON_LABELS",
     "MAX_AHEAD_S",
     "MIN_KEY_BYTES",
     "TOKEN_PATTERN",

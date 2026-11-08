@@ -101,6 +101,23 @@ SecretFileName = Annotated[
 ]
 """A file name inside the secrets directory: one path segment, not starting with `.`."""
 
+CORE_SECRET_NAMES = frozenset({"HORAE_ACT_KEY"})
+"""The secrets the core itself reads (`horae.secrets.CORE_SECRETS`, #38): no `secrets.refs`
+entry and no `deidentification.vocabulary` may name their file or environment variable, so a
+plugin is never handed the core's key through a reference."""
+
+
+def _not_core_secret(value: str) -> str:
+    if value.upper() in CORE_SECRET_NAMES:
+        raise ValueError("names a secret only the core may read")
+    return value
+
+
+PublicEnvVarName = Annotated[EnvVarName, AfterValidator(_not_core_secret)]
+"""An `EnvVarName` that is not a core secret's (`CORE_SECRET_NAMES`, any case)."""
+PublicSecretFileName = Annotated[SecretFileName, AfterValidator(_not_core_secret)]
+"""A `SecretFileName` that is not a core secret's (`CORE_SECRET_NAMES`, any case)."""
+
 # --- backend endpoints -----------------------------------------------------------------------
 
 _OCTET = r"(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])"
@@ -321,13 +338,15 @@ class ModelAlias(Contract):
 class EnvSecretRef(Contract):
     """Read the secret from an environment variable."""
 
-    env: EnvVarName
+    env: PublicEnvVarName
+    """Not a core secret's variable (`HORAE_ACT_KEY`)."""
 
 
 class FileSecretRef(Contract):
     """Read the secret from a file in the secrets directory (Docker or Compose secrets)."""
 
-    file: SecretFileName
+    file: PublicSecretFileName
+    """Not a core secret's file (`HORAE_ACT_KEY`)."""
 
 
 SecretRef = EnvSecretRef | FileSecretRef
@@ -480,14 +499,34 @@ PUBLIC_URL_PATTERN = rf"^https://{HOST}(:{_PORT})?$"
 """`http.public_url`: an `https://` origin on a host name (no IP literal), an optional port, no
 path, query, fragment or user info."""
 
-PublicUrl = Annotated[str, Strict(), StringConstraints(pattern=PUBLIC_URL_PATTERN, max_length=300)]
+
+def _default_port(value: str) -> str:
+    return value.removesuffix(":443")
+
+
+PublicUrl = Annotated[
+    str,
+    Strict(),
+    StringConstraints(pattern=PUBLIC_URL_PATTERN, max_length=300),
+    AfterValidator(_default_port),
+]
+"""Normalised: the default port `:443` is dropped, as a browser's `Origin` drops it."""
+
+
+MIN_PROXY_PREFIX = {4: 8, 6: 32}
+"""The shortest `trusted_proxies` prefix: /8 for IPv4, /32 for IPv6 (a wider one, `/0` above
+all, would trust any client's `X-Forwarded-For`)."""
 
 
 def _ip_network(value: str) -> str:
     try:
-        return str(ipaddress.ip_network(value, strict=True))
+        network = ipaddress.ip_network(value, strict=True)
     except ValueError:
         raise ValueError("not an IP address or a CIDR network (no host bits set)") from None
+    if network.prefixlen < MIN_PROXY_PREFIX[network.version]:
+        shortest = MIN_PROXY_PREFIX[network.version]
+        raise ValueError(f"a trusted proxy network must be /{shortest} or narrower")
+    return str(network)
 
 
 IpNetwork = Annotated[
@@ -496,7 +535,8 @@ IpNetwork = Annotated[
     StringConstraints(pattern=r"^[0-9a-fA-F:.]{2,45}(/[0-9]{1,3})?$", max_length=49),
     AfterValidator(_ip_network),
 ]
-"""An IP address or a CIDR network, e.g. `172.18.0.0/16` (normalised; host bits must be zero)."""
+"""An IP address or a CIDR network, e.g. `172.18.0.0/16` (normalised; host bits must be zero;
+at least /8 for IPv4, /32 for IPv6)."""
 
 MAX_TRUSTED_PROXIES = 16
 
@@ -572,7 +612,7 @@ class BudgetsConfig(Contract):
 class DeidentificationConfig(Contract):
     """De-identification before a cloud model (#34, schemas decision 47)."""
 
-    vocabulary: SecretFileName | None = None
+    vocabulary: PublicSecretFileName | None = None
     """A file in `secrets.dir` (never in the instance repository: it holds personal data)
     listing known terms, one `class: term` per line (`person`, `email`, `phone` or `place`;
     `#` starts a comment), replaced by pseudonyms wherever they appear in a string or key

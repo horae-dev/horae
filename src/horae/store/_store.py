@@ -128,8 +128,12 @@ hides these rows unless `--all`."""
 ACT_PIPELINE = "_act"
 """The reserved pipeline of the `/act` runs (#38, schemas decision 54): a pipeline name never
 starts with `_`; such a row never gets a run record (migration 8)."""
-ActOutcome = Literal["pending", "applied", "stale", "failed"]
-ACT_OUTCOMES: frozenset[str] = frozenset({"pending", "applied", "stale", "failed"})
+ActOutcome = Literal["pending", "applied", "not_changed", "stale", "failed"]
+ACT_OUTCOMES: frozenset[str] = frozenset({"pending", "applied", "not_changed", "stale", "failed"})
+ACT_RETENTION_S = 24 * 3600 + 300
+"""How long a used `/act` token's row is kept after the token expired: the token's furthest
+accepted expiry (`horae.api.act.MAX_AHEAD_S`, 24 h 05 min), so a clock stepped back by less
+than that cannot make a used token usable again."""
 
 DEFAULT_BUSY_TIMEOUT_MS = 5000
 HEARTBEAT_BUSY_TIMEOUT_MS = 100
@@ -422,6 +426,9 @@ class TaskEntry(Contract):
     """The plugin call that proposed it, e.g. `calendar.events`."""
     run_id: RunId | None = None
     """The run that last wrote it."""
+    recurring: bool = False
+    """The task repeats (Obsidian Tasks `🔁`), as the collected data or the sink said (#38):
+    no `/act` button closes it (a recurring task is ticked in Obsidian)."""
 
     @model_validator(mode="after")
     def _consistent(self) -> Self:
@@ -1051,7 +1058,7 @@ class Store:
         self,
         run_id: str,
         *,
-        status: Literal["ok", "failed"],
+        status: Literal["ok", "noop", "failed"],
         at: datetime,
         cost: Usage,
         error: str | None = None,
@@ -1307,11 +1314,11 @@ class Store:
                 (_ts(older_than),),
             )
             pruned = cur.rowcount
-            # Consumed `/act` nonces of tokens that expired before `older_than` (#38): long
-            # refused by their expiry already.
+            # Consumed `/act` nonces of tokens that expired `ACT_RETENTION_S` before
+            # `older_than` (#38): long refused by their expiry already.
             self._conn.execute(
                 "DELETE FROM act_consumed WHERE expires_at < ?",
-                (int(older_than.timestamp()),),
+                (int(older_than.timestamp()) - ACT_RETENTION_S,),
             )
             self._conn.execute(
                 "DELETE FROM blobs WHERE NOT EXISTS "
@@ -1694,14 +1701,14 @@ class Store:
             self._write_flags(task.run_id, details)
             self._conn.execute(
                 "INSERT INTO tasks (fingerprint, title, status, due, time, snoozed_until, "
-                "snooze_tz, wake_at, target, source, run_id, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "snooze_tz, wake_at, target, source, run_id, created_at, updated_at, recurring) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT (fingerprint) DO UPDATE SET title = excluded.title, "
                 "status = excluded.status, due = excluded.due, time = excluded.time, "
                 "snoozed_until = excluded.snoozed_until, snooze_tz = excluded.snooze_tz, "
                 "wake_at = excluded.wake_at, target = excluded.target, "
                 "source = excluded.source, run_id = excluded.run_id, "
-                "updated_at = excluded.updated_at",
+                "updated_at = excluded.updated_at, recurring = excluded.recurring",
                 (
                     task.fingerprint,
                     title,
@@ -1716,6 +1723,7 @@ class Store:
                     task.run_id,
                     stamp,
                     stamp,
+                    int(task.recurring),
                 ),
             )
 
@@ -1748,6 +1756,20 @@ class Store:
             if cur.rowcount != 1:
                 raise UnknownTask(fingerprint)
 
+    @_api
+    def set_task_recurring(self, fingerprint: str, recurring: bool, *, at: datetime) -> None:
+        """Record whether a task repeats (#38: the collected data or the sink said so).
+        Raises `UnknownTask`."""
+        if type(recurring) is not bool:
+            raise ValueError("recurring is a bool")
+        with self.transaction():
+            cur = self._conn.execute(
+                "UPDATE tasks SET recurring = ?, updated_at = ? WHERE fingerprint = ?",
+                (int(recurring), _ts(at), fingerprint),
+            )
+            if cur.rowcount != 1:
+                raise UnknownTask(fingerprint)
+
     @staticmethod
     def _task(row: tuple[Any, ...]) -> TaskEntry:
         return TaskEntry.model_validate(
@@ -1762,6 +1784,7 @@ class Store:
                 "target": row[7],
                 "source": row[8],
                 "run_id": row[9],
+                "recurring": bool(row[10]),
             }
         )
 
@@ -1769,7 +1792,7 @@ class Store:
     def get_task(self, fingerprint: str) -> TaskEntry | None:
         row = self._conn.execute(
             "SELECT fingerprint, title, status, due, time, snoozed_until, snooze_tz, target, "
-            "source, run_id FROM tasks WHERE fingerprint = ?",
+            "source, run_id, recurring FROM tasks WHERE fingerprint = ?",
             (fingerprint,),
         ).fetchone()
         return None if row is None else self._task(row)
@@ -1779,7 +1802,7 @@ class Store:
         """Tasks by due date (undated last), then fingerprint."""
         rows = self._conn.execute(
             "SELECT fingerprint, title, status, due, time, snoozed_until, snooze_tz, target, "
-            "source, run_id FROM tasks WHERE (:status IS NULL OR status = :status) "
+            "source, run_id, recurring FROM tasks WHERE (:status IS NULL OR status = :status) "
             "ORDER BY due IS NULL, due, fingerprint",
             {"status": status},
         ).fetchall()
@@ -1790,7 +1813,7 @@ class Store:
         """Snoozed tasks whose wake time is at or before `now`, earliest first."""
         rows = self._conn.execute(
             "SELECT fingerprint, title, status, due, time, snoozed_until, snooze_tz, target, "
-            "source, run_id FROM tasks WHERE status = 'snoozed' AND wake_at <= ? "
+            "source, run_id, recurring FROM tasks WHERE status = 'snoozed' AND wake_at <= ? "
             "ORDER BY wake_at, fingerprint",
             (_ts(now),),
         ).fetchall()

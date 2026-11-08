@@ -147,6 +147,7 @@
       "description": "Read the secret from an environment variable.",
       "properties": {
         "env": {
+          "description": "Not a core secret's variable (`HORAE_ACT_KEY`).",
           "maxLength": 128,
           "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
           "title": "Env",
@@ -164,6 +165,7 @@
       "description": "Read the secret from a file in the secrets directory (Docker or Compose secrets).",
       "properties": {
         "file": {
+          "description": "Not a core secret's file (`HORAE_ACT_KEY`).",
           "maxLength": 255,
           "pattern": "^[A-Za-z0-9_-][A-Za-z0-9._-]*$",
           "title": "File",

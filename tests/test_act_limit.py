@@ -3,6 +3,7 @@
 decision 9), including the reference deployment: Cloudflare tunnel, then Traefik."""
 
 from pathlib import Path
+from typing import Any
 
 from fastapi.testclient import TestClient
 
@@ -14,6 +15,7 @@ from horae.api.act._limit import (
     PER_IP_PER_MIN,
     RateLimiter,
     client_ip,
+    limit_key,
     parse_networks,
 )
 from horae.api.act._routes import ActSetup
@@ -51,11 +53,12 @@ def test_per_ip_limit_returns_429() -> None:
 def test_global_limit_returns_429() -> None:
     ticks = Ticks()
     limiter = RateLimiter(clock=ticks)
-    allowed = [limiter.acquire(f"10.0.{i // 250}.{i % 250}") for i in range(61)]
+    allowed = [limiter.acquire_global() for _ in range(61)]
     assert allowed[:60] == [None] * 60
     assert allowed[60] == 1  # 60 a minute overall: the next one in a second
+    assert limiter.acquire("10.9.9.9") is None  # the client buckets are separate
     ticks.now += 1
-    assert limiter.acquire("10.9.9.9") is None
+    assert limiter.acquire_global() is None
 
 
 def test_invalid_tokens_cost_more() -> None:
@@ -71,10 +74,12 @@ def test_invalid_tokens_cost_more() -> None:
     deep = RateLimiter(clock=ticks)
     for _ in range(10):
         deep.charge("a", 100)
-    # Both debts are bounded by their bursts: the client's at -5, the global one at -60.
-    ticks.now += 60
-    assert deep.acquire("a") is not None  # the global bucket is back to 0 only
-    ticks.now += 1
+    # The client's debt is bounded by its burst (-5); the global bucket is never charged.
+    assert deep.acquire_global() is None
+    assert deep._global.tokens == GLOBAL_PER_MIN - 1
+    ticks.now += 30  # -5 + 5 = 0
+    assert deep.acquire("a") is not None
+    ticks.now += 6
     assert deep.acquire("a") is None
 
 
@@ -136,3 +141,57 @@ def test_forwarded_for_from_the_trusted_proxy_separates_clients(tmp_path: Path) 
         assert proxy.get(f"/act/{token()}", headers=two).status_code == 200
         spoof = {"X-Forwarded-For": "203.0.113.77, 203.0.113.5"}  # the right-most counts
         assert proxy.get(f"/act/{token()}", headers=spoof).status_code == 429
+
+
+def test_an_ipv6_client_is_its_64() -> None:
+    assert limit_key("2001:db8:1:2::1") == "2001:db8:1:2::/64"
+    assert limit_key("2001:db8:1:2:ffff:eeee:dddd:cccc") == "2001:db8:1:2::/64"
+    assert limit_key("2001:db8:1:3::1") == "2001:db8:1:3::/64"
+    assert limit_key("203.0.113.5") == "203.0.113.5"
+    assert limit_key("unknown") == "unknown"
+    assert limit_key("testclient") == "testclient"
+
+
+def _behind_proxy(tmp_path: Path, limiter: RateLimiter) -> tuple[TestClient, Any]:
+    from act_fixtures import HOST, IDLE
+    from horae.api import ApiContext, create_app
+
+    env = make_env(tmp_path, limiter=limiter)
+    setup = ActSetup(env.service, PUBLIC, env.limiter, DOCKER)
+    app = create_app(
+        ApiContext(env.store_path, env.state_dir, lambda: IDLE, frozenset({HOST}), setup)
+    )
+    return TestClient(app, base_url=PUBLIC, client=("172.18.0.3", 80)), env
+
+
+def test_rotating_addresses_inside_one_ipv6_64_share_a_bucket(tmp_path: Path) -> None:
+    proxy, _ = _behind_proxy(tmp_path, RateLimiter(clock=Ticks()))
+    with proxy:
+        statuses = [
+            proxy.get(
+                f"/act/{token()}", headers={"X-Forwarded-For": f"2001:db8:0:1::{i:x}"}
+            ).status_code
+            for i in range(1, 7)
+        ]
+        other = {"X-Forwarded-For": "2001:db8:0:2::1"}
+        assert proxy.get(f"/act/{token()}", headers=other).status_code == 200
+    assert statuses == [200] * 5 + [429]
+
+
+def test_a_rotating_ipv6_flood_of_invalid_tokens_never_blocks_a_valid_one(
+    tmp_path: Path,
+) -> None:
+    # An attacker with many /64s (e.g. a /48) floods invalid tokens, one /64 at a time: each
+    # /64 is limited on its own, and none of it reaches the global bucket.
+    proxy, env = _behind_proxy(tmp_path, RateLimiter(clock=Ticks()))
+    forged = token()[:-4] + "AAAA"
+    with proxy:
+        for net in range(300):
+            for host in range(3):
+                header = {"X-Forwarded-For": f"2001:db8:{net:x}:{net:x}::{host + 1:x}"}
+                status = proxy.post(f"/act/{forged}", headers=header).status_code
+                assert status in {404, 429}
+        phone = {"X-Forwarded-For": "2001:db8:ffff:1::1"}
+        assert proxy.get(f"/act/{token()}", headers=phone).status_code == 200
+        assert proxy.post(f"/act/{token()}", headers=phone).status_code == 200
+    assert len(env.sink.calls) == 1

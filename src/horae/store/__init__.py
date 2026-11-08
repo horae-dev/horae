@@ -29,6 +29,7 @@ from horae.store._schema import SCHEMA_VERSION, Migration, load_migrations, migr
 from horae.store._store import (
     ACT_OUTCOMES,
     ACT_PIPELINE,
+    ACT_RETENTION_S,
     DEFAULT_BUSY_TIMEOUT_MS,
     EVAL_PIPELINE_PREFIX,
     HEARTBEAT_BUSY_TIMEOUT_MS,
@@ -51,6 +52,7 @@ from horae.store._store import (
 __all__ = [
     "ACT_OUTCOMES",
     "ACT_PIPELINE",
+    "ACT_RETENTION_S",
     "DEFAULT_BUSY_TIMEOUT_MS",
     "EVAL_PIPELINE_PREFIX",
     "HEARTBEAT_BUSY_TIMEOUT_MS",

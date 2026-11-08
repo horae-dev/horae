@@ -231,7 +231,8 @@ MAX_NOTIFY_ACTIONS = 3
 class NotifyAction(Contract):
     """A notification button that changes one task once, through a signed `/act` link the
     core mints when it sends the notification (#38). The proposer names the task and the
-    kind; it never sees or writes a URL."""
+    kind; it never sees or writes a URL, nor the button's text: the core labels each button
+    from its kind and duration (`Done`, `Snooze 1h`, `Snooze 3h`, `Tomorrow`)."""
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -241,8 +242,11 @@ class NotifyAction(Contract):
         }
     )
 
-    label: ActionLabel
-    """The button text (untrusted data, shown as is)."""
+    label: ActionLabel | None = None
+    """Deprecated and **ignored** (#38, schemas decision 54 B): the core labels each button
+    from its kind and duration, so a button's text always says what it does. Still accepted
+    (one line, at most 64 characters, no control character) so that proposals written with
+    it stay valid."""
     kind: ActKind
     """What the button does."""
     task: Fingerprint

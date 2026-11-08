@@ -86,11 +86,12 @@ def token(
 
 @dataclass
 class SlowSink(FixtureSink):
-    """A `FixtureSink` whose `apply` takes `delay` seconds (to overlap concurrent requests)
-    or raises `boom`."""
+    """A `FixtureSink` whose `apply` takes `delay` seconds (to overlap concurrent requests),
+    raises `boom`, or answers `answer` (as plugin-obsidian does for a recurring task)."""
 
     delay: float = 0.0
     boom: BaseException | None = None
+    answer: Applied | None = None
     calls: list[SinkCall] = field(default_factory=list)
 
     async def apply(self, call: SinkCall, *, expected_before_sha256: str | None) -> Applied:
@@ -99,6 +100,8 @@ class SlowSink(FixtureSink):
             await asyncio.sleep(self.delay)
         if self.boom is not None:
             raise self.boom
+        if self.answer is not None:
+            return self.answer
         return await super().apply(call, expected_before_sha256=expected_before_sha256)
 
 

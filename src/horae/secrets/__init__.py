@@ -28,12 +28,12 @@ import os
 import stat
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, NoReturn, final
+from typing import Any, Literal, NoReturn, final
 
 from pydantic import GetCoreSchemaHandler, TypeAdapter, ValidationError
 from pydantic_core import CoreSchema, core_schema
 
-from horae.contracts.instance import EnvSecretRef, SecretRef
+from horae.contracts.instance import CORE_SECRET_NAMES, EnvSecretRef, SecretRef
 from horae.contracts.types import SecretName
 from horae.secrets import redact
 
@@ -158,10 +158,12 @@ class SecretMissing(SecretError):
     `SecretError`."""
 
 
-CORE_SECRETS = frozenset({"HORAE_ACT_KEY"})
+CORE_SECRETS = CORE_SECRET_NAMES
 """The secrets the core itself reads (`SecretResolver.resolve_core`). Their names start with
 `HORAE_`, which `SecretName` reserves for the core, so no `secrets.refs` entry and no plugin can
-name them: `HORAE_ACT_KEY` is the HMAC key of the `/act` links (#38, schemas decision 54)."""
+name them, and no `secrets.refs` `env` / `file` or `deidentification.vocabulary` may point at
+their variable or file (the contract refuses it): `HORAE_ACT_KEY` is the HMAC key of the
+`/act` links (#38, schemas decision 54)."""
 
 
 _SECRET_NAME: TypeAdapter[str] = TypeAdapter(SecretName)
@@ -289,6 +291,15 @@ class SecretResolver:
         self._resolved[name] = secret
         redact.remember(secret)
         return secret
+
+    def core_source(self, name: str) -> Literal["file", "env"] | None:
+        """Where `resolve_core` reads the core secret `name` from: its file, else its
+        environment variable, else `None` (set nowhere). Reads no value."""
+        if name not in CORE_SECRETS:
+            return None
+        if os.path.lexists(self._directory / name):
+            return "file"
+        return "env" if name in self._environ else None
 
     def read_file(self, file_name: str) -> bytes:
         """The bytes of the private file `file_name` of the secrets directory (e.g. the

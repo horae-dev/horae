@@ -23,6 +23,7 @@ from act_fixtures import (
     NOW,
     OTHER_KEY_VALUE,
     PUBLIC,
+    T0,
     TASK,
     TITLE,
     TOOL,
@@ -33,11 +34,12 @@ from act_fixtures import (
     token,
 )
 from act_fixtures import key as act_key
-from horae.api.act import TOKEN_TTL_S, verify
+from horae.api.act import MAX_AHEAD_S, TOKEN_TTL_S, verify
 from horae.api.act._page import CONTENT_SECURITY_POLICY, MAX_TITLE, PAGE_HEADERS
+from horae.api.act._service import PURGE_AFTER_S
 from horae.contracts.intents import TaskUpdateStatus
 from horae.runner import try_acquire_apply_lock
-from horae.store import Store, TaskEntry
+from horae.store import ACT_RETENTION_S, Store, TaskEntry
 
 
 @pytest.fixture
@@ -247,15 +249,46 @@ def test_cleanup_keeps_unexpired_nonces(env: Env) -> None:
         assert client.post(f"/act/{later}").status_code == 200
         assert len(_rows(env.store_path, "SELECT nonce FROM act_consumed")) == 2
         assert client.post(f"/act/{used}").status_code == 404  # still refused: used
-    # More than an hour past the first token's expiry its row goes; the second's stays.
+    # A day past the first token's expiry its row is still kept (a clock stepped back by
+    # up to 24 h 05 min must still find it used).
     env.clock.advance(hours=23)  # NOW + 26 h: the first token expired 2 h ago
     with Store.open(env.store_path) as store:
         store.set_task_status(TASK, "todo", at=env.clock())
     third = token(at=NOW + 26 * 3600)
     with env.client() as client:
         assert client.post(f"/act/{third}").status_code == 200
+    assert len(_rows(env.store_path, "SELECT nonce FROM act_consumed")) == 3
+    # More than `MAX_AHEAD_S` past the first token's expiry its row goes; the others stay.
+    env.clock.advance(hours=23)  # NOW + 49 h: the first token expired 25 h ago
+    with Store.open(env.store_path) as store:
+        store.set_task_status(TASK, "todo", at=env.clock())
+    fourth = token(at=NOW + 49 * 3600)
+    with env.client() as client:
+        assert client.post(f"/act/{fourth}").status_code == 200
     exps = sorted(row[0] for row in _rows(env.store_path, "SELECT expires_at FROM act_consumed"))
-    assert exps == [NOW + 3 * 3600 + TOKEN_TTL_S, NOW + 26 * 3600 + TOKEN_TTL_S]
+    assert exps == [NOW + h * 3600 + TOKEN_TTL_S for h in (3, 26, 49)]
+
+
+def test_a_clock_stepped_back_never_reenables_a_used_token(env: Env) -> None:
+    used = token()
+    with env.client() as client:
+        assert client.post(f"/act/{used}").status_code == 200
+    with Store.open(env.store_path) as store:
+        store.set_task_status(TASK, "todo", at=env.clock())
+    # The clock runs a day past the token's expiry; a POST purges what it may...
+    env.clock.advance(hours=24 + 23)
+    with Store.open(env.store_path) as store:
+        store.set_task_status(TASK, "todo", at=env.clock())
+    with env.client() as client:
+        assert client.post(f"/act/{token(at=NOW + 47 * 3600)}").status_code == 200
+    with Store.open(env.store_path) as store:
+        store.prune_runs(env.clock())  # ...and so does the retention
+        store.set_task_status(TASK, "todo", at=env.clock())
+    # ...then steps back to when the used token was valid: it is still refused.
+    env.clock.at = T0 + dt.timedelta(hours=1)
+    with env.client() as client:
+        assert client.post(f"/act/{used}").status_code == 404
+    assert PURGE_AFTER_S == MAX_AHEAD_S == ACT_RETENTION_S >= 24 * 3600
 
 
 # --- AC4: GET shows, POST applies ----------------------------------------------------------------
@@ -355,9 +388,13 @@ def test_the_page_has_no_script_or_external_asset_and_strict_csp(env: Env) -> No
         assert CONTENT_SECURITY_POLICY.startswith("default-src 'none'; style-src 'sha256-")
         assert "form-action 'self'" in CONTENT_SECURITY_POLICY
         for name, value_ in PAGE_HEADERS.items():
-            assert page.headers[name] == value_
+            if name != "referrer-policy":
+                assert page.headers[name] == value_
         assert page.headers["cache-control"] == "no-store"
-        assert page.headers["referrer-policy"] == "no-referrer"
+        # The confirmation page sends its origin with the form's POST (never the path);
+        # every other page sends nothing.
+        policy = "strict-origin" if page is pages[0] else "no-referrer"
+        assert page.headers["referrer-policy"] == policy
         assert page.headers["x-robots-tag"] == "noindex, nofollow"
         assert "set-cookie" not in page.headers
         assert page.headers["content-type"].startswith("text/html")
@@ -563,7 +600,9 @@ def test_a_sink_timeout_consumes_the_token(env: Env) -> None:
     env.sink.delay = 2.0
     env.service.call_timeout_s = 0.1
     with env.client() as client:
-        assert client.post(f"/act/{token()}").status_code == 502
+        response = client.post(f"/act/{token()}")
+    assert response.status_code == 502
+    assert "may not have been applied" in response.text
     (row,) = _rows(env.store_path, "SELECT outcome FROM act_consumed")
     assert row[0] == "failed"
 
@@ -864,3 +903,180 @@ def test_the_base_url_comes_from_config_not_the_host_header(env: Env) -> None:
         assert "evil" not in body
         assert HOST not in body
         assert "action=" not in body
+
+
+# --- review fixes (#115) -------------------------------------------------------------------------
+
+
+def _browser_submit(client: Any, path: str, shown: Any) -> Any:
+    """Submit the page's one form as a browser does (HTML form submission, Fetch): its
+    `method`, its `action` (none: the page's own URL), `Sec-Fetch-Site: same-origin`, and the
+    `Origin` and `Referer` the page's `Referrer-Policy` allows: under `no-referrer` a browser
+    serialises the request's origin as `null` and sends no `Referer`; under `strict-origin`
+    it sends the origin in both, never the path."""
+    import html
+    import re
+
+    (attrs,) = re.findall(r"<form([^>]*)>", shown.text)
+    method = re.search(r'method="([^"]+)"', attrs)
+    action = re.search(r'action="([^"]*)"', attrs)
+    target = path if action is None or not action.group(1) else html.unescape(action.group(1))
+    policy = shown.headers["referrer-policy"]
+    headers = {
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-Mode": "navigate",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Origin": "null" if policy == "no-referrer" else PUBLIC,
+    }
+    if policy in {"strict-origin", "origin", "strict-origin-when-cross-origin"}:
+        headers["Referer"] = PUBLIC + "/"
+    elif policy != "no-referrer":
+        headers["Referer"] = PUBLIC + path
+    assert method is not None
+    return client.request(method.group(1).upper(), target, headers=headers, content=b"")
+
+
+def test_the_confirmation_form_submits_like_a_browser(env: Env) -> None:
+    # The review's HIGH finding: under `Referrer-Policy: no-referrer` a browser sends
+    # `Origin: null` with the form's POST, which the origin check refuses.
+    value = token()
+    path = f"/act/{value}"
+    with env.client() as client:
+        shown = client.get(path)
+        assert shown.status_code == 200
+        assert shown.headers["referrer-policy"] == "strict-origin"
+        done = _browser_submit(client, path, shown)
+    assert done.status_code == 200, done.text
+    assert "Marked as done." in done.text
+    assert len(env.sink.calls) == 1
+
+
+def test_a_page_without_a_referrer_could_not_submit(env: Env) -> None:
+    # The regression guard: the same form under `no-referrer` (the old header) is refused,
+    # and `Origin: null` stays refused.
+    from horae.api.act import _page as page
+
+    value = token()
+    path = f"/act/{value}"
+    with env.client() as client:
+        shown = client.get(path)
+        shown.headers["referrer-policy"] = "no-referrer"
+        assert _browser_submit(client, path, shown).status_code == 404
+    assert env.sink.calls == []
+    assert page.CONFIRM_REFERRER_POLICY == "strict-origin"
+
+
+def test_a_browser_post_with_the_public_origin_applies(env: Env) -> None:
+    with env.client() as client:
+        response = client.post(
+            f"/act/{token()}", headers={"Origin": PUBLIC, "Sec-Fetch-Site": "same-origin"}
+        )
+    assert response.status_code == 200
+    assert len(env.sink.calls) == 1
+
+
+def test_the_origin_matches_a_public_url_with_its_default_port(env: Env) -> None:
+    from horae.api.act._routes import origin_allowed
+    from horae.contracts import InstanceConfig
+
+    config = InstanceConfig.model_validate({"http": {"public_url": PUBLIC + ":443"}})
+    assert config.http.public_url == PUBLIC  # normalised as a browser's Origin is
+    assert origin_allowed([PUBLIC], [], PUBLIC + ":443")
+    assert origin_allowed([PUBLIC + ":443"], [], PUBLIC)
+    assert not origin_allowed([PUBLIC + ":8443"], [], PUBLIC)
+    with env.client(public_url=PUBLIC + ":443") as client:
+        response = client.post(
+            f"/act/{token()}", headers={"Origin": PUBLIC, "Sec-Fetch-Site": "same-origin"}
+        )
+    assert response.status_code == 200
+
+
+@pytest.mark.parametrize("recurring", [True, False])
+def test_a_sink_that_changes_nothing_leaves_the_index_alone(env: Env, recurring: bool) -> None:
+    from horae.apply import Applied
+
+    details: dict[str, Any] = {"changed": False}
+    if recurring:
+        details["recurring"] = "tick in Obsidian"  # plugin-obsidian's answer
+    env.sink.answer = Applied(TASK, details=details)
+    value = token()
+    with env.client() as client:
+        response = client.post(f"/act/{value}")
+        again = client.post(f"/act/{value}")
+    assert response.status_code == 200
+    assert "Not changed" in response.text
+    if recurring:
+        assert "tick it in Obsidian" in response.text
+    else:
+        assert "already was in that state" in response.text
+    assert "Marked as done" not in response.text
+    assert again.status_code == 404  # the token is used up
+    (row,) = _rows(env.store_path, "SELECT outcome, run_id FROM act_consumed")
+    assert row[0] == "not_changed"
+    with Store.open(env.store_path) as store:
+        task = store.get_task(TASK)
+        assert task is not None
+        assert task.status == "todo"  # the index keeps what the sink kept
+        assert task.recurring is recurring
+        run = store.run_summary(row[1])
+        assert run is not None
+        assert run.status == "noop"
+        (entry,) = store.journal(row[1])
+        assert entry.applied is True  # the sink answered
+
+
+def test_an_error_after_the_token_is_used_says_it_may_have_been_applied(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def boom(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("the store went away")
+
+    monkeypatch.setattr(Store, "journal_mark_applied", boom)
+    value = token()
+    with env.client() as client:
+        response = client.post(f"/act/{value}")
+    assert response.status_code == 500
+    assert "may have been applied" in response.text
+    assert "not available" not in response.text.lower()
+    assert "went away" not in response.text
+    (row,) = _rows(env.store_path, "SELECT outcome FROM act_consumed")
+    assert row[0] == "pending"  # used: at most once
+
+
+def test_invalid_tokens_never_drain_the_global_limit(tmp_path: Path) -> None:
+    from fastapi.testclient import TestClient
+
+    from horae.api.act._limit import RateLimiter
+
+    env = make_env(
+        tmp_path, limiter=RateLimiter(per_ip_burst=100, global_burst=3, clock=lambda: 0.0)
+    )
+    app = env.app()
+    forged = token()[:-4] + "AAAA"
+    for i in range(40):  # 40 clients, each sending invalid tokens
+        with TestClient(app, base_url=PUBLIC, client=(f"198.51.100.{i}", 1)) as client:
+            assert client.get(f"/act/{forged}").status_code == 404
+            assert client.post("/act/" + "A" * 120).status_code == 404
+    with TestClient(app, base_url=PUBLIC, client=("203.0.113.9", 1)) as client:
+        assert client.get(f"/act/{token()}").status_code == 200
+        assert client.post(f"/act/{token()}").status_code == 200
+        # Only tokens whose MAC verified count against the global bucket (burst 3).
+        assert client.get(f"/act/{token()}").status_code == 409  # the task is done now
+        assert client.get(f"/act/{token()}").status_code == 429
+
+
+def test_sinks_failing_to_close_after_the_outcome_keep_the_outcome_page(env: Env) -> None:
+    from contextlib import asynccontextmanager
+
+    from horae.apply import StaticSinks
+
+    @asynccontextmanager
+    async def closing_badly() -> Any:
+        yield StaticSinks({TOOL: env.sink})
+        raise OSError("the plugin host did not stop")
+
+    env.service.sinks = closing_badly
+    with env.client() as client:
+        response = client.post(f"/act/{token()}")
+    assert response.status_code == 200
+    assert "Marked as done." in response.text

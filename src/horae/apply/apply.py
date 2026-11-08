@@ -336,6 +336,7 @@ def index_task(
                     target=None if current is None else current.target,
                     source=tool,
                     run_id=run_id,
+                    recurring=False if current is None else current.recurring,
                 )
                 store.upsert_task(entry, at=at)
         elif isinstance(intent, TaskUpdateStatus):
@@ -353,6 +354,32 @@ def index_task(
         return
     except (StoreError, ValueError) as exc:
         _log.warning("task index: not updated (%s)", type(exc).__name__)
+
+
+def _index_applied(
+    store: Store,
+    intent: Intent,
+    result: object,
+    tool: str,
+    run_id: str,
+    at: datetime,
+    timezone: str,
+) -> None:
+    """Keep the task index after an applied task change (`index_task`), unless the sink
+    answered that it changed nothing (`details.changed` is `false`, e.g. a recurring task
+    asked `done`, #38); a task the sink says repeats (`details.recurring`) is flagged."""
+    details = getattr(result, "details", None)
+    details = details if isinstance(details, dict) else {}
+    if details.get("recurring") and isinstance(intent, TaskUpdateStatus):
+        try:
+            store.set_task_recurring(intent.task, True, at=at)
+        except UnknownTask:
+            pass
+        except (StoreError, ValueError) as exc:
+            _log.warning("task index: not updated (%s)", type(exc).__name__)
+    if details.get("changed") is False:
+        return
+    index_task(store, intent, tool=tool, run_id=run_id, at=at, timezone=timezone)
 
 
 def _identity(sink: Sink, index: int, tool: str, known: dict[int, str | None]) -> str | None:
@@ -460,9 +487,7 @@ async def _apply_all(
             store.journal_mark_applied(entry.id, actual_after=actual)
         applied.append(AppliedChange(intent=index, target=target))
         if isinstance(item, TaskItem):
-            index_task(
-                store, intent, tool=tool, run_id=record.id, at=clock(), timezone=extras.timezone
-            )
+            _index_applied(store, intent, result, tool, record.id, clock(), extras.timezone)
         if isinstance(item, FileDiff):
             assert after is not None  # noqa: S101 - set for every note
             pending[(id(sink), item.path)] = after

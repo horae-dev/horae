@@ -269,10 +269,10 @@ def build_act(instance: Instance, hosts: frozenset[str]) -> "tuple[ActSetup, str
     than 32 bytes, unreadable) refuses to start: `CommandFailed(config_invalid)`."""
     from horae.api.act import ActKeyError, load_act_key, route_permitted, tasks_route
     from horae.api.act._limit import parse_networks
+    from horae.api.act._mint import installed_intents
     from horae.api.act._routes import ActSetup
     from horae.api.act._service import ActService
-    from horae.cli_host import host_sinks, plugins_dir
-    from horae.plugins.host import HostRegistry
+    from horae.cli_host import host_sinks
 
     config = instance.config
     trusted = parse_networks(config.http.trusted_proxies)
@@ -283,10 +283,7 @@ def build_act(instance: Instance, hosts: frozenset[str]) -> "tuple[ActSetup, str
         raise CommandFailed(EXIT_PROBLEMS, "config_invalid", str(exc)) from None
     route = tasks_route(instance.pipelines)
 
-    def intents_of(tool: str) -> frozenset[str]:
-        registry = HostRegistry.from_directory(instance.lock, plugins_dir(instance.root))
-        return frozenset(registry.plugin_for_tool(tool).manifest.permissions.intents)
-
+    intents_of = installed_intents(instance)
     reason = None
     if key is None:
         reason = "HORAE_ACT_KEY is not set"

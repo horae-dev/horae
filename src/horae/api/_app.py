@@ -29,9 +29,10 @@ binds to loopback by default.
 - **Headers**: `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`,
   `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`,
   `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY` on every response from the app
-  (uvicorn's own replies to a malformed request, before the app runs, have none); no CORS;
-  the OpenAPI document and the docs pages are disabled; no slash redirect (`/runs/` is
-  `404`, never a redirect).
+  (a response's own value wins: the `/act` pages set their own CSP, and the confirmation
+  page `Referrer-Policy: strict-origin`; uvicorn's own replies to a malformed request,
+  before the app runs, have none); no CORS; the OpenAPI document and the docs pages are
+  disabled; no slash redirect (`/runs/` is `404`, never a redirect).
 - **Host check (DNS rebinding)**: a request whose `Host` is not an allowed host is `400
   invalid_host` before any route runs (the host is never echoed in the response). Allowed:
   `localhost`, `127.0.0.1`, `::1` and the hosts `horae serve` is given (`--allowed-host`,

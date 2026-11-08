@@ -9,12 +9,16 @@ never reach another route through the prefix the reverse proxy exempts from SSO 
 SSO header and set or read no cookie: the token is the only credential. The `Host` check
 (#37) still applies.
 
-In order, for both methods: the rate limit (`horae.api.act._limit`, before any decoding or
-store access: 429 with `Retry-After`), `/act` disabled (no key, no `http.public_url` or no
-route: 503), then for `POST` the origin check (an `Origin` header, when present, must be
-`http.public_url`'s origin; a `Sec-Fetch-Site` header, when present, must be `same-origin` or
-`none`; the ntfy app's native client sends neither), then the service. Every refusal of a token
-is the same 404 page and costs `INVALID_COST` in the rate limit.
+In order, for both methods: the client's rate limit (`horae.api.act._limit`, before any
+decoding or store access: 429 with `Retry-After`; an IPv6 client by its /64), `/act` disabled
+(no key, no `http.public_url` or no route: 503), then for `POST` the origin check (an `Origin`
+header, when present, must be `http.public_url`'s origin; a `Sec-Fetch-Site` header, when
+present, must be `same-origin` or `none`; the ntfy app's native client sends neither; the
+confirmation page's `Referrer-Policy: strict-origin` makes a browser send the origin, not
+`null`), then the token's MAC (`ActService.check`, no store access), then the **global** rate
+limit (only a token whose MAC verified is charged to it: invalid tokens never block valid
+ones), then the service. Every refusal of a token is the same 404 page and costs its client
+`INVALID_COST` in all.
 
 **Logs.** One line per request (`horae.api.act`): `act <method> <kind> <ref> <outcome>`, where
 `ref` is the first 8 hex digits of SHA-256(nonce), only for a token whose tag verified; an
@@ -29,7 +33,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.responses import HTMLResponse, Response
 
 from horae.api.act import _page as page
-from horae.api.act._limit import INVALID_COST, IpNetwork, RateLimiter, client_ip
+from horae.api.act._limit import INVALID_COST, IpNetwork, RateLimiter, client_ip, limit_key
 from horae.api.act._service import ActService, Result
 
 logger = logging.getLogger("horae.api.act")
@@ -40,6 +44,7 @@ _SAME_SITE = frozenset({"same-origin", "none"})
 def act_response(shown: page.Page) -> Response:
     """`shown` as an HTML response with the `/act` headers."""
     headers = dict(page.PAGE_HEADERS)
+    headers["referrer-policy"] = shown.referrer_policy
     if shown.retry_after is not None:
         headers["retry-after"] = str(shown.retry_after)
     return HTMLResponse(shown.body, shown.status, headers=headers)
@@ -51,7 +56,8 @@ def is_act_path(path: str) -> bool:
 
 
 def _origin(url: str) -> str:
-    return url.rstrip("/").lower()
+    text = url.strip().rstrip("/").lower()
+    return text.removesuffix(":443") if text.startswith("https://") else text
 
 
 def origin_allowed(origin: list[str], fetch_site: list[str], public_url: str) -> bool:
@@ -81,7 +87,8 @@ def add_act_routes(app: FastAPI, setup: ActSetup) -> None:
 
     def client(request: Request) -> str:
         peer = request.client.host if request.client is not None else None
-        return client_ip(peer, request.headers.getlist("x-forwarded-for"), trusted_proxies)
+        address = client_ip(peer, request.headers.getlist("x-forwarded-for"), trusted_proxies)
+        return limit_key(address)
 
     def log(method: str, token: str, result: Result) -> None:
         if result.token is None:
@@ -90,11 +97,16 @@ def add_act_routes(app: FastAPI, setup: ActSetup) -> None:
             parsed = result.token
             logger.info("act %s %s %s %s", method, parsed.kind, parsed.ref, result.outcome)
 
-    def limited(who: str) -> Response | None:
-        wait = limiter.acquire(who)
+    def limited(wait: int | None) -> Response | None:
         if wait is None:
             return None
         return act_response(page.Page(429, page.TOO_MANY.body, wait))
+
+    def refused(method: str, token: str, who: str) -> Response:
+        """A token whose MAC did not verify: the 404 page, charged to its client only."""
+        limiter.charge(who, INVALID_COST - 1)
+        logger.info("act %s invalid len=%d", method, len(token))
+        return act_response(page.NOT_VALID)
 
     def finish(method: str, token: str, who: str, result: Result) -> Response:
         if result.page.status == page.NOT_VALID.status:
@@ -105,12 +117,17 @@ def add_act_routes(app: FastAPI, setup: ActSetup) -> None:
     @app.get("/act/{token}", include_in_schema=False)
     async def act_get(request: Request, token: str) -> Response:
         who = client(request)
-        if (refused := limited(who)) is not None:
-            return refused
+        if (busy := limited(limiter.acquire(who))) is not None:
+            return busy
         if service is None:
             return act_response(page.UNAVAILABLE)
+        parsed = service.check(token)
+        if parsed is None:
+            return refused("GET", token, who)
+        if (busy := limited(limiter.acquire_global())) is not None:
+            return busy
         try:
-            result = await run_in_threadpool(service.preview, token)
+            result = await run_in_threadpool(service.show, parsed)
         except Exception as exc:
             logger.warning("act GET failed (%s)", type(exc).__name__)
             return act_response(page.UNAVAILABLE)
@@ -119,8 +136,8 @@ def add_act_routes(app: FastAPI, setup: ActSetup) -> None:
     @app.post("/act/{token}", include_in_schema=False)
     async def act_post(request: Request, token: str) -> Response:
         who = client(request)
-        if (refused := limited(who)) is not None:
-            return refused
+        if (busy := limited(limiter.acquire(who))) is not None:
+            return busy
         if service is None or public_url is None:
             return act_response(page.UNAVAILABLE)
         headers = request.headers
@@ -130,8 +147,13 @@ def add_act_routes(app: FastAPI, setup: ActSetup) -> None:
             limiter.charge(who, INVALID_COST - 1)
             logger.info("act POST refused: cross-origin")
             return act_response(page.NOT_VALID)
+        parsed = service.check(token)
+        if parsed is None:
+            return refused("POST", token, who)
+        if (busy := limited(limiter.acquire_global())) is not None:
+            return busy
         try:
-            result = await service.act(token)
+            result = await service.apply(parsed)
         except Exception as exc:
             logger.warning("act POST failed (%s)", type(exc).__name__)
             return act_response(page.UNAVAILABLE)

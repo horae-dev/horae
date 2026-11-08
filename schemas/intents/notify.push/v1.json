@@ -4,7 +4,7 @@
   "$defs": {
     "NotifyAction": {
       "additionalProperties": false,
-      "description": "A notification button that changes one task once, through a signed `/act` link the\ncore mints when it sends the notification (#38). The proposer names the task and the\nkind; it never sees or writes a URL.",
+      "description": "A notification button that changes one task once, through a signed `/act` link the\ncore mints when it sends the notification (#38). The proposer names the task and the\nkind; it never sees or writes a URL, nor the button's text: the core labels each button\nfrom its kind and duration (`Done`, `Snooze 1h`, `Snooze 3h`, `Tomorrow`).",
       "else": {
         "properties": {
           "duration": {
@@ -21,11 +21,19 @@
       },
       "properties": {
         "label": {
-          "description": "The button text (untrusted data, shown as is).",
-          "maxLength": 64,
-          "pattern": "^[^\\x00-\\x1f\\x7f]+$",
-          "title": "Label",
-          "type": "string"
+          "anyOf": [
+            {
+              "maxLength": 64,
+              "pattern": "^[^\\x00-\\x1f\\x7f]+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Deprecated and **ignored** (#38, schemas decision 54 B): the core labels each button\nfrom its kind and duration, so a button's text always says what it does. Still accepted\n(one line, at most 64 characters, no control character) so that proposals written with\nit stay valid.",
+          "title": "Label"
         },
         "kind": {
           "description": "What the button does.",
@@ -63,7 +71,6 @@
         }
       },
       "required": [
-        "label",
         "kind",
         "task"
       ],

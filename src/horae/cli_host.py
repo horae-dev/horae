@@ -419,8 +419,9 @@ def _validator_problems(instance: Instance) -> list[Problem]:
 def _act_problems(instance: Instance) -> list[Problem]:
     """The `/act` links (#38, schemas decision 54 C): an error for a `HORAE_ACT_KEY` that is
     set but unusable (shorter than 32 bytes, unreadable: `horae serve` refuses to start); a
-    warning when the key is set but links cannot be minted (no `http.public_url`, no single
-    `mode: tasks` entry): notifications are then sent without buttons."""
+    warning when the key comes from the environment rather than its file, and when the key
+    is set but links cannot be minted (no `http.public_url`, no single `mode: tasks`
+    entry): notifications are then sent without buttons."""
     from horae.api.act import ActKeyError, load_act_key, tasks_route
 
     try:
@@ -430,6 +431,13 @@ def _act_problems(instance: Instance) -> list[Problem]:
     if key is None:
         return []
     problems: list[Problem] = []
+    if instance.secret_resolver().core_source("HORAE_ACT_KEY") == "env":
+        message = (
+            "/act: HORAE_ACT_KEY comes from the environment: prefer the file "
+            "<secrets.dir>/HORAE_ACT_KEY (a plugin running as the same user can read the "
+            "core's environment through /proc)"
+        )
+        problems.append(Problem(CONFIG_FILE, None, None, message, severity="warning"))
     if instance.config.http.public_url is None:
         message = "/act: HORAE_ACT_KEY is set but http.public_url is not: no button is minted"
         problems.append(Problem(CONFIG_FILE, None, None, message, severity="warning"))

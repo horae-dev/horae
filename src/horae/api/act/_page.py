@@ -6,7 +6,11 @@ other meta tags a link preview could use, one inline `<style>` allowed by its ha
 Content-Security-Policy. What a page shows of a task is its **title** (HTML-escaped, cut to
 `MAX_TITLE` characters) and its **due date** (maintainer decision 5); never the fingerprint,
 the note it lives in or anything else from the vault. Every page has the same headers
-(`PAGE_HEADERS`): strict CSP, `no-store`, `no-referrer`, `nosniff`, `noindex`.
+(`PAGE_HEADERS`): strict CSP, `no-store`, `no-referrer`, `nosniff`, `noindex`; except that the
+confirmation page (`confirm`) has `Referrer-Policy: strict-origin` (`CONFIRM_REFERRER_POLICY`):
+under `no-referrer` a browser sends `Origin: null` with the form's `POST`, which the origin
+check refuses. `strict-origin` sends the origin only, never the path, so the token does not
+leave in a `Referer`.
 
 Every refusal of a token (malformed, forged, another key, expired, already used, unknown
 task, a cross-origin `POST`) is the same `NOT_VALID` page with status 404: it does not say
@@ -46,6 +50,10 @@ PAGE_HEADERS: dict[str, str] = {
     "x-frame-options": "DENY",
 }
 
+CONFIRM_REFERRER_POLICY = "strict-origin"
+"""The confirmation page's `Referrer-Policy`: the browser then sends `Origin: <public_url>`
+with the form's `POST` (under `no-referrer` it sends `Origin: null`, refused)."""
+
 ACTION_TEXT: dict[tuple[str, str | None], str] = {
     ("task.done", None): "Mark as done",
     ("task.snooze", "1h"): "Snooze for 1 hour",
@@ -61,6 +69,7 @@ class Page:
     status: int
     body: str
     retry_after: int | None = None
+    referrer_policy: str = "no-referrer"
 
 
 def _document(heading: str, *parts: str) -> str:
@@ -94,7 +103,9 @@ def confirm(kind: str, duration: str | None, title: str, due: date | None) -> Pa
     """The `GET` page: what the link does, the task, one button that `POST`s to the same URL."""
     action = ACTION_TEXT[(kind, duration)]
     form = f'<form method="post"><button type="submit">{html.escape(action)}</button></form>'
-    return Page(200, _document(f"{action}?", *_task(title, due), form))
+    return Page(
+        200, _document(f"{action}?", *_task(title, due), form), None, CONFIRM_REFERRER_POLICY
+    )
 
 
 def stale_preview(title: str, due: date | None) -> Page:
@@ -115,10 +126,40 @@ def stale(title: str) -> Page:
     return Page(409, _document("Task changed", _p(shown_title(title), "task"), _p(text)))
 
 
-def failed(title: str) -> Page:
-    """The sink could not apply the change: the link is used up (single attempt)."""
-    text = "The change could not be applied. The link is used up; change the task in your notes."
-    return Page(502, _document("Not applied", _p(shown_title(title), "task"), _p(text)))
+def not_changed(title: str, *, recurring: bool) -> Page:
+    """The sink answered that it changed nothing (a recurring task, or one already in that
+    state): the link is used up."""
+    text = (
+        "Not changed \N{EM DASH} tick it in Obsidian (a recurring task)."
+        if recurring
+        else "Not changed: the task already was in that state."
+    )
+    return Page(200, _document("Not changed", _p(shown_title(title), "task"), _p(text)))
+
+
+def failed(title: str, *, timed_out: bool = False) -> Page:
+    """The sink failed, or did not answer in time: the link is used up (single attempt)."""
+    if timed_out:
+        heading = "No answer"
+        text = (
+            "Your notes did not answer in time: the change may not have been applied. The "
+            "link is used up; check the task in your notes."
+        )
+    else:
+        heading = "Not applied"
+        text = (
+            "The change could not be applied. The link is used up; change the task in your notes."
+        )
+    return Page(502, _document(heading, _p(shown_title(title), "task"), _p(text)))
+
+
+def maybe_applied(title: str) -> Page:
+    """Something failed after the link was used up: the change may have been applied."""
+    text = (
+        "Something went wrong after the link was used: the change may have been applied. "
+        "The link is used up; check the task in your notes."
+    )
+    return Page(500, _document("Maybe applied", _p(shown_title(title), "task"), _p(text)))
 
 
 NOT_VALID = Page(404, _document("Link not valid", _p("This link is not valid any more.")))
@@ -130,6 +171,7 @@ BUSY = Page(503, _document("Busy", _p("Horae is busy; try the link again in a mo
 __all__ = [
     "ACTION_TEXT",
     "BUSY",
+    "CONFIRM_REFERRER_POLICY",
     "CONTENT_SECURITY_POLICY",
     "MAX_TITLE",
     "NOT_VALID",
@@ -140,6 +182,8 @@ __all__ = [
     "applied",
     "confirm",
     "failed",
+    "maybe_applied",
+    "not_changed",
     "shown_title",
     "stale",
     "stale_preview",

@@ -645,11 +645,13 @@ class Runner:
 
     def _minter(self, record: RunRecord) -> ActMinter | None:
         """The `/act` link minter (#38), only for a run with a notification that has buttons
-        (`None` without `http.public_url`, a route or a usable `HORAE_ACT_KEY`: those
-        notifications are then sent without buttons)."""
+        (`None` without `http.public_url`, a route its plugin may apply, or a usable
+        `HORAE_ACT_KEY`: those notifications are then sent without buttons). It reads the
+        run's collected data for recurring tasks (no done button for them)."""
         if not any(isinstance(p.intent, NotifyPush) and p.intent.actions for p in record.intents):
             return None
-        return act_minter(self.instance, clock=self.clock)
+        collected = [snapshot.data for snapshot in record.inputs]
+        return act_minter(self.instance, clock=self.clock, collected=collected)
 
     def _ledger_llm(self, pipeline: Pipeline, run_id: str) -> LlmBackend | None:
         """The run's LLM backend behind the daily budgets and the usage ledger (#33)."""
