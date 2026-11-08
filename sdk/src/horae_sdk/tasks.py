@@ -3,7 +3,7 @@
 
 A task title is **data** (`horae.contracts.intents`): a sink writing Obsidian Tasks syntax must
 not let it set a due date, a recurrence, a priority, a tag or a link. Tasks reads its fields
-from the raw Markdown line (`- [ ] Pay the bill 📅 2026-10-22 ⏰ 19:00`), so a title holding
+from the raw Markdown line (`- [ ] Pay the bill ⏰ 19:00 📅 2026-10-22`), so a title holding
 `📅 2020-01-01 🔁 every day` would otherwise schedule the task. Schemas decision 50 records the
 rules below and why.
 
@@ -50,6 +50,7 @@ plain-text targets only (a push notification, a log): it is **not** an exact inv
 fed to a Markdown or Tasks target.
 """
 
+import hashlib
 import re
 import unicodedata
 from collections.abc import Mapping
@@ -306,6 +307,26 @@ def link_destination(link: str) -> str:
     return "".join(pieces)
 
 
+BLOCK_ID_PREFIX = "h-"
+"""The prefix of the block id `task_block_id` gives (Horae's, so no user block id collides)."""
+BLOCK_ID_HEX = 12
+"""How many hex digits of the fingerprint's SHA-256 the block id keeps (48 bits)."""
+_FINGERPRINT = re.compile(r"[A-Za-z0-9._:-]{1,128}")
+
+
+def task_block_id(fingerprint: str) -> str:
+    """The Obsidian block id that links a Tasks line Horae wrote back to its task:
+    `h-` and the first 12 hex digits of the SHA-256 of `fingerprint` (UTF-8), e.g.
+    `h-3f2a9c01b7de`. The line ends with it as `^h-3f2a9c01b7de`: Obsidian hides it in reading
+    view, Tasks ignores it, and it survives edits to the text. It is a one-way digest: a
+    reader keeps its own index from block id to fingerprint. `fingerprint` must be a
+    `task.create` fingerprint (`^[A-Za-z0-9._:-]{1,128}$`); `ValueError` otherwise."""
+    if not isinstance(fingerprint, str) or not _FINGERPRINT.fullmatch(fingerprint):  # type: ignore[redundant-expr]
+        raise ValueError("fingerprint must match ^[A-Za-z0-9._:-]{1,128}$")
+    digest = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()
+    return BLOCK_ID_PREFIX + digest[:BLOCK_ID_HEX]
+
+
 def task_line(
     title: str,
     *,
@@ -313,9 +334,11 @@ def task_line(
     time: str | None = None,
     link: str | None = None,
     done: bool = False,
+    fingerprint: str | None = None,
 ) -> str:
-    """One Obsidian Tasks line, `- [ ] <escaped title> [link](<url>) 📅 <due> ⏰ <time>`, the
-    title always escaped (`escape_title`, idempotent: an already escaped title is unchanged).
+    """One Obsidian Tasks line, `- [ ] <escaped title> [link](<url>) ⏰ <time> 📅 <due>
+    ^h-<hash>`, the title always escaped (`escape_title`, idempotent: an already escaped title
+    is unchanged).
 
     `due` is a real date, `YYYY-MM-DD` (or a `date`), `time` `HH:MM` and requires `due`, and
     `link` a valid task link (`is_task_link`, the `task.create` contract); `ValueError`
@@ -323,7 +346,13 @@ def task_line(
     text `LINK_LABEL` and the destination `link_destination(link)`: the title cannot open or
     close it (its brackets and parentheses are escaped), and Tasks reads it as part of the
     description, never as a field (schemas decision 52). A destination longer than
-    `MAX_DESTINATION` characters is left out (the line is written without the link)."""
+    `MAX_DESTINATION` characters is left out (the line is written without the link).
+
+    The `⏰` reminder (Horae's, not a Tasks field) comes **before** the Tasks date fields:
+    Tasks reads fields from the end of the line and stops at a signifier it does not know, so
+    `⏰` after `📅` would hide the due date from Tasks queries. With `fingerprint`, the line
+    ends with the block id `^<task_block_id(fingerprint)>` (Obsidian requires a block id last
+    on its line)."""
     due_text = due.isoformat() if isinstance(due, date) else due
     if due_text is not None and not _real_date(due_text):
         raise ValueError("due must be a real date, YYYY-MM-DD")
@@ -331,23 +360,28 @@ def task_line(
         due_text is None or not re.fullmatch(r"([01][0-9]|2[0-3]):[0-5][0-9]", time)
     ):
         raise ValueError("time must be HH:MM and requires due")
+    block = None if fingerprint is None else task_block_id(fingerprint)
     destination = None if link is None else link_destination(link)
     parts = [f"- [{'x' if done else ' '}]", escape_title(title)]
     if destination is not None and len(destination) <= MAX_DESTINATION:
         parts.append(f"[{LINK_LABEL}]({destination})")
-    if due_text is not None:
-        parts.append(f"{DUE} {due_text}")
     if time is not None:
         parts.append(f"{REMINDER} {time}")
+    if due_text is not None:
+        parts.append(f"{DUE} {due_text}")
+    if block is not None:
+        parts.append(f"^{block}")
     return " ".join(parts)
 
 
-def task_line_for(intent: Mapping[str, object]) -> str:
-    """`task_line` for a `task.create` intent (as the core sends it to a sink's `apply`)."""
+def task_line_for(intent: Mapping[str, object], *, block_id: bool = False) -> str:
+    """`task_line` for a `task.create` intent (as the core sends it to a sink's `apply`); with
+    `block_id`, the line ends with the block id of the intent's fingerprint
+    (`task_block_id`)."""
     if intent.get("type") != "task.create":
         raise ValueError("not a task.create intent")
     title, due, time = intent.get("title"), intent.get("due"), intent.get("time")
-    link = intent.get("link")
+    link, key = intent.get("link"), intent.get("fingerprint")
     if not isinstance(title, str):
         raise ValueError("the intent has no title")
     if not (
@@ -356,10 +390,15 @@ def task_line_for(intent: Mapping[str, object]) -> str:
         and (link is None or isinstance(link, str))
     ):
         raise ValueError("due, time and link must be strings")
-    return task_line(title, due=due, time=time, link=link)
+    if block_id and not isinstance(key, str):
+        raise ValueError("the intent has no fingerprint")
+    fingerprint = key if block_id and isinstance(key, str) else None
+    return task_line(title, due=due, time=time, link=link, fingerprint=fingerprint)
 
 
 __all__ = [
+    "BLOCK_ID_HEX",
+    "BLOCK_ID_PREFIX",
     "DUE",
     "LINK_LABEL",
     "MARKDOWN",
@@ -373,6 +412,7 @@ __all__ = [
     "is_task_link",
     "link_destination",
     "plain_text",
+    "task_block_id",
     "task_line",
     "task_line_for",
 ]
