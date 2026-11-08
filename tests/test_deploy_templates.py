@@ -4,16 +4,17 @@
 The files are rendered here without Docker: parsed, then the operator's settings substituted as
 Compose does (`${VAR}`, `:-`, `-`, `:?`, `?`, `$$`).
 
-The Coolify template is tested in the reference deployment's layout: a Cloudflare Tunnel
-(cloudflared) reaches Traefik's `http` entry point, the routers are the template's own labels
-(Coolify generates none: the service has no domain), and SSO is a forwardAuth middleware and an
-outpost service that Traefik's dynamic file configuration defines once for every app
-(`authentik@file`, `sso@file`), referenced by name. Requests are routed with Traefik's rules: a
-router naming a middleware that no provider defines is refused; among the matching routers of
-the entry point, the one of highest priority (an explicit `priority`, else the length of the
-rule) wins, after the entry point's `http.sanitizePath` (on by default in Traefik v3) cleaned
-the path: percent-decoded, dot segments and repeated slashes removed (Go's `path.Clean`), a
-trailing slash kept.
+The Coolify template is tested in both of its modes: the secure default (routers on Traefik's
+`https` entry point, with TLS) and the reference deployment's opt-in tunnel mode (a Cloudflare
+Tunnel reaches the `http` entry point, TLS ended by Cloudflare). Either way the routers are the
+template's own labels (Coolify generates none: the service has no domain), Horae joins a proxy
+network that has no default, and SSO is a forwardAuth middleware and an outpost service that
+Traefik's dynamic file configuration defines (`authentik@file`, `sso@file`), referenced by name.
+Requests are routed with Traefik's rules: a router naming a middleware that no provider defines
+is refused; among the matching routers of the entry point, the one of highest priority (an
+explicit `priority`, else the length of the rule) wins, after the entry point's
+`http.sanitizePath` (on by default in Traefik v3) cleaned the path: percent-decoded, dot
+segments and repeated slashes removed (Go's `path.Clean`), a trailing slash kept.
 
 The threat-model criterion: only `/act/` is exempt from the SSO middleware; `/runs`,
 `/healthz` and everything else require SSO; the outpost path goes to the SSO service, never to
@@ -63,16 +64,22 @@ FILE_SERVICES = {FILE_OUTPOST: "http://authentik-server:9000/outpost.goauthentik
 
 COOLIFY_REQUIRED = {
     "HORAE_PUBLIC_HOST",
+    "HORAE_TRAEFIK_NETWORK",
     "HORAE_ANTHROPIC_API_KEY",
     "HORAE_MONITOR_DAILY_BRIEF_URL",
     "HORAE_MONITOR_REMIND_URL",
 }
+PROXY_NETWORK = "horae-proxy"  # shared only by Horae and the proxy
 COOLIFY_ENV = {
     "HORAE_PUBLIC_HOST": FQDN,
+    "HORAE_TRAEFIK_NETWORK": PROXY_NETWORK,
     "HORAE_ANTHROPIC_API_KEY": "synthetic-anthropic-key-for-tests",
     "HORAE_MONITOR_DAILY_BRIEF_URL": "https://kuma.example.test/api/push/synthetic1",
     "HORAE_MONITOR_REMIND_URL": "https://kuma.example.test/api/push/synthetic2",
 }
+# The opt-in tunnel mode of the reference deployment.
+TUNNEL = {"HORAE_TRAEFIK_ENTRYPOINT": "http", "HORAE_TRAEFIK_TLS": "false"}
+MODES = {"default": ("https", "true", {}), "tunnel": ("http", "false", TUNNEL)}
 
 # Paths that must go through SSO. `/act` (no slash) and look-alikes are not `/act/`; the
 # traversals are cleaned by Traefik's `sanitizePath` before routing (to `/runs`).
@@ -408,7 +415,7 @@ def assert_coolify_only_act_is_exempt(
     *,
     name: str = NAME,
     host: str = FQDN,
-    entrypoint: str = "http",
+    entrypoint: str = "https",
     sso: str = FILE_SSO,
     outpost: str = FILE_OUTPOST,
 ) -> None:
@@ -447,30 +454,45 @@ def assert_coolify_only_act_is_exempt(
         assert reached.service == outpost, (path, reached)
 
 
-def test_coolify_only_act_is_exempt_from_sso() -> None:
-    _, labels = coolify_rendered()
-    assert_coolify_only_act_is_exempt(labels)
+@pytest.mark.parametrize("mode", sorted(MODES))
+def test_coolify_only_act_is_exempt_from_sso(mode: str) -> None:
+    entrypoint, tls, settings = MODES[mode]
+    _, labels = coolify_rendered({**COOLIFY_ENV, **settings})
+    assert_coolify_only_act_is_exempt(labels, entrypoint=entrypoint)
     assert routers_of(labels)[f"{NAME}-outpost"].service in FILE_SERVICES
     assert labels["traefik.enable"] == "true"
     for router in routers_of(labels).values():
-        assert router.entrypoints == ("http",), router  # cloudflared reaches Traefik on `http`
+        assert router.entrypoints == (entrypoint,), router
     for key, value in labels.items():
         if key.endswith(".tls"):
-            assert value == "false", key  # Cloudflare terminates TLS
+            assert value == tls, key
 
 
-def test_coolify_nothing_is_routed_on_another_entrypoint_or_host() -> None:
-    _, labels = coolify_rendered()
+def test_coolify_is_secure_by_default() -> None:
+    # Without settings: the `https` entry point with TLS; plain http is an explicit opt-in.
+    text = COOLIFY.read_text(encoding="utf-8")
+    assert "${HORAE_TRAEFIK_ENTRYPOINT:-https}" in text
+    assert "${HORAE_TRAEFIK_TLS:-true}" in text
+    assert "HORAE_TRAEFIK_ENTRYPOINT:-http}" not in text
+    assert "HORAE_TRAEFIK_TLS:-false}" not in text
+
+
+@pytest.mark.parametrize("mode", sorted(MODES))
+def test_coolify_nothing_is_routed_on_another_entrypoint_or_host(mode: str) -> None:
+    entrypoint, _, settings = MODES[mode]
+    other = "http" if entrypoint == "https" else "https"
+    _, labels = coolify_rendered({**COOLIFY_ENV, **settings})
     routers = routers_of(labels)
     for path in SSO_PATHS + ACT_PATHS + OUTPOST_PATHS:
-        assert route(routers, "https", FQDN, path) is None, path
-        assert route(routers, "http", "other.example.test", path) is None, path
+        assert route(routers, other, FQDN, path) is None, path
+        assert route(routers, entrypoint, "other.example.test", path) is None, path
 
 
 @pytest.mark.parametrize(
     "settings",
     [
         {"HORAE_TRAEFIK_ENTRYPOINT": "websecure", "HORAE_TRAEFIK_TLS": "true"},
+        TUNNEL,
         {"HORAE_SSO_MIDDLEWARE": "sso-auth@file", "HORAE_SSO_OUTPOST_SERVICE": "outpost@file"},
         {"HORAE_TRAEFIK_NAME": "horae-two"},
     ],
@@ -480,12 +502,12 @@ def test_coolify_settings_keep_only_act_exempt(settings: dict[str, str]) -> None
     assert_coolify_only_act_is_exempt(
         labels,
         name=settings.get("HORAE_TRAEFIK_NAME", NAME),
-        entrypoint=settings.get("HORAE_TRAEFIK_ENTRYPOINT", "http"),
+        entrypoint=settings.get("HORAE_TRAEFIK_ENTRYPOINT", "https"),
         sso=settings.get("HORAE_SSO_MIDDLEWARE", FILE_SSO),
         outpost=settings.get("HORAE_SSO_OUTPOST_SERVICE", FILE_OUTPOST),
     )
     tls = {value for key, value in labels.items() if key.endswith(".tls")}
-    assert tls == {settings.get("HORAE_TRAEFIK_TLS", "false")}
+    assert tls == {settings.get("HORAE_TRAEFIK_TLS", "true")}
 
 
 def test_coolify_the_sso_middleware_is_never_empty() -> None:
@@ -513,7 +535,7 @@ def test_coolify_a_missing_shared_middleware_fails_closed() -> None:
     _, labels = coolify_rendered({**COOLIFY_ENV, "HORAE_SSO_MIDDLEWARE": "typo@file"})
     routers = routers_of(labels)
     for path in SSO_PATHS:
-        reached = route(routers, "http", FQDN, path, middlewares=set(FILE_MIDDLEWARES))
+        reached = route(routers, "https", FQDN, path, middlewares=set(FILE_MIDDLEWARES))
         assert reached is None or reached.service != NAME, (path, reached)
 
 
@@ -530,18 +552,24 @@ def test_coolify_with_escaped_labels_nothing_is_served() -> None:
             assert route(routers, entrypoint, FQDN, path) is None, path
 
 
-def test_coolify_a_domain_set_by_mistake_does_not_bypass_sso_on_the_public_host() -> None:
+@pytest.mark.parametrize("mode", sorted(MODES))
+def test_coolify_a_domain_set_by_mistake_does_not_bypass_sso_on_the_public_host(
+    mode: str,
+) -> None:
     # A domain on the service makes Coolify generate `Host() && PathPrefix(/)` routers with no
     # SSO. On the public host the template's routers still win (explicit priorities above any
     # rule length); on another host the generated routers are open, which the guide warns of.
-    _, labels = coolify_rendered(extra_labels=coolify_generated_labels())
+    entrypoint, _, settings = MODES[mode]
+    _, labels = coolify_rendered(
+        {**COOLIFY_ENV, **settings}, extra_labels=coolify_generated_labels()
+    )
     routers = routers_of(labels)
     generated = [r for r in routers.values() if r.name.startswith(("http-0-", "https-0-"))]
     assert generated
     assert all(r.priority < routers[NAME].priority for r in generated)
     middlewares = provided_middlewares(labels)
     for path in SSO_PATHS:
-        reached = route(routers, "http", FQDN, path, middlewares=middlewares)
+        reached = route(routers, entrypoint, FQDN, path, middlewares=middlewares)
         assert reached is not None, path
         assert FILE_SSO in reached.middlewares, (path, reached)
 
@@ -581,18 +609,23 @@ def test_coolify_allowed_hosts_are_the_public_host() -> None:
     assert env["HORAE_SCHEDULER"] == "external"
 
 
-def test_coolify_publishes_no_port_and_joins_the_proxy_network() -> None:
+def test_coolify_publishes_no_port_and_joins_only_the_dedicated_proxy_network() -> None:
     data = load(COOLIFY)
     for name, service in data["services"].items():
         assert "ports" not in service, name
         assert "network_mode" not in service, name
     assert "networks" not in data["services"]["horae-init"]  # its own network only
+    # No default network: a shared one (a server-wide `traefik-network`) would let every app
+    # on it reach port 8080 without SSO, so the operator names the dedicated one.
+    assert data["networks"]["proxy"] == {"external": True, "name": "${HORAE_TRAEFIK_NETWORK:?}"}
+    labels = labels_of(data["services"]["horae"])
+    assert labels["traefik.docker.network"] == "${HORAE_TRAEFIK_NETWORK:?}"
+    body = [line for line in COOLIFY.read_text(encoding="utf-8").splitlines() if "#" not in line]
+    assert not any("traefik-network" in line for line in body)
     rendered, labels = coolify_rendered()
     assert rendered["services"]["horae"]["networks"] == ["default", "proxy"]
-    assert rendered["networks"] == {"proxy": {"external": True, "name": "traefik-network"}}
-    assert labels["traefik.docker.network"] == "traefik-network"
-    other, labels = coolify_rendered({**COOLIFY_ENV, "HORAE_TRAEFIK_NETWORK": "horae-proxy"})
-    assert other["networks"]["proxy"]["name"] == labels["traefik.docker.network"] == "horae-proxy"
+    assert rendered["networks"] == {"proxy": {"external": True, "name": PROXY_NETWORK}}
+    assert labels["traefik.docker.network"] == PROXY_NETWORK
 
 
 def _traefik_names(labels: Mapping[str, str]) -> set[tuple[str, str]]:
@@ -640,7 +673,7 @@ def test_coolify_two_horae_with_the_same_name_fail_closed() -> None:
     assert not routers  # every router differs by its host: all dropped
     for host in (FQDN, second):
         for path in SSO_PATHS + ACT_PATHS:
-            assert route(routers, "http", host, path) is None, (host, path)
+            assert route(routers, "https", host, path) is None, (host, path)
 
 
 def test_coolify_two_horae_with_their_own_names_both_work() -> None:
@@ -670,8 +703,10 @@ def forward_auth_sees_uri(
 def test_the_shared_middleware_trusts_forward_headers_only_safely_behind_an_untrusted_peer() -> (
     None
 ):
-    # The reference server: no trustedIPs, no insecure on any entry point, so cloudflared is
-    # an untrusted peer and a client's spoofed X-Forwarded-Uri never reaches the provider.
+    # The reference server's shared middleware has trustForwardHeader: true. With no
+    # trustedIPs and no insecure on the entry point, the peer (cloudflared) is untrusted and a
+    # client's spoofed X-Forwarded-Uri never reaches the provider. The guide prefers a
+    # Horae-only middleware with trustForwardHeader: false, which never depends on that.
     assert FILE_MIDDLEWARES[FILE_SSO]["forwardAuth"]["trustForwardHeader"] is True
     spoofed = {"X-Forwarded-Uri": "/act/x", "X-Forwarded-Host": "other.example.test"}
     assert forward_auth_sees_uri("/runs", spoofed, peer_trusted=False) == "/runs"

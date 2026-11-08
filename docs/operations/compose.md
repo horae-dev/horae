@@ -119,10 +119,10 @@ docker compose -f docker-compose.yaml -f traefik.yaml up -d
   never on `X-Forwarded-*` headers a client sent (a spoofed `X-Forwarded-Uri` could make it
   decide on another path than the one routed), even if your entry point trusts an upstream
   proxy's forwarded headers ([coolify.md](coolify.md#routing-only-act-is-exempt-from-sso)).
-- The Coolify template instead names a forwardAuth middleware that Traefik's file
-  configuration shares between apps (`authentik@file`, behind a Cloudflare Tunnel), with
-  `trustForwardHeader: true`: [coolify.md](coolify.md#the-layout-tunnel-file-provider-sso-hand-written-routers)
-  says when that is safe. This override keeps its own middleware.
+- The Coolify template instead names a forwardAuth middleware of Traefik's file
+  configuration (preferably a Horae-only one with `trustForwardHeader: false`;
+  [coolify.md](coolify.md#forwarded-headers) says when a shared one with `true` is safe). This
+  override keeps its own middleware.
 - **Network**: Horae joins `horae-proxy`, which must hold only Horae and Traefik. Any container
   on a network with Horae can reach port 8080 and send any `Host` (the Host check stops
   browsers, not neighbours; [decision 51](../../schemas/README.md#decisions) B). `--internal`

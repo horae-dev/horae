@@ -2889,11 +2889,10 @@ loosened later without breaking a valid file.
     - **Not done (follow-ups)**: `/act` (#38), `api.allowed_hosts` in `horae.yaml`; no ETag
       or conditional requests; no metrics endpoint. Done in #41: the SSO-exemption test
       against the rendered templates (`tests/test_deploy_templates.py`, docs/security.md
-      T15). The network (B): plain compose, one shared only with Traefik; the Coolify
-      template joins `HORAE_TRAEFIK_NETWORK`, by default the reference server's
-      `traefik-network`, which other label-routed apps share (they reach port 8080 without
-      SSO): B holds only once the operator sets it to a network of Horae and the proxy alone
-      (docs/operations/coolify.md, "The proxy network").
+      T15) and the network of B: plain compose, one shared only with Traefik; the Coolify
+      template, `HORAE_TRAEFIK_NETWORK`, required with no default, a network of Horae and the
+      proxy alone (never a shared `traefik-network`; docs/operations/coolify.md, "The proxy
+      network").
 
 ### Provisional decisions (#122, pending maintainer review)
 

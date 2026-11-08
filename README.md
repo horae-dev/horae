@@ -121,9 +121,9 @@ a read-only root filesystem and a one-off `horae init` on a new volume:
 
 - **Coolify** (the reference deployment, PLAN §7):
   [`deploy/coolify/docker-compose.yaml`](deploy/coolify/docker-compose.yaml), a *Docker Compose
-  Empty* service reached through a Cloudflare Tunnel on Traefik's `http` entry point, with its
-  own Traefik routers and the shared authentik forwardAuth middleware of Traefik's file
-  configuration (`authentik@file`); only `/act/` is exempt from SSO. Required variables block
+  Empty* service with its own Traefik routers (on `https` by default, or behind a Cloudflare
+  Tunnel as an opt-in), an authentik forwardAuth middleware of Traefik's file configuration and
+  a proxy network shared only with Traefik; only `/act/` is exempt from SSO. Required variables block
   the deployment until they are set; Scheduled Tasks run `horae run daily-brief` and `horae run
   remind`, each with an Uptime Kuma push monitor. Guide (prerequisites, the tunnel's public host
   name, what to verify on the server): [docs/operations/coolify.md](docs/operations/coolify.md).
