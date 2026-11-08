@@ -337,6 +337,9 @@ async def plan_changes(
     notes: list[NotificationItem] = []
     calls: list[HttpItem] = []
     problems: list[Problem] = []
+    planned_keys: set[str] = set()
+    """The dedupe keys of the notifications planned so far: a keyed notification repeated in one
+    run is sent once (apply skips it), so the plan shows it as a duplicate."""
     pending: dict[tuple[int, str], tuple[bytes, int]] = {}
     """The bytes each (sink, note) is left with by the last planned intent, and that intent."""
     for index, proposed in enumerate(record.intents):
@@ -360,6 +363,9 @@ async def plan_changes(
         if isinstance(described, Notification):
             key = dedupe_key(record, index, timezone)
             duplicate = None if notified is None else notified(key)
+            if key in planned_keys:
+                duplicate = True
+            planned_keys.add(key)
             notes.append(NotificationItem(index, tool, described, key, duplicate))
             continue
         if isinstance(described, HttpCall):
