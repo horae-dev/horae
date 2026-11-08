@@ -15,8 +15,14 @@ sensitive_paths:
   - "schemas/**"
   - ".github/workflows/**"
   - "Dockerfile"
+  - ".dockerignore"
+  - "scripts/smoke-image.sh"
   - "deploy/**"
   - "docs/security.md"
+  - "sdk/**"
+  - "renovate.json"
+  - "uv.lock"
+  - "pyproject.toml"
 
 # When nothing else matches: one human.
 default:
