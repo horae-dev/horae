@@ -2975,8 +2975,32 @@ loosened later without breaking a valid file.
       as plain text in angle brackets (`(link <url>)`, terminal-escaped), so a `)` in the
       URL cannot read as the end of the parenthesis.
     - **F, the SDK.** `intents.task_create(..., link=None)` checks the same shape
-      (`tasks.is_task_link`); `horae-sdk` goes to 0.2.0 (not yet published; there is no
-      changelog file, the README's "Task links" section and this decision are the notes).
+      (`tasks.is_task_link`); `horae-sdk` goes to 0.2.0 for the link, then 0.3.0
+      for the reminder order and the block id (decision 53; not yet published; there is no
+      changelog file, the README's "Task links" section and these decisions are the notes).
+    - **Order and block id (#127, decision 53).** The link comes first, then the `⏰ HH:MM`
+      reminder, then the Tasks date fields, so a trailing `⏰` cannot hide `📅` (a line
+      written as `📅 d ⏰ t` by SDK 0.2.0 is read but not rewritten); with a fingerprint the
+      line ends with the `^h-` block id, which a sink's index must treat as collidable
+      (48 bits) and fail closed on.
     - **Not done (follow-ups)**: the Obsidian plugin's own Tasks writer must render the link
       the same way (`link_destination`) before it may list `task.create` links as supported;
       `task.update_status` takes no link.
+
+### Provisional decisions (#127, pending maintainer review)
+
+53. **The SDK writes the reminder before the Tasks fields, and a block id (#127).** This
+    number is provisional and may be renumbered against other open PRs.
+    - **A, the order.** `horae_sdk.tasks.task_line` writes `- [ ] <title> ⏰ HH:MM 📅 date`
+      (SDK 0.3.0), where 0.2.0 wrote `📅 date ⏰ HH:MM`. Tasks reads fields from the end of
+      the line and stops at a signifier it does not know; a trailing `⏰` hid the due date from
+      it. **Readers must accept both orders** (plugin-obsidian's parser does).
+    - **B, old lines are not rewritten (decision).** Lines written in the old order keep it;
+      their due date stays invisible to Tasks until the line is edited.
+    - **C, the block id.** With `fingerprint` (`task_line_for(..., block_id=True)`), the line
+      ends with `^h-` and 12 hex digits of the SHA-256 of the fingerprint. The prefix makes it
+      unlikely to collide with a user's block ids. 48 bits can collide between two
+      fingerprints (about 2e-5 at 100,000 tasks): a sink's block-id to fingerprint index must
+      detect a second fingerprint mapping to the same id and **fail closed** (refuse) rather
+      than overwrite. A non-string or invalid fingerprint is a `ValueError`.
+    - **D, the SDK version.** `horae-sdk` is 0.3.0.

@@ -196,7 +196,7 @@ runtime: { protocol: mcp-stdio, command: ["python", "-m", "horae_github"] }
 
 | Plugin | Kind | Notes, with the research behind each one |
 |---|---|---|
-| `plugin-obsidian` | source + sink | Reads and writes a vault folder in Obsidian Tasks syntax (`- [ ] … 📅 2026-10-22 ⏰ 19:00`). Only writes files or blocks it owns (`*.assistant.md`). Atomic writes. |
+| `plugin-obsidian` | source + sink | Reads and writes a vault folder in Obsidian Tasks syntax (`- [ ] … ⏰ 19:00 📅 2026-10-22`). Only writes files or blocks it owns (`*.assistant.md`). Atomic writes. |
 | `plugin-livesync` | infra helper | Runs the official `livesync-cli daemon` so the vault exists as plain files on the server (E2EE CouchDB). ⚠️ Check that CLI encryption matches the plugin's. |
 | `plugin-ntfy` | notifier | Digest, `⏰` reminders, overdue nudge, quiet hours, `obsidian://` deep links, and "Done" / "Snooze" buttons through `/act`. ⚠️ Test the iOS behaviour of `http` actions and `obsidian://` links. |
 | `plugin-github` | source | Review requests, assigned issues, mentions, participating notifications (needs a classic PAT) |
