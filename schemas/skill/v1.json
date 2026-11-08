@@ -176,6 +176,16 @@
       ],
       "description": "Intents the skill may propose, a list of types or a mapping `type: max` (at most `max`\nper step): within the shipping plugin's `permissions.intents` (checked by the loader).\nEmpty means the skill proposes none.",
       "title": "Intents"
+    },
+    "links": {
+      "default": "input",
+      "description": "Links in the skill's note text: `input` (only URLs of the viewed input, the default) or\n`none` (no link, autolink or bare URL at all; schemas decision 53).",
+      "enum": [
+        "input",
+        "none"
+      ],
+      "title": "Links",
+      "type": "string"
     }
   },
   "required": [

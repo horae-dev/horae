@@ -9,6 +9,8 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from horae.contracts import Permissions, TaskCreate
+from horae.engine.guard import SIGNIFIERS as GUARD_SIGNIFIERS
+from horae.engine.guard import note_problem
 from horae.intents import validate_intents
 from horae_sdk import intents
 from horae_sdk.tasks import (
@@ -455,3 +457,25 @@ def test_any_link_text_stays_inert(path: str) -> None:
     link = PR + "?" + path
     if is_task_link(link):
         _check_link(link)
+
+
+# --- the core's action guard (#128, schemas decision 53) ------------------------------------
+
+
+def test_the_guard_signifiers_are_the_sdk_signifiers() -> None:
+    """The core keeps a copy (it does not depend on the SDK): they must not drift."""
+    assert frozenset(SIGNIFIERS) == GUARD_SIGNIFIERS
+
+
+_NOTE_TOKENS = [*_HOSTILE_TOKENS, "horae", ":begin", ":end", " block", "#", "#tag", "- [ ] ", "> "]
+
+
+@given(st.lists(st.sampled_from(_NOTE_TOKENS), max_size=60).map("".join) | st.text(max_size=80))
+def test_an_escaped_title_never_trips_the_guard_note_structure_rules(title: str) -> None:
+    """A skill may list escaped titles in a note (`- <title>`): the note structure rules read
+    the source, where `escape_title` left no checkbox, signifier, wikilink, field, comment,
+    tag or block marker. (The guard's link rules may still refuse an escaped URL that is not
+    in the input: they read the Markdown-unescaped text too, decision 46.)"""
+    escaped = escape_title(title)
+    assert note_problem(escaped) is None
+    assert note_problem(f"- {escaped}\n> - {escaped}") is None

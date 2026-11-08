@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from jsonschema import Draft202012Validator
 from pydantic import ValidationError
 
 from horae.contracts import PluginManifest, SkillManifest
@@ -596,3 +597,38 @@ def test_directory_skills_from_an_installed_registry(tmp_path: Path) -> None:
     skills = DirectorySkills({p.manifest.name: p.root for p in registry.plugins()})
     skill = skills.load_skill(SKILL, registry.plugin_for_skill(SKILL))
     assert skill.version == "1.0.0"
+
+
+# --- the `links` option (#128, schemas decision 53) --------------------------------------------
+
+
+def test_links_option(plugin: Path) -> None:
+    assert load_skill(FIXTURE, SKILL).links == "input"  # the default: compatible
+    text = (_folder(plugin) / "skill.yaml").read_text()
+    _edit_yaml(plugin, text + "links: none\n")
+    assert load_skill(plugin, SKILL, allowed_intents=INTENTS).links == "none"
+    _edit_yaml(plugin, text + "links: input\n")
+    assert load_skill(plugin, SKILL, allowed_intents=INTENTS).links == "input"
+    for bad in ("all", "None", "[]", "true"):
+        _edit_yaml(plugin, text + f"links: {bad}\n")
+        _fails(plugin, "links")
+
+
+@pytest.mark.parametrize(("links", "valid"), [("input", True), ("none", True), ("all", False)])
+def test_links_option_in_the_json_schema(links: str, valid: bool) -> None:
+    schema = json.loads(
+        (Path(__file__).parents[1] / "schemas" / "skill" / "v1.json").read_text(encoding="utf-8")
+    )
+    manifest = {
+        "name": SKILL,
+        "version": "1.0.0",
+        "description": "d",
+        "input_view": ["a"],
+        "links": links,
+    }
+    assert Draft202012Validator(schema).is_valid(manifest) is valid
+    if valid:
+        assert SkillManifest.model_validate(manifest).links == links
+    else:
+        with pytest.raises(ValidationError):
+            SkillManifest.model_validate(manifest)

@@ -44,7 +44,7 @@ NOTE_PATH = "Daily/2026-10-27.assistant.md"
 NOTE = {
     "type": "note.replace_owned_block",
     "block": "horae-brief",
-    "content": "- [ ] Review PR 42\n",
+    "content": "- Review PR 42\n",
 }
 PUSH = {"type": "notify.push", "body": "2 items today"}
 SKILL = "daily-brief/rank-and-word"

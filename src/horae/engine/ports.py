@@ -41,6 +41,7 @@ from horae.contracts.intents import IntentType
 from horae.contracts.pipeline import Budget
 from horae.contracts.plugin import PluginManifest
 from horae.contracts.run import ErrorKind, Usage, Violation
+from horae.contracts.skill import SkillLinks
 
 LlmBackendName = Literal["claude-cli", "anthropic", "openai-compatible", "ollama"]
 
@@ -356,6 +357,12 @@ class LoadedSkill(Protocol):
     def intent_limits(self) -> Mapping[str, int]:
         """The most intents of a type the skill may propose per step (types not listed: no
         limit beyond the run's)."""
+        ...
+
+    @property
+    def links(self) -> SkillLinks:
+        """The skill's `links` option: `none` refuses every link in its note text (the action
+        guard, schemas decision 53)."""
         ...
 
     @property

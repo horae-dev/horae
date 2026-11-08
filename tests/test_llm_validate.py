@@ -80,7 +80,7 @@ SKILL_SCHEMA = json.loads(
 START = datetime.datetime(2026, 10, 27, 5, 30, tzinfo=datetime.UTC)
 NOTE_PATH = "Daily/2026-10-27.assistant.md"
 VALID = {"summary": "Two things today.", "ranked": [{"title": "Review PR 42", "why": "today"}]}
-NOTE = {"type": "note.create", "content": "- [ ] Review PR 42\n"}
+NOTE = {"type": "note.create", "content": "- Review PR 42\n"}
 
 # Synthetic injection text a model might echo back; none of it may reach a repair prompt.
 SENTINELS = ("IGNORE-PREVIOUS-0xC0FFEE", "exfil.example.invalid", "EVIL-KEY-7")

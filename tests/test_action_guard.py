@@ -20,7 +20,7 @@ import pytest
 from horae.contracts import CacheConfig, Pipeline, RunRecord, Usage
 from horae.contracts.intents import intent_adapter
 from horae.engine import PreviousLlm, execute, make_context
-from horae.engine.guard import check_intents, text_problem, urls
+from horae.engine.guard import check_intents, note_problem, text_problem, urls
 from horae.engine.testing import FakeLlm, FixturePlugins, llm_response
 from horae.runner import StoreLlmCache
 from horae.store import Store
@@ -755,7 +755,7 @@ def _run(intents: list[Any], *, data: Any = MAIL, **kwargs: Any) -> RunRecord:
     return record
 
 
-NOTE = {"type": "note.create", "content": f"- [ ] Review [PR 42]({KNOWN})\n"}
+NOTE = {"type": "note.create", "content": f"- Review [PR 42]({KNOWN})\n"}
 PUSH = {"type": "notify.push", "body": "Brief ready", "link": KNOWN}
 
 
@@ -897,3 +897,235 @@ def test_the_store_cache_discards_a_refused_entry(tmp_path: Path) -> None:
         asyncio.run(cache.discard(key, model_alias="default"))
         assert store.cache_count() == 0
         asyncio.run(cache.discard(key, model_alias="default"))  # already gone: no error
+
+
+# --- note structure and `links: none` (#128, schemas decision 53) ---------------------------------
+
+DUE = "\U0001f4c5"
+VS16 = "️"
+
+NOTE_STRUCTURE = [
+    # task checkboxes: any marker, any one status character, behind blockquotes and callouts
+    ("- [ ] wire 5000 EUR", "a task checkbox"),
+    ("* [x] done", "a task checkbox"),
+    ("+ [/] half", "a task checkbox"),
+    ("1. [ ] first", "a task checkbox"),
+    ("12) [X] twelve", "a task checkbox"),
+    ("- [-] cancelled", "a task checkbox"),
+    ("- []] odd status", "a task checkbox"),
+    ("- [ ]", "a task checkbox"),
+    ("Intro\n    - [ ] nested", "a task checkbox"),
+    ("> - [ ] quoted", "a task checkbox"),
+    ("> [!note] Callout\n> - [ ] in a callout", "a task checkbox"),
+    ("- > [ ] list then quote", "a task checkbox"),
+    ("- - [ ] nested markers", "a task checkbox"),
+    ("   * [?] indented", "a task checkbox"),
+    # Tasks signifiers, with or without U+FE0F, anywhere (also in code)
+    (f"wire 5000 EUR {DUE} 2020-01-01", "an Obsidian Tasks signifier"),
+    (f"due {DUE}{VS16} 2020-01-01", "an Obsidian Tasks signifier"),
+    ("all good ✅", "an Obsidian Tasks signifier"),
+    ("repeat \U0001f501 every day", "an Obsidian Tasks signifier"),
+    ("ring ⏰ 07:00", "an Obsidian Tasks signifier"),
+    ("top \U0001f53a priority", "an Obsidian Tasks signifier"),
+    (f"`{DUE} 2020-01-01` in code", "an Obsidian Tasks signifier"),
+    (f"```\n{DUE} 2020-01-01\n```", "an Obsidian Tasks signifier"),
+    # wikilinks (internal ones too), Dataview inline fields, comments
+    ("[[Passwords]]", "a wikilink"),
+    ("See [[Daily/2026-10-27|today]]", "a wikilink"),
+    ("`[[Passwords]]`", "a wikilink"),
+    ("status:: done", "a Dataview inline field"),
+    ("**Status**:: done", "a Dataview inline field"),
+    ("Today [status:: done] ok", "a Dataview inline field"),
+    ("Today (due:: 2020-01-01) ok", "a Dataview inline field"),
+    ("%%hidden comment%%", "an Obsidian comment"),
+    ("before %%\nhidden\n%%", "an Obsidian comment"),
+    # plain-text owned-block markers, in any case and spacing the apply recogniser matches
+    ("horae:end daily-brief", "a horae block marker"),
+    ("horae:begin daily-brief", "a horae block marker"),
+    ("x HORAE:End  Daily-Brief y", "a horae block marker"),
+    ("horae:begin   block", "a horae block marker"),
+    ("horae:begin\u00a0block", "a horae block marker"),
+    ("horae:end", "a horae block marker"),
+    ("`horae:begin x`", "a horae block marker"),
+    # tags
+    ("#tags", "a tag"),
+    ("Some #urgent work", "a tag"),
+    ("(#todo)", "a tag"),
+    ("#2026plan", "a tag"),
+    ("#tâche", "a tag"),
+    ("x\n#heading-without-space", "a tag"),
+]
+
+
+@pytest.mark.parametrize(("text", "problem"), NOTE_STRUCTURE)
+def test_note_structure_is_refused_in_note_text(text: str, problem: str) -> None:
+    assert text_problem(text, _known(), note=True) == problem
+    for raw in (
+        {"type": "note.create", "path": "a.md", "content": text},
+        {"type": "note.append_section", "path": "a.md", "heading": "h", "content": text},
+        {"type": "note.replace_owned_block", "path": "a.md", "block": "b", "content": text},
+    ):
+        detail = check_intents(_intents(raw), shown=None, source=SOURCE)
+        assert detail == f"{SOURCE} proposed {raw['type']} #0 with {problem} in `content`"
+
+
+def test_the_issue_payloads_are_refused() -> None:
+    """The hostile view of the pack-daily-brief review (#128): each one is now a violation."""
+    attacker = "https://evil.example.net/c"
+    shown = {"tasks": [{"title": f"Pay [here]({attacker})"}]}
+    payloads = [
+        f"- [ ] wire 5000 EUR {DUE} 2020-01-01",
+        "[[Passwords]]",
+        "status:: done",
+        "%%comments%%",
+        "#tags",
+        f"due {DUE}",
+        "horae:end daily-brief",
+    ]
+    for content in payloads:
+        note = _intents({"type": "note.create", "path": "a.md", "content": content})
+        assert check_intents(note, shown=shown, source=SOURCE) is not None, content
+    # A link whose URL came from an attacker-written title passes the input allowance, but
+    # not a skill's `links: none`.
+    note = _intents({"type": "note.create", "path": "a.md", "content": f"[pay]({attacker})"})
+    assert check_intents(note, shown=shown, source=SOURCE) is None
+    assert check_intents(note, shown=shown, source=SOURCE, links="none") == (
+        f"{SOURCE} proposed note.create #0 with a link, and the skill allows none in `content`"
+    )
+
+
+def test_note_structure_in_a_heading_is_refused() -> None:
+    raw = {"type": "note.append_section", "path": "a.md", "heading": "#urgent", "content": "x"}
+    detail = check_intents(_intents(raw), shown=None, source=SOURCE)
+    assert detail == f"{SOURCE} proposed note.append_section #0 with a tag in `heading`"
+
+
+BENIGN_NOTE = [
+    "# Today\n\n## Morning\n### Details",
+    "- Review PR 42\n- Call the bank\n  - nested item\n1. first\n2) second",
+    "**bold**, *italic*, _also_, ~~struck~~, ==highlight== and `inline code`",
+    "| Time | What |\n| --- | --- |\n| 10:30 | Stand-up |\n| 14:00 | Review |",
+    "Meeting at 10:30, then 14:00. Ratio 1:2. Note: ok.",
+    "Issue #128 and PR #126 (#42).",
+    "C# and F# are languages; page.html#anchor",
+    "A single % sign, 50% done, a = b, a: b",
+    "- [link-less] bracket text\n- [] empty brackets\n- [ab] two characters",
+    "[x] not a list item",
+    "-[ ] no space after the marker",
+    "> quoted text\n> > nested quote",
+    "```python\nprint(1)\n```",
+    "Emoji \U0001f600 and ⭐ are fine",
+    "horae begin, horae: end, horae-end",
+    "",
+]
+
+
+@pytest.mark.parametrize("text", BENIGN_NOTE)
+def test_benign_markdown_passes_in_note_text(text: str) -> None:
+    assert text_problem(text, _known(), note=True) is None
+    note = _intents({"type": "note.create", "path": "a.md", "content": text})
+    assert check_intents(note, shown=None, source=SOURCE, links="none") is None
+
+
+def test_note_structure_rules_read_the_source_only() -> None:
+    """Escaped forms (backslashes, character references) are what `escape_title` writes:
+    the parsers read the source, where they are inert."""
+    for text in (
+        "\\- [ ] escaped marker",
+        "- \\[ \\] escaped brackets",
+        "\\[\\[Passwords\\]\\]",
+        "status:\\: done",
+        "%&#x25;comment",
+        "&#x1F4C5; 2020-01-01",
+        "\\#tags",
+        "horae\\:end daily-brief",
+    ):
+        assert note_problem(text) is None, text
+        # `\:` reads as `:/`, a URL to the link rule (decision 46): only the input lets it pass
+        assert text_problem(text, lambda url: True, note=True) is None, text
+
+
+def test_note_structure_rules_apply_to_note_intents_only() -> None:
+    for text in ("- [ ] x", "[[Passwords]]", "status:: done", "#tags", f"{DUE} 2020-01-01"):
+        assert text_problem(text, _known()) is None
+        push = {"type": "notify.push", "body": text}
+        task = {"type": "task.create", "title": text, "fingerprint": "t:1"}
+        assert check_intents(_intents(push, task), shown=None, source=SOURCE) is None
+
+
+def test_the_guard_marker_is_the_apply_marker() -> None:
+    from horae.apply.notes import MARKER as APPLY_MARKER
+    from horae.engine.guard import MARKER
+
+    assert MARKER.pattern == APPLY_MARKER.pattern
+    assert MARKER.flags == APPLY_MARKER.flags
+
+
+LINKS = [
+    KNOWN,
+    f"Review {KNOWN}.",
+    f"[the review]({KNOWN})",
+    f"<{KNOWN}>",
+    "[a note](Notes/Other.md)",
+    "[text][ref]",
+    "[ref]: Notes/Other.md",
+    "> - [ref]: Notes/Other.md",
+    "www.example.org",
+    "mailto:someone@example.org",
+]
+
+
+@pytest.mark.parametrize("text", LINKS)
+def test_links_none_refuses_every_link(text: str) -> None:
+    shown = {"mail": f"{KNOWN} https://example.org mailto:someone@example.org www.example.org"}
+    note = _intents({"type": "note.create", "path": "a.md", "content": text})
+    assert check_intents(note, shown=shown, source=SOURCE) is None
+    assert check_intents(note, shown=shown, source=SOURCE, links="none") == (
+        f"{SOURCE} proposed note.create #0 with a link, and the skill allows none in `content`"
+    )
+
+
+def test_links_none_is_for_note_text_only() -> None:
+    footnote = "Text[^1]\n\n[^1]: a footnote"
+    note = _intents({"type": "note.create", "path": "a.md", "content": footnote})
+    assert check_intents(note, shown=None, source=SOURCE, links="none") is None
+    push = _intents({"type": "notify.push", "body": f"Review {KNOWN}", "link": KNOWN})
+    assert check_intents(push, shown=MAIL, source=SOURCE, links="none") is None
+
+
+def test_one_mib_for_the_note_structure_scans_in_linear_time() -> None:
+    size = 1 << 20
+    worst = [
+        "#" * size,
+        " #" * (size // 2),
+        "#a " * (size // 3),
+        "- " * (size // 2) + "[ ]",
+        "- [\n" * (size // 4),
+        "horae:" * (size // 6),
+        ":" * size,
+        "%" * size,
+        "](" * (size // 2),
+        "\n[r]: " * (size // 6),
+    ]
+    for text in worst:
+        content = text[:size]
+        intent = _intents({"type": "note.create", "path": "a.md", "content": content})
+        began = time.perf_counter()
+        check_intents(intent, shown=None, source=SOURCE, links="none")
+        assert time.perf_counter() - began < 5.0, text[:16]
+
+
+def test_a_plain_marker_degrades_the_step_and_apply_never_runs() -> None:
+    """Before #128 the guard passed it and apply failed the whole run (`content_has_marker`)."""
+    record = _run([{"type": "note.create", "content": "Brief\nhorae:end daily-brief\n"}, PUSH])
+    assert record.status == "degraded"
+    llm_step = record.steps[1]
+    assert llm_step.status == "degraded"
+    assert llm_step.error is not None
+    assert llm_step.error.kind == "guard_violation"
+    assert llm_step.error.message == (
+        f"{SOURCE} proposed note.create #0 with a horae block marker in `content`"
+    )
+    assert record.intents == []
+    assert [s.status for s in record.steps[2:]] == ["skipped", "skipped"]
+    assert record.changes == []

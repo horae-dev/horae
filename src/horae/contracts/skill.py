@@ -34,10 +34,16 @@ when present.
 **Intents.** `intents` is either a list of intent types or a mapping `type: max` (#35): the
 skill may propose at most `max` intents of that type per step (the engine enforces it,
 `intent_rejected`). Omitted: the skill proposes none.
+
+**Links.** `links` (schemas decision 53) is `input` (the default: a URL in note text must come
+from the viewed input, decision 46) or `none`: the action guard then refuses every link,
+autolink and bare URL in the `note.*` text the skill proposes, even one the input holds. A
+skill that writes no link (a daily brief) should say `none`: the input allowance only lets
+an attacker's URL through.
 """
 
 import itertools
-from typing import Annotated, Any, Self
+from typing import Annotated, Any, Literal, Self
 
 from pydantic import AfterValidator, Field, Strict, StringConstraints, model_validator
 
@@ -100,6 +106,10 @@ ViewOptions = Annotated[
 
 IntentMax = Annotated[int, Strict(), Field(ge=1, le=MAX_ITEMS)]
 
+SkillLinks = Literal["input", "none"]
+"""A skill's `links` option: `input` (URLs of the viewed input only) or `none` (no link in
+note text)."""
+
 PROMPT_FILE = "prompt.md"
 OUTPUT_SCHEMA_FILE = "output.schema.json"
 
@@ -139,6 +149,9 @@ class SkillManifest(Contract):
     """Intents the skill may propose, a list of types or a mapping `type: max` (at most `max`
     per step): within the shipping plugin's `permissions.intents` (checked by the loader).
     Empty means the skill proposes none."""
+    links: SkillLinks = "input"
+    """Links in the skill's note text: `input` (only URLs of the viewed input, the default) or
+    `none` (no link, autolink or bare URL at all; schemas decision 53)."""
 
     @property
     def view_paths(self) -> tuple[str, ...]:

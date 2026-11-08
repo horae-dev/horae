@@ -49,7 +49,7 @@ EXAMPLES = ROOT / "schemas" / "examples" / "pipeline" / "valid"
 START = datetime.datetime(2026, 10, 27, 5, 30, tzinfo=datetime.UTC)
 CONTEXT = make_context(START, "Europe/Paris")
 BRIEF = {"items": ["Review PR 42", "Dentist at 10:00"]}
-NOTE = {"type": "note.replace_owned_block", "block": "horae-brief", "content": "- [ ] PR 42\n"}
+NOTE = {"type": "note.replace_owned_block", "block": "horae-brief", "content": "- PR 42\n"}
 PUSH = {"type": "notify.push", "body": "2 items today"}
 SKILL = "daily-brief/rank-and-word"
 MODELS = {"default": "fixture-model"}
