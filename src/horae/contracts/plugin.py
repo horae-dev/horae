@@ -80,11 +80,29 @@ class Permissions(Contract):
     network: UniqueList[Hostname] = Field(default_factory=list)
     """Hosts the plugin may connect to."""
     secrets: UniqueList[SecretName] = Field(default_factory=list)
-    """Secrets injected (only) into this plugin's environment."""
+    """Secrets injected (only) into this plugin's environment. Each must resolve, or the
+    plugin does not start (`secret_missing`)."""
+    optional_secrets: UniqueList[SecretName] = Field(default_factory=list)
+    """Secrets injected like `secrets` when they resolve; one that does not is left out of the
+    environment and the plugin still starts. Granted by `horae.lock` like any secret. Not
+    also in `secrets`."""
     paths: PathPermissions = Field(default_factory=PathPermissions)
     """Filesystem paths."""
     intents: UniqueList[IntentType] = Field(default_factory=list)
     """Intents the plugin may propose or, for a sink, apply. Empty means a pure source."""
+
+    @model_validator(mode="after")
+    def _secrets_not_both(self) -> Self:
+        # Not expressible in JSON Schema: checked by the pydantic model only.
+        both = sorted(set(self.secrets) & set(self.optional_secrets))
+        if both:
+            raise ValueError(f"{', '.join(both)}: listed in both secrets and optional_secrets")
+        return self
+
+    @property
+    def all_secrets(self) -> list[str]:
+        """Every secret the plugin may be given: required, then optional."""
+        return [*self.secrets, *self.optional_secrets]
 
 
 class StdioRuntime(Contract):

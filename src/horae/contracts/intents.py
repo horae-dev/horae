@@ -279,7 +279,7 @@ class NotifyPush(Contract):
     core mints their links when it sends the notification; without the `/act` key or
     `http.public_url` the notification is sent without them."""
     key: Fingerprint | None = None
-    """Optional stable key (#137, schemas decision 56): `^[A-Za-z0-9._:-]{1,128}$`. The same
+    """Optional stable key (#137, schemas decision 57): `^[A-Za-z0-9._:-]{1,128}$`. The same
     keyed notification of one pipeline entry, proposed by any number of runs on one local day
     (the instance's time zone), is sent once; the next day it is sent again. Without a key
     the notification is deduplicated per run (or per input)."""

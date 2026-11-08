@@ -63,6 +63,8 @@ class Permissions:
     intents: Sequence[str] = ()
     network: Sequence[str] = ()
     secrets: Sequence[str] = ()
+    optional_secrets: Sequence[str] = ()
+    """Injected when they resolve; the plugin still starts without them."""
     read: Sequence[str] = ()
     write: Sequence[str] = ()
 
@@ -72,6 +74,11 @@ class Permissions:
             ("intents", self.intents, lambda v: v in INTENT_TYPES),
             ("network", self.network, lambda v: bool(_HOST.fullmatch(v)) and len(v) <= 253),
             ("secrets", self.secrets, lambda v: bool(_SECRET.fullmatch(v))),
+            (
+                "optional_secrets",
+                self.optional_secrets,
+                lambda v: bool(_SECRET.fullmatch(v)),
+            ),
             ("paths.read", self.read, _absolute),
             ("paths.write", self.write, _absolute),
         )
@@ -83,13 +90,16 @@ class Permissions:
                     raise ManifestError(f"permissions.{what}: {value!r} is not valid")
             if len(set(values)) != len(values):
                 raise ManifestError(f"permissions.{what} lists a value twice")
-        if any(name.startswith("HORAE_") for name in self.secrets):
-            raise ManifestError("permissions.secrets: HORAE_* names are reserved")
+        for what, names in (("secrets", self.secrets), ("optional_secrets", self.optional_secrets)):
+            if any(name.startswith("HORAE_") for name in names):
+                raise ManifestError(f"permissions.{what}: HORAE_* names are reserved")
+        if set(self.secrets) & set(self.optional_secrets):
+            raise ManifestError("permissions: a secret is in both secrets and optional_secrets")
 
     def to_dict(self) -> dict[str, Any]:
         """The `permissions` mapping, empty lists left out (they are the default)."""
         data: dict[str, Any] = {}
-        for key in ("network", "secrets"):
+        for key in ("network", "secrets", "optional_secrets"):
             if getattr(self, key):
                 data[key] = list(getattr(self, key))
         paths = {key: list(getattr(self, key)) for key in ("read", "write") if getattr(self, key)}

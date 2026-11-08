@@ -307,6 +307,22 @@ def test_the_registry_checks_the_lock() -> None:
         registry(manifest, twin)
 
 
+def test_an_optional_secret_is_a_permission_the_lock_must_grant() -> None:
+    manifest = probe_manifest(
+        permissions={"secrets": ["PROBE_TOKEN"], "optional_secrets": ["EXTRA"]}
+    )
+    lock = lock_for(probe_manifest())  # approves PROBE_TOKEN only
+    with pytest.raises(RegistryError, match="optional_secrets: EXTRA"):
+        HostRegistry(lock, {"probe": PluginManifest.model_validate(manifest)})
+    approved = lock_for(manifest)
+    reg = HostRegistry(approved, {"probe": PluginManifest.model_validate(manifest)})
+    assert reg.installed("probe").manifest.permissions.optional_secrets == ["EXTRA"]
+    # An optional request is not satisfied by a grant of the same name as a required secret.
+    as_required = probe_manifest(permissions={"secrets": ["PROBE_TOKEN", "EXTRA"]})
+    with pytest.raises(RegistryError, match="optional_secrets: EXTRA"):
+        HostRegistry(lock_for(as_required), {"probe": PluginManifest.model_validate(manifest)})
+
+
 def test_the_locked_permissions_are_in_force() -> None:
     manifest = probe_manifest(permissions={"secrets": [], "intents": []})
     lock = lock_for(probe_manifest())  # the user approved more than the manifest asks

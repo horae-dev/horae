@@ -316,6 +316,12 @@ REJECTED: list[tuple[str, Mutation]] = [
     ("plugin-manifest", _set("permissions", "secrets", value=["DYLD_INSERT_LIBRARIES"])),
     ("plugin-manifest", _set("permissions", "secrets", value=["PYTHONPATH"])),
     ("plugin-manifest", _set("permissions", "secrets", value=["PATH"])),
+    ("plugin-manifest", _set("permissions", "optional_secrets", value=["lower_case"])),
+    ("plugin-manifest", _set("permissions", "optional_secrets", value=["HORAE_ACT_KEY"])),
+    ("plugin-manifest", _set("permissions", "optional_secrets", value=["PATH"])),
+    ("plugin-manifest", _set("permissions", "optional_secrets", value=["A_TOKEN", "A_TOKEN"])),
+    ("plugin-manifest", _set("permissions", "optional_secrets", value=[{"name": "A_TOKEN"}])),
+    ("lockfile", _set(*GH, "permissions", "optional_secrets", value=["lower"])),
     ("plugin-manifest", _set("permissions", "secrets", value=["HOME"])),
     ("plugin-manifest", _set("permissions", "paths", value={"exec": ["/bin"]})),
     ("plugin-manifest", _set("permissions", "paths", value={"read": ["/vault/"]})),
@@ -398,6 +404,8 @@ ACCEPTED: list[tuple[str, Mutation]] = [
     ("pipeline", _set(*LLM, "budget", "usd", value=1)),
     ("plugin-manifest", _set("permissions", "network", value=["coach", "x1.example"])),
     ("plugin-manifest", _set("permissions", "secrets", value=["MY_HOME", "PATHS_TOKEN"])),
+    ("plugin-manifest", _set("permissions", "optional_secrets", value=["MY_HOME", "PATHS_TOKEN"])),
+    ("plugin-manifest", _set("permissions", "optional_secrets", value=[])),
     ("plugin-manifest", _set("permissions", "paths", value={"read": ["/home/me/.config"]})),
     ("plugin-manifest", _set("permissions", "paths", value={"read": ["/vault/My Notes"]})),
     ("intents/http.post", _set("url", value="https://hooks.example.org")),
@@ -579,3 +587,15 @@ def test_python_date_objects_are_accepted() -> None:
     record["started_at"] = datetime.date(2026, 10, 27)
     with pytest.raises(ModelError):
         RunRecord.model_validate(record)
+
+
+def test_a_secret_cannot_be_both_required_and_optional() -> None:
+    # Not expressible in JSON Schema: the pydantic model alone refuses it.
+    data = _load(EXAMPLES / "plugin-manifest/valid/github.yaml")
+    data["permissions"]["optional_secrets"] = ["GITHUB_TOKEN"]
+    with pytest.raises(ModelError, match="both secrets and optional_secrets"):
+        PluginManifest.model_validate(data)
+    data["permissions"]["optional_secrets"] = ["OTHER_TOKEN"]
+    manifest = PluginManifest.model_validate(data)
+    assert manifest.permissions.optional_secrets == ["OTHER_TOKEN"]
+    assert manifest.permissions.all_secrets == ["GITHUB_TOKEN", "OTHER_TOKEN"]

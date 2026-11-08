@@ -96,7 +96,9 @@ print(dump_manifest(data))
 
 `provides` comes from what the plugin registered, `permissions` from `Plugin(...,
 permissions=Permissions(...))`: `intents`, `network` (host names), `secrets` (injected as
-environment variables), `read` and `write` paths. Declare the least you need: undeclared
+environment variables; the plugin does not start without them), `optional_secrets` (injected
+only when they resolve; read them with `os.environ.get` and report `secret_missing` yourself
+when a call needs one that is absent), `read` and `write` paths. Declare the least you need: undeclared
 access is a bug, and blocked from M5. The SDK checks the usual mistakes (`ManifestError`);
 the core's loader is the judge. The SDK's tests validate what it writes against
 `schemas/plugin-manifest/v1.json` and the core's model.

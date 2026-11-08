@@ -345,3 +345,61 @@ def test_doctor_reports_a_schema_a_backend_refuses(
     problems = report["problems"]
     assert isinstance(problems, list)
     assert [p["severity"] for p in problems] == ["warning"]
+
+
+def _grant_optional(root: Path, *names: str) -> None:
+    lock = root / "horae.lock"
+    text = lock.read_text(encoding="utf-8")
+    lock.write_text(
+        text.replace(
+            "      secrets: [GITHUB_TOKEN]\n",
+            f"      secrets: [GITHUB_TOKEN]\n      optional_secrets: [{', '.join(names)}]\n",
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_an_unresolved_optional_secret_is_info_not_an_error(with_secrets: Path) -> None:
+    _grant_optional(with_secrets, "GITHUB_ENTERPRISE_TOKEN")
+    code, out = _doctor("-i", str(with_secrets))
+    assert code == 0
+    lines = out.strip().splitlines()
+    assert lines[0].startswith(f"{with_secrets / 'horae.lock'}:11:")
+    assert ": info: optional secret GITHUB_ENTERPRISE_TOKEN: " in lines[0]
+    assert "plugin github runs without it" in lines[0]
+    assert lines[-1].startswith("OK: ")
+    code, out = _doctor("-i", str(with_secrets), "--json")
+    assert code == 0
+    report = json.loads(out)
+    assert report["ok"] is True
+    assert [p["severity"] for p in report["problems"]] == ["info"]
+
+
+def test_a_resolved_optional_secret_is_not_reported(with_secrets: Path) -> None:
+    (with_secrets / "secrets" / "GITHUB_ENTERPRISE_TOKEN").write_text("x" * 20, encoding="utf-8")
+    _grant_optional(with_secrets, "GITHUB_ENTERPRISE_TOKEN")
+    code, out = _doctor("-i", str(with_secrets))
+    assert code == 0
+    assert out.strip() == "OK: 2 pipelines, 1 plugin, 2 model aliases"
+
+
+def test_a_missing_required_secret_is_still_an_error_beside_an_optional_info(
+    instance_dir: Path,
+) -> None:
+    _grant_optional(instance_dir, "GITHUB_ENTERPRISE_TOKEN")
+    code, out = _doctor("-i", str(instance_dir))
+    assert code == 1
+    assert out.strip().splitlines()[-1] == "2 problems found"
+    assert ": info: optional secret" in out
+
+
+def test_an_unusable_optional_secret_is_a_warning_and_never_shows_its_value(
+    with_secrets: Path,
+) -> None:
+    (with_secrets / "secrets" / "GITHUB_ENTERPRISE_TOKEN").write_text("short", encoding="utf-8")
+    _grant_optional(with_secrets, "GITHUB_ENTERPRISE_TOKEN")
+    code, out = _doctor("-i", str(with_secrets))
+    assert code == 0
+    assert ": warning: optional secret GITHUB_ENTERPRISE_TOKEN" in out
+    assert "too short" in out
+    assert "short\n" not in out.replace("too short", "")
