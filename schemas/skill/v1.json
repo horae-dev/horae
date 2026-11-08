@@ -179,7 +179,7 @@
     },
     "links": {
       "default": "input",
-      "description": "Links in the skill's note text: `input` (only URLs of the viewed input, the default) or\n`none` (no link, autolink or bare URL at all; schemas decision 53).",
+      "description": "Links in the skill's note text: `input` (only URLs of the viewed input, the default) or\n`none` (no link, autolink or bare URL at all; schemas decision 54).",
       "enum": [
         "input",
         "none"

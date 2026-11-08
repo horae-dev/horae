@@ -35,7 +35,7 @@ when present.
 skill may propose at most `max` intents of that type per step (the engine enforces it,
 `intent_rejected`). Omitted: the skill proposes none.
 
-**Links.** `links` (schemas decision 53) is `input` (the default: a URL in note text must come
+**Links.** `links` (schemas decision 54) is `input` (the default: a URL in note text must come
 from the viewed input, decision 46) or `none`: the action guard then refuses every link,
 autolink and bare URL in the `note.*` text the skill proposes, even one the input holds. A
 skill that writes no link (a daily brief) should say `none`: the input allowance only lets
@@ -151,7 +151,7 @@ class SkillManifest(Contract):
     Empty means the skill proposes none."""
     links: SkillLinks = "input"
     """Links in the skill's note text: `input` (only URLs of the viewed input, the default) or
-    `none` (no link, autolink or bare URL at all; schemas decision 53)."""
+    `none` (no link, autolink or bare URL at all; schemas decision 54)."""
 
     @property
     def view_paths(self) -> tuple[str, ...]:

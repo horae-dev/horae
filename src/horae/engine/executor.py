@@ -133,7 +133,7 @@ a small inert allowlist and no HTML attribute, no `javascript:` / `data:` / `fil
 protocol-relative link in its text, and every
 URL in its text (and a `notify.push` `link`) an exact string of the viewed input; in note text
 no task checkbox, Tasks signifier, wikilink, Dataview field, comment, tag or block marker, and
-no link at all for a skill with `links: none` (schemas decision 53). A refusal
+no link at all for a skill with `links: none` (schemas decision 54). A refusal
 records a `guard` violation (a content-free detail) and **degrades the whole step**
 (`guard_violation`): nothing it proposed is routed, its output is not used, later steps are
 skipped. On a reuse, a refusal is a cache miss, and a cached entry is deleted (`discard`, when

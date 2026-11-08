@@ -116,7 +116,7 @@ class Skill:
 
     @property
     def links(self) -> SkillLinks:
-        """The `links` option (`none`: no link in note text, schemas decision 53)."""
+        """The `links` option (`none`: no link in note text, schemas decision 54)."""
         return self.manifest.links
 
     @property

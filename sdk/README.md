@@ -132,7 +132,7 @@ leaves the plugin, as the core would refuse the whole step.
 ## Obsidian Tasks titles
 
 A task title is untrusted data. Obsidian Tasks reads its fields from the raw line
-(`- [ ] Pay 📅 2026-10-22 ⏰ 19:00`), so a title from a mail subject holding
+(`- [ ] Pay ⏰ 19:00 📅 2026-10-22`), so a title from a mail subject holding
 `📅 2020-01-01 🔁 every day` would schedule the task. `intents.task_create` therefore
 **escapes the title** (`horae_sdk.tasks.escape_title`, threat model T02, schemas decision 50):
 
@@ -157,7 +157,8 @@ A task title is untrusted data. Obsidian Tasks reads its fields from the raw lin
 
 **The intent's title is the Tasks-safe form**, not the plain text (the acceptance criterion
 of #42 puts the escaping in the builder). A sink writing Tasks syntax writes it as it is:
-`tasks.task_line(title, due=..., time=...)` and `tasks.task_line_for(intent)` always escape,
+`tasks.task_line(title, due=..., time=..., link=..., done=..., fingerprint=...)` and
+`tasks.task_line_for(intent, block_id=False)` always escape,
 and the escaping is **idempotent**, so a title the builder escaped is unchanged. A sink for
 any other target (a push notification, a log) shows `tasks.plain_text(title)`: references and
 backslash escapes resolved, **for plain-text display only**. Never feed `plain_text` to a
@@ -212,6 +213,42 @@ description, never as a field. A destination longer than `tasks.MAX_DESTINATION`
 characters, possible for a link of mostly non-ASCII characters (up to 12 characters each once
 encoded), is left out: the line is written without the link, so it stays well under a reader's
 size cap (plugin-obsidian analyses at most 16 KiB).
+
+### Reminder order and the task block id
+
+`tasks.task_line` writes Horae's `⏰ HH:MM` reminder right after the title (and link), **before**
+the Tasks date fields (SDK 0.3.0; 0.2.0 wrote it last). The Tasks plugin reads fields from the
+end of the line and stops at a signifier it does not know, so a trailing `⏰` would hide the
+due date from Tasks queries; written first, Tasks sees `📅` and keeps `⏰ 19:00` in the
+description:
+
+```
+- [ ] Pay the bill ⏰ 19:00 📅 2026-10-22 ^h-3f2a9c01b7de
+```
+
+`tasks.task_block_id(fingerprint)` is the hidden link from a line back to the task that
+created it: `h-` and the first 12 hex digits of the SHA-256 of the fingerprint (a
+`task.create` fingerprint, `ValueError` otherwise). `task_line(..., fingerprint=...)` and
+`task_line_for(intent, block_id=True)` end the line with it as `^h-…`, an Obsidian block id:
+hidden in reading view, ignored by Tasks, and kept when the text is edited. It is a one-way
+digest, so a reader that needs the fingerprint back keeps its own index from block id to
+fingerprint (plugin-obsidian does, under its `paths.write`). Without `fingerprint` (the
+default) no block id is written. A title cannot fake one: its `^` is escaped and the real
+block id is always last.
+
+The `h-` prefix makes the id unlikely to collide with a user's own block ids. Two different
+fingerprints can still share a block id: it keeps 48 bits, so the chance is about 2e-5 at
+100,000 tasks (negligible, not zero). A sink's block-id to fingerprint index must detect a
+second fingerprint mapping to an id it already holds and **fail closed** (refuse the write)
+rather than overwrite the first entry, which would point a line at the wrong task.
+
+#### Migrating from 0.2.0 (line order)
+
+0.2.0 wrote `- [ ] Pay 📅 2026-10-22 ⏰ 19:00`; 0.3.0 writes `- [ ] Pay ⏰ 19:00 📅 2026-10-22`.
+The trailing `⏰` (not a Tasks field) stopped Tasks reading fields from the end of the line, so
+the due date was invisible to Tasks queries. Readers must accept **both** orders (plugin-obsidian's
+parser does). Lines already written are **not rewritten** (a decision): their due date stays
+invisible to Tasks until the line is edited and rewritten in the new order.
 
 ### Manual check in a real vault
 

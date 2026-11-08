@@ -55,7 +55,7 @@ cache), after schema validation and before routing:
    wikilink `[[…]]` holding `://` or a refused scheme (internal wikilinks pass); an
    `obsidian:` URI not in the input set; and, in a note intent's `content`, a frontmatter
    block (a first non-blank line of three or more `-`).
-8. **Note structure** (every text field of a `note.*` intent, schemas decision 53). Obsidian,
+8. **Note structure** (every text field of a `note.*` intent, schemas decision 54). Obsidian,
    the Tasks and Dataview plugins and `horae.apply.notes` read a note's **source**, where a
    backslash escape or a character reference keeps them from matching, so these rules run on
    the text as written only (not its decoded views; `horae_sdk.tasks.escape_title` output
@@ -70,7 +70,7 @@ cache), after schema validation and before routing:
    `\\` or `/`, followed by a tag body that is not only ASCII digits: `#128` passes, `#todo`
    does not). Every rule but the checkbox is a substring search anywhere in the text, so
    prefixes, indentation and nesting cannot hide one.
-9. **`links: none`** (a skill option, decision 53): in that skill's `note.*` text, every link
+9. **`links: none`** (a skill option, decision 54): in that skill's `note.*` text, every link
    is refused, whatever the input holds: a URL (6), `](`, `][` and a line's leading
    `[label]:` (not a footnote), on every view.
 

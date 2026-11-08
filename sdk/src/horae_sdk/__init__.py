@@ -20,7 +20,7 @@ from horae_sdk.manifest import Permissions, dump_manifest, manifest
 from horae_sdk.plugin import Call, Output, Paths, Plugin, PluginError, Source, Transform
 from horae_sdk.sinks import Applied, ApplyRequest, Notifier, Sink, SinkError
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "Applied",

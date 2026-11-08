@@ -899,7 +899,7 @@ def test_the_store_cache_discards_a_refused_entry(tmp_path: Path) -> None:
         asyncio.run(cache.discard(key, model_alias="default"))  # already gone: no error
 
 
-# --- note structure and `links: none` (#128, schemas decision 53) ---------------------------------
+# --- note structure and `links: none` (#128, schemas decision 54) ---------------------------------
 
 DUE = "\U0001f4c5"
 VS16 = "️"

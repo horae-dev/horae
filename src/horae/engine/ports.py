@@ -362,7 +362,7 @@ class LoadedSkill(Protocol):
     @property
     def links(self) -> SkillLinks:
         """The skill's `links` option: `none` refuses every link in its note text (the action
-        guard, schemas decision 53)."""
+        guard, schemas decision 54)."""
         ...
 
     @property
