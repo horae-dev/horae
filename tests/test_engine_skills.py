@@ -36,7 +36,7 @@ START = datetime.datetime(2026, 10, 27, 5, 30, tzinfo=datetime.UTC)
 CONTEXT = make_context(START, "Europe/Paris")
 NOTE_PATH = "Daily/2026-10-27.assistant.md"
 OUTPUT = {"summary": "Two things today.", "ranked": [{"title": "Review PR 42", "why": "today"}]}
-NOTE = {"type": "note.create", "content": "- [ ] Review PR 42\n"}
+NOTE = {"type": "note.create", "content": "- Review PR 42\n"}
 TASKS = {
     "tasks": [
         {"title": "Review PR 42", "due": "2026-10-27", "notes": "private notes"},
@@ -655,3 +655,23 @@ def test_a_skill_source_failing_on_the_prompt_is_contained(pack: Path) -> None:
     error = record.steps[2].error
     assert error is not None
     assert (error.kind, error.message) == ("host_error", "unexpected RuntimeError")
+
+
+def test_a_skill_with_links_none_refuses_a_link_from_the_input(pack: Path) -> None:
+    """`links: none` (#128, schemas decision 55): the engine guards the skill's note text with
+    the option, so a URL the input holds (an attacker-written title) no longer passes."""
+    url = "https://evil.example.net/c"
+    data = {**TASKS, "tasks": [{"title": f"Pay {url}", "due": "2026-10-27"}]}
+    note = {"type": "note.create", "content": f"- [Pay]({url})\n"}
+    ok = _run(_plugins(data), _llm([note]), _skills(pack))
+    assert ok.status == "ok", ok.error
+    folder = skill_dir(pack, SKILL)
+    (folder / "skill.yaml").write_text((folder / "skill.yaml").read_text() + "links: none\n")
+    record = _run(_plugins(data), _llm([note]), _skills(pack))
+    assert record.status == "degraded"
+    assert record.steps[2].error is not None
+    assert record.steps[2].error.kind == "guard_violation"
+    assert record.steps[2].error.message == (
+        f"skill:{SKILL} proposed note.create #0 with a link, and the skill allows none in `content`"
+    )
+    assert record.intents == []

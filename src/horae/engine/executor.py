@@ -132,7 +132,9 @@ step proposes (fresh or reused) is checked after validation and before routing: 
 skill's `intent_limits` of each type, no Markdown image or Obsidian embed, no HTML tag outside
 a small inert allowlist and no HTML attribute, no `javascript:` / `data:` / `file:` /
 protocol-relative link in its text, and every
-URL in its text (and a `notify.push` `link`) an exact string of the viewed input. A refusal
+URL in its text (and a `notify.push` `link`) an exact string of the viewed input; in note text
+no task checkbox, Tasks signifier, wikilink, Dataview field, comment, tag or block marker, and
+no link at all for a skill with `links: none` (schemas decision 55). A refusal
 records a `guard` violation (a content-free detail) and **degrades the whole step**
 (`guard_violation`): nothing it proposed is routed, its output is not used, later steps are
 skipped. On a reuse, a refusal is a cache miss, and a cached entry is deleted (`discard`, when
@@ -1507,10 +1509,11 @@ async def _discard(cache: LlmCache | None, key: str, model_alias: str) -> None:
 
 def _shown(step: _Planned, viewed: Any, source: str) -> dict[str, Any]:
     """The action guard on what the model was shown (the viewed input), with the skill's
-    per-type intent limits; with a skill, `task.update_status` fingerprints must also come
-    from the viewed input."""
+    per-type intent limits and `links` option; with a skill, `task.update_status`
+    fingerprints must also come from the viewed input."""
     limits = None if step.skill is None else step.skill.intent_limits
-    guard = {"guard": guard_for(viewed, source, limits)}
+    links = "input" if step.skill is None else step.skill.links
+    guard = {"guard": guard_for(viewed, source, limits, links)}
     return guard if step.skill is None else {**guard, "shown": (viewed,)}
 
 

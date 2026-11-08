@@ -350,7 +350,13 @@ def judge_intents(sue: SkillUnderEval, loaded: LoadedCase, viewed: Any, result: 
     except IntentRejected as rejected:
         result.intents_error = "; ".join(r.describe() for r in rejected.rejections)[:1000]
         return
-    detail = check_intents(typed, shown=viewed, source=sue.source, limits=sue.skill.intent_limits)
+    detail = check_intents(
+        typed,
+        shown=viewed,
+        source=sue.source,
+        limits=sue.skill.intent_limits,
+        links=sue.skill.links,
+    )
     result.guard = "pass" if detail is None else "violation"
     result.guard_detail = detail
     # A run routes a `task.update_status` only for a task the model was shown (engine rule 4).

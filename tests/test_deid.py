@@ -105,7 +105,7 @@ OUTPUT = {
         {"title": "Call [PERSON_4] about [PLACE_1]", "why": "later"},
     ],
 }
-NOTE = {"type": "note.create", "content": "- [ ] Dentist for [PERSON_3]\n"}
+NOTE = {"type": "note.create", "content": "- Dentist for [PERSON_3]\n"}
 REAL_OUTPUT = {
     "summary": "Lunch with Bob Martin; ask [PERSON_9] and Person 7",
     "ranked": [
@@ -113,7 +113,7 @@ REAL_OUTPUT = {
         {"title": "Call Zoë about Annecy", "why": "later"},
     ],
 }
-REAL_NOTE = {"type": "note.create", "content": "- [ ] Dentist for Alice\n"}
+REAL_NOTE = {"type": "note.create", "content": "- Dentist for Alice\n"}
 UNRESOLVED = ["Person 7", "[PERSON_9]"]
 CLOUD = {"backend": "anthropic", "model": "fixture-model", "secret": "ANTHROPIC_API_KEY"}
 LOCAL = {"backend": "ollama", "model": "fixture-model", "base_url": "http://ollama:11434"}
@@ -639,7 +639,7 @@ def test_the_action_guard_sees_re_identified_intents(pack: Path, tmp_path: Path)
     # guard's input set once put back; a pseudonym never reaches the guard's link rules.
     data = {**DATA, "tasks": [{"title": "Notes at https://wiki.example.org/Alice/plan"}]}
     sent_url = "https://wiki.example.org/[PERSON_3]/plan"
-    note = {"type": "note.create", "content": f"- [ ] [PERSON_3]: see [plan]({sent_url})\n"}
+    note = {"type": "note.create", "content": f"- For [PERSON_3]: see [plan]({sent_url})\n"}
     provider = Provider("anthropic", {**OUTPUT, "intents": [note]})
     plugins = _plugins(data)
     record = asyncio.run(
@@ -658,7 +658,7 @@ def test_the_action_guard_sees_re_identified_intents(pack: Path, tmp_path: Path)
     assert record.status == "ok", (record.steps[2].error, record.violations)
     assert "Alice" not in provider.sent[0].decode()
     content = record.intents[0].intent.model_dump(mode="json")["content"]
-    assert content == "- [ ] Alice: see [plan](https://wiki.example.org/Alice/plan)\n"
+    assert content == "- For Alice: see [plan](https://wiki.example.org/Alice/plan)\n"
     # Another URL (not in the real input) is still refused by the guard.
     other = {"type": "note.create", "content": "[x](https://evil.example.net/[PERSON_3])\n"}
     provider = Provider("anthropic", {**OUTPUT, "intents": [other]})

@@ -3208,3 +3208,87 @@ loosened later without breaking a valid file.
       against the rendered template and the Traefik access-log setting (#41); an SDK intent
       builder for `actions` (the field is plain JSON meanwhile); showing the buttons in the
       dry-run diff.
+
+### Provisional decisions (#128, pending maintainer review)
+
+55. **The action guard refuses note structure, and a skill may refuse every link (#128).**
+    Numbering: 52 is #122's, 53 #127's, 54 #38's (`/act`, PR #115). One compatible addition to `skill/v1.json` (an optional
+    `links`); no other contract change. The pack-daily-brief review found an obeyed injection
+    could still write live Obsidian constructs into LLM note content; decision 46 is extended:
+    - **A, note structure** (rule 8 of `horae.engine.guard`). In **every text field of a
+      `note.*` intent** (`content`, and `note.append_section`'s `heading`) proposed by an LLM
+      skill, refused:
+      - a **task checkbox**: a line whose prefix (any whitespace, `>` at any depth, list
+        markers `-`, `*`, `+` and ordered markers `<digits>.` / `<digits>)` with **any number
+        of digits**, each followed by whitespace, repeatedly) holds at least one list marker
+        and is followed by `[`, **any one character**, `]` (`- [ ]`, `* [x]`, `+ [/]`,
+        `1. [ ]`, `- []]`, `> > - [ ]` in a callout, `- - [ ]`,
+        `1234567890. [ ]`); a space after `]` is not required (conservative). This walk is
+        its own, wider than the Tasks plugin's `^[\s>]*([-*+]|[0-9]+[.)]) +\[.\]`: the
+        CommonMark walker of H2 stops ordered markers at nine digits, which Tasks does not
+        (a security review finding). `[x]` without a list marker, `-[ ]` and `- [ab]` pass.
+        The other rules below are substring searches anywhere in the text, so no prefix,
+        indentation or nesting can hide them;
+      - any **Tasks signifier** (`SIGNIFIERS`, with or without U+FE0F) anywhere, not only on a
+        task line: a copy of the keys of `horae_sdk.tasks.SIGNIFIERS` (the core does not
+        depend on the SDK at run time); `sdk/tests/test_sdk_tasks.py` checks they are equal.
+        Known cost: a brief cannot use ✅ or ❌ as decoration;
+      - any `[[` (a **wikilink**, internal ones too: decision 46 H1e let them pass; a note
+        link is a click away from any note of the vault, and embeds `![[` stay refused by
+        rule 2);
+      - any `::` (a **Dataview inline field**: `key:: v` on a line, `[key:: v]`,
+        `(key:: v)`); known cost: `std::vector`, `::1`;
+      - any `%%` (an **Obsidian comment**, which hides text in reading view);
+      - a **horae block marker**: `MARKER`, the very recogniser of `horae.apply.notes`
+        (`horae:(begin|end)`, any case, any spacing; a test checks the patterns are equal).
+        Before, the guard passed `horae:end daily-brief` and apply then failed the whole run
+        (`content_has_marker`) every day the input held it; now the `llm` step degrades
+        (`guard_violation`) and apply never runs;
+      - a **tag** (answer to "allow `#tags`?": **refused**). Tags execute nothing, but they
+        put the note into the user's tag searches, Dataview `FROM #tag` queries and a Tasks
+        global filter, so an injected `#urgent` or `#todo` reaches dashboards the pipeline
+        does not own; a brief needs none. A tag is a `#` at the start or after a character
+        that is not a letter, digit, `_`, `&` (a character reference `&#x25;`), `\` (an
+        escape) or `/` (a URL fragment), followed by a body (up to whitespace or one of
+        `` !@#$%^&*(),.?":{}|<>``, the Tasks tag pattern) that is **not only ASCII digits**:
+        `#128`, `(#42)`, `C#`, `page#x` and a heading `# Title` pass; `#todo`, `#2026plan`
+        and `##x` do not. Known cost: a `# comment` in a code block is refused.
+
+      **No code exemption** (conservative): the rules apply inside inline code and fences
+      too. Tasks reads its fields from the raw line by regex (a backtick does not hide a
+      signifier from it), Dataview's inline-field parsing of code spans is not documented,
+      and an exemption would need a CommonMark-exact code-span parser.
+
+      **On the source only.** Obsidian's metadata cache, Tasks, Dataview and apply read the
+      note **as written**; a backslash escape (`\[\[`, `\#`, `:\:`) or a character reference
+      (`&#x1F4C5;`, `%&#x25;`) keeps them from matching (decision 50 relies on the same
+      reading). So these rules run on the text as written, not on the entity-decoded and
+      Markdown-unescaped views of decision 46 (which keep guarding links, embeds and HTML,
+      what a renderer produces). Consequence: `horae_sdk.tasks.escape_title` output always
+      passes them (a Hypothesis property in `sdk/tests/test_sdk_tasks.py`, also as
+      `- <title>` and `> - <title>` lines), so a skill may list escaped titles. The link
+      rules may still refuse an escaped URL not in the input (`https\://…` reads as a URL
+      once unescaped, decision 46 0b).
+    - **B, `links: none`** (a skill option, `SkillManifest.links`, `input` by default). The
+      input allowance (decision 46, 4) lets a URL through when the viewed input holds it, and
+      an attacker writes the input (a task title, a mail). A skill that writes no link says
+      `links: none`: in its `note.*` text every link is refused, on every view, whatever the
+      input holds: a URL (rule 6: `scheme:/…`, special schemes, `//…`, `www.`, so bare URLs
+      and autolinks), `](` (inline links, also to vault paths), `][` (reference links) and a
+      line's leading `[label]:` definition (also behind a `[^footnote]:` prefix), and a bare email address. A shortcut reference
+      `[label]` alone is not refused: it links only through a definition already in the
+      note (the user's). `notify.push` and `task.create` `link` fields keep their own rules
+      (exactly an input URL under a trusted `link_prefix`, decisions 30, 52). Detail:
+      `` … with a link, and the skill allows none in `content` ``. The option does not join
+      the skill digest (the cache key): the guard runs on every reuse, so a cached output is
+      checked with the current option. The engine passes it from `LoadedSkill.links` (a
+      new member of the port) and `horae eval` from the skill under evaluation.
+    - **C, not done (follow-up).** A template render transform, so a skill returns
+      structured lines that the core renders and escapes instead of free Markdown (the
+      issue's third proposal), is left for a later issue: these refusals are the floor
+      whatever renders the note.
+    - **D, compatibility.** `links` is optional with a default, so every v1 skill stays
+      valid and behaves as before for links. The note-structure rules are new refusals:
+      a skill whose prompt asks for task checkboxes, tags or wikilinks in a note now
+      degrades its step; tasks belong in `task.create` intents (escaped by the sink,
+      decision 50).

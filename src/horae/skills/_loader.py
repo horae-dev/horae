@@ -25,7 +25,7 @@ from pydantic import TypeAdapter, ValidationError
 
 from horae.config.documents import ProblemsError, parse_yaml, validate
 from horae.contracts.intents import IntentType
-from horae.contracts.skill import SkillManifest
+from horae.contracts.skill import SkillLinks, SkillManifest
 from horae.contracts.types import SkillRef
 from horae.engine.canonical import canonical_json, sha256_hex
 from horae.engine.ports import ResolvedPlugin, SkillUnavailable
@@ -113,6 +113,11 @@ class Skill:
     def intent_limits(self) -> Mapping[str, int]:
         """The most intents of each type the skill may propose per step (map form)."""
         return self.manifest.intent_limits
+
+    @property
+    def links(self) -> SkillLinks:
+        """The `links` option (`none`: no link in note text, schemas decision 55)."""
+        return self.manifest.links
 
     @property
     def view_paths(self) -> tuple[str, ...]:

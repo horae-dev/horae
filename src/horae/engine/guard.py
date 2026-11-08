@@ -55,6 +55,24 @@ cache), after schema validation and before routing:
    wikilink `[[…]]` holding `://` or a refused scheme (internal wikilinks pass); an
    `obsidian:` URI not in the input set; and, in a note intent's `content`, a frontmatter
    block (a first non-blank line of three or more `-`).
+8. **Note structure** (every text field of a `note.*` intent, schemas decision 55). Obsidian,
+   the Tasks and Dataview plugins and `horae.apply.notes` read a note's **source**, where a
+   backslash escape or a character reference keeps them from matching, so these rules run on
+   the text as written only (not its decoded views; `horae_sdk.tasks.escape_title` output
+   passes them). Refused, also inside code spans and fences (conservative): a block marker
+   (`MARKER`, the recogniser of `horae.apply.notes`: `horae:begin` / `horae:end` in any case,
+   which would make apply fail); any `[[` (a wikilink); any `::` (a Dataview inline field,
+   `key:: v`, `[key:: v]`, `(key:: v)`); any `%%` (an Obsidian comment); any character of
+   `SIGNIFIERS` (an Obsidian Tasks signifier, with or without U+FE0F); a task checkbox (a line
+   whose prefix of whitespace, `>` at any depth and list markers, ordered ones with any
+   number of digits, holds a list marker and is followed by `[`, any one character, `]`);
+   and a tag (`#` at the start or after a character other than a letter, digit, `_`, `&`,
+   `\\` or `/`, followed by a tag body that is not only ASCII digits: `#128` passes, `#todo`
+   does not). Every rule but the checkbox is a substring search anywhere in the text, so
+   prefixes, indentation and nesting cannot hide one.
+9. **`links: none`** (a skill option, decision 55): in that skill's `note.*` text, every link
+   is refused, whatever the input holds: a URL (6), `](`, `][` and a line's leading
+   `[label]:` (also after a `[^note]:` prefix) and a bare email address, on every view.
 
 A refused scheme in prose (`data: three items`, colon then a space) is not a link in Markdown
 and passes. Every check runs on the text as written and on its HTML-entity-decoded forms (up
@@ -80,6 +98,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from typing import Any
 
 from horae.contracts.intents import Intent, IntentType, NotifyPush, TaskCreate
+from horae.contracts.skill import SkillLinks
 from horae.contracts.types import PLUGIN_NAME
 
 GUARD_ERROR = "guard_violation"
@@ -128,6 +147,25 @@ ACTIVE_FENCES = frozenset(
 )
 """Code fence info words refused in text bound for a note or a notification: Obsidian or a
 common plugin runs, queries or draws them instead of showing code (decision 46)."""
+
+SIGNIFIERS = frozenset(
+    {"\U0001f4c5", "\U0001f4c6", "\U0001f5d3", "\u23f3", "\u231b", "\U0001f6eb", "\u2795"}
+    | {"\u2705", "\u274c", "\U0001f501", "\u23f0", "\U0001f53a", "\u23eb", "\U0001f53c"}
+    | {"\U0001f53d", "\u23ec", "\U0001f194", "\u26d4", "\U0001f3c1"}
+)
+"""Every Obsidian Tasks signifier (and the reminder): a copy of the keys of
+`horae_sdk.tasks.SIGNIFIERS`, since the core does not depend on the SDK (a test checks that
+they are equal). Refused anywhere in a note intent's text (8)."""
+
+MARKER = re.compile(r"horae:(begin|end)(?:\s+([a-z0-9-]+))?", re.IGNORECASE)
+"""`horae.apply.notes.MARKER` (a test checks that they are equal): the engine does not import
+the appliers. A match in a note intent's text would make apply fail (8)."""
+
+_TAG_END = frozenset(' !@#$%^&*(),.?":{}|<>')
+"""What ends a tag body (the Obsidian Tasks tag pattern), besides whitespace."""
+_TAG_ATTACHED = frozenset("_&\\/")
+"""Before a `#`, these (and letters and digits) mean it does not start a tag: a word
+(`C#`), a character reference (`&#x25;`), an escape (`\\#`) or a URL fragment (`/#x`)."""
 
 _LOWER = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
 _LETTERS = frozenset(string.ascii_lowercase)
@@ -344,17 +382,22 @@ def _tag_problem(low: str) -> str | None:
 
 
 def _content_start(line: str) -> int:
+    """Where a line's content starts once its container prefixes are skipped (`_prefix`)."""
+    return _prefix(line)[0]
+
+
+def _prefix(line: str) -> tuple[int, bool]:
     """Where a line's content starts once its container prefixes are skipped: spaces and tabs
     (any number: more than CommonMark's three is refused too, being conservative), blockquote
     `>` and list markers (`-`, `*`, `+`, `1.`, `1)` followed by a space, a tab or the line
-    end), repeatedly. Each character is looked at once or twice (a marker's digits, at most
-    nine, once more)."""
-    at, size = 0, len(line)
+    end), repeatedly; and whether a list marker was skipped. Each character is looked at once
+    or twice (a marker's digits, at most nine, once more)."""
+    at, size, listed = 0, len(line), False
     while True:
         while at < size and line[at] in " \t":
             at += 1
         if at == size:
-            return at
+            return at, listed
         if line[at] == ">":
             at += 1
             continue
@@ -366,9 +409,9 @@ def _content_start(line: str) -> int:
         else:
             marker = at if line[at] in "-*+" else -1
         if marker != -1 and (marker + 1 == size or line[marker + 1] in " \t"):
-            at = marker + 1
+            at, listed = marker + 1, True
             continue
-        return at
+        return at, listed
 
 
 def _fence_problem(line: str, start: int) -> str | None:
@@ -449,6 +492,99 @@ def _clicks(line: str, start: int) -> bool:
     return False
 
 
+def _checkbox(line: str) -> bool:
+    """A task checkbox: a list item whose content starts with `[`, any one character and `]`
+    (Obsidian Tasks reads any status character). Its own prefix walk, wider than Tasks'
+    `^[\\s>]*([-*+]|[0-9]+[.)]) +\\[.\\]` and than CommonMark (`_prefix` stops ordered
+    markers at nine digits, Tasks does not): any whitespace and `>` (any depth), then list
+    markers with **any number of digits**, each followed by whitespace, repeatedly. Each
+    character is looked at once."""
+    at, size, listed = 0, len(line), False
+    while True:
+        while at < size and (line[at] == ">" or line[at].isspace()):
+            at += 1
+        marker = at
+        while marker < size and line[marker] in string.digits:
+            marker += 1
+        if marker > at:  # an ordered list marker: digits then `.` or `)`
+            if marker == size or line[marker] not in ".)":
+                return False
+            marker += 1
+        elif at < size and line[at] in "-*+":
+            marker = at + 1
+        else:
+            break
+        if marker == size or not line[marker].isspace():
+            return False
+        at, listed = marker, True
+    return listed and at + 2 < size and line[at] == "[" and line[at + 2] == "]"
+
+
+def _has_tag(text: str) -> bool:
+    """A `#` at the start or after a character that does not attach it to a word, a
+    reference, an escape or a URL (`_TAG_ATTACHED`), followed by a tag body (up to whitespace
+    or `_TAG_END`) that is not only ASCII digits. Each search resumes after the previous body,
+    so the scans are disjoint."""
+    found = text.find("#")
+    while found != -1:
+        before = text[found - 1] if found else " "
+        end = found + 1
+        if not (before.isalnum() or before in _TAG_ATTACHED):
+            while end < len(text) and not text[end].isspace() and text[end] not in _TAG_END:
+                end += 1
+            body = text[found + 1 : end]
+            if body.strip(string.digits) or not body.isascii():
+                return True
+        found = text.find("#", end)
+    return False
+
+
+def note_problem(text: str) -> str | None:
+    """What Obsidian, its Tasks and Dataview plugins or apply would read as structure in a note
+    intent's text (module docstring, 8), on the text as written: a block marker, a wikilink, a
+    Dataview inline field, a comment, a Tasks signifier, a task checkbox or a tag."""
+    if MARKER.search(text) is not None:
+        return "a horae block marker"
+    if "[[" in text:
+        return "a wikilink"
+    if "::" in text:
+        return "a Dataview inline field"
+    if "%%" in text:
+        return "an Obsidian comment"
+    if any(_checkbox(line) for line in text.split("\n")):
+        return "a task checkbox"
+    if not text.isascii() and any(char in SIGNIFIERS for char in text):
+        return "an Obsidian Tasks signifier"
+    if _has_tag(text):
+        return "a tag"
+    return None
+
+
+_EMAIL = re.compile(r"[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63})+")
+
+
+def _definition(line: str) -> bool:
+    """A `[label]:` reference definition at the start of `line` (after list and quote prefixes),
+    also behind footnote prefixes (`[^1]: [b]: foo.md`)."""
+    rest = line[_content_start(line) :] if line else line
+    while rest.startswith("[^"):
+        end = rest.find("]:")
+        if end == -1:
+            return False
+        rest = rest[end + 2 :].lstrip()
+    return rest.startswith("[") and "]:" in rest
+
+
+def _any_link(view: str) -> bool:
+    """Any link in `view` (module docstring, 9): a URL, `](`, `][`, a leading `[label]:` or a
+    bare email address (bounded quantifiers: linear)."""
+    if "](" in view or "][" in view or next(urls(view), None) is not None:
+        return True
+    if "@" in view and _EMAIL.search(view) is not None:
+        return True
+    return any(_definition(line) for line in view.split("\n"))
+
+
 class _Known:
     """The input set: every URL variant extracted from the viewed input, built on first use."""
 
@@ -488,16 +624,20 @@ def text_problem(
     *,
     obsidian: bool = True,
     note_content: bool = False,
+    note: bool = False,
+    links: SkillLinks = "input",
 ) -> str | None:
     """What the guard refuses in one untrusted text (a closed-set description), or `None`.
 
     `known(url)` says whether a URL is in the input set. `obsidian`: the text is bound for a
     note or a notification, so Obsidian's active constructs are refused too
     (`_obsidian_problem`); `note_content`: it is a note intent's `content`, which must not
-    open with a frontmatter block. A text whose entities are not exhausted after the allowed
-    decoding passes is refused (fail closed). Control and format characters are refused
-    first, then markup on every view, so an embed is reported as one even when its URL is
-    also unknown."""
+    open with a frontmatter block; `note`: it is a text field of a note intent, so the note
+    structure rules apply too (`note_problem`, on the text as written); `links`: the skill's
+    option, `none` refusing every link in note text. A text whose entities are not exhausted
+    after the allowed decoding passes is refused (fail closed). Control and format characters
+    are refused first, then markup on every view, so an embed is reported as one even when its
+    URL is also unknown."""
     if _entities_exhausted(text):
         return "too many levels of HTML entities"
     views = list(_views(text))
@@ -512,6 +652,12 @@ def text_problem(
             problem = _obsidian_problem(low, note_content=note_content)
         if problem is not None:
             return problem
+    if note or note_content:
+        problem = note_problem(text)
+        if problem is not None:
+            return problem
+        if links == "none" and any(_any_link(view) for view in views):
+            return "a link, and the skill allows none"
     unknown = False
     for view in views:
         for url in urls(view):
@@ -538,12 +684,14 @@ def check_intents(
     shown: Any,
     source: str,
     limits: Mapping[str, int] | None = None,
+    links: SkillLinks = "input",
 ) -> str | None:
     """`None` when the guard accepts every intent of the batch; else the content-free detail
     of the first violation. `shown` is what the model was shown (the viewed input), `source`
     the proposer: `skill:` and the pipeline's `SkillRef` (`<namespace>/<skill>`, a validated
     configuration value, never model or input text), else `ValueError`, so a detail and its
-    log line stay content-free. `limits` is the most intents of each type."""
+    log line stay content-free. `limits` is the most intents of each type; `links` the skill's
+    `links` option (`none`: no link at all in note text)."""
     if len(source) > 134 or _SOURCE.fullmatch(source) is None:
         raise ValueError("the guard's source must be `skill:<namespace>/<skill>`")
     for intent_type, most in sorted((limits or {}).items()):
@@ -559,9 +707,12 @@ def check_intents(
         if link is not None and not known(link):
             return _detail(f"{where} with a link not in the input in `link`")
         obsidian = intent.type != "http.post"
+        note = intent.type.startswith("note.")
         for name, text in _fields(intent):
-            note_content = name == "content" and intent.type.startswith("note.")
-            problem = text_problem(text, known, obsidian=obsidian, note_content=note_content)
+            note_content = name == "content" and note
+            problem = text_problem(
+                text, known, obsidian=obsidian, note_content=note_content, note=note, links=links
+            )
             if problem is not None:
                 return _detail(f"{where} with {problem} in `{name}`")
     return None
@@ -572,11 +723,16 @@ def _detail(text: str) -> str:
 
 
 def guard_for(
-    shown: Any, source: str, limits: Mapping[str, int] | None = None
+    shown: Any,
+    source: str,
+    limits: Mapping[str, int] | None = None,
+    links: SkillLinks = "input",
 ) -> Callable[[Iterable[Intent]], str | None]:
-    """`check_intents` bound to one step's viewed input, proposer and limits."""
+    """`check_intents` bound to one step's viewed input, proposer, limits and links option."""
     bound = dict(limits or {})
-    return lambda intents: check_intents(tuple(intents), shown=shown, source=source, limits=bound)
+    return lambda intents: check_intents(
+        tuple(intents), shown=shown, source=source, limits=bound, links=links
+    )
 
 
 __all__ = [
@@ -584,12 +740,15 @@ __all__ = [
     "EMBED_TAGS",
     "GUARD_ERROR",
     "INERT_TAGS",
+    "MARKER",
     "MAX_DETAIL",
     "REFUSED_SCHEMES",
+    "SIGNIFIERS",
     "SPECIAL_SCHEMES",
     "TEXT_FIELDS",
     "check_intents",
     "guard_for",
+    "note_problem",
     "text_problem",
     "urls",
 ]
