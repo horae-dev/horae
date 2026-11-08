@@ -419,6 +419,7 @@ FIELDS = [
     ({"type": "notify.push", "title": EVIL, "body": "hi"}, "title"),
     ({"type": "notify.push", "body": f"<img src={KNOWN}>"}, "body"),
     ({"type": "notify.push", "body": "hi", "link": EVIL}, "link"),
+    ({"type": "task.create", "title": "Pay", "fingerprint": "t:1", "link": EVIL}, "link"),
     (
         {"type": "http.post", "url": "https://api.example.org/x", "body": {"a": [{"b": EVIL}]}},
         "body",
@@ -444,6 +445,7 @@ def test_targets_and_known_links_pass() -> None:
         {"type": "http.post", "url": "https://api.example.org/x", "body": {"n": 1}},
         {"type": "notify.push", "body": "Review", "link": KNOWN},
         {"type": "task.update_status", "task": "t:1", "status": "done"},
+        {"type": "task.create", "title": "Review", "fingerprint": "t:2", "link": KNOWN},
     )
     assert check_intents(batch, shown=MAIL, source=SOURCE) is None
     # A notification link must be the whole URL, not a longer string around it.
@@ -452,6 +454,12 @@ def test_targets_and_known_links_pass() -> None:
         shown=MAIL,
         source=SOURCE,
     ) == (f"{SOURCE} proposed notify.push #0 with a link not in the input in `link`")
+    # The same for a task link (schemas decision 52): exactly a URL of the input.
+    for link in (KNOWN + "?q=1", KNOWN + "/", KNOWN.replace("https://", "https://www.")):
+        task = {"type": "task.create", "title": "x", "fingerprint": "t:1", "link": link}
+        assert check_intents(_intents(task), shown=MAIL, source=SOURCE) == (
+            f"{SOURCE} proposed task.create #0 with a link not in the input in `link`"
+        )
 
 
 def test_the_input_set_is_the_viewed_input_strings_and_keys() -> None:

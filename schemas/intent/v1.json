@@ -257,6 +257,21 @@
           "default": null,
           "description": "Reminder time on the due date, `HH:MM` (24 h). Requires `due`.",
           "title": "Time"
+        },
+        "link": {
+          "anyOf": [
+            {
+              "maxLength": 2048,
+              "pattern": "^https://[^\\x00-\\x20\\x7f-\\xa0\\xad\\u0600-\\u0605\\u061c\\u06dd\\u070f\\u0890\\u0891\\u08e2\\u1680\\u180e\\u2000-\\u200f\\u2028-\\u202f\\u205f-\\u2064\\u2066-\\u206f\\u3000\\ufeff\\ufff9-\\ufffb/?#@\\\\%\\[\\]]+([/?#][^\\x00-\\x20\\x7f-\\xa0\\xad\\u0600-\\u0605\\u061c\\u06dd\\u070f\\u0890\\u0891\\u08e2\\u1680\\u180e\\u2000-\\u200f\\u2028-\\u202f\\u205f-\\u2064\\u2066-\\u206f\\u3000\\ufeff\\ufff9-\\ufffb\\\\]*)?$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional `https://` link to the item the task comes from (no user info), routed only\nunder the `tasks` entry's trusted `link_prefix`.",
+          "title": "Link"
         }
       },
       "required": [
