@@ -28,7 +28,7 @@ from collections.abc import Mapping
 from datetime import date, datetime
 from typing import Any, Literal
 
-from horae_sdk.tasks import MAX_TITLE, escape_title
+from horae_sdk.tasks import MAX_TITLE, escape_title, is_task_link
 
 Intent = dict[str, Any]
 INTENT_TYPES = (
@@ -185,12 +185,17 @@ def task_create(
     key: str,
     due: str | date | None = None,
     time: str | None = None,
+    link: str | None = None,
     escape: bool = True,
 ) -> Intent:
     """`task.create` with fingerprint `key` (e.g. from `fingerprint(...)`). The title is
     escaped for Obsidian Tasks unless `escape=False` (see the module docstring), then cut to
     500 characters; nothing printable left, it is `(untitled)`. `due` must be a real date,
-    and `time` (`HH:MM`) requires `due`."""
+    and `time` (`HH:MM`) requires `due`. `link` is an optional absolute `https://` URL (at
+    most 2048 characters, a host name, not an IP address, no user info, backslash, or control,
+    format or space character) to the item the task comes from, kept as it is: the core
+    routes it only under the `tasks` entry's trusted `link_prefix`, and a Tasks sink renders
+    it with `tasks.task_line` (schemas decision 52)."""
     if not isinstance(title, str):
         raise IntentError("title must be a string")
     if escape:
@@ -207,6 +212,13 @@ def task_create(
         if not _matches(_CLOCK, time):
             raise IntentError("time must be HH:MM (24 h)")
         intent["time"] = time
+    if link is not None:
+        if not is_task_link(link):
+            raise IntentError(
+                "link must be an https:// URL with a host name (no IP), without user info,"
+                " whitespace, control or format character or backslash"
+            )
+        intent["link"] = link
     return intent
 
 

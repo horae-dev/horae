@@ -2,6 +2,7 @@
 """Obsidian Tasks title escaping (threat model T02, #42): builders and Tasks sinks."""
 
 import re
+from urllib.parse import unquote
 
 import pytest
 from hypothesis import given
@@ -11,10 +12,15 @@ from horae.contracts import Permissions, TaskCreate
 from horae.intents import validate_intents
 from horae_sdk import intents
 from horae_sdk.tasks import (
+    LINK_LABEL,
     MARKDOWN,
+    MAX_DESTINATION,
+    MAX_LINK,
     SIGNIFIERS,
     UNTITLED,
     escape_title,
+    is_task_link,
+    link_destination,
     plain_text,
     task_line,
     task_line_for,
@@ -327,3 +333,125 @@ def test_escaping_hostile_alphabets(title: str) -> None:
 @given(st.text(max_size=300))
 def test_escaping_is_idempotent_and_inert(title: str) -> None:
     _check_inert(title)
+
+
+# --- task links (#122, schemas decision 52) --------------------------------------------------
+PR = "https://code.example.org/acme/app/pull/42"
+# A Markdown inline link with the fixed label; its destination holds no space, `(`, `)`, `<`, `>`.
+_LINK = re.compile(rf"\[{LINK_LABEL}\]\(([^\s()<>]*)\)")
+_URL_CHARS = re.compile(r"[A-Za-z0-9\-._~:/?#@!&'*+,;=%]*")
+
+
+def test_a_task_line_renders_the_link_after_the_title() -> None:
+    assert task_line("Review PR 42", link=PR) == f"- [ ] Review PR 42 [link]({PR})"
+    line = task_line("Review", link=PR + "#c-7", due="2026-10-22", time="19:00", done=True)
+    assert line == f"- [x] Review [link]({PR}#c-7) {DUE} 2026-10-22 {REMINDER} 19:00"
+    intent = intents.task_create("Review", key="github:pr:42", due="2026-10-22", link=PR)
+    assert task_line_for(intent) == f"- [ ] Review [link]({PR}) {DUE} 2026-10-22"
+    for bad in (
+        "http://code.example.org/x",
+        "javascript:alert(1)",
+        "https://u@h/x",
+        "https://h/ x",
+    ):
+        with pytest.raises(ValueError, match="link"):
+            task_line("x", link=bad)
+    with pytest.raises(ValueError, match="strings"):
+        task_line_for({"type": "task.create", "title": "x", "link": 1})
+
+
+@pytest.mark.parametrize("char", ["\u754c", "\U0001f600"])  # 3 and 4 UTF-8 bytes
+def test_a_link_too_long_once_encoded_is_left_out(char: str) -> None:
+    base = "https://x.example/"
+    link = base + char * (MAX_LINK - len(base))  # 2030 characters, a valid link
+    assert len(link) == MAX_LINK
+    assert is_task_link(link)
+    assert len(link_destination(link)) > MAX_DESTINATION  # 9 or 12 characters each
+    # The line is written without the link: nothing of it, no error.
+    assert task_line("Review", link=link, due="2026-10-22") == f"- [ ] Review {DUE} 2026-10-22"
+    intent = intents.task_create("Review", key="x:1", link=link)
+    assert task_line_for(intent) == "- [ ] Review"
+    # Up to the cap, it is kept.
+    width = 3 * len(char.encode())
+    fits = base + char * ((MAX_DESTINATION - len(base)) // width)
+    assert len(link_destination(fits)) <= MAX_DESTINATION
+    assert task_line("x", link=fits) == f"- [ ] x [link]({link_destination(fits)})"
+    over = fits + char
+    assert len(link_destination(over)) > MAX_DESTINATION
+    assert task_line("x", link=over) == "- [ ] x"
+
+
+def test_a_link_destination_is_inert_and_the_same_url() -> None:
+    assert link_destination(PR + "?q=is%3Aopen&x=1#top") == PR + "?q=is%3Aopen&x=1#top"
+    hostile = PR + '/(a)[b]<c>`d`$e${f}|^"x"\u00e9\U0001f4c5?q=a==b&amp;c&#x2E;::d%%e%zz'
+    encoded = link_destination(hostile)
+    assert encoded == (
+        PR + "/%28a%29%5Bb%5D%3Cc%3E%60d%60%24e%24%7Bf%7D%7C%5E%22x%22%C3%A9%F0%9F%93%85"
+        "?q=a=%3Db%26amp;c%26#x2E;:%3Ad%25%25e%25zz"
+    )
+    assert unquote(encoded) == unquote(hostile)  # percent-decodes to the same string
+    assert link_destination(encoded) == encoded  # idempotent
+
+
+def test_the_title_cannot_forge_or_break_the_link() -> None:
+    title = f"x](https://evil.example/) [link](https://evil.example/) {HOSTILE}"
+    line = task_line(title, link=PR + "/)x(", due="2026-10-22")
+    assert _LINK.findall(line) == [PR + "/%29x%28"]
+    assert signifiers_in(line) == [DUE]
+    # Of the ported Tasks and Obsidian regexes, only the line's own due date and the URL scheme
+    # of the link itself match.
+    assert tasks_fields(line) == ["emoji due", "url scheme"]
+    _check_fields(line)
+
+
+_LINK_TOKENS = [
+    *_HOSTILE_TOKENS,
+    "(",
+    ")",
+    "<",
+    ">",
+    "`",
+    "$",
+    "&amp;",
+    "&#x2E;",
+    "%2e",
+    "%",
+    "?",
+    "#",
+]
+
+
+def _check_link(link: str) -> None:
+    encoded = link_destination(link)
+    assert link_destination(encoded) == encoded
+    assert _URL_CHARS.fullmatch(encoded)
+    assert unquote(encoded) == unquote(link)
+    for pair in ("::", "%%", "=="):
+        assert pair not in encoded
+    assert not re.search(r"&(#[0-9]+|#[xX][0-9A-Fa-f]+|[A-Za-z][A-Za-z0-9]*);", encoded)
+    line = task_line(HOSTILE, link=link, due="2026-10-22")
+    assert _LINK.findall(line) == [encoded]
+    assert signifiers_in(line) == [DUE]
+    _check_fields(line)
+
+
+def _check_fields(line: str) -> None:
+    """Only the line's own due date is a Tasks field, and no Obsidian construct is left,
+    except the autolink patterns inside the link destination, which is not inline text."""
+    inside = {"url scheme", "www autolink"}
+    assert [name for name in tasks_fields(line) if name not in inside] == ["emoji due"]
+    assert tasks_fields(_LINK.sub("[link](x)", line)) == ["emoji due"]
+
+
+@given(st.lists(st.sampled_from(_LINK_TOKENS), max_size=40).map("".join))
+def test_hostile_link_paths_stay_inert(path: str) -> None:
+    link = PR + "/" + path
+    if is_task_link(link):
+        _check_link(link)
+
+
+@given(st.text(alphabet=st.characters(codec="utf-8"), max_size=200))
+def test_any_link_text_stays_inert(path: str) -> None:
+    link = PR + "?" + path
+    if is_task_link(link):
+        _check_link(link)

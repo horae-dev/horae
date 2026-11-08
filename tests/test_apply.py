@@ -360,6 +360,9 @@ def test_previews_are_built_by_the_core_without_calling_the_sink() -> None:
     assert changes.notifications[0].notification == Notification("Brief", "2 items today")
     timed = _record_with({**INTENTS[2], "time": "09:00"})
     assert _plan(timed, sink).tasks[0].change.after.endswith("(due 2026-10-27 09:00)")
+    linked = _record_with({**INTENTS[2], "link": "https://code.example.org/acme/app/pull/42"})
+    after = _plan(linked, sink).tasks[0].change.after
+    assert after.endswith("(link <https://code.example.org/acme/app/pull/42>)")
     snooze = {"type": "task.update_status", "task": "f", "status": "snoozed", "until": "2026-11-01"}
     assert _plan(_record_with(snooze), sink).tasks[0].change.after == "snoozed until 2026-11-01"
 

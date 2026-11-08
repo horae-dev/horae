@@ -61,6 +61,7 @@ def test_a_tasks_sink_written_with_the_sdk_escapes_titles_end_to_end(tmp_path: P
     vault.mkdir()
     manifest = pinned(load_example(TASKS_FILE).plugin.manifest(command=["python3"]), TASKS_FILE)
     fields = {"title": HOSTILE, "fingerprint": "mail:1", "due": "2026-10-22", "time": "19:00"}
+    fields["link"] = "https://code.example.org/acme/app/pull/42(x)"
     intent = TaskCreate.model_validate({"type": "task.create", **fields})
 
     async def scenario() -> None:
@@ -80,4 +81,5 @@ def test_a_tasks_sink_written_with_the_sdk_escapes_titles_end_to_end(tmp_path: P
     (line,) = (vault / "Tasks.md").read_text(encoding="utf-8").splitlines()
     assert line.startswith("- [ ] Pay &#x1F4C5; 2020-01-01 ")
     assert signifiers_in(line) == [DUE, REMINDER]
-    assert line.endswith(f" {DUE} 2026-10-22 {REMINDER} 19:00")
+    link = "[link](https://code.example.org/acme/app/pull/42%28x%29)"
+    assert line.endswith(f" {link} {DUE} 2026-10-22 {REMINDER} 19:00")

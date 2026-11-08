@@ -42,7 +42,7 @@ and every other step `skipped`, when:
   the record's `context`. The same holds for an `llm` step's skill: a prompt or output
   schema (loaded through the `SkillSource`) holding a secret is `params_invalid`;
 - an `act` entry has no valid `mode`, or its binding parameters (or a `notify` entry's
-  `link_prefix`) are invalid (`params_invalid`, see below);
+  `link_prefix`, or a `mode: tasks` entry's) are invalid (`params_invalid`, see below);
 - the pipeline has more than `MAX_ITEMS` `collect` calls in all, or uses more than
   `MAX_ITEMS` plugins (`plan_too_large`: the run record could not hold them);
 - the pipeline has an `llm` step and no backend was given (`llm_unavailable`).
@@ -92,15 +92,24 @@ entry of a later step, which is recorded in `ProposedIntent.applied_by` (the ent
    empty, `.` or `..` segment, backslash, or the escapes below), e.g.
    `https://notes.example.org/daily/` or
    `obsidian://vault/Main/`. Both are parsed with `urllib.parse.urlsplit`: the link must have
-   the same scheme and exactly the same netloc, and its path must start with the prefix's
-   path; the rest of the path may have no empty, `.` or `..` segment, backslash, or `%2e`,
-   `%2f`, `%5c` or `%25` (any case). The link may add its own query and fragment;
+   the same scheme and the same authority, and its path must start with the prefix's path
+   (compared case-sensitively). For `https` the authority is compared as a DNS origin: the
+   host case-insensitively, a single trailing dot on the host ignored, and an explicit `:443`
+   equal to no port; the link may hold no user info. An `obsidian://` netloc must be exactly
+   the prefix's (schemas decision 52 B). The rest of the path may have no empty, `.` or `..`
+   segment, backslash, or `%2e`, `%2f`, `%5c` or `%25` (any case). The link may add its own
+   query and fragment. The same rule binds a `task.create` `link` (schemas decision 52): it
+   is taken only by a `mode: tasks` entry with a trusted `link_prefix` it falls under, and
+   that prefix must be `https://` (a `link_prefix` on an entry of another `mode` is
+   `params_invalid`); a `task.create` without a link needs none. When a `tasks` entry would
+   take a `task.create` but for its link, the `intent_unrouted` message says
+   `task link not under a trusted link_prefix` (a fixed text: no link is echoed);
 4. a `task.update_status` is routed only if its `task` fingerprint appears, as an exact string
    value, in the data collected so far in the run (`RunRecord.inputs`, and the current
    `collect` step's earlier sources and own output; for an `llm` step with a loaded skill,
    only its **viewed** input, what the model was shown): a proposer can change the status of
-   a task it was shown, not of one it guessed. `task.create` binds no target: its title is free
-   text.
+   a task it was shown, not of one it guessed. `task.create` binds no target (its title is free
+   text) beyond its optional `link` (rule 3).
 
 An intent that no entry takes fails the step (`intent_unrouted`), as does one that several
 entries take (`intent_ambiguous`): untrusted data can never pick a target outside the trusted
@@ -134,7 +143,7 @@ plugins, #52).
 | `create` | `note.create` | `path` (required) |
 | `append-section` | `note.append_section` | `path` (required) |
 | `replace-owned` | `note.replace_owned_block` | `path` (required) |
-| `tasks` | `task.create`, `task.update_status` | none (fingerprint check, rule 4) |
+| `tasks` | `task.create`, `task.update_status` | none (rule 4); optional `link_prefix` (rule 3) |
 | `post` | `http.post` | `url` (required) |
 
 A missing or unknown `mode`, a `mode` whose types the sink may not apply, or a missing or
@@ -256,11 +265,19 @@ import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, NoReturn
-from urllib.parse import urlsplit
+from urllib.parse import SplitResult, urlsplit
 
 from pydantic import TypeAdapter, ValidationError
 
-from horae.contracts.intents import Intent, IntentType, NotifyLink, NotifyPush, TaskUpdateStatus
+from horae.contracts.intents import (
+    Intent,
+    IntentType,
+    NotifyLink,
+    NotifyPush,
+    TaskCreate,
+    TaskLink,
+    TaskUpdateStatus,
+)
 from horae.contracts.pipeline import (
     ActStep,
     Budget,
@@ -357,7 +374,9 @@ TARGET_FIELDS: dict[IntentType, str] = {
 
 _NOTIFY_TYPES: frozenset[IntentType] = frozenset({"notify.push"})
 _LINK: TypeAdapter[str] = TypeAdapter(NotifyLink)
+_TASK_LINK: TypeAdapter[str] = TypeAdapter(TaskLink)
 _LINK_SCHEMES = frozenset({"https", "obsidian"})
+_TASK_LINK_SCHEMES = frozenset({"https"})
 _UNSAFE_ESCAPES = ("%2e", "%2f", "%5c", "%25")
 _BINDING_TYPES: dict[str, TypeAdapter[str]] = {
     "path": TypeAdapter(NotePath),
@@ -553,12 +572,16 @@ class _Entry:
     binds: dict[str, str]
 
     def takes(self, intent: Intent) -> bool:
-        """Exact string comparison: no case folding, Unicode or URL normalisation."""
+        """Exact string comparison of bound targets (no case folding, Unicode or URL
+        normalisation); a link is compared with its `link_prefix` by `_link_under`."""
         if intent.type not in self.types:
             return False
         if isinstance(intent, NotifyPush):
             prefix = self.binds.get("link_prefix")
             return intent.link is None or (prefix is not None and _link_under(intent.link, prefix))
+        if isinstance(intent, TaskCreate) and intent.link is not None:
+            prefix = self.binds.get("link_prefix")
+            return prefix is not None and _link_under(intent.link, prefix)
         bound = TARGET_FIELDS.get(intent.type)
         return bound is None or self.binds.get(bound) == getattr(intent, bound)
 
@@ -623,11 +646,11 @@ def _clean_path(path: str, *, prefix: bool) -> bool:
     return all(segment not in ("", ".", "..") for segment in segments)
 
 
-def _check_link_prefix(prefix: str) -> str:
-    """`prefix` if it is a safe `link_prefix`; `ValueError` otherwise."""
+def _check_link_prefix(prefix: str, schemes: frozenset[str] = _LINK_SCHEMES) -> str:
+    """`prefix` if it is a safe `link_prefix` with one of `schemes`; `ValueError` otherwise."""
     parts = urlsplit(prefix)
     if (
-        parts.scheme not in _LINK_SCHEMES
+        parts.scheme not in schemes
         or not parts.netloc
         or "@" in parts.netloc
         or "?" in prefix
@@ -639,13 +662,36 @@ def _check_link_prefix(prefix: str) -> str:
     return prefix
 
 
+def _authority(parts: SplitResult) -> tuple[str, int | None] | None:
+    """The authority `_link_under` compares: for `https`, the host lowercased without one
+    trailing dot and the port (`None` for none or the default `443`); for another scheme,
+    the netloc exactly. `None` if it is invalid (user info, a bad port, no host)."""
+    if parts.scheme != "https":
+        return parts.netloc, None
+    try:
+        port = parts.port
+    except ValueError:
+        return None
+    host = parts.hostname
+    if "@" in parts.netloc or not host:
+        return None
+    if host.endswith("."):
+        host = host[:-1]
+    return (host, None if port == 443 else port) if host else None
+
+
 def _link_under(link: str, prefix: str) -> bool:
-    """`link` falls under `prefix` (a `_check_link_prefix`-valid prefix), compared parsed."""
+    """`link` falls under `prefix` (a `_check_link_prefix`-valid prefix), compared parsed:
+    the same scheme and authority (`_authority`), and a clean rest of path under the prefix's
+    path (case-sensitive). Shared by `notify.push` and `task.create` links."""
     try:
         got, want = urlsplit(link), urlsplit(prefix)
     except ValueError:
         return False
-    if got.scheme != want.scheme or got.netloc != want.netloc:
+    if got.scheme != want.scheme:
+        return False
+    authority = _authority(got)
+    if authority is None or authority != _authority(want):
         return False
     if not got.path.startswith(want.path):
         return False
@@ -678,6 +724,15 @@ def _entry_binding(
     if not isinstance(mode, str) or mode not in ACT_MODES:
         what = "a missing" if mode is None else "an unknown"
         raise ValueError(f"{ref}: {what} `mode` (one of {', '.join(sorted(ACT_MODES))})")
+    if "link_prefix" in params:
+        if mode != "tasks":
+            raise ValueError(f"{ref}: only a `mode: tasks` entry takes `link_prefix`")
+        try:
+            prefix = _TASK_LINK.validate_python(params["link_prefix"])
+            binds["link_prefix"] = _check_link_prefix(prefix, _TASK_LINK_SCHEMES)
+        except (ValidationError, ValueError):
+            message = "must be an https:// link with a clean path ending in /"
+            raise ValueError(f"{ref}: `link_prefix` {message}") from None
     types = ACT_MODES[mode]
     if not types <= allowed:
         raise ValueError(f"{ref}: plugin may not apply mode {mode} (permissions.intents)")
@@ -938,7 +993,7 @@ class _Run:
         and returned as a `guard_violation` error (nothing of the batch is routed)."""
         raw = _intent_list(raw)
         entries = [entry for entry in self.entries if entry.step > index]
-        unroutable: list[tuple[str, int, str]] = []
+        unroutable: list[tuple[str, int, str, str]] = []
         if isinstance(raw, list):
             raw = [self._fill(payload, i, entries, unroutable) for i, payload in enumerate(raw)]
         try:
@@ -948,7 +1003,7 @@ class _Run:
         except IntentRejected as rejected:
             # An intent whose target could not be filled fails its schema (the target is
             # required): that is a routing error, reported once permissions passed.
-            unfilled = {position for _, position, _ in unroutable}
+            unfilled = {position for _, position, _, _ in unroutable}
             if unroutable and all(
                 r.index in unfilled and r.code == "intent_invalid" for r in rejected.rejections
             ):
@@ -976,12 +1031,13 @@ class _Run:
         routed: list[ProposedIntent] = []
         for position, intent in enumerate(typed):
             if position in unknown:
-                unroutable.append(("intent_unrouted", position, intent.type))
+                unroutable.append(("intent_unrouted", position, intent.type, ""))
                 continue
             takers = [entry for entry in entries if entry.takes(intent)]
             if len(takers) != 1:
                 code = "intent_unrouted" if not takers else "intent_ambiguous"
-                unroutable.append((code, position, intent.type))
+                reason = "" if takers else _unrouted_reason(intent, entries)
+                unroutable.append((code, position, intent.type, reason))
                 continue
             entry = takers[0]
             routed.append(
@@ -1000,7 +1056,10 @@ class _Run:
 
     @staticmethod
     def _fill(
-        payload: Any, position: int, entries: list[_Entry], unroutable: list[tuple[str, int, str]]
+        payload: Any,
+        position: int,
+        entries: list[_Entry],
+        unroutable: list[tuple[str, int, str, str]],
     ) -> Any:
         """`payload` with its omitted target filled from the one entry that binds its type;
         unchanged (and noted in `unroutable`) when no single entry does."""
@@ -1015,7 +1074,7 @@ class _Run:
         takers = [entry for entry in entries if intent_type in entry.types]
         if len(takers) != 1:
             code = "intent_unrouted" if not takers else "intent_ambiguous"
-            unroutable.append((code, position, intent_type))
+            unroutable.append((code, position, intent_type, ""))
             return payload
         return fill_target(payload, takers[0].binds)
 
@@ -1069,10 +1128,28 @@ def _strings(*values: Any) -> frozenset[str]:
     return frozenset(found)
 
 
-def _route_error(source: str, unroutable: list[tuple[str, int, str]]) -> StepError:
-    """Only closed-set values (codes, positions, intent types) are echoed."""
+TASK_LINK_UNROUTED = "task link not under a trusted link_prefix"
+"""Why a `task.create` with a `link` that a `tasks` entry would otherwise take is unrouted."""
+
+
+def _unrouted_reason(intent: Intent, entries: Sequence[_Entry]) -> str:
+    """A fixed reason when nothing takes `intent` only because of its `link`, else `""`."""
+    if (
+        isinstance(intent, TaskCreate)
+        and intent.link is not None
+        and any(intent.type in entry.types for entry in entries)
+    ):
+        return TASK_LINK_UNROUTED
+    return ""
+
+
+def _route_error(source: str, unroutable: list[tuple[str, int, str, str]]) -> StepError:
+    """Only closed-set values (codes, positions, intent types, fixed reasons) are echoed."""
     lines = [f"{source!r} proposed {len(unroutable)} intent(s) no single entry can apply"]
-    lines += [f"#{position} {intent_type} {code}" for code, position, intent_type in unroutable]
+    lines += [
+        f"#{position} {intent_type} {code}" + (f": {reason}" if reason else "")
+        for code, position, intent_type, reason in unroutable
+    ]
     return StepError(kind=unroutable[0][0], message=_cap("\n".join(lines)))
 
 

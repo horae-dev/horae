@@ -133,7 +133,8 @@ class ActStep(Contract):
     validates every intent against the proposing plugin's `permissions.intents`, routes it to
     the one entry whose sink may apply it and whose trusted parameters (a required `mode`, and
     `path` or `url`) bind its target, shows it in a dry run and journals it (rules in
-    `horae.engine.executor`)."""
+    `horae.engine.executor`). A `task.create` `link` is routed only to a `mode: tasks` entry
+    whose trusted `link_prefix` it falls under."""
 
     act: CallList
 

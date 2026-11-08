@@ -43,8 +43,8 @@ cache), after schema validation and before routing:
    set**: an exact string extracted, the same way, from the viewed input the model was shown
    (strings and object keys). Trailing punctuation (`.,;:!?)]}'"*_~` and backtick, at most 16
    characters) may be dropped on either side, so `[a](https://x/p)` matches `https://x/p.` in
-   the input. A `notify.push` `link` must be exactly such a URL (and is also routed only under
-   a trusted `link_prefix`, decision 30).
+   the input. A `notify.push` or `task.create` `link` must be exactly such a URL (and is also
+   routed only under a trusted `link_prefix`, decisions 30 and 52).
 
 7. **The Obsidian rendering surface** (text bound for a note or a notification: every field
    but `http.post`'s `body`). Refused: a code fence (backticks or tildes, behind any spaces,
@@ -79,7 +79,7 @@ import unicodedata
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from typing import Any
 
-from horae.contracts.intents import Intent, IntentType, NotifyPush
+from horae.contracts.intents import Intent, IntentType, NotifyPush, TaskCreate
 from horae.contracts.types import PLUGIN_NAME
 
 GUARD_ERROR = "guard_violation"
@@ -98,8 +98,8 @@ TEXT_FIELDS: Mapping[IntentType, tuple[str, ...]] = {
     "notify.push": ("title", "body"),
     "http.post": ("body",),
 }
-"""The untrusted text fields of each intent type that the guard scans (`notify.push` `link`
-is checked as a whole URL; targets bound by routing are not text)."""
+"""The untrusted text fields of each intent type that the guard scans (a `notify.push` or
+`task.create` `link` is checked as a whole URL; targets bound by routing are not text)."""
 
 INERT_TAGS = frozenset(
     {"b", "i", "u", "s", "em", "strong", "code", "pre", "br", "hr", "p", "ul", "ol", "li"}
@@ -554,7 +554,8 @@ def check_intents(
     known = input_set.__contains__
     for position, intent in enumerate(intents):
         where = f"{source} proposed {intent.type} #{position}"
-        if isinstance(intent, NotifyPush) and intent.link is not None and not known(intent.link):
+        link = intent.link if isinstance(intent, (NotifyPush, TaskCreate)) else None
+        if link is not None and not known(link):
             return _detail(f"{where} with a link not in the input in `link`")
         obsidian = intent.type != "http.post"
         for name, text in _fields(intent):
