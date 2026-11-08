@@ -920,6 +920,13 @@ NOTE_STRUCTURE = [
     ("- > [ ] list then quote", "a task checkbox"),
     ("- - [ ] nested markers", "a task checkbox"),
     ("   * [?] indented", "a task checkbox"),
+    # Tasks reads ordered markers with any number of digits (CommonMark stops at nine)
+    (f"1234567890. [ ] wire money {DUE} 2026-01-01", "a task checkbox"),
+    ("12345678901234567890) [ ] twenty digits", "a task checkbox"),
+    ("> > - [ ] nested callout", "a task checkbox"),
+    ("> [!todo]\n> > > 1234567890. [x] deep", "a task checkbox"),
+    ("\u00a0- [ ] no-break space prefix", "a task checkbox"),
+    ("-\u00a0[ ] no-break space after the marker", "a task checkbox"),
     # Tasks signifiers, with or without U+FE0F, anywhere (also in code)
     (f"wire 5000 EUR {DUE} 2020-01-01", "an Obsidian Tasks signifier"),
     (f"due {DUE}{VS16} 2020-01-01", "an Obsidian Tasks signifier"),
@@ -1012,6 +1019,8 @@ BENIGN_NOTE = [
     "- [link-less] bracket text\n- [] empty brackets\n- [ab] two characters",
     "[x] not a list item",
     "-[ ] no space after the marker",
+    "1234567890.[ ] no space after a long marker",
+    "12a. [ ] not a marker",
     "> quoted text\n> > nested quote",
     "```python\nprint(1)\n```",
     "Emoji \U0001f600 and ⭐ are fine",
@@ -1025,6 +1034,13 @@ def test_benign_markdown_passes_in_note_text(text: str) -> None:
     assert text_problem(text, _known(), note=True) is None
     note = _intents({"type": "note.create", "path": "a.md", "content": text})
     assert check_intents(note, shown=None, source=SOURCE, links="none") is None
+
+
+def test_checkbox_lines_with_tabs_are_refused() -> None:
+    """A tab is a control character (rule 2, refused first); the checkbox walk accepts it too."""
+    for text in ("-\t[ ] tab", "\t- [ ] tab", "1234567890.\t[ ] tab"):
+        assert text_problem(text, _known(), note=True) == "a control or format character"
+        assert note_problem(text) == "a task checkbox"
 
 
 def test_note_structure_rules_read_the_source_only() -> None:

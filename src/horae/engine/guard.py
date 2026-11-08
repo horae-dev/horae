@@ -64,10 +64,12 @@ cache), after schema validation and before routing:
    which would make apply fail); any `[[` (a wikilink); any `::` (a Dataview inline field,
    `key:: v`, `[key:: v]`, `(key:: v)`); any `%%` (an Obsidian comment); any character of
    `SIGNIFIERS` (an Obsidian Tasks signifier, with or without U+FE0F); a task checkbox (a line
-   whose container prefix, spaces, `>` and list markers as in 7, holds a list marker and is
-   followed by `[`, any one character, `]`); and a tag (`#` at the start or after a character
-   other than a letter, digit, `_`, `&`, `\\` or `/`, followed by a tag body that is not only
-   ASCII digits: `#128` passes, `#todo` does not).
+   whose prefix of whitespace, `>` at any depth and list markers, ordered ones with any
+   number of digits, holds a list marker and is followed by `[`, any one character, `]`);
+   and a tag (`#` at the start or after a character other than a letter, digit, `_`, `&`,
+   `\\` or `/`, followed by a tag body that is not only ASCII digits: `#128` passes, `#todo`
+   does not). Every rule but the checkbox is a substring search anywhere in the text, so
+   prefixes, indentation and nesting cannot hide one.
 9. **`links: none`** (a skill option, decision 53): in that skill's `note.*` text, every link
    is refused, whatever the input holds: a URL (6), `](`, `][` and a line's leading
    `[label]:` (not a footnote), on every view.
@@ -490,10 +492,31 @@ def _clicks(line: str, start: int) -> bool:
 
 
 def _checkbox(line: str) -> bool:
-    """A task checkbox: a list item (behind any container prefix) whose content starts with
-    `[`, any one character and `]` (Obsidian Tasks reads any status character)."""
-    at, listed = _prefix(line)
-    return listed and at + 2 < len(line) and line[at] == "[" and line[at + 2] == "]"
+    """A task checkbox: a list item whose content starts with `[`, any one character and `]`
+    (Obsidian Tasks reads any status character). Its own prefix walk, wider than Tasks'
+    `^[\\s>]*([-*+]|[0-9]+[.)]) +\\[.\\]` and than CommonMark (`_prefix` stops ordered
+    markers at nine digits, Tasks does not): any whitespace and `>` (any depth), then list
+    markers with **any number of digits**, each followed by whitespace, repeatedly. Each
+    character is looked at once."""
+    at, size, listed = 0, len(line), False
+    while True:
+        while at < size and (line[at] == ">" or line[at].isspace()):
+            at += 1
+        marker = at
+        while marker < size and line[marker] in string.digits:
+            marker += 1
+        if marker > at:  # an ordered list marker: digits then `.` or `)`
+            if marker == size or line[marker] not in ".)":
+                return False
+            marker += 1
+        elif at < size and line[at] in "-*+":
+            marker = at + 1
+        else:
+            break
+        if marker == size or not line[marker].isspace():
+            return False
+        at, listed = marker, True
+    return listed and at + 2 < size and line[at] == "[" and line[at + 2] == "]"
 
 
 def _has_tag(text: str) -> bool:

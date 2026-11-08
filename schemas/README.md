@@ -2991,11 +2991,17 @@ loosened later without breaking a valid file.
     - **A, note structure** (rule 8 of `horae.engine.guard`). In **every text field of a
       `note.*` intent** (`content`, and `note.append_section`'s `heading`) proposed by an LLM
       skill, refused:
-      - a **task checkbox**: a line whose container prefix (spaces and tabs, blockquote `>`,
-        list markers `-`, `*`, `+`, `1.`, `1)`, repeatedly, as in H2) holds at least one list
-        marker and is followed by `[`, **any one character**, `]` (`- [ ]`, `* [x]`,
-        `+ [/]`, `1. [ ]`, `- []]`, `> - [ ]` in a callout, `- - [ ]`); a space after `]` is
-        not required (conservative). `[x]` without a list marker, `-[ ]` and `- [ab]` pass;
+      - a **task checkbox**: a line whose prefix (any whitespace, `>` at any depth, list
+        markers `-`, `*`, `+` and ordered markers `<digits>.` / `<digits>)` with **any number
+        of digits**, each followed by whitespace, repeatedly) holds at least one list marker
+        and is followed by `[`, **any one character**, `]` (`- [ ]`, `* [x]`, `+ [/]`,
+        `1. [ ]`, `- []]`, `> > - [ ]` in a callout, `- - [ ]`,
+        `1234567890. [ ]`); a space after `]` is not required (conservative). This walk is
+        its own, wider than the Tasks plugin's `^[\s>]*([-*+]|[0-9]+[.)]) +\[.\]`: the
+        CommonMark walker of H2 stops ordered markers at nine digits, which Tasks does not
+        (a security review finding). `[x]` without a list marker, `-[ ]` and `- [ab]` pass.
+        The other rules below are substring searches anywhere in the text, so no prefix,
+        indentation or nesting can hide them;
       - any **Tasks signifier** (`SIGNIFIERS`, with or without U+FE0F) anywhere, not only on a
         task line: a copy of the keys of `horae_sdk.tasks.SIGNIFIERS` (the core does not
         depend on the SDK at run time); `sdk/tests/test_sdk_tasks.py` checks they are equal.
