@@ -237,18 +237,17 @@ jobs:
             exit 1
           fi
           grep -q "required variable HORAE_SECRETS_DIR is missing a value" "${RUNNER_TEMP}/err.txt"
-      - name: Coolify template, with sample magic variables, and without each required one
+      - name: Coolify template, with sample settings, and without each required one
         working-directory: deploy/coolify
         env:
-          SERVICE_FQDN_HORAE: horae.example.test
-          HORAE_SSO_FORWARD_AUTH_URL: http://authentik-server:9000/outpost.goauthentik.io/auth/traefik
+          HORAE_PUBLIC_HOST: horae.example.test
           HORAE_ANTHROPIC_API_KEY: placeholder-not-a-key
           HORAE_MONITOR_DAILY_BRIEF_URL: https://kuma.example.test/api/push/placeholder1
           HORAE_MONITOR_REMIND_URL: https://kuma.example.test/api/push/placeholder2
         run: |
           set -euo pipefail
           docker compose -f docker-compose.yaml config --quiet
-          for name in HORAE_SSO_FORWARD_AUTH_URL HORAE_ANTHROPIC_API_KEY \
+          for name in HORAE_PUBLIC_HOST HORAE_ANTHROPIC_API_KEY \
                       HORAE_MONITOR_DAILY_BRIEF_URL HORAE_MONITOR_REMIND_URL; do
             if env -u "${name}" docker compose -f docker-compose.yaml config --quiet 2> "${RUNNER_TEMP}/err.txt"; then
               echo "::error::rendered without ${name}"

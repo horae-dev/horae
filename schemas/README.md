@@ -2888,8 +2888,12 @@ loosened later without breaking a valid file.
       deliberate bump, not a side effect of a FastAPI update.
     - **Not done (follow-ups)**: `/act` (#38), `api.allowed_hosts` in `horae.yaml`; no ETag
       or conditional requests; no metrics endpoint. Done in #41: the SSO-exemption test
-      against the rendered templates and the network shared only with the proxy
-      (`tests/test_deploy_templates.py`, docs/security.md T15).
+      against the rendered templates (`tests/test_deploy_templates.py`, docs/security.md
+      T15). The network (B): plain compose, one shared only with Traefik; the Coolify
+      template joins `HORAE_TRAEFIK_NETWORK`, by default the reference server's
+      `traefik-network`, which other label-routed apps share (they reach port 8080 without
+      SSO): B holds only once the operator sets it to a network of Horae and the proxy alone
+      (docs/operations/coolify.md, "The proxy network").
 
 ### Provisional decisions (#122, pending maintainer review)
 

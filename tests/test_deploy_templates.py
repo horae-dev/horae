@@ -1,26 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
 """The Coolify template and the plain compose files (#41, docs/security.md T15).
 
-The files are rendered here without Docker: parsed, the Coolify magic variables and the
-operator's settings substituted as Compose does (`${VAR}`, `:-`, `-`, `:?`, `?`, `$$`), and,
-for Coolify, the routers Coolify itself generates for the domain added the way its
-`fqdnLabelsForTraefik` does (coollabsio/coolify `bootstrap/helpers/docker.php`): an `https`
-and an `http` router per domain, `Host() && PathPrefix(/)`, with every middleware the service
-defines by label. Requests are then routed with Traefik's rule: the matching router of
-highest priority (an explicit `priority`, else the length of the rule) wins, after the entry
-point's `http.sanitizePath` (on by default in Traefik v3, which Coolify's proxy runs) cleaned
+The files are rendered here without Docker: parsed, then the operator's settings substituted as
+Compose does (`${VAR}`, `:-`, `-`, `:?`, `?`, `$$`).
+
+The Coolify template is tested in the reference deployment's layout: a Cloudflare Tunnel
+(cloudflared) reaches Traefik's `http` entry point, the routers are the template's own labels
+(Coolify generates none: the service has no domain), and SSO is a forwardAuth middleware and an
+outpost service that Traefik's dynamic file configuration defines once for every app
+(`authentik@file`, `sso@file`), referenced by name. Requests are routed with Traefik's rules: a
+router naming a middleware that no provider defines is refused; among the matching routers of
+the entry point, the one of highest priority (an explicit `priority`, else the length of the
+rule) wins, after the entry point's `http.sanitizePath` (on by default in Traefik v3) cleaned
 the path: percent-decoded, dot segments and repeated slashes removed (Go's `path.Clean`), a
 trailing slash kept.
 
 The threat-model criterion: only `/act/` is exempt from the SSO middleware; `/runs`,
-`/healthz` and everything else require SSO; no router reaches Horae without one of the two.
-CI also runs `docker compose config` on these files (`.github/workflows/ci.yml`, job
+`/healthz` and everything else require SSO; the outpost path goes to the SSO service, never to
+Horae. CI also runs `docker compose config` on these files (`.github/workflows/ci.yml`, job
 `deploy`).
 """
 
 import posixpath
 import re
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -41,17 +44,31 @@ SSO = "horae-sso"
 ACT = "horae-act"
 COOLIFY_UUID = "abcd1234efgh5678ijkl9012"
 
+# Coolify: the routers are named after HORAE_TRAEFIK_NAME (default `horae`); SSO is the file
+# provider's middleware and the outpost its service, as Traefik's dynamic file config defines
+# them on the reference server.
+NAME = "horae"
+FILE_SSO = "authentik@file"
+FILE_OUTPOST = "sso@file"
+FILE_MIDDLEWARES = {
+    FILE_SSO: {
+        "forwardAuth": {
+            "address": "http://authentik-server:9000/outpost.goauthentik.io/auth/traefik",
+            "trustForwardHeader": True,
+            "authResponseHeaders": ["X-authentik-username", "X-authentik-groups"],
+        }
+    }
+}
+FILE_SERVICES = {FILE_OUTPOST: "http://authentik-server:9000/outpost.goauthentik.io"}
+
 COOLIFY_REQUIRED = {
-    "HORAE_SSO_FORWARD_AUTH_URL",
+    "HORAE_PUBLIC_HOST",
     "HORAE_ANTHROPIC_API_KEY",
     "HORAE_MONITOR_DAILY_BRIEF_URL",
     "HORAE_MONITOR_REMIND_URL",
 }
 COOLIFY_ENV = {
-    # Set by Coolify from the domain of the `horae` service (SERVICE_URL_HORAE_8080).
-    "SERVICE_FQDN_HORAE": FQDN,
-    "SERVICE_URL_HORAE": f"https://{FQDN}",
-    "HORAE_SSO_FORWARD_AUTH_URL": SSO_URL,
+    "HORAE_PUBLIC_HOST": FQDN,
     "HORAE_ANTHROPIC_API_KEY": "synthetic-anthropic-key-for-tests",
     "HORAE_MONITOR_DAILY_BRIEF_URL": "https://kuma.example.test/api/push/synthetic1",
     "HORAE_MONITOR_REMIND_URL": "https://kuma.example.test/api/push/synthetic2",
@@ -59,7 +76,13 @@ COOLIFY_ENV = {
 
 # Paths that must go through SSO. `/act` (no slash) and look-alikes are not `/act/`; the
 # traversals are cleaned by Traefik's `sanitizePath` before routing (to `/runs`).
-TRAVERSALS = ("/act/../runs", "/act/%2e%2e/runs", "/act/..%2Fruns", "//act/../runs")
+TRAVERSALS = (
+    "/act/../runs",
+    "/act/%2e%2e/runs",
+    "/act/..%2Fruns",
+    "//act/../runs",
+    "/outpost.goauthentik.io/../runs",
+)
 SSO_PATHS = (
     "/",
     "/runs",
@@ -69,9 +92,15 @@ SSO_PATHS = (
     "/act",
     "/actx",
     "/ACT/x",
+    "/outpost.goauthentik.io",
     *TRAVERSALS,
 )
 ACT_PATHS = ("/act/", "/act/token123")
+OUTPOST_PATHS = (
+    "/outpost.goauthentik.io/start?rd=https%3A%2F%2Fhorae.example.test%2Fruns",
+    "/outpost.goauthentik.io/callback?code=x",
+    "/act/../outpost.goauthentik.io/start",
+)
 
 
 class MissingVariable(Exception):
@@ -152,39 +181,33 @@ def label_middlewares(labels: Mapping[str, str]) -> list[str]:
 
 
 def coolify_generated_labels(
-    service_labels: Mapping[str, str],
     *,
-    force_https: bool,
     service: str = "horae",
-    port: int,
+    port: int = 8080,
     fqdn: str = FQDN,
     uuid: str = COOLIFY_UUID,
 ) -> dict[str, str]:
-    """The labels Coolify adds for an `https://<fqdn>` domain with no path (gzip on)."""
+    """The routers Coolify adds when a service has an `https://<fqdn>` domain (its
+    `fqdnLabelsForTraefik`, coollabsio/coolify `bootstrap/helpers/docker.php`): `https` and
+    `http`, `Host() && PathPrefix(/)`, with only gzip, since the template defines no middleware
+    by label. The template's service has no domain: this is the misconfiguration."""
     https = f"https-0-{uuid}-{service}"
     http = f"http-0-{uuid}-{service}"
     rule = f"Host(`{fqdn}`) && PathPrefix(`/`)"
-    middlewares = ["gzip-sse", *label_middlewares(service_labels)]
-    labels = {
-        "traefik.enable": "true",
-        "traefik.http.middlewares.gzip-sse.compress.excludedcontenttypes": "text/event-stream",
-        "traefik.http.middlewares.redirect-to-https.redirectscheme.scheme": "https",
+    return {
+        "traefik.http.middlewares.gzip.compress": "true",
         f"traefik.http.routers.{https}.rule": rule,
         f"traefik.http.routers.{https}.entryPoints": "https",
         f"traefik.http.routers.{https}.service": https,
         f"traefik.http.services.{https}.loadbalancer.server.port": str(port),
-        f"traefik.http.routers.{https}.middlewares": ",".join(middlewares),
+        f"traefik.http.routers.{https}.middlewares": "gzip",
         f"traefik.http.routers.{https}.tls": "true",
-        f"traefik.http.routers.{https}.tls.certresolver": "letsencrypt",
         f"traefik.http.routers.{http}.rule": rule,
         f"traefik.http.routers.{http}.entryPoints": "http",
         f"traefik.http.services.{http}.loadbalancer.server.port": str(port),
         f"traefik.http.routers.{http}.service": http,
-        f"traefik.http.routers.{http}.middlewares": (
-            "redirect-to-https" if force_https else ",".join(middlewares)
-        ),
+        f"traefik.http.routers.{http}.middlewares": "gzip",
     }
-    return labels
 
 
 @dataclass(frozen=True)
@@ -256,12 +279,23 @@ def test_sanitize_path_models_traefik() -> None:
     assert sanitize_path("/runs?limit=5") == "/runs?limit=5"
 
 
-def route(routers: Mapping[str, Router], entrypoint: str, host: str, path: str) -> Router | None:
+def route(
+    routers: Mapping[str, Router],
+    entrypoint: str,
+    host: str,
+    path: str,
+    *,
+    middlewares: Collection[str] | None = None,
+) -> Router | None:
+    """The router Traefik serves `path` with. `middlewares`, when given, are the middleware
+    names the providers define: a router naming any other one is refused by Traefik."""
     path = sanitize_path(path)
     candidates = [
         r
         for r in routers.values()
-        if entrypoint in r.entrypoints and rule_matches(r.rule, host, path)
+        if entrypoint in r.entrypoints
+        and rule_matches(r.rule, host, path)
+        and (middlewares is None or set(r.middlewares) <= set(middlewares))
     ]
     if not candidates:
         return None
@@ -275,25 +309,31 @@ def coolify_rendered(
     env: Mapping[str, str] = COOLIFY_ENV,
     *,
     escape_labels: bool = False,
-    force_https: bool = True,
-    uuid: str = COOLIFY_UUID,
+    extra_labels: Mapping[str, str] | None = None,
 ) -> tuple[dict[str, Any], dict[str, str]]:
-    """The Coolify file as deployed: the generated labels merged in, then interpolated.
+    """The Coolify file as deployed, interpolated.
 
     `escape_labels` is Coolify's "Escape special characters in labels" (on by default): every
-    `$` of the service's own labels becomes `$$`, so their variables stay literal."""
+    `$` of the service's labels becomes `$$`, so their variables stay literal. `extra_labels`
+    are labels Coolify adds (generated routers, for a misconfiguration)."""
     data = load(COOLIFY)
     service = data["services"]["horae"]
-    own = labels_of(service)
+    raw = [str(item) for item in service["labels"]]
     if escape_labels:
-        own = {key: value.replace("$", "$$") for key, value in own.items()}
-    generated = coolify_generated_labels(
-        own, force_https=force_https, port=8080, fqdn=env.get("SERVICE_FQDN_HORAE", FQDN), uuid=uuid
-    )
-    merged = {**own, **generated}
-    service["labels"] = [f"{key}={value}" for key, value in merged.items()]
+        raw = [item.replace("$", "$$") for item in raw]
+    raw += [f"{key}={value}" for key, value in (extra_labels or {}).items()]
+    service["labels"] = raw
     rendered = render(data, env)
     return rendered, labels_of(rendered["services"]["horae"])
+
+
+def provided_middlewares(
+    labels: Mapping[str, str], file_middlewares: Collection[str] = tuple(FILE_MIDDLEWARES)
+) -> set[str]:
+    """What a router of these labels may name: the file provider's middlewares and the ones
+    the labels define (`name` or `name@docker`)."""
+    defined = set(label_middlewares(labels))
+    return set(file_middlewares) | defined | {f"{name}@docker" for name in defined}
 
 
 def compose_rendered(*, traefik: bool, env: Mapping[str, str]) -> dict[str, Any]:
@@ -363,29 +403,147 @@ def assert_only_act_bypasses_sso(
 # --- Coolify ---------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("force_https", [True, False])
-def test_coolify_only_act_is_exempt_from_sso(force_https: bool) -> None:
-    _, labels = coolify_rendered(force_https=force_https)
-    assert_only_act_bypasses_sso(labels, "https", ("http",))
+def assert_coolify_only_act_is_exempt(
+    labels: Mapping[str, str],
+    *,
+    name: str = NAME,
+    host: str = FQDN,
+    entrypoint: str = "http",
+    sso: str = FILE_SSO,
+    outpost: str = FILE_OUTPOST,
+) -> None:
+    """The file provider defines `sso` (a middleware) and `outpost` (a service)."""
+    routers = routers_of(labels)
+    middlewares = provided_middlewares(labels, {sso})
+    # Structure: the template's three routers, every one of them on the public host.
+    main, act, out = routers[name], routers[f"{name}-act"], routers[f"{name}-outpost"]
+    assert main.rule == f"Host(`{host}`)"
+    assert main.middlewares == (sso,)
+    assert main.service == name
+    assert act.rule == f"Host(`{host}`) && PathPrefix(`/act/`)"
+    assert act.middlewares == ()
+    assert act.service == name
+    assert out.rule == f"Host(`{host}`) && PathPrefix(`/outpost.goauthentik.io/`)"
+    assert out.service == outpost
+    assert act.priority > main.priority
+    assert out.priority > main.priority
+    # Any router that reaches Horae without SSO is the /act/ router.
+    for router in routers.values():
+        if router.service == name and sso not in router.middlewares:
+            assert router.name == act.name, router
+    # Behaviour: what each request reaches.
+    for path in SSO_PATHS:
+        reached = route(routers, entrypoint, host, path, middlewares=middlewares)
+        assert reached is not None, path
+        assert reached.service == name, (path, reached)
+        assert sso in reached.middlewares, (path, reached)
+    for path in ACT_PATHS:
+        reached = route(routers, entrypoint, host, path, middlewares=middlewares)
+        assert reached is not None, path
+        assert reached.name == act.name, (path, reached)
+    for path in OUTPOST_PATHS:
+        reached = route(routers, entrypoint, host, path, middlewares=middlewares)
+        assert reached is not None, path
+        assert reached.service == outpost, (path, reached)
 
 
-def test_coolify_the_template_defines_no_other_middleware() -> None:
-    # Coolify adds every label-defined middleware to the routers it generates: only SSO here.
-    assert label_middlewares(labels_of(load(COOLIFY)["services"]["horae"])) == [SSO]
+def test_coolify_only_act_is_exempt_from_sso() -> None:
+    _, labels = coolify_rendered()
+    assert_coolify_only_act_is_exempt(labels)
+    assert routers_of(labels)[f"{NAME}-outpost"].service in FILE_SERVICES
+    assert labels["traefik.enable"] == "true"
+    for router in routers_of(labels).values():
+        assert router.entrypoints == ("http",), router  # cloudflared reaches Traefik on `http`
+    for key, value in labels.items():
+        if key.endswith(".tls"):
+            assert value == "false", key  # Cloudflare terminates TLS
 
 
-def test_coolify_with_escaped_labels_everything_fails_closed() -> None:
-    # Coolify's default escapes `$` in labels: the /act/ router's host stays literal and never
-    # matches, so /act/ falls back to the SSO router (whose forwardAuth address is literal too:
-    # Traefik refuses the requests). Nothing is exposed.
+def test_coolify_nothing_is_routed_on_another_entrypoint_or_host() -> None:
+    _, labels = coolify_rendered()
+    routers = routers_of(labels)
+    for path in SSO_PATHS + ACT_PATHS + OUTPOST_PATHS:
+        assert route(routers, "https", FQDN, path) is None, path
+        assert route(routers, "http", "other.example.test", path) is None, path
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"HORAE_TRAEFIK_ENTRYPOINT": "websecure", "HORAE_TRAEFIK_TLS": "true"},
+        {"HORAE_SSO_MIDDLEWARE": "sso-auth@file", "HORAE_SSO_OUTPOST_SERVICE": "outpost@file"},
+        {"HORAE_TRAEFIK_NAME": "horae-two"},
+    ],
+)
+def test_coolify_settings_keep_only_act_exempt(settings: dict[str, str]) -> None:
+    _, labels = coolify_rendered({**COOLIFY_ENV, **settings})
+    assert_coolify_only_act_is_exempt(
+        labels,
+        name=settings.get("HORAE_TRAEFIK_NAME", NAME),
+        entrypoint=settings.get("HORAE_TRAEFIK_ENTRYPOINT", "http"),
+        sso=settings.get("HORAE_SSO_MIDDLEWARE", FILE_SSO),
+        outpost=settings.get("HORAE_SSO_OUTPOST_SERVICE", FILE_OUTPOST),
+    )
+    tls = {value for key, value in labels.items() if key.endswith(".tls")}
+    assert tls == {settings.get("HORAE_TRAEFIK_TLS", "false")}
+
+
+def test_coolify_the_sso_middleware_is_never_empty() -> None:
+    # `:-`: unset or empty, the main router still names the shared middleware.
+    for value in (None, ""):
+        env = dict(COOLIFY_ENV)
+        if value is not None:
+            env["HORAE_SSO_MIDDLEWARE"] = value
+        _, labels = coolify_rendered(env)
+        assert routers_of(labels)[NAME].middlewares == (FILE_SSO,)
+
+
+def test_coolify_the_template_defines_no_middleware() -> None:
+    # SSO is the file provider's middleware, named; the template defines none by label (Coolify
+    # would add a label-defined middleware to routers it generates, and a second definition of
+    # the forwardAuth per app is what the shared one avoids).
+    labels = labels_of(load(COOLIFY)["services"]["horae"])
+    assert label_middlewares(labels) == []
+    assert not any(key.startswith("traefik.http.middlewares.") for key in labels)
+
+
+def test_coolify_a_missing_shared_middleware_fails_closed() -> None:
+    # The file provider lacks the named middleware (a typo, or authentik's file config is
+    # gone): Traefik refuses the main router; only /act/ and the outpost path are served.
+    _, labels = coolify_rendered({**COOLIFY_ENV, "HORAE_SSO_MIDDLEWARE": "typo@file"})
+    routers = routers_of(labels)
+    for path in SSO_PATHS:
+        reached = route(routers, "http", FQDN, path, middlewares=set(FILE_MIDDLEWARES))
+        assert reached is None or reached.service != NAME, (path, reached)
+
+
+def test_coolify_with_escaped_labels_nothing_is_served() -> None:
+    # Coolify's default escapes `$` in labels: hosts, entry points, names and the middleware
+    # stay literal `${...}`: no router matches, nothing is served.
     _, labels = coolify_rendered(escape_labels=True)
     routers = routers_of(labels)
-    assert "${SERVICE_FQDN_HORAE}" in routers[ACT].rule
-    assert labels[f"traefik.http.middlewares.{SSO}.forwardauth.address"].startswith("${")
-    for path in SSO_PATHS + ACT_PATHS:
-        reached = route(routers, "https", FQDN, path)
+    assert routers
+    for router in routers.values():
+        assert "${HORAE_PUBLIC_HOST" in router.rule, router
+    for path in SSO_PATHS + ACT_PATHS + OUTPOST_PATHS:
+        for entrypoint in ("http", "https"):
+            assert route(routers, entrypoint, FQDN, path) is None, path
+
+
+def test_coolify_a_domain_set_by_mistake_does_not_bypass_sso_on_the_public_host() -> None:
+    # A domain on the service makes Coolify generate `Host() && PathPrefix(/)` routers with no
+    # SSO. On the public host the template's routers still win (explicit priorities above any
+    # rule length); on another host the generated routers are open, which the guide warns of.
+    _, labels = coolify_rendered(extra_labels=coolify_generated_labels())
+    routers = routers_of(labels)
+    generated = [r for r in routers.values() if r.name.startswith(("http-0-", "https-0-"))]
+    assert generated
+    assert all(r.priority < routers[NAME].priority for r in generated)
+    middlewares = provided_middlewares(labels)
+    for path in SSO_PATHS:
+        reached = route(routers, "http", FQDN, path, middlewares=middlewares)
         assert reached is not None, path
-        assert SSO in reached.middlewares, path
+        assert FILE_SSO in reached.middlewares, (path, reached)
 
 
 def test_coolify_required_variables_use_the_bare_required_form() -> None:
@@ -412,31 +570,29 @@ def test_coolify_a_missing_required_variable_blocks_the_deployment(name: str, un
         coolify_rendered(env)
 
 
-def test_coolify_allowed_hosts_come_from_the_domain() -> None:
+def test_coolify_allowed_hosts_are_the_public_host() -> None:
     raw = env_of(load(COOLIFY)["services"]["horae"])
-    assert "SERVICE_URL_HORAE_8080" in raw  # the domain routes to port 8080
-    assert raw["HORAE_ALLOWED_HOSTS"] == "${SERVICE_FQDN_HORAE}"
+    assert raw["HORAE_ALLOWED_HOSTS"] == "${HORAE_PUBLIC_HOST:?}"
+    # No Coolify domain: no SERVICE_URL_* / SERVICE_FQDN_* (they would give the service one).
+    assert "SERVICE_" not in COOLIFY.read_text(encoding="utf-8").split("services:", 1)[1]
     rendered, _ = coolify_rendered()
     env = env_of(rendered["services"]["horae"])
     assert env["HORAE_ALLOWED_HOSTS"] == FQDN
     assert env["HORAE_SCHEDULER"] == "external"
 
 
-def test_coolify_publishes_no_port_and_stays_on_its_own_network() -> None:
+def test_coolify_publishes_no_port_and_joins_the_proxy_network() -> None:
     data = load(COOLIFY)
-    assert "networks" not in data
     for name, service in data["services"].items():
         assert "ports" not in service, name
-        assert "networks" not in service, name
         assert "network_mode" not in service, name
-
-
-def test_coolify_act_router_leaves_the_certificate_to_coolify() -> None:
-    # TLS on, no resolver named: the certificate is the domain's, obtained by the router Coolify
-    # generates for it with the server's resolver (Traefik picks certificates by SNI).
-    labels = labels_of(load(COOLIFY)["services"]["horae"])
-    assert labels[f"traefik.http.routers.{ACT}.tls"] == "true"
-    assert not any(key.endswith(".certresolver") for key in labels)
+    assert "networks" not in data["services"]["horae-init"]  # its own network only
+    rendered, labels = coolify_rendered()
+    assert rendered["services"]["horae"]["networks"] == ["default", "proxy"]
+    assert rendered["networks"] == {"proxy": {"external": True, "name": "traefik-network"}}
+    assert labels["traefik.docker.network"] == "traefik-network"
+    other, labels = coolify_rendered({**COOLIFY_ENV, "HORAE_TRAEFIK_NETWORK": "horae-proxy"})
+    assert other["networks"]["proxy"]["name"] == labels["traefik.docker.network"] == "horae-proxy"
 
 
 def _traefik_names(labels: Mapping[str, str]) -> set[tuple[str, str]]:
@@ -448,21 +604,21 @@ def _traefik_names(labels: Mapping[str, str]) -> set[tuple[str, str]]:
     return names
 
 
-def test_coolify_template_names_are_fixed_one_horae_per_server() -> None:
-    # Coolify substitutes no per-resource value into labels (COOLIFY_RESOURCE_UUID is only
-    # in the containers' environment, not in the `.env` that Compose interpolates; the
-    # SERVICE_NAME_* values are the compose service names): the template's own names are
-    # fixed, so docs/operations/coolify.md says one Horae per Coolify server. If this set
-    # changes, update the doc and the two-instance test below.
-    labels = labels_of(load(COOLIFY)["services"]["horae"])
-    assert _traefik_names(labels) == {("middlewares", SSO), ("routers", ACT), ("services", ACT)}
+def test_coolify_every_traefik_name_carries_the_resource_name() -> None:
+    _, labels = coolify_rendered({**COOLIFY_ENV, "HORAE_TRAEFIK_NAME": "horae-two"})
+    names = _traefik_names(labels)
+    assert names == {
+        ("routers", "horae-two"),
+        ("routers", "horae-two-act"),
+        ("routers", "horae-two-outpost"),
+        ("services", "horae-two"),
+    }
 
 
 def _merge_like_traefik(*containers: Mapping[str, str]) -> dict[str, str]:
     """Traefik's Docker provider across containers: an element (router, middleware, service)
     defined by several containers with different configurations is dropped ("defined multiple
-    times with different configurations"); a router whose middleware is missing is not
-    served."""
+    times with different configurations")."""
     by_name: dict[tuple[str, str], list[dict[str, str]]] = {}
     for labels in containers:
         for kind, name in _traefik_names(labels):
@@ -473,34 +629,55 @@ def _merge_like_traefik(*containers: Mapping[str, str]) -> dict[str, str]:
     for configs in by_name.values():
         if all(config == configs[0] for config in configs):
             merged.update(configs[0])
-    middlewares = {name for kind, name in _traefik_names(merged) if kind == "middlewares"}
-    for name, router in routers_of(merged).items():
-        if not set(router.middlewares) <= middlewares:
-            for key in [k for k in merged if k.startswith(f"traefik.http.routers.{name}.")]:
-                del merged[key]
     return merged
 
 
-@pytest.mark.parametrize("same_sso", [True, False])
-def test_coolify_a_second_horae_on_the_server_fails_closed(same_sso: bool) -> None:
-    second_fqdn = "second.example.test"
-    _, first = coolify_rendered()
-    env = {
-        **COOLIFY_ENV,
-        "SERVICE_FQDN_HORAE": second_fqdn,
-        "SERVICE_URL_HORAE": f"https://{second_fqdn}",
-        "HORAE_SSO_FORWARD_AUTH_URL": SSO_URL if same_sso else SSO_URL + "?other",
-    }
-    # The second resource has its own UUID: its generated routers do not clash.
-    _, second = coolify_rendered(env, uuid="zyxw9876vuts5432rqpo1098")
-    routers = routers_of(_merge_like_traefik(first, second))
-    assert ACT not in routers  # dropped: the two `horae-act` routers differ (their hosts)
-    for host in (FQDN, second_fqdn):
+def test_coolify_two_horae_with_the_same_name_fail_closed() -> None:
+    second = "second.example.test"
+    _, first_labels = coolify_rendered()
+    _, second_labels = coolify_rendered({**COOLIFY_ENV, "HORAE_PUBLIC_HOST": second})
+    routers = routers_of(_merge_like_traefik(first_labels, second_labels))
+    assert not routers  # every router differs by its host: all dropped
+    for host in (FQDN, second):
         for path in SSO_PATHS + ACT_PATHS:
-            reached = route(routers, "https", host, path)
-            # Nothing at all (the SSO middleware clashed), or the SSO router: never Horae
-            # without SSO.
-            assert reached is None or SSO in reached.middlewares, (host, path, reached)
+            assert route(routers, "http", host, path) is None, (host, path)
+
+
+def test_coolify_two_horae_with_their_own_names_both_work() -> None:
+    second = "second.example.test"
+    _, first_labels = coolify_rendered()
+    env = {**COOLIFY_ENV, "HORAE_PUBLIC_HOST": second, "HORAE_TRAEFIK_NAME": "horae-two"}
+    _, second_labels = coolify_rendered(env)
+    merged = _merge_like_traefik(first_labels, second_labels)
+    assert_coolify_only_act_is_exempt(merged)
+    assert_coolify_only_act_is_exempt(merged, name="horae-two", host=second)
+
+
+def forward_auth_sees_uri(
+    request_uri: str, client_headers: Mapping[str, str], *, peer_trusted: bool
+) -> str:
+    """The X-Forwarded-Uri the SSO provider decides on, with `trustForwardHeader: true`.
+
+    The entry point removes the X-Forwarded-* headers of a peer it does not trust
+    (`forwardedHeaders.trustedIPs` / `insecure`); forwardAuth then keeps a remaining
+    X-Forwarded-Uri (trustForwardHeader) or sets the URI Traefik received."""
+    headers = dict(client_headers)
+    if not peer_trusted:
+        headers = {k: v for k, v in headers.items() if not k.lower().startswith("x-forwarded-")}
+    return headers.get("X-Forwarded-Uri", request_uri)
+
+
+def test_the_shared_middleware_trusts_forward_headers_only_safely_behind_an_untrusted_peer() -> (
+    None
+):
+    # The reference server: no trustedIPs, no insecure on any entry point, so cloudflared is
+    # an untrusted peer and a client's spoofed X-Forwarded-Uri never reaches the provider.
+    assert FILE_MIDDLEWARES[FILE_SSO]["forwardAuth"]["trustForwardHeader"] is True
+    spoofed = {"X-Forwarded-Uri": "/act/x", "X-Forwarded-Host": "other.example.test"}
+    assert forward_auth_sees_uri("/runs", spoofed, peer_trusted=False) == "/runs"
+    # The condition the guide and T15 warn of: cloudflared's network in trustedIPs (or
+    # `insecure`) and the client's value is what the provider decides on.
+    assert forward_auth_sees_uri("/runs", spoofed, peer_trusted=True) == "/act/x"
 
 
 def test_the_image_default_is_written_once_per_file_and_agrees() -> None:
