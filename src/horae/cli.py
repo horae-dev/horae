@@ -386,6 +386,7 @@ def _diff(instance: Path, run_id: str, vault: Path | None, json_output: bool, co
                         sinks,
                         notified=notified,
                         call_timeout_s=config.plugin_defaults.call_timeout_s,
+                        timezone=config.timezone,
                     )
 
             changes = asyncio.run(plan())

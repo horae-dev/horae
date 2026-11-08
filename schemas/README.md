@@ -3319,3 +3319,25 @@ loosened later without breaking a valid file.
     - **E, compatibility.** Additive: an optional field with a default. Older cores reading a
       manifest with `optional_secrets` refuse it (`additionalProperties: false`), as for any
       new field.
+
+### Provisional decisions (#137, pending maintainer review)
+
+57. **`notify.push` takes an optional stable `key` (#137).** A compatible v1 addition. `key` is a `Fingerprint`
+    (`^[A-Za-z0-9._:-]{1,128}$`).
+    - **A, key.** Without `key` the `dedupe_key` is unchanged (decision 30): the SHA-256 of
+      pipeline, routing entry, `input_hash` or run id, intent and occurrence. A pipeline
+      without an LLM step has no `input_hash`, so a reminder re-proposed every 5 minutes got
+      a new key each run. With `key`, the `dedupe_key` is the SHA-256 of (pipeline, routing
+      entry, `key`, the local date of the run's `started_at` in the instance `timezone`):
+      the text, the input, the run and the occurrence no longer count. The same keyed
+      notification proposed by many runs on one local day is recorded once; the next local
+      day (DST days are 23 or 25 h long, the date is the calendar date in the zone) it is
+      sent again.
+    - **B, skipping.** Unchanged mechanism: `plan_changes(notified=)` marks the key
+      `duplicate` (information, not a problem) and `apply_changes` skips it, without a
+      journal entry, listing it in `ApplyResult.duplicates`. Two keyed notifications with the
+      same key and entry in one run are one send.
+    - **C, compatibility.** `key` is absent from the identity of a notification without it,
+      so upgrading re-sends nothing. `horae_sdk.intents.notify_push(..., key=None)` builds it.
+    - **Follow-up.** plugin-ntfy keeps its own `dedupe: daily` derivation until its callers
+      pass `key`; obsidian.reminders should set `key` to the reminder's stable id.

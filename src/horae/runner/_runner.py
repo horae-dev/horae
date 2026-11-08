@@ -618,7 +618,11 @@ class Runner:
                 state.applying = True
                 timeout_s = self.instance.config.plugin_defaults.call_timeout_s
                 planned = await plan_changes(
-                    record, sinks, notified=notified, call_timeout_s=timeout_s
+                    record,
+                    sinks,
+                    notified=notified,
+                    call_timeout_s=timeout_s,
+                    timezone=self.instance.config.timezone,
                 )
                 result = await apply_changes(
                     record,
