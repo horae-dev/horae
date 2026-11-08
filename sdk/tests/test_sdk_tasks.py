@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Obsidian Tasks title escaping (threat model T02, #42): builders and Tasks sinks."""
 
+import hashlib
 import re
 from urllib.parse import unquote
 
@@ -22,6 +23,7 @@ from horae_sdk.tasks import (
     is_task_link,
     link_destination,
     plain_text,
+    task_block_id,
     task_line,
     task_line_for,
 )
@@ -72,8 +74,9 @@ def test_a_tasks_sink_line_holds_only_its_own_fields() -> None:
     for intent in (raw, {**built}):
         line = task_line_for({**intent, "due": "2026-10-22", "time": "19:00"})
         assert line.startswith("- [ ] ")
-        assert signifiers_in(line) == [DUE, REMINDER]
-        assert line.endswith(f" {DUE} 2026-10-22 {REMINDER} 19:00")
+        assert signifiers_in(line) == [REMINDER, DUE]
+        assert line.endswith(f" {REMINDER} 19:00 {DUE} 2026-10-22")
+        assert tasks_trailing_fields(line) == ["due"]  # Tasks still sees the due date
     # escaping twice is escaping once: the builder's title and the raw one give the same line
     assert task_line_for({**raw, "due": "2026-10-22"}) == task_line_for({**built, "time": None})
 
@@ -95,6 +98,42 @@ def test_task_lines() -> None:
 
     with pytest.raises(ValueError, match="real date"):
         task_line("x", due="2026-02-30")
+
+
+def test_the_reminder_comes_before_the_tasks_date_fields() -> None:
+    line = task_line("Pay", due="2026-10-22", time="19:00")
+    assert line == f"- [ ] Pay {REMINDER} 19:00 {DUE} 2026-10-22"
+    # Tasks reads fields from the end and stops at a signifier it does not know (⏰): written
+    # last, ⏰ would hide 📅; written first, the due date is seen and ⏰ stays description.
+    assert tasks_trailing_fields(line) == ["due"]
+    assert tasks_trailing_fields(f"- [ ] Pay {DUE} 2026-10-22 {REMINDER} 19:00") == []
+    assert tasks_fields(line) == ["emoji due"]
+
+
+def test_the_task_block_id_links_the_line_back_to_its_fingerprint() -> None:
+    block = task_block_id("github:pr:42")
+    assert re.fullmatch(r"h-[0-9a-f]{12}", block)
+    assert block == "h-" + hashlib.sha256(b"github:pr:42").hexdigest()[:12]
+    assert task_block_id("github:pr:42") == block  # stable across runs
+    assert task_block_id("github:pr:43") != block
+    for bad in ("", "a b", "x" * 129, "é", "a\nb", 42):
+        with pytest.raises(ValueError, match="fingerprint"):
+            task_block_id(bad)  # type: ignore[arg-type]
+    line = task_line("Review", due="2026-10-22", time="09:30", link=PR, fingerprint="github:pr:42")
+    assert line == f"- [ ] Review [link]({PR}) {REMINDER} 09:30 {DUE} 2026-10-22 ^{block}"
+    assert tasks_trailing_fields(line) == ["due"]
+    _check_fields(line)
+    assert task_line("x", fingerprint="a:1") == f"- [ ] x ^{task_block_id('a:1')}"
+    intent = intents.task_create(HOSTILE, key="mail:42", due="2026-10-22", time="19:00")
+    assert task_line_for(intent, block_id=True) == task_line(
+        intent["title"], due="2026-10-22", time="19:00", fingerprint="mail:42"
+    )
+    assert not task_line_for(intent).endswith(block)  # off by default (compatible)
+    with pytest.raises(ValueError, match="fingerprint"):
+        task_line_for({"type": "task.create", "title": "x"}, block_id=True)
+    # The title cannot fake the block id: its `^` is escaped and the real one is last.
+    forged = task_line(f"x ^{block}", fingerprint="a:1")
+    assert forged.endswith(f"\\^{block} ^{task_block_id('a:1')}")
 
 
 def test_lines_controls_and_variation_selectors() -> None:
@@ -264,6 +303,29 @@ _OBSIDIAN = {
 }
 
 
+_BLOCK_ID = re.compile(r"\s\^[a-zA-Z0-9-]+$")
+
+
+def tasks_trailing_fields(line: str) -> list[str]:
+    """The fields Tasks reads from `line` as it does: a trailing block id dropped, then one
+    known field (or trailing tag) at a time from the end, stopping at anything else."""
+    rest = _BLOCK_ID.sub("", line).rstrip()
+    found: list[str] = []
+    anchored = {
+        name: re.compile(rf"(?:^|\s){regex}\s*$", re.IGNORECASE)
+        for name, regex in {**_EMOJI_FIELDS, "tag": r"#[^ !@#$%^&*(),.?\":{}|<>]+"}.items()
+    }
+    while True:
+        for name, regex in anchored.items():
+            match = regex.search(rest)
+            if match:
+                found.insert(0, name)
+                rest = rest[: match.start()].rstrip()
+                break
+        else:
+            return found
+
+
 def tasks_fields(line: str) -> list[str]:
     """The Tasks fields and Obsidian constructs found in `line`."""
     found = [name for name, regex in _TASKS_REGEXES.items() if regex.search(line)]
@@ -345,7 +407,7 @@ _URL_CHARS = re.compile(r"[A-Za-z0-9\-._~:/?#@!&'*+,;=%]*")
 def test_a_task_line_renders_the_link_after_the_title() -> None:
     assert task_line("Review PR 42", link=PR) == f"- [ ] Review PR 42 [link]({PR})"
     line = task_line("Review", link=PR + "#c-7", due="2026-10-22", time="19:00", done=True)
-    assert line == f"- [x] Review [link]({PR}#c-7) {DUE} 2026-10-22 {REMINDER} 19:00"
+    assert line == f"- [x] Review [link]({PR}#c-7) {REMINDER} 19:00 {DUE} 2026-10-22"
     intent = intents.task_create("Review", key="github:pr:42", due="2026-10-22", link=PR)
     assert task_line_for(intent) == f"- [ ] Review [link]({PR}) {DUE} 2026-10-22"
     for bad in (
@@ -455,3 +517,65 @@ def test_any_link_text_stays_inert(path: str) -> None:
     link = PR + "?" + path
     if is_task_link(link):
         _check_link(link)
+
+
+# --- reminder order and block id (#127, schemas decision 53) ---------------------------------
+def test_a_hostile_title_fingerprint_and_link_leave_only_the_due_field() -> None:
+    fingerprint = "mail:42"
+    block = task_block_id(fingerprint)
+    title = f"{HOSTILE} \U0001f4c5 2020-01-01 ⏰ 01:00 ^{block} #tag"
+    hostile_link = PR + "/a%20b?q=\U0001f4c5+2020-01-01&r=⏰#x"
+    for done in (False, True):
+        line = task_line(
+            title,
+            due="2030-01-01",
+            time="19:00",
+            link=hostile_link,
+            fingerprint=fingerprint,
+            done=done,
+        )
+        assert line.startswith("- [x] " if done else "- [ ] ")
+        # the ported scan (trailing fields, as Tasks reads them) sees the real due date only
+        assert tasks_trailing_fields(line) == ["due"]
+        assert tasks_fields(_LINK.sub("[link](x)", line)) == ["emoji due"]
+        assert line.endswith(f"{REMINDER} 19:00 {DUE} 2030-01-01 ^{block}")
+        # the block-id pattern matches the real id, at the end, and nothing the title holds
+        assert [m.group(0) for m in re.finditer(r"(?<!\\)\^h-[0-9a-f]{12}", line)] == [f"^{block}"]
+        assert re.search(rf"\s\^{block}$", line)
+        assert line.count(DUE) == 1
+        assert line.count(REMINDER) == 1
+    # without a due date or a reminder, the title still cannot end in a field or a hashtag
+    bare = task_line(title, link=hostile_link, fingerprint=fingerprint)
+    assert tasks_trailing_fields(bare) == []
+    assert tasks_fields(_LINK.sub("[link](x)", bare)) == []
+    assert re.search(r"\\#tag", bare)
+
+
+def test_task_line_for_checks_the_fingerprint_it_turns_into_a_block_id() -> None:
+    base = {"type": "task.create", "title": "x"}
+    for bad in (42, None, b"a:1", ["a:1"], "", "a b", "é:1", "a/b", "a\nb", "x" * 129):
+        with pytest.raises(ValueError, match="fingerprint"):
+            task_line_for({**base, "fingerprint": bad}, block_id=True)
+    # without block_id the fingerprint is not read at all
+    assert task_line_for({**base, "fingerprint": 42}) == "- [ ] x"
+    done = task_line_for({**base, "fingerprint": "a:1"}, block_id=True)
+    assert done == f"- [ ] x ^{task_block_id('a:1')}"
+
+
+def test_a_done_task_keeps_its_block_id_last() -> None:
+    block = task_block_id("a:1")
+    line = task_line_for(
+        {
+            "type": "task.create",
+            "title": "Pay",
+            "fingerprint": "a:1",
+            "due": "2026-10-22",
+            "time": "19:00",
+        },
+        block_id=True,
+    )
+    assert line == f"- [ ] Pay {REMINDER} 19:00 {DUE} 2026-10-22 ^{block}"
+    assert task_line("Pay", due="2026-10-22", time="19:00", fingerprint="a:1", done=True) == (
+        f"- [x] Pay {REMINDER} 19:00 {DUE} 2026-10-22 ^{block}"
+    )
+    assert tasks_trailing_fields(line.replace("[ ]", "[x]")) == ["due"]

@@ -80,6 +80,6 @@ def test_a_tasks_sink_written_with_the_sdk_escapes_titles_end_to_end(tmp_path: P
     asyncio.run(scenario())
     (line,) = (vault / "Tasks.md").read_text(encoding="utf-8").splitlines()
     assert line.startswith("- [ ] Pay &#x1F4C5; 2020-01-01 ")
-    assert signifiers_in(line) == [DUE, REMINDER]
+    assert signifiers_in(line) == [REMINDER, DUE]
     link = "[link](https://code.example.org/acme/app/pull/42%28x%29)"
-    assert line.endswith(f" {link} {DUE} 2026-10-22 {REMINDER} 19:00")
+    assert line.endswith(f" {link} {REMINDER} 19:00 {DUE} 2026-10-22")

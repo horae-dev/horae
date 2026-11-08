@@ -50,7 +50,7 @@ Set `GRAFT_AGENT`, `GRAFT_MODEL` and `GRAFT_TASK` (e.g. `15` or `#15`) before co
 ## Review
 - Graft posts an intent card and applies [`graft.yaml`](graft.yaml).
 - Trivial and small low-risk changes can be approved without a human.
-- Changes touching sensitive paths (`src/horae/permissions/`, `src/horae/plugins/host/`, `src/horae/sandbox/`, `src/horae/marketplace/`, `src/horae/api/act/`, `src/horae/llm/backends/`, `src/horae/secrets/`, `schemas/`, workflows, Dockerfile and `deploy/`), large changes and anything Graft rates `sensitive` need the maintainer.
+- Changes touching sensitive paths (`src/horae/permissions/`, `src/horae/plugins/host/`, `src/horae/sandbox/`, `src/horae/marketplace/`, `src/horae/api/act/`, `src/horae/llm/backends/`, `src/horae/secrets/`, `schemas/`, `sdk/`, workflows, the Dockerfile, `.dockerignore`, `scripts/smoke-image.sh`, `deploy/`, `docs/security.md`, `pyproject.toml`, `uv.lock` and `renovate.json`), large changes and anything Graft rates `sensitive` need the maintainer.
 - Address review comments in new commits; don't force-push over reviewed commits.
 
 ## Definition of done
