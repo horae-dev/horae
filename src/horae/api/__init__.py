@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """The HTTP API (#37, schemas decision 51): `/healthz`, the read-only `/runs`, and the signed
-single-use action links `/act/<token>` (#38, schemas decision 53).
+single-use action links `/act/<token>` (#38, schemas decision 54).
 
 See `horae.api._app` for the routes, the redaction and the headers, `horae.api._server` for
 serving it in `horae serve`'s event loop, and `horae.api.act` for the action links. Imported

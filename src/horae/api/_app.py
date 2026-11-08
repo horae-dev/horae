@@ -360,7 +360,7 @@ def create_app(context: ApiContext) -> FastAPI:
     async def http_error(request: Request, exc: HTTPException) -> Response:
         if exc.status_code == 404 and is_act_path(request.url.path):
             # `/act`, `/act/`, `/act/<a>/<b>`, an encoded `/`...: the same page as every
-            # refused token (decision 53 K), never a hint of another route.
+            # refused token (decision 54 K), never a hint of another route.
             return act_response(act_page.NOT_VALID)
         # Horae's words for the status, never the exception's detail.
         kind, message = _HTTP_ERRORS.get(exc.status_code, ("http_error", "request refused"))

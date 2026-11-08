@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Notification buttons (#38, schemas decision 53 A): `notify.push.actions` in the engine
+"""Notification buttons (#38, schemas decision 54 A): `notify.push.actions` in the engine
 (rule 4, the action guard), the task index the apply phase keeps, the links the core mints
 when it sends a notification (and how the notifier receives them), the minter's conditions,
 `horae serve`'s `/act` setup, `horae doctor`, and an end-to-end tap."""

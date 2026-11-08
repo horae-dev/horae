@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """The `/act` token: a fixed binary payload and its HMAC, one base64url segment (#38, schemas
-decision 53 B).
+decision 54 B).
 
 ```
 token   = b64url(payload || tag)                       (no padding)

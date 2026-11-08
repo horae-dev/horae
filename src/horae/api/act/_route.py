@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Which sink applies an `/act` change (#38, schemas decision 53 F).
+"""Which sink applies an `/act` change (#38, schemas decision 54 F).
 
 A button's change is a `task.update_status` the core builds itself; it is applied by the
 instance's **one** `mode: tasks` `act` entry, as decision 30 routes a `task.update_status`

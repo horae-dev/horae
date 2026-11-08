@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Signed single-use action links, `/act/<token>` (#38, schemas decision 53).
+"""Signed single-use action links, `/act/<token>` (#38, schemas decision 54).
 
 A tap on a notification button changes **one task** in **one predefined way**, once, within
 24 hours, without SSO: the token is the only credential.

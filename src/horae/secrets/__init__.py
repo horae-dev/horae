@@ -161,7 +161,7 @@ class SecretMissing(SecretError):
 CORE_SECRETS = frozenset({"HORAE_ACT_KEY"})
 """The secrets the core itself reads (`SecretResolver.resolve_core`). Their names start with
 `HORAE_`, which `SecretName` reserves for the core, so no `secrets.refs` entry and no plugin can
-name them: `HORAE_ACT_KEY` is the HMAC key of the `/act` links (#38, schemas decision 53)."""
+name them: `HORAE_ACT_KEY` is the HMAC key of the `/act` links (#38, schemas decision 54)."""
 
 
 _SECRET_NAME: TypeAdapter[str] = TypeAdapter(SecretName)

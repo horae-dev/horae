@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The `/act` token and key (#38, schemas decision 53 B, C, E): format, MAC, strict decoding,
+"""The `/act` token and key (#38, schemas decision 54 B, C, E): format, MAC, strict decoding,
 expiry, key id and rotation, and what a token does not carry."""
 
 import base64

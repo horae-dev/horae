@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Minting the `/act` links of a notification's buttons (#38, schemas decision 53 A).
+"""Minting the `/act` links of a notification's buttons (#38, schemas decision 54 A).
 
 Only the core holds the key: a notifier never builds a URL. When the apply phase sends a
 `notify.push` with `actions`, it asks the `LinkMinter` for one link per action: the task must

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The `/act` pages (#38, schemas decision 53 G, K).
+"""The `/act` pages (#38, schemas decision 54 G, K).
 
 Static HTML written by Horae: no script, no external font, image or style, no Open Graph or
 other meta tags a link preview could use, one inline `<style>` allowed by its hash in the
@@ -10,7 +10,7 @@ the note it lives in or anything else from the vault. Every page has the same he
 
 Every refusal of a token (malformed, forged, another key, expired, already used, unknown
 task, a cross-origin `POST`) is the same `NOT_VALID` page with status 404: it does not say
-which check failed (decision 53 K).
+which check failed (decision 54 K).
 """
 
 import base64

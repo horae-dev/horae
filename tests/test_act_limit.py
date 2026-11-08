@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The `/act` rate limit and the client address (#38, schemas decision 53 H; maintainer
+"""The `/act` rate limit and the client address (#38, schemas decision 54 H; maintainer
 decision 9), including the reference deployment: Cloudflare tunnel, then Traefik."""
 
 from pathlib import Path

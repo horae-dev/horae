@@ -417,7 +417,7 @@ def _validator_problems(instance: Instance) -> list[Problem]:
 
 
 def _act_problems(instance: Instance) -> list[Problem]:
-    """The `/act` links (#38, schemas decision 53 C): an error for a `HORAE_ACT_KEY` that is
+    """The `/act` links (#38, schemas decision 54 C): an error for a `HORAE_ACT_KEY` that is
     set but unusable (shorter than 32 bytes, unreadable: `horae serve` refuses to start); a
     warning when the key is set but links cannot be minted (no `http.public_url`, no single
     `mode: tasks` entry): notifications are then sent without buttons."""

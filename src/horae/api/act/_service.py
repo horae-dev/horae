@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""What `GET` and `POST /act/<token>` do (#38, schemas decision 53 D to G, K).
+"""What `GET` and `POST /act/<token>` do (#38, schemas decision 54 D to G, K).
 
 **`preview` (`GET`) writes nothing.** It verifies the token (format, tag, key id, expiry),
 then reads the store **read-only** (`Store.open(read_only=True, immutable=False)`): not yet

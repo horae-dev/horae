@@ -126,7 +126,7 @@ pipeline name never holds `:`, so an eval row never collides with a pipeline's; 
 hides these rows unless `--all`."""
 
 ACT_PIPELINE = "_act"
-"""The reserved pipeline of the `/act` runs (#38, schemas decision 53): a pipeline name never
+"""The reserved pipeline of the `/act` runs (#38, schemas decision 54): a pipeline name never
 starts with `_`; such a row never gets a run record (migration 8)."""
 ActOutcome = Literal["pending", "applied", "stale", "failed"]
 ACT_OUTCOMES: frozenset[str] = frozenset({"pending", "applied", "stale", "failed"})
@@ -1796,7 +1796,7 @@ class Store:
         ).fetchall()
         return [self._task(row) for row in rows]
 
-    # --- /act links (#38, schemas decision 53) ------------------------------------------------
+    # --- /act links (#38, schemas decision 54) ------------------------------------------------
 
     @staticmethod
     def _act_args(nonce: bytes, outcome: str | None = None) -> None:

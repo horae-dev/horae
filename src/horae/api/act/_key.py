@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The `/act` HMAC key (#38, schemas decision 53 C).
+"""The `/act` HMAC key (#38, schemas decision 54 C).
 
 A dedicated secret, `HORAE_ACT_KEY`, never shared with another use, read by
 `SecretResolver.resolve_core` (the file `<secrets.dir>/HORAE_ACT_KEY`, else the environment

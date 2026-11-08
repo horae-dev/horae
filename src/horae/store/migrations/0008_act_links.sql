@@ -1,5 +1,5 @@
 -- SPDX-License-Identifier: Apache-2.0
--- Signed single-use action links (#38, schemas decision 53).
+-- Signed single-use action links (#38, schemas decision 54).
 --
 -- 1. Each `POST /act/<token>` is a run of the reserved pipeline `_act` (a pipeline name never
 --    starts with `_`): a run row, with the journal entry of the task change it applies, that

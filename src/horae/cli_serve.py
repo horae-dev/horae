@@ -13,7 +13,7 @@ the same event loop: `GET /healthz` (store and `Scheduler.state()`), `GET /runs`
 /runs/<id>`, read-only and without authentication of its own, on `--host:--port`
 (`HORAE_HOST`, `HORAE_PORT`; `127.0.0.1:8080` by default; the image sets `0.0.0.0` for the
 reverse proxy, whose SSO middleware guards it), and the signed single-use action links
-`GET` / `POST /act/<token>` (#38, schemas decision 53: on with a usable `HORAE_ACT_KEY`,
+`GET` / `POST /act/<token>` (#38, schemas decision 54: on with a usable `HORAE_ACT_KEY`,
 `horae.yaml` `http.public_url` and one `mode: tasks` entry, else 503; a key set but shorter
 than 32 bytes refuses to start, `config_invalid`). The store is created and migrated once at
 start, so `/healthz` reports it from the first request.
@@ -262,7 +262,7 @@ def prepare_store(instance: Instance) -> None:
 
 
 def build_act(instance: Instance, hosts: frozenset[str]) -> "tuple[ActSetup, str]":
-    """The `/act` links' setup (#38, schemas decision 53) and a line saying whether they are
+    """The `/act` links' setup (#38, schemas decision 54) and a line saying whether they are
     on. On only with a usable `HORAE_ACT_KEY`, `http.public_url` and one `mode: tasks` entry
     whose plugin may apply `task.update_status`; otherwise every `/act` request is 503 (and
     the runs send notifications without buttons). A key that is set but unusable (shorter

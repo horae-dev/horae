@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The `/act/{token}` routes (#38, schemas decision 53 G to K).
+"""The `/act/{token}` routes (#38, schemas decision 54 G to K).
 
 **Exactly `/act/{token}`**, `GET` and `POST` (`HEAD` and the other methods are 405): the
 token is one path segment (Starlette's default converter, which stops at `/`); no path

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""`GET` and `POST /act/<token>` (#38, schemas decision 53): single use, GET consumes nothing,
+"""`GET` and `POST /act/<token>` (#38, schemas decision 54): single use, GET consumes nothing,
 the origin check, the same 404 for every refused token, staleness, the apply lock, the pages
 and their headers, the routing under the SSO-exempt prefix, and no token in any log or store.
 Driven in process (`TestClient`); the concurrent tests use threads and processes."""

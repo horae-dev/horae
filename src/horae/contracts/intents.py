@@ -211,7 +211,7 @@ class TaskUpdateStatus(Contract):
 
 
 ActKind = Literal["task.done", "task.snooze"]
-"""What a notification button does to its task, through `/act` (#38, schemas decision 53):
+"""What a notification button does to its task, through `/act` (#38, schemas decision 54):
 `task.done` applies `task.update_status {status: done}`, `task.snooze` applies `{status:
 snoozed, until}` with `until` computed by the core when the button is pressed."""
 

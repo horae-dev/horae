@@ -93,7 +93,7 @@ when it listens on `0.0.0.0` or `::` without one, and logs each refused `Host` o
 container, change the port with `HORAE_PORT` rather than `--port` (the image's health check
 follows `HORAE_PORT`).
 
-**Action links** ([decision 53](schemas/README.md)). A `notify.push` may carry up to three
+**Action links** ([decision 54](schemas/README.md)). A `notify.push` may carry up to three
 buttons (`actions: [{label, kind: task.done | task.snooze, task, duration: 1h | 3h |
 tomorrow}]`, for tasks the run collected); when it is sent, the core mints for each a signed,
 single-use link `<http.public_url>/act/<token>`, valid 24 hours and bound to the task's

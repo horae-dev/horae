@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The `/act` rate limit (#38, schemas decision 53 H; maintainer decision 9).
+"""The `/act` rate limit (#38, schemas decision 54 H; maintainer decision 9).
 
 In process, before any decoding or store access, for `GET` and `POST`: a token bucket **per
 client IP** (`PER_IP_PER_MIN` requests a minute, a burst of `PER_IP_BURST`) and a **global**
