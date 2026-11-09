@@ -89,15 +89,53 @@ The note lands in the volume's `vault/Daily/`. Compose equivalent: `read_only: t
 `tmpfs: [/tmp]`, `cap_drop: [ALL]`, `security_opt: [no-new-privileges:true]`, a volume on
 `/instance`.
 
-The image has no pip, no ensurepip, no uv and no compiler.
+The image has no pip, no ensurepip and no compiler. It does carry **uv** and **git**, for
+`horae plugin add` only (see below).
 
-Plugins run without uv: each installed plugin has its own venv, built at install time from its
-`uv.lock` and linked to the image's Python (schemas decision 69), and the host sets
-`UV_OFFLINE=1` and `PIP_NO_INDEX=1`. Installing one (`horae plugin add`) needs uv, which the
-image does not ship: inside the container it fails with "uv is not installed" (exit 1). The
-venv links to the interpreter that built it (`/usr/local/bin/python3.12` here), so it must be
-built by this image's Python; giving the image an install-time uv (or an installer variant of
-the image) is a follow-up. The built-in plugins are unaffected: they run from `/opt/venv`.
+### Installing plugins in the container
+
+[#169](https://github.com/horae-dev/horae/issues/169). Plugins run without uv: each installed
+plugin has its own venv, built at install time from its `uv.lock` and linked to the Python that
+built it (schemas decision 69), and the host sets `UV_OFFLINE=1`, `UV_PYTHON_DOWNLOADS=never` and
+`PIP_NO_INDEX=1` in every plugin child (`/usr/local/bin`, where uv lives, is on a plugin's `PATH`, but a uv it
+ran would be offline and could not download an interpreter). Installing one is the only thing
+that uses uv, so the image ships:
+
+- **uv**, copied in the final stage from the same pinned official image the build stage uses
+  (`UV_IMAGE` in the [`Dockerfile`](../../Dockerfile): `ghcr.io/astral-sh/uv:<version>@sha256:<digest>`,
+  a static binary at `/usr/local/bin/uv`). Renovate bumps the tag and digest together, grouped
+  with CI's uv. It is not used by `horae serve`, `run` or any pipeline.
+- **git**, which `horae plugin add` clones marketplace indexes and plugin repositories with
+  (https only, no hook). It brings Perl with it, which is most of the image's size increase.
+
+The venv is built by the image's own interpreter (`/usr/local/bin/python3.12`), so it works in
+that container with no network. Everything it writes is under `/instance`, the one writable
+volume: the plugin tree and its `.venv` in `plugins/<name>`, uv's cache in `state/uv-cache`
+(owned by 10001 like the rest; nothing else is writable, and `/tmp` may stay `noexec`).
+**Installing needs network access** (git over https to the marketplace and the plugin's
+repository, and the package index named in the plugin's `uv.lock`); running does not, and
+`--network none` still works for everything but `plugin add`.
+
+```
+docker compose exec horae horae plugin add obsidian    # compose; Coolify: the Terminal, or docker exec
+```
+
+A plugin installed this way is **not enabled** until `horae.lock` lists it with the permissions
+you approved ([#46](https://github.com/horae-dev/horae/issues/46), PR #168). Until #168 is
+merged `plugin add` only installs and prints the pending notice; once it is, `plugin add`
+shows the plugin's permissions and asks for your approval in the terminal, so use an interactive
+`exec` (`docker compose exec`, or `docker exec -it`). For a reproducible, non-interactive
+install, commit the `horae.lock` of a reviewed install into your instance repository and install
+with `--yes`, which approves only when `horae.lock` already lists that exact version, commit and
+permissions, and is refused otherwise (this part depends on #168 too; the flag does not exist
+before it). Without a terminal and without `--yes` the install is refused. A plugin is installed into the volume, so it survives restarts and
+image upgrades: after an upgrade, the plugin's venv still points at the same interpreter path
+(`/usr/local/bin/python3.12`), which is stable within a Python minor version; a release that
+changes the image's Python minor version says so in its notes, and the plugin must then be
+reinstalled (`horae plugin upgrade`, #47).
+
+The image's size grew by about 53 MB for uv and about 120 MB for git and Perl, so the
+runtime image went from 341 MB to 514 MB (arm64, uncompressed).
 
 ### `horae serve`, the HTTP API and the health check
 
@@ -177,7 +215,7 @@ the digest as well: `HORAE_IMAGE_TAG=<tag>@sha256:<digest>`.
 
 `scripts/smoke-image.sh IMAGE [PLATFORM]` is the CI smoke test: non-root, PID 1 is tini,
 `--version` format (and `EXPECTED_VERSION` if set), a read-only root filesystem probed as root
-against a writable control, no pip/ensurepip/uv/compiler, then `init`, `doctor` and
+against a writable control, no pip/ensurepip/compiler, `uv --version` (the Dockerfile's pin), a plugin venv built inside the container offline (`scripts/smoke-plugin-env.py`: a fixture plugin locked against a local file index, installed by `PluginEnvironment` on the volume, linked to the image's Python, runnable renamed), then `init`, `doctor` and
 `run daily-fixture` on named volumes with no network, and finally the default `horae serve`:
 healthy by the image's own `HEALTHCHECK`, `/runs` answering, exit 0 on `docker stop`. Run it after `docker build -t horae:test .`;
 pull requests run it on native amd64.
