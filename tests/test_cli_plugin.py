@@ -11,7 +11,7 @@ from typer.testing import CliRunner
 
 from horae import cli_plugin
 from horae.cli import app
-from horae.marketplace import MarketplaceClient, PluginInstaller
+from horae.marketplace import MarketplaceClient, PluginInstaller, approval
 from marketplace_fixtures import (
     PLUGIN_URL,
     A,
@@ -196,6 +196,7 @@ def demo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
         cli_plugin, "make_installer", lambda where: LocalInstaller(where, {PLUGIN_URL: repo})
     )
     monkeypatch.setattr(cli_plugin, "interactive", lambda: True)  # approval: tests answer
+    monkeypatch.setattr(approval, "FIRST_PARTY_INDEXES", frozenset({A}))
     return {"good": good, "moved": moved}
 
 

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Permission approval at install (#46, schemas decision 70).
 
-- `require_installable(name, tier)`: before M5 only `first-party` marketplace plugins install
+- `require_installable(name, tier, index)`: before M5 only `first-party` marketplace plugins install
   (docs/security.md T04); a direct install from a git URL (#48) has no tier and passes `None`,
   which is refused the same way. One check for both.
 - `with_grants(asked, hosts, local)`: what the manifest asks for, plus the hosts and
@@ -18,6 +18,7 @@ from collections.abc import Sequence
 
 from pydantic import TypeAdapter, ValidationError
 
+from horae.contracts.instance import DEFAULT_MARKETPLACE
 from horae.contracts.intents import IntentType
 from horae.contracts.lockfile import LockedPlugin
 from horae.contracts.marketplace import Tier
@@ -27,6 +28,11 @@ from horae.marketplace.errors import InvalidReference, TierRefused
 
 INSTALLABLE_TIERS: frozenset[str] = frozenset({"first-party"})
 """The tiers that install while plugins run as plain subprocesses (before M5)."""
+
+FIRST_PARTY_INDEXES: frozenset[str] = frozenset({DEFAULT_MARKETPLACE})
+"""The indexes whose `tier: first-party` is believed. The tier is a claim in the index file,
+so an index the user added (`marketplaces`) cannot vouch for itself: its plugins are refused
+like community ones."""
 
 INTENT_MEANINGS: dict[IntentType, str] = {
     "note.create": "create a new note in your vault (a note Horae owns)",
@@ -47,11 +53,17 @@ _host: TypeAdapter[str] = TypeAdapter(Hostname)
 _local: TypeAdapter[str] = TypeAdapter(LocalEndpoint)
 
 
-def require_installable(name: str, tier: Tier | None) -> None:
-    """`TierRefused` unless `tier` may be installed now. `None` is a direct install (#48)."""
-    if tier in INSTALLABLE_TIERS:
+def require_installable(name: str, tier: Tier | None, index: str | None) -> None:
+    """`TierRefused` unless `tier`, claimed by the index `index`, may be installed now. `None`
+    is a direct install (#48). `first-party` counts only from `FIRST_PARTY_INDEXES`."""
+    if tier in INSTALLABLE_TIERS and index in FIRST_PARTY_INDEXES:
         return
-    what = "a direct install (no marketplace tier)" if tier is None else f"tier {tier!r}"
+    if tier is None:
+        what = "a direct install (no marketplace tier)"
+    elif tier in INSTALLABLE_TIERS:
+        what = f"tier 'first-party' claimed by {index}, which is not the Horae marketplace"
+    else:
+        what = f"tier {tier!r}"
     raise TierRefused(
         f"refusing to install {name}: {what}. Until M5 plugins run as plain subprocesses with "
         "your user's rights, so only first-party marketplace plugins can be installed "

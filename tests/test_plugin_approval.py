@@ -16,9 +16,10 @@ from typer.testing import CliRunner
 from horae import cli_plugin
 from horae.cli import app
 from horae.config import load_instance
+from horae.contracts.instance import DEFAULT_MARKETPLACE
 from horae.contracts.intents import INTENT_TYPES
 from horae.contracts.lockfile import Lockfile
-from horae.marketplace import LockInvalid, MarketplaceClient, TierRefused
+from horae.marketplace import LockInvalid, MarketplaceClient, TierRefused, approval
 from horae.marketplace.approval import INTENT_MEANINGS, require_installable
 from horae.marketplace.install import INSTALL_RECORD
 from horae.marketplace.lock import DEFAULT_HEADER, dump_lock, guard, read_lock
@@ -77,6 +78,7 @@ def market(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
         lambda where: LocalInstaller(where, {PLUGIN_URL: repo, COMMUNITY_URL: other}),
     )
     monkeypatch.setattr(cli_plugin, "interactive", lambda: True)
+    monkeypatch.setattr(approval, "FIRST_PARTY_INDEXES", frozenset({A}))
     return {"first": first, "second": second}
 
 
@@ -371,12 +373,34 @@ def test_a_community_plugin_is_refused_before_m5(inst: Path, market: dict[str, s
     assert (inst / "horae.lock").read_bytes() == before
 
 
+def test_a_first_party_claim_of_an_untrusted_index_is_refused_before_any_clone(
+    inst: Path, market: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(approval, "FIRST_PARTY_INDEXES", frozenset({"https://example.org/x"}))
+    before = (inst / "horae.lock").read_bytes()
+    code, out, _ = _add(inst, "demo", "--json", answer="y\n")
+    assert code == 3
+    assert _error(out)["kind"] == "tier_refused"
+    assert _nothing_installed(inst)
+    assert (inst / "horae.lock").read_bytes() == before
+
+
 def test_the_tier_rule_is_shared_with_direct_installs() -> None:
-    require_installable("demo", "first-party")
+    require_installable("demo", "first-party", DEFAULT_MARKETPLACE)
     with pytest.raises(TierRefused, match="M5"):
-        require_installable("demo", "community")
+        require_installable("demo", "community", DEFAULT_MARKETPLACE)
     with pytest.raises(TierRefused, match="direct install"):
-        require_installable("demo", None)  # #48: a git URL has no tier
+        require_installable("demo", None, None)  # #48: a git URL has no tier
+    for tier in ("First-Party", "first-party ", "FIRST-PARTY", "unknown", ""):
+        with pytest.raises(TierRefused):
+            require_installable("demo", tier, DEFAULT_MARKETPLACE)  # type: ignore[arg-type]
+
+
+def test_an_added_index_cannot_vouch_for_its_own_first_party_tier() -> None:
+    with pytest.raises(TierRefused, match="not the Horae marketplace"):
+        require_installable("demo", "first-party", "https://example.org/evil/market")
+    with pytest.raises(TierRefused):
+        require_installable("demo", "first-party", None)
 
 
 def test_every_intent_has_a_meaning() -> None:

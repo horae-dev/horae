@@ -288,7 +288,7 @@ def _add(
     lock_path = instance / LOCK_FILE
     try:
         found = resolve(ref, loaded.indexes, pins=config.marketplace_pins, allow_prerelease=pre)
-        require_installable(found.name, found.tier)
+        require_installable(found.name, found.tier, found.index)
         with guard(loaded_instance.state_dir):
             lock, header = read_lock(lock_path)
             approval = _Approval(lock, found, grants, yes=yes, json_output=json_output)

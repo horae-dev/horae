@@ -4023,7 +4023,9 @@ loosened later without breaking a valid file.
       placed tree is removed (exit 1, `lock_write_failed`).
     - **E, tier (docs/security.md T04).** Before M5, `horae plugin add` refuses a plugin whose
       marketplace tier is not `first-party`, before anything is fetched (exit 3,
-      `tier_refused`, pointing to M5). `require_installable(name, tier)` is the one check;
+      `tier_refused`, pointing to M5). The tier is a claim in the index file, so `first-party` is
+      believed only from the default Horae marketplace (`FIRST_PARTY_INDEXES`): an index the
+      user added cannot vouch for itself. `require_installable(name, tier, index)` is the one check;
       a direct install from a git URL (#48) passes `tier=None`, which is refused the same way.
     - **F, at run.** `HostRegistry.from_directory` already refuses a manifest asking for more
       than the lock grants and a version other than the locked one. It now also reads the
