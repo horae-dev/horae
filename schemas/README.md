@@ -3985,24 +3985,29 @@ loosened later without breaking a valid file.
     before the atomic rename, so `plugins/<name>/.venv` exists exactly when the plugin does,
     and a failure leaves nothing. Plugins never share a dependency.
     - **A, what a plugin ships.** A `pyproject.toml` with a `[project]` name and a committed
-      `uv.lock`, else the install is **refused** before uv runs. In the lock, every package
-      from an index or URL has a `sha256` hash for each of its files; any other package is a
-      directory, editable or path **inside** the tree (no `..`, not absolute); a `git` source
-      (no hash) is refused. A committed `.venv` is refused.
+      `uv.lock`, else the install is **refused** before uv runs. In the lock, every package but
+      the plugin's own project (whose source is the tree, `.`) comes from an index or URL, has
+      **at least one wheel**, and has a `sha256` hash for each of its files. An sdist-only
+      package, a `git` source (no hash), another in-tree package or one outside the tree is
+      refused, the message naming it. A committed `.venv` is refused.
     - **B, the build backend allow-list.** `build-system.build-backend` must be one of
       `hatchling.build`, `setuptools.build_meta`, `uv_build`, `flit_core.buildapi`,
       `pdm.backend`; `build-system.requires` may name only that backend's distribution (and
       `wheel` for setuptools), never with a direct URL; `backend-path` (an in-tree backend) and
       `tool.uv.package = false` (a virtual project, which would not be installed) are refused.
-      This narrows, but does not remove, code execution at install time: a backend runs the
+      The allow-list covers the only build that happens (dependencies are never built, C).
+      It narrows, but does not remove, code execution at install time: a backend runs the
       project's own build code (`setup.py`, a hatch build hook) as the Horae user, before #46
       shows the permissions, and the backend's own version is not hash-pinned (uv resolves
       build requirements, which are not in `uv.lock`). `uv_build` is recommended: uv carries
       it, nothing is fetched. Isolation is M5 (#51, #52); accepted for first-party plugins
       meanwhile (T04, `docs/security.md` T39).
     - **C, the commands.** `uv venv --relocatable --no-project --python <python> .venv`, then
-      `uv sync --locked --no-dev --no-editable --python .venv/bin/python`, both with
-      `--no-config`. `--locked` reads the lock and fails if it no longer matches
+      `uv sync --locked --no-dev --no-editable --python .venv/bin/python
+      --no-build-package=<name>` for every dependency of the lock, both with `--no-config`.
+      **Only the plugin's own project is ever built**: a dependency installs from a hashed
+      wheel, and when none fits the machine uv refuses rather than build its sdist (whose
+      backend, not on any allow-list, would run code). `--locked` reads the lock and fails if it no longer matches
       `pyproject.toml` (never re-resolves, never writes; `--frozen` is not used, it would skip
       that check); uv checks every file against its hash; the project is built and installed
       **non-editable**, so the tree's sources are not imported at run time. The venv is
@@ -4022,8 +4027,10 @@ loosened later without breaking a valid file.
       or the plugin's own `pyproject.toml`, and the hashes pin the bytes either way.
       `index_url` (`--default-index`) is a constructor argument only, never a `horae.yaml`
       setting: tests pass a local `file://` index.
-    - **F, limits.** Each uv call at most 600 s; the venv at most 1 GiB, measured while uv
-      runs (killed past it); `pyproject.toml` and `uv.lock` at most 4 MiB each. uv's failures
+    - **F, limits.** Each uv call at most 600 s; what the install writes at most 1 GiB: the
+      venv, uv's temporary directory (sdist and build environments) and what it adds to the
+      shared cache (its size before the install is the baseline), measured while uv runs
+      (killed past it); `pyproject.toml` and `uv.lock` at most 4 MiB each. uv's failures
       are `InstallRefused` (exit 3) when the lock, a hash or `requires-python` is at fault,
       else `InstallError` (exit 1); uv missing is `InstallError`.
     - **G, run time: how `runtime.command` maps onto the venv.** A plugin directory with

@@ -13,16 +13,19 @@ plugin's lock file pins.
   `BUILD_BACKENDS` (hatchling, setuptools, uv_build, flit_core, pdm-backend), whose `requires`
   names only that backend's distribution (and `wheel` for setuptools), without a direct URL,
   and without `backend-path` (an in-tree backend); not `tool.uv.package = false`;
-- `uv.lock`, committed, in which every package from an index or a URL carries a `sha256` hash
-  for each of its files, and every other package is a directory, editable or path inside the
-  plugin tree (a `git` source has no hash and is refused).
+- `uv.lock`, committed, in which every package but the plugin's own project comes from an
+  index or a URL, has at least one **wheel**, and carries a `sha256` hash for each of its files
+  (an sdist-only package, a `git` source, another in-tree package are refused, by name). The
+  project itself is the tree (`.`).
 
 **What runs** (`uv`, found on the host's `PATH` unless given):
 
 1. `uv venv --relocatable --no-project --python <python> <tree>/.venv`, where `<python>` is
    Horae's own interpreter unless given: the venv lives offline with what is already on the
    machine, and a relocatable venv keeps working once the tree is renamed;
-2. `uv sync --locked --no-dev --no-editable --python <tree>/.venv/bin/python`: the lock is
+2. `uv sync --locked --no-dev --no-editable --python <tree>/.venv/bin/python
+   --no-build-package=<each dependency>`: dependencies install from their hashed wheels only,
+   never built (no wheel fits this machine: refused, not built from the sdist); the lock is
    only read, never re-resolved or rewritten (`--locked` fails when it no longer matches
    `pyproject.toml`); every file is checked against its hash; the plugin's own project is
    built (by its backend, the one place plugin code can run at install time, see
@@ -40,9 +43,10 @@ setting of the caller's reaches uv: the index is uv's default (PyPI) or the plug
 and is a constructor argument only, never a setting of `horae.yaml` (tests pass a local
 `file://` index).
 
-**Limits**: each uv call at most `timeout_s` (default `UV_TIMEOUT_S`), the venv at most
-`max_bytes` (`MAX_VENV_BYTES`, measured while uv runs: it is killed past it), `pyproject.toml`
-and `uv.lock` at most `MAX_PROJECT_BYTES` each.
+**Limits**: each uv call at most `timeout_s` (default `UV_TIMEOUT_S`); what the install
+writes, the venv plus uv's temporary directory plus what it adds to the cache, at most
+`max_bytes` (`MAX_VENV_BYTES`, measured while uv runs: it is killed past it);
+`pyproject.toml` and `uv.lock` at most `MAX_PROJECT_BYTES` each.
 
 **At run time** the host starts the plugin from that venv (`horae.plugins.host.env`): a bare
 `runtime.command[0]` (`python`, `python3`, a console script) is looked up in
@@ -184,15 +188,21 @@ def _artifacts(package: dict[str, Any]) -> list[Any]:
     return found
 
 
-def check_lock(tree: Path, plugin: str) -> None:
-    """`InstallRefused` unless `<tree>/uv.lock` pins every package by hash or to the tree."""
+def check_lock(tree: Path, plugin: str, project: str) -> list[str]:
+    """The names of the packages `<tree>/uv.lock` installs besides `project`, the plugin's own
+    project; `InstallRefused` unless each comes from an index or URL with at least one wheel
+    and a `sha256` hash on every file, and `project` itself is the tree (`.`). Only `project`
+    is ever built: the others are installed from their wheels (`--no-build-package`)."""
     data = _read_toml(tree / LOCK_FILE, plugin)
     packages = data.get("package", [])
     if not isinstance(packages, list) or not packages:
         raise InstallRefused(f"plugin {plugin}: {LOCK_FILE} lists no package")
+    dependencies: list[str] = []
     for package in packages:
         name = package.get("name", "?") if isinstance(package, dict) else "?"
         source = package.get("source") if isinstance(package, dict) else None
+        if not isinstance(name, str) or not _NAME.fullmatch(name):
+            raise InstallRefused(f"plugin {plugin}: {LOCK_FILE}: a package has no valid name")
         if not isinstance(source, dict) or len(source) != 1:
             raise InstallRefused(f"plugin {plugin}: {LOCK_FILE}: {name} has no single source")
         ((kind, where),) = source.items()
@@ -205,20 +215,44 @@ def check_lock(tree: Path, plugin: str) -> None:
                 raise InstallRefused(
                     f"plugin {plugin}: {LOCK_FILE}: {name} has a file without a sha256 hash"
                 )
+            wheels = package.get("wheels")
+            if not isinstance(wheels, list) or not wheels:
+                raise InstallRefused(
+                    f"plugin {plugin}: {LOCK_FILE}: {name} has no wheel (an sdist only would "
+                    "run its build backend at install): refused"
+                )
+            dependencies.append(name)
         elif kind in _IN_TREE:
             if not _in_tree(where):
                 raise InstallRefused(
                     f"plugin {plugin}: {LOCK_FILE}: {name} comes from {where!r}, outside the plugin"
+                )
+            if normalize(name) != normalize(project) or posixpath.normpath(str(where)) != ".":
+                raise InstallRefused(
+                    f"plugin {plugin}: {LOCK_FILE}: {name} comes from {where!r} in the tree; "
+                    "only the plugin's own project may be built"
                 )
         else:
             raise InstallRefused(
                 f"plugin {plugin}: {LOCK_FILE}: {name} comes from a {kind} source, which has "
                 "no hash"
             )
+    return sorted(set(dependencies))
 
 
 class UvTooLarge(InstallRefused):
     """The venv grew past its budget; uv was killed."""
+
+
+@dataclass(frozen=True)
+class _Budget:
+    """Bytes an install wrote: under `paths`, less what was there before (`baseline`)."""
+
+    paths: tuple[Path, ...]
+    baseline: int
+
+    def used(self) -> int:
+        return sum(tree_bytes(path) for path in self.paths) - self.baseline
 
 
 @dataclass(frozen=True)
@@ -240,8 +274,8 @@ class PluginEnvironment:
 
     def prepare(self, tree: Path, plugin: str) -> Path:
         """Check the project and its lock, then build `<tree>/.venv`; returns it."""
-        check_project(tree, plugin)
-        check_lock(tree, plugin)
+        project = check_project(tree, plugin)
+        dependencies = check_lock(tree, plugin, project)
         venv = tree / VENV_DIR
         if os.path.lexists(venv):
             raise InstallRefused(f"plugin {plugin}: the tree holds a {VENV_DIR}; it must not")
@@ -255,26 +289,30 @@ class PluginEnvironment:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             raise InstallError(f"cannot write {self.cache_dir}: {exc.strerror}") from None
+        baseline = tree_bytes(self.cache_dir)
         with tempfile.TemporaryDirectory(prefix="horae-uv-") as home:
             env = self.env(tree, Path(home))
+            # The budget covers what this install writes: the venv, uv's temporary directory
+            # (sdist and build environments) and what it adds to the shared cache.
+            watch = _Budget((venv, Path(home), self.cache_dir), baseline)
             self._run(
                 plugin,
                 [uv, "venv", "--relocatable", "--no-project", "--python", self.python],
                 [str(venv)],
                 tree,
                 env,
-                venv,
+                watch,
             )
             sync = ["sync", "--locked", "--no-dev", "--no-editable"]
             self._run(
                 plugin,
                 [uv, *sync, "--python", str(venv / "bin" / "python")],
-                self._index_args(),
+                [*self._index_args(), *(f"--no-build-package={name}" for name in dependencies)],
                 tree,
                 env,
-                venv,
+                watch,
             )
-        self._check_venv(venv, plugin)
+            self._check_venv(venv, plugin, watch)
         return venv
 
     def env(self, tree: Path, home: Path) -> dict[str, str]:
@@ -297,7 +335,7 @@ class PluginEnvironment:
     def _index_args(self) -> list[str]:
         return ["--default-index", self.index_url] if self.index_url else []
 
-    def _check_venv(self, venv: Path, plugin: str) -> None:
+    def _check_venv(self, venv: Path, plugin: str, watch: "_Budget") -> None:
         cfg = venv / "pyvenv.cfg"
         try:
             text = cfg.read_text(encoding="utf-8")
@@ -306,10 +344,10 @@ class PluginEnvironment:
         if not re.search(r"^relocatable\s*=\s*true\s*$", text, re.MULTILINE):
             # uv replaced the venv (another interpreter): its scripts name the scratch path.
             raise InstallRefused(f"plugin {plugin}: uv rebuilt the venv with another interpreter")
-        size = tree_bytes(venv)
-        if size > self.max_bytes:
+        used = watch.used()
+        if used > self.max_bytes:
             raise UvTooLarge(
-                f"plugin {plugin}: its venv is {size} bytes, more than {self.max_bytes}"
+                f"plugin {plugin}: its install wrote {used} bytes, more than {self.max_bytes}"
             )
 
     def _run(
@@ -319,7 +357,7 @@ class PluginEnvironment:
         extra: Sequence[str],
         cwd: Path,
         env: dict[str, str],
-        watch: Path,
+        watch: "_Budget",
     ) -> None:
         argv = [command[0], "--no-config", *command[1:], *extra]
         try:
@@ -345,9 +383,12 @@ class PluginEnvironment:
             except BaseException:
                 kill_session(proc)
                 raise
-            if tree_bytes(watch) > self.max_bytes:
+            if watch.used() > self.max_bytes:
                 kill_session(proc)
-                raise UvTooLarge(f"plugin {plugin}: its venv grew past {self.max_bytes} bytes")
+                raise UvTooLarge(
+                    f"plugin {plugin}: its install wrote more than {self.max_bytes} bytes "
+                    "(venv, temporary files and cache)"
+                )
             if time.monotonic() >= deadline:
                 kill_session(proc)
                 raise InstallError(f"plugin {plugin}: uv timed out after {self.timeout_s:g}s")

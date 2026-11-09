@@ -279,6 +279,11 @@ BAD_LOCKS = {
     "git": '[[package]]\nname = "x"\nsource = { git = "https://example.org/x?rev=1#1" }\n',
     "outside": '[[package]]\nname = "x"\nsource = { directory = "../elsewhere" }\n',
     "absolute": '[[package]]\nname = "x"\nsource = { path = "/tmp/x.whl" }\n',
+    "sdist only": (
+        '[[package]]\nname = "x"\nsource = { registry = "https://pypi.org/simple" }\n'
+        'sdist = { url = "https://example.org/x.tar.gz", hash = "sha256:' + "a" * 64 + '" }\n'
+    ),
+    "another in-tree package": '[[package]]\nname = "x"\nsource = { editable = "libs/x" }\n',
     "md5 only": (
         '[[package]]\nname = "x"\nsource = { url = "https://example.org/x.tar.gz" }\n'
         'sdist = { url = "https://example.org/x.tar.gz", hash = "md5:00" }\n'
@@ -292,16 +297,51 @@ def test_a_lock_entry_without_a_hash_or_from_outside_the_tree_is_refused(
 ) -> None:
     (tmp_path / "uv.lock").write_text(LOCK_HEAD + BAD_LOCKS[case])
     with pytest.raises(InstallRefused):
-        check_lock(tmp_path, "alpha")
+        check_lock(tmp_path, "alpha", "alpha")
 
 
-def test_a_hashed_lock_passes(tmp_path: Path) -> None:
+def test_an_sdist_only_dependency_is_refused_by_name(tmp_path: Path) -> None:
+    (tmp_path / "uv.lock").write_text(LOCK_HEAD + BAD_LOCKS["sdist only"])
+    with pytest.raises(InstallRefused, match=r"x has no wheel"):
+        check_lock(tmp_path, "alpha", "alpha")
+
+
+def test_a_hashed_lock_passes_and_lists_what_is_never_built(tmp_path: Path) -> None:
     (tmp_path / "uv.lock").write_text(
         LOCK_HEAD + '[[package]]\nname = "x"\nsource = { registry = "https://pypi.org/simple" }\n'
         'sdist = { url = "https://example.org/x.tar.gz", hash = "sha256:' + "a" * 64 + '" }\n'
         'wheels = [{ url = "https://example.org/x.whl", hash = "sha256:' + "b" * 64 + '" }]\n'
     )
-    check_lock(tmp_path, "alpha")
+    assert check_lock(tmp_path, "alpha", "alpha") == ["x"]
+
+
+def test_a_dependency_with_only_an_sdist_is_refused_before_anything_runs(tmp_path: Path) -> None:
+    files = venv_plugin_files("alpha", "1.0.0", "1.0.0")
+    files["uv.lock"] = LOCK_HEAD + BAD_LOCKS["sdist only"]
+    manifest = files.pop("plugin.yaml")
+    repo, sha = plugin_repo(tmp_path / "repo", name="alpha", manifest=manifest, files=files)
+    plugins = tmp_path / "plugins"
+    never = PluginEnvironment(tmp_path / "cache", uv=str(tmp_path / "no-such-uv"))
+    with pytest.raises(InstallRefused, match="x has no wheel"):
+        LocalInstaller(plugins, {ALPHA_URL: repo}).install(
+            "alpha", "1.0.0", ALPHA_URL, sha, prepare=never
+        )
+    assert _left(plugins) == []
+
+
+@needs_uv
+def test_a_dependency_is_never_built_even_when_no_wheel_fits(tmp_path: Path) -> None:
+    # The index has a wheel uv cannot use here and an sdist whose build would leave a marker:
+    # the lock passes check_lock (it has a hashed wheel), and uv must refuse to build it.
+    index = local_index(tmp_path / "index", foreign_sdist=True)
+    repo, sha = _repo(tmp_path, index, "alpha", "1.0.0", "3.0.0")
+    plugins = tmp_path / "plugins"
+    with pytest.raises(InstallError, match="cannot install the dependencies of alpha"):
+        LocalInstaller(plugins, {ALPHA_URL: repo}).install(
+            "alpha", "1.0.0", ALPHA_URL, sha, prepare=_environment(tmp_path, index)
+        )
+    assert _left(plugins) == []
+    assert not (tmp_path / "BUILT").exists()
 
 
 def test_a_committed_venv_is_refused(tmp_path: Path) -> None:

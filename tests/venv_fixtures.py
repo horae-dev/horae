@@ -11,10 +11,12 @@ imported, its interpreter and its environment.
 
 import base64
 import hashlib
+import io
 import json
 import os
 import shutil
 import subprocess
+import tarfile
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -62,14 +64,13 @@ for line in sys.stdin:
 """
 
 
-def _wheel(directory: Path, version: str) -> Path:
-    path = directory / f"tinydep-{version}-py3-none-any.whl"
+def _wheel(directory: Path, version: str, tag: str = "py3-none-any") -> Path:
+    path = directory / f"tinydep-{version}-{tag}.whl"
     info = f"tinydep-{version}.dist-info"
     files = {
         "tinydep/__init__.py": f"VERSION = {version!r}\n",
         f"{info}/METADATA": f"Metadata-Version: 2.1\nName: tinydep\nVersion: {version}\n",
-        f"{info}/WHEEL": "Wheel-Version: 1.0\nGenerator: t\nRoot-Is-Purelib: true\n"
-        "Tag: py3-none-any\n",
+        f"{info}/WHEEL": f"Wheel-Version: 1.0\nGenerator: t\nRoot-Is-Purelib: true\nTag: {tag}\n",
     }
     record = []
     with zipfile.ZipFile(path, "w") as archive:
@@ -83,15 +84,38 @@ def _wheel(directory: Path, version: str) -> Path:
     return path
 
 
-def local_index(root: Path) -> str:
-    """A PEP 503 index of `tinydep` at `root`; returns its `file://` URL."""
+def _sdist(directory: Path, version: str) -> Path:
+    """An sdist whose build would write `BUILT` next to the index (it must never be built)."""
+    path = directory / f"tinydep-{version}.tar.gz"
+    base = f"tinydep-{version}"
+    marker = directory.parent.parent / "BUILT"
+    files = {
+        f"{base}/PKG-INFO": f"Metadata-Version: 2.1\nName: tinydep\nVersion: {version}\n",
+        f"{base}/pyproject.toml": f'[project]\nname = "tinydep"\nversion = "{version}"\n'
+        '[build-system]\nrequires = []\nbuild-backend = "backend"\nbackend-path = ["."]\n',
+        f"{base}/backend.py": f"open({str(marker)!r}, 'w').close()\n",
+    }
+    with tarfile.open(path, "w:gz") as archive:
+        for name, text in files.items():
+            data = text.encode()
+            member = tarfile.TarInfo(name)
+            member.size = len(data)
+            archive.addfile(member, io.BytesIO(data))
+    return path
+
+
+def local_index(root: Path, *, foreign_sdist: bool = False) -> str:
+    """A PEP 503 index of `tinydep` at `root`; returns its `file://` URL. With
+    `foreign_sdist`, version 3.0.0 has only a wheel for another platform and an sdist."""
     project = root / "tinydep"
     project.mkdir(parents=True)
+    files = [_wheel(project, version) for version in TINYDEP_VERSIONS]
+    if foreign_sdist:
+        files += [_wheel(project, "3.0.0", "py3-none-win_amd64"), _sdist(project, "3.0.0")]
     links = []
-    for version in TINYDEP_VERSIONS:
-        wheel = _wheel(project, version)
-        digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
-        links.append(f'<a href="{wheel.name}#sha256={digest}">{wheel.name}</a>')
+    for file in files:
+        digest = hashlib.sha256(file.read_bytes()).hexdigest()
+        links.append(f'<a href="{file.name}#sha256={digest}">{file.name}</a>')
     (project / "index.html").write_text(f"<html><body>{''.join(links)}</body></html>")
     (root / "index.html").write_text('<html><body><a href="tinydep/">tinydep</a></body></html>')
     return root.as_uri()
