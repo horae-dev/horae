@@ -41,3 +41,16 @@ class ConflictError(MarketplaceError):
             f"repositories: {where}. Choose one by adding to horae.yaml: "
             f"marketplace_pins: {{{name}: {first}}}"
         )
+
+
+class InstallError(MarketplaceError):
+    """A plugin could not be fetched or installed (network, git, disk). Nothing is left."""
+
+
+class InstallRefused(InstallError):
+    """A plugin was fetched but refused: the tag and the pinned SHA disagree, the tree breaks
+    a limit or escapes, or `plugin.yaml` is invalid or names another plugin or version."""
+
+
+class AlreadyInstalled(InstallRefused):
+    """The instance already has a plugin of that name (upgrading is `horae plugin upgrade`)."""

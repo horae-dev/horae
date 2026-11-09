@@ -7,7 +7,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from horae.marketplace import MarketplaceClient
+from horae.marketplace import MarketplaceClient, PluginInstaller
 
 _GIT_ENV = {
     **{k: v for k, v in os.environ.items() if k in {"PATH", "HOME", "LANG", "TMPDIR"}},
@@ -78,3 +78,66 @@ class LocalClient(MarketplaceClient):
 
 A = "https://example.org/a/marketplace"
 B = "https://example.org/b/marketplace"
+
+
+# --- plugin repositories (#44) --------------------------------------------------------------
+
+PLUGIN_URL = "https://example.org/x/plugin-demo"
+
+
+def plugin_manifest(name: str = "demo", version: str = "1.0.0", **changes: Any) -> str:
+    data: dict[str, Any] = {
+        "name": name,
+        "version": version,
+        "horae": ">=0",
+        "provides": {"sources": [f"{name}.fetch"]},
+        "permissions": {"network": ["api.example.org"]},
+        "runtime": {"protocol": "mcp-stdio", "command": ["python3", "server.py"]},
+        **changes,
+    }
+    return json.dumps(data, indent=2)
+
+
+def plugin_repo(
+    root: Path,
+    *,
+    name: str = "demo",
+    version: str = "1.0.0",
+    manifest: str | None = None,
+    files: dict[str, str] | None = None,
+    tag: str | None = "",
+    annotated: bool = False,
+) -> tuple[Path, str]:
+    """A plugin repository at `root` with one commit tagged `v<version>` (unless `tag` is
+    `None`; a non-empty `tag` names another tag). Returns the repository and the commit."""
+    root.mkdir(parents=True, exist_ok=True)
+    if not (root / ".git").exists():
+        git(root, "init", "-q", "-b", "main")
+    content = {"plugin.yaml": plugin_manifest(name, version), "server.py": "print('hi')\n"}
+    if manifest is not None:
+        content["plugin.yaml"] = manifest
+    content.update(files or {})
+    for path, text in content.items():
+        (root / path).parent.mkdir(parents=True, exist_ok=True)
+        (root / path).write_text(text, encoding="utf-8")
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "--allow-empty", "-m", f"release {version}")
+    if tag is not None:
+        tag_name = tag or f"v{version}"
+        if annotated:
+            git(root, "tag", "-f", "-a", tag_name, "-m", tag_name)
+        else:
+            git(root, "tag", "-f", tag_name)
+    return root, git(root, "rev-parse", "HEAD")
+
+
+class LocalInstaller(PluginInstaller):
+    """An installer that maps the `https://` names to local repositories, over `file` only."""
+
+    def __init__(self, plugins_dir: Path, remotes: dict[str, Path | str]) -> None:
+        super().__init__(plugins_dir, allow_protocol="file", timeout_s=30)
+        self.remotes = remotes
+
+    def remote(self, url: str) -> str:
+        where = self.remotes[url]
+        return where.as_uri() if isinstance(where, Path) else where

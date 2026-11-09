@@ -3529,6 +3529,54 @@ loosened later without breaking a valid file.
       only point to a repository and a SHA. #44 re-verifies the tag and the SHA, #46 shows the
       permissions.
 
+### Provisional decisions (#44, pending maintainer review)
+
+62. **Install from git with a pinned commit (#44).** `horae plugin add NAME[@VERSION]`
+    (`--offline`, `--pre`, `--json`, `-i`) resolves the name as decision 61 D, then
+    `horae.marketplace.install.PluginInstaller.install(name, version, repo, sha)`, which a
+    direct install from a git URL (#48) calls the same way, without the marketplace. No schema
+    change.
+    - **A, fetch.** The marketplace's hardened git runner (decision 61 C), extended for every
+      call with `core.hooksPath=/dev/null` and `GIT_LFS_SKIP_SMUDGE=1`. `git clone --bare
+      --depth=1 --no-tags --single-branch --no-recurse-submodules --branch v<version> --
+      <repo>`, then one `fetch -- <repo> <sha> +refs/tags/v<version>:refs/tags/v<version>`,
+      so the tag is the remote's (a branch named like the tag cannot stand in for it). Only
+      `https` (`GitRepoUrl`) is accepted, checked before git runs; the transport is a
+      constructor argument, never a setting (only tests pass `file`).
+    - **B, verify.** `rev-parse <sha>^{commit}` must be the pinned SHA and
+      `refs/tags/v<version>^{commit}` (an annotated tag dereferenced) the same commit, else the
+      install is **refused**: a moved tag, a tampered index, or a SHA the repository does not
+      have. The tag name is `v<version>`, as the marketplace's verifier expects.
+    - **C, the tree.** Before checkout, from `ls-tree`: at most 5000 entries and 100 MiB of
+      file content (and at most 200 MiB fetched); no `.`, `..`, empty or `.git` segment (any
+      case); no `.horae-install.json` at the root; no symlink whose target is absolute or climbs
+      out of the tree. Checkout of the tree only (no `.git` is installed) with
+      `core.symlinks=false` (a symlink inside the tree becomes a small file holding its target),
+      `core.protectHFS`/`protectNTFS`, `--no-recurse-submodules` (a submodule stays an empty
+      directory). No hook or filter runs: hooks are off, and a filter needs config, which is
+      `/dev/null` (global, system) or written by our clone (the repository's is never cloned).
+    - **D, manifest.** `plugin.yaml` at the commit must validate as `PluginManifest` and name
+      the resolved plugin and version, else refused.
+    - **E, where, and atomicity.** `<instance>/plugins/<name>`, the layout the plugin host
+      already reads (`HostRegistry.from_directory`), derived from the validated name only. All
+      the work happens in `plugins/.install-<random>/`, and the finished tree is renamed into
+      place (same file system: atomic), so `plugins/<name>` is absent or complete, even if the
+      process is killed. A scratch directory is never read by the host; one older than an hour
+      is removed by the next install. A name already installed is refused (upgrade is #47).
+    - **F, what is recorded: a manifest in the install directory, not `horae.lock`.**
+      `plugins/<name>/.horae-install.json` = `{schema_version: 1, name, version, repo, commit}`,
+      the fields of a `LockedPlugin` without `permissions` (`Installed.lock_entry(permissions)`
+      builds the entry). `horae.lock` stays the list of **approved** plugins: writing it is
+      #46, with the permissions the user approves. So an installed plugin is **not enabled**:
+      the host loads only the plugins of `horae.lock`, and the CLI says so and what is left
+      (approve its permissions, install its dependencies). The record is what #46 and #47 read
+      to know what is on disk.
+    - **G, dependencies.** `install(..., prepare=...)` runs on the verified tree before the
+      rename: the hook for #45 (the plugin's venv); a failure aborts and leaves nothing.
+    - **H, CLI exits.** 0 installed; 1 a repository that cannot be fetched (`install_failed`);
+      3 refused (`install_refused`) or already installed (`already_installed`); the others as
+      decision 61 G.
+
 ### Provisional decisions (#131, pending maintainer review)
 
 63. **The locked network list travels in every plugin call's `_meta` (#131).** No schema

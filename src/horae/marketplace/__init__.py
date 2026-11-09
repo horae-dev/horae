@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """The marketplace client (#43): fetch the configured indexes, cache them, resolve plugin
-names. Installing what a name resolves to is #44."""
+names, and install what a name resolves to (#44)."""
 
 from horae.marketplace.errors import (
+    AlreadyInstalled,
     ConflictError,
     FetchError,
+    InstallError,
+    InstallRefused,
     InvalidReference,
     MarketplaceError,
     NoCacheError,
@@ -12,18 +15,24 @@ from horae.marketplace.errors import (
     UnknownVersion,
 )
 from horae.marketplace.index import Loaded, LoadedIndex, MarketplaceClient
+from horae.marketplace.install import Installed, PluginInstaller
 from horae.marketplace.resolve import Found, Resolved, parse_ref, resolve, search
 
 __all__ = [
+    "AlreadyInstalled",
     "ConflictError",
     "FetchError",
     "Found",
+    "InstallError",
+    "InstallRefused",
+    "Installed",
     "InvalidReference",
     "Loaded",
     "LoadedIndex",
     "MarketplaceClient",
     "MarketplaceError",
     "NoCacheError",
+    "PluginInstaller",
     "Resolved",
     "UnknownPlugin",
     "UnknownVersion",

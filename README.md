@@ -53,7 +53,8 @@ uv run horae undo <run-id> -i ~/horae-demo     # restores every note the run cha
 uv run horae usage -i ~/horae-demo             # LLM cost per pipeline and day (the usage ledger)
 uv run horae cache purge --all -i ~/horae-demo # forget cached LLM outputs (the next run asks again)
 uv run horae plugin search -i ~/horae-demo     # plugins of the `marketplaces` in horae.yaml (cached; --offline works)
-uv run horae plugin resolve github@0.2.0 -i ~/horae-demo   # -> repo and pinned commit; installs nothing yet (#44)
+uv run horae plugin resolve github@0.2.0 -i ~/horae-demo   # -> repo and pinned commit
+uv run horae plugin add github@0.2.0 -i ~/horae-demo       # clone, verify tag and SHA, install into plugins/ (not enabled yet: #45, #46)
 uv run horae eval daily-brief/rank-and-word --plugin-dir tests/fixtures/plugins  # golden cases, offline
 ```
 
