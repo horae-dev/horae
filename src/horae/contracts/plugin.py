@@ -13,6 +13,7 @@ from horae.contracts.types import (
     Hostname,
     HttpsUrl,
     Line,
+    LocalEndpoint,
     PipelineName,
     PluginName,
     PluginRef,
@@ -78,7 +79,12 @@ class Permissions(Contract):
     """Everything the plugin may touch. Undeclared access is a bug, blocked from M5."""
 
     network: UniqueList[Hostname] = Field(default_factory=list)
-    """Hosts the plugin may connect to."""
+    """Hosts the plugin may connect to: public DNS names, `https` only, any port."""
+    network_local: UniqueList[LocalEndpoint] = Field(default_factory=list)
+    """Services on the local network the plugin may connect to (decision 66): loopback,
+    private or link-local IP literals and `.local` / `.lan` / `.internal` / `.home.arpa`
+    names, each with an explicit port, matched exactly (host and port), plain `http` allowed.
+    Shown apart from `network` at approval ("local network")."""
     secrets: UniqueList[SecretName] = Field(default_factory=list)
     """Secrets injected (only) into this plugin's environment. Each must resolve, or the
     plugin does not start (`secret_missing`)."""

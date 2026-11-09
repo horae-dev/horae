@@ -129,13 +129,19 @@ class ApplyRequest:
     never the intent's own `actions`; each `url` is a single-use credential: send it to the
     push service only, never log it."""
     network: Network = field(default_factory=Network)
-    """The network allow-list approved in `horae.lock` (trusted; horae-sdk 0.5); unknown when
-    the core is older. `host_allowed(url)` checks a URL against it."""
+    """The network allow-list approved in `horae.lock` (trusted; horae-sdk 0.5) and its
+    local-network endpoints (horae-sdk 0.6); unknown when the core is older.
+    `host_allowed(url)` checks a URL against it."""
 
     def host_allowed(self, url: str) -> bool | None:
-        """Whether `url` (https) is on the approved list: `True`/`False`, or `None` when the
-        core sent no list (unknown: fall back to the sink's own configuration)."""
+        """Whether `url` is approved (an `https` URL on an approved host, or an `http(s)` URL
+        on an approved local endpoint): `True`/`False`, or `None` when the core sent no list
+        (unknown: fall back to the sink's own configuration)."""
         return self.network.allows(url)
+
+    def address_allowed(self, host: str, port: int) -> bool | None:
+        """Like `host_allowed` for a protocol that is not HTTP. See `Network.address_allowed`."""
+        return self.network.address_allowed(host, port)
 
 
 @dataclass(frozen=True)

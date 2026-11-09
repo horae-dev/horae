@@ -128,6 +128,7 @@ def echo(ctx: Context, value: Any = None, reveal: str | None = None) -> dict[str
         "input": meta.get("dev.horae/input"),
         "revealed": revealed,
         "meta_network": meta.get("horae/network", "absent"),
+        "meta_network_local": meta.get("horae/network_local", "absent"),
     }
 
 

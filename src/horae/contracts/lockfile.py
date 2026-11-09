@@ -80,13 +80,18 @@ class LockedPlugin(Contract):
     commit: CommitSha
     """The commit checked out; the tag for `version` must point to it."""
     permissions: Permissions
-    """The permissions the user approved at install or upgrade time (sorted when written)."""
+    """The permissions the user approved at install or upgrade time (sorted when written).
+    `network_local` (decision 66) is left out when empty, so a lock without a local grant
+    is written exactly as before and an older core still reads it."""
 
     @field_serializer("permissions", mode="wrap")
     def _canonical_permissions(
         self, value: Permissions, handler: SerializerFunctionWrapHandler
     ) -> Any:
-        return _sorted_lists(handler(value))
+        data = _sorted_lists(handler(value))
+        if isinstance(data, dict) and not data.get("network_local"):
+            data.pop("network_local", None)
+        return data
 
 
 class Lockfile(Contract):
