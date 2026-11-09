@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """`horae plugin search [QUERY]`, `horae plugin resolve NAME[@VERSION]` (#43) and
-`horae plugin add NAME[@VERSION]` (#44, approval and `horae.lock` #46).
+`horae plugin add NAME[@VERSION]` (#44, approval and `horae.lock` #46), or
+`horae plugin add https://HOST/OWNER/REPO@SHA` (a direct install, #48).
 
 All read the marketplace indexes of `horae.yaml` (`marketplaces`, highest priority first),
 refreshing each into the instance's cache (`<state_dir>/marketplaces`) unless `--offline`.
@@ -12,6 +13,13 @@ decision 69; uv's cache is `<state_dir>/uv-cache`), shows the permissions its ma
 for and, once the user approves them, writes its entry to `horae.lock`
 (`horae.marketplace.approval` and `horae.marketplace.lock`, decision 70). Approval runs
 before the venv is built, so a refused plugin's dependencies are never installed.
+
+A direct install (a git URL pinned to a full commit SHA, `horae.marketplace.direct`) reads no
+marketplace and has no tier: before M5 it is refused before anything is fetched
+(`require_installable`, docs/security.md T04). Behind that gate it installs the commit only
+when the repository's own branches or tags reach it (`PluginInstaller.install_commit`, the
+same hardening) and goes through the same approval, venv
+and `horae.lock` entry (its repo and commit), with `--yes` only for an identical entry.
 
 Exit codes (`horae.cli_output`): 0 ok; 1 configuration problem, an index that cannot be
 fetched and has no cache, or a plugin that cannot be fetched; 2 usage error (a malformed
@@ -26,6 +34,7 @@ is never rewritten. With `--json` the report carries `warnings`; an error is
 
 import shutil
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -56,6 +65,7 @@ from horae.marketplace import (
     ApprovalRefused,
     ConflictError,
     FetchError,
+    Installed,
     InstallError,
     InstallRefused,
     InvalidReference,
@@ -68,7 +78,6 @@ from horae.marketplace import (
     PluginEnvironment,
     PluginInstaller,
     Prepare,
-    Resolved,
     TierRefused,
     UnknownPlugin,
     UnknownVersion,
@@ -82,6 +91,7 @@ from horae.marketplace.approval import (
     require_installable,
     with_grants,
 )
+from horae.marketplace.direct import is_direct, parse_direct
 from horae.marketplace.lock import LOCK_FILE, guard, read_lock, write_lock
 
 MARKETPLACES_DIR = "marketplaces"
@@ -228,41 +238,42 @@ def _chain(*steps: Prepare | None) -> Prepare:
 class _Approval:
     """The `prepare` hook of the install: shows what the verified manifest asks for and gets
     it approved (interactively, or by `--yes` against `horae.lock`), before the tree is moved
-    into place. A refusal raises `ApprovalRefused`, so nothing is installed."""
+    into place. A refusal raises `ApprovalRefused`, so nothing is installed. The name and
+    version are the manifest's (the installer has checked them against what was resolved);
+    `repo` and `sha` are what is being installed."""
 
     def __init__(
         self,
         lock: Lockfile,
-        found: Resolved,
+        repo: str,
+        sha: str,
         grants: tuple[list[str], list[str]],
         *,
         yes: bool,
         json_output: bool,
     ) -> None:
         self.lock = lock
-        self.found = found
+        self.repo = repo
+        self.sha = sha
         self.hosts, self.local = grants
         self.yes = yes
         self.json_output = json_output
         self.entry: LockedPlugin | None = None
 
     def __call__(self, _tree: Path, manifest: PluginManifest) -> None:
+        name, version = manifest.name, manifest.version
         granted = with_grants(manifest.permissions, self.hosts, self.local)
         wanted = LockedPlugin(
-            version=self.found.version,
-            repo=self.found.repo,
-            commit=self.found.sha,
+            version=version,
+            repo=self.repo,
+            commit=self.sha,
             permissions=granted,
             personal_fields=manifest.provides.personal_fields,
         )
-        existing = self.lock.plugins.get(self.found.name)
+        existing = self.lock.plugins.get(name)
         err = self.json_output
         for line in describe(
-            self.found.name,
-            self.found.version,
-            manifest.permissions,
-            granted,
-            manifest.provides.personal_fields,
+            name, version, manifest.permissions, granted, manifest.provides.personal_fields
         ):
             echo(safe(line), err=err)
         if self.yes:
@@ -277,21 +288,99 @@ class _Approval:
         else:
             if existing is not None and lock_mismatch(existing, wanted) is not None:
                 echo(
-                    f"this replaces the horae.lock entry for {self.found.name} "
+                    f"this replaces the horae.lock entry for {name} "
                     f"({existing.version} at {existing.commit})",
                     err=err,
                 )
             try:
                 approved = typer.confirm(
-                    f"Approve these permissions and install {self.found.name}?",
-                    default=False,
-                    err=err,
+                    f"Approve these permissions and install {name}?", default=False, err=err
                 )
             except (click.exceptions.Abort, typer.Abort):  # end of input, Ctrl-C
                 approved = False
             if not approved:
                 raise ApprovalRefused("permissions not approved; nothing was installed")
         self.entry = wanted
+
+
+Install = Callable[[PluginInstaller, Prepare], Installed]
+"""How `add` installs, given the installer and the `prepare` chain: at a marketplace pin
+(`install`), or a direct commit (`install_commit`, #48)."""
+
+
+def _install_and_lock(
+    loaded_instance: Instance,
+    instance: Path,
+    repo: str,
+    sha: str,
+    grants: tuple[list[str], list[str]],
+    install: Install,
+    *,
+    yes: bool,
+    json_output: bool,
+) -> tuple[Installed, LockedPlugin]:
+    """Under the lock guard: install with approval then the venv (`_chain`) as `prepare`,
+    and write the approved entry to `horae.lock`. Raises `MarketplaceError`."""
+    lock_path = instance / LOCK_FILE
+    with guard(loaded_instance.state_dir):
+        lock, header = read_lock(lock_path)
+        approval = _Approval(lock, repo, sha, grants, yes=yes, json_output=json_output)
+        installed = install(
+            make_installer(plugins_dir(instance)),
+            _chain(approval, make_environment(loaded_instance.state_dir / UV_CACHE_DIR)),
+        )
+        entry = approval.entry
+        if entry is None or installed.lock_entry(entry.permissions) != entry:
+            # The install record and the approved entry must be the same plugin.
+            shutil.rmtree(installed.path, ignore_errors=True)
+            raise ApprovalRefused("the installed plugin is not the one approved; removed")
+        plugins = {**lock.plugins, installed.name: entry}
+        try:
+            write_lock(lock_path, Lockfile(schema_version=1, plugins=plugins), header)
+        except OSError as exc:
+            shutil.rmtree(installed.path, ignore_errors=True)
+            raise CommandFailed(
+                EXIT_PROBLEMS,
+                "lock_write_failed",
+                f"cannot write {lock_path}: {exc.strerror or exc}; the install was undone",
+            ) from None
+    return installed, entry
+
+
+def _report(
+    installed: Installed,
+    entry: LockedPlugin,
+    tier: str | None,
+    index: str | None,
+    warnings: list[str],
+    json_output: bool,
+) -> int:
+    where = f"{PLUGINS_DIR}/{installed.name}"
+    if json_output:
+        echo_json(
+            {
+                "schema_version": SCHEMA_VERSION,
+                **installed.record(),
+                "tier": tier,
+                "index": index,
+                "path": where,
+                "permissions": entry.model_dump(mode="json")["permissions"],
+                "approved": True,
+                "enabled": False,
+                "pending": [],
+                "warnings": warnings,
+            }
+        )
+        return EXIT_OK
+    echo(f"installed {installed.name}@{installed.version} into {where}")
+    echo(f"  repo    {installed.repo}")
+    if tier is None:
+        echo(f"  commit  {installed.commit} (direct install, pinned by its SHA)")
+    else:
+        echo(f"  commit  {installed.commit} (tag v{installed.version} points to it)")
+        echo(f"  tier    {tier}")
+    echo(PENDING)
+    return EXIT_OK
 
 
 def _add(
@@ -304,68 +393,71 @@ def _add(
     allow_host: list[str],
     allow_local: list[str],
 ) -> int:
+    direct = is_direct(ref)
     try:
         grants = parse_grants(allow_host, allow_local)
+        if direct:
+            repo, sha = parse_direct(ref)
+            if pre or offline:
+                flag = "--pre" if pre else "--offline"
+                raise InvalidReference(
+                    f"{flag} applies to marketplace names, not to a git URL (a direct install "
+                    "reads no marketplace and must fetch the repository)"
+                )
     except MarketplaceError as exc:
         raise _failed(exc) from None
+    if direct:
+        return _add_direct(instance, repo, sha, grants, yes=yes, json_output=json_output)
     loaded_instance = load(instance)
     config, loaded = _load_indexes(loaded_instance, offline)
-    lock_path = instance / LOCK_FILE
     try:
         found = resolve(ref, loaded.indexes, pins=config.marketplace_pins, allow_prerelease=pre)
         require_installable(found.name, found.tier, found.index)
-        with guard(loaded_instance.state_dir):
-            lock, header = read_lock(lock_path)
-            approval = _Approval(lock, found, grants, yes=yes, json_output=json_output)
-            installed = make_installer(plugins_dir(instance)).install(
-                found.name,
-                found.version,
-                found.repo,
-                found.sha,
-                prepare=_chain(
-                    approval, make_environment(loaded_instance.state_dir / UV_CACHE_DIR)
-                ),
-            )
-            entry = approval.entry
-            if entry is None or installed.lock_entry(entry.permissions) != entry:
-                # The install record and the approved entry must be the same plugin.
-                shutil.rmtree(installed.path, ignore_errors=True)
-                raise ApprovalRefused("the installed plugin is not the one approved; removed")
-            plugins = {**lock.plugins, installed.name: entry}
-            try:
-                write_lock(lock_path, Lockfile(schema_version=1, plugins=plugins), header)
-            except OSError as exc:
-                shutil.rmtree(installed.path, ignore_errors=True)
-                raise CommandFailed(
-                    EXIT_PROBLEMS,
-                    "lock_write_failed",
-                    f"cannot write {lock_path}: {exc.strerror or exc}; the install was undone",
-                ) from None
+        installed, entry = _install_and_lock(
+            loaded_instance,
+            instance,
+            found.repo,
+            found.sha,
+            grants,
+            lambda installer, prepare: installer.install(
+                found.name, found.version, found.repo, found.sha, prepare=prepare
+            ),
+            yes=yes,
+            json_output=json_output,
+        )
     except MarketplaceError as exc:
         raise _failed(exc) from None
-    where = f"{PLUGINS_DIR}/{installed.name}"
-    if json_output:
-        echo_json(
-            {
-                "schema_version": SCHEMA_VERSION,
-                **installed.record(),
-                "tier": found.tier,
-                "index": found.index,
-                "path": where,
-                "permissions": entry.model_dump(mode="json")["permissions"],
-                "approved": True,
-                "enabled": False,
-                "pending": [],
-                "warnings": list(loaded.warnings),
-            }
+    return _report(installed, entry, found.tier, found.index, list(loaded.warnings), json_output)
+
+
+def _add_direct(
+    instance: Path,
+    repo: str,
+    sha: str,
+    grants: tuple[list[str], list[str]],
+    *,
+    yes: bool,
+    json_output: bool,
+) -> int:
+    """A direct install from a git URL (#48): no marketplace is read. Refused before M5
+    (`require_installable` with no tier, docs/security.md T04) before anything is fetched;
+    otherwise the same approval, venv and `horae.lock` as a marketplace install."""
+    loaded_instance = load(instance)
+    try:
+        require_installable(repo, None, None)
+        installed, entry = _install_and_lock(
+            loaded_instance,
+            instance,
+            repo,
+            sha,
+            grants,
+            lambda installer, prepare: installer.install_commit(repo, sha, prepare=prepare),
+            yes=yes,
+            json_output=json_output,
         )
-        return EXIT_OK
-    echo(f"installed {installed.name}@{installed.version} into {where}")
-    echo(f"  repo    {installed.repo}")
-    echo(f"  commit  {installed.commit} (tag v{installed.version} points to it)")
-    echo(f"  tier    {found.tier}")
-    echo(PENDING)
-    return EXIT_OK
+    except MarketplaceError as exc:
+        raise _failed(exc) from None
+    return _report(installed, entry, None, None, [], json_output)
 
 
 def _search(instance: Path, query: str, offline: bool, json_output: bool) -> int:
@@ -424,7 +516,14 @@ def resolve_command(
 
 @plugin_app.command("add", cls=JsonUsageCommand)
 def add_command(
-    ref: Annotated[str, typer.Argument(metavar="NAME[@VERSION]", help="Plugin to install.")],
+    ref: Annotated[
+        str,
+        typer.Argument(
+            metavar="NAME[@VERSION] | URL@SHA",
+            help="Plugin to install: a marketplace name, or an https git URL pinned to a full "
+            "commit SHA (a direct install, refused before M5).",
+        ),
+    ],
     instance: InstanceOption = Path(),
     offline: OfflineOption = False,
     pre: Annotated[
@@ -468,8 +567,12 @@ def add_command(
     shown and must be approved: interactively, or with --yes when horae.lock already approves
     exactly this version, commit and permissions (without a terminal and without --yes, the
     install is refused). --allow-host and --allow-local add grants beyond the manifest (written
-    to horae.lock; give them again with --yes). Nothing is half-installed. Its dependencies are
-    not installed yet.
+    to horae.lock; give them again with --yes). Nothing is half-installed. Once approved, its
+    dependencies are installed in its own venv.
+
+    A direct install, https://HOST/OWNER/REPO@SHA with the full commit SHA (no tag, branch or
+    short SHA; no credentials, http, ssh or file URL), reads no marketplace (so --pre and
+    --offline do not apply) and is refused before M5 (no tier).
 
     Exit codes: 0 installed and approved, 1 configuration problem, unreachable marketplace
     without cache, a repository that cannot be fetched, or an invalid horae.lock, 2 malformed

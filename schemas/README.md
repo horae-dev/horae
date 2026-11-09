@@ -4114,3 +4114,50 @@ loosened later without breaking a valid file.
       regular file (no symlink) of at most 64 KiB holding a JSON object. A plugin **without** a
       record (the built-in ones `horae init` installs, a plugin copied by hand) is checked by
       its manifest only: an accepted gap until the files of a plugin are pinned (#47 or M5).
+
+### Provisional decisions (#48, pending maintainer review)
+
+71. **Direct install from a git URL (#48).** No schema change. `horae plugin add
+    https://<host>/<owner>/<repo>@<sha>` installs without any marketplace.
+    - **A, the reference** (`horae.marketplace.direct`). An argument holding `:` or `/` (a
+      plugin name never does) is a git URL. It must start with `https://` (no `http`, `file`,
+      `ssh`, `git`, `ext::` or scp-style `git@host:path`), carry no user info, be a `GitRepoUrl` (the
+      contract `horae.lock` stores: DNS host, no port, IP literal or `localhost`, no `.`/`..`
+      segment, query or fragment) and be pinned after its last `@` to a **full** commit SHA
+      (`CommitSha`: 40 lowercase hex digits, or 64 for a SHA-256 repository). A tag, branch or
+      abbreviated SHA is refused: what is approved is one commit. Any refusal is a usage error
+      (exit 2, `usage`); no error repeats the URL (a token may sit in its user info, query or
+      fragment). `--pre` and `--offline` do not apply to a URL (no index is read, the
+      repository must be fetched): each is a usage error (exit 2).
+    - **B, the gate (docs/security.md T04).** A direct install has no marketplace tier, so
+      `require_installable(url, None, None)` refuses it before M5, after the reference and the
+      instance are read and **before anything is fetched** (exit 3, `tier_refused`). The whole
+      path behind the gate is implemented and tested with it open; lifting it in M5 is
+      `approval.DIRECT_INSTALLS = True`.
+    - **C, the fetch** (`PluginInstaller.install_commit`). The commit is **never fetched by
+      its id**: a forge may serve, through a repository's URL, objects that exist only in a
+      fork or a pull request (GitHub does), and the approval and the lock would then name the
+      trusted repository for a fork's code. Instead `git ls-remote --refs -- <url>
+      refs/heads/* refs/tags/*` lists the repository's own tips (names of `A-Z a-z 0-9 . _ / -`
+      only; `refs/pull/*` and anything else is ignored; none is a refusal, more than
+      `MAX_DIRECT_REFS` = 1000 too), an empty bare repository fetches exactly those refs
+      (`--depth=MAX_REACH_DEPTH`, 1000 commits, `--no-tags --no-recurse-submodules`, the byte
+      budget of the download), and `merge-base --is-ancestor <sha> <tip>^{commit}` must hold
+      for at least one tip. Otherwise, a commit further than the depth from every tip included,
+      the install is refused (exit 3, `install_refused`): fail closed. No tag is compared: the
+      SHA is the pin. Then the same steps and limits as decision 62: the tree checks (paths,
+      file count and size, no submodule, no escaping symlink), the hardened git (https only,
+      no hook, no LFS smudge, no filter, no user or system config), the checkout without
+      `.git`, and the atomic placement. The name and version are those of the commit's
+      `plugin.yaml`; the name is checked against `plugins/` once the manifest is read, before
+      approval.
+    - **D, approval and lock.** The same `prepare` chain as a marketplace install (decision 70):
+      the permissions are shown and approved first, then the venv is built (decision 69), so a
+      declined plugin's dependencies are never installed. The `horae.lock` entry is the usual
+      one: `version` from the manifest, `repo` the URL as given, `commit` the SHA. `--yes`
+      passes only when the lock's entry for that name has the same repository (exact string),
+      version, commit and permissions. The `--json` report has `tier` and `index` `null`.
+    - **E, open.** A lock entry does not say whether it came from a marketplace or a direct
+      install (`LockedPlugin.commit` is documented as the commit the version's tag points to,
+      which a direct install does not check). `upgrade` (#47) will need to tell them apart:
+      a `source` field, or "no index lists this repo", is left to it.
