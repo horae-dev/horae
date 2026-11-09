@@ -10,7 +10,8 @@ repository and CI: no instance is read then, unless `--alias` or `--live` needs 
 provider backend of the recorded backend (or of `--alias`'s), and its recorded response goes
 through the same validator, intent check and action guard as a run's `llm` step
 (`horae.evals`). A recording made for another skill digest, prompt, input or schema is
-reported `stale` (a warning, not a failure).
+a case error, `stale_recording`, that names the case and what changed (exit 1). In a live
+eval a stale recording is only reported `stale` (the new answer replaces it).
 
 **Live** (`--live`): each case is sent once (no repair retry) through the alias' backend and
 its API key (the alias' declared secret). Spending money is explicit and recorded (decision
@@ -296,7 +297,7 @@ def text_report(document: dict[str, Any]) -> list[str]:
             lines.append(safe(f"  - {check['name']}: {check['message'] or 'failed'}"))
             for diff_line in (check["diff"] or "").splitlines():
                 lines.append("    " + safe(diff_line))
-        if case["stale"]:
+        if case["stale"] and (case["error"] or {}).get("kind") != "stale_recording":
             stale = ", ".join(case["stale"])
             lines.append(f"  stale recording ({stale} changed): re-record with --live --record")
         if case["usage"] is not None and document["mode"] == "live":

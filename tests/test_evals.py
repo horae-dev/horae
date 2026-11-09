@@ -18,16 +18,20 @@ import horae.cli_eval as cli_eval
 from horae.cli import app
 from horae.cli_output import CommandFailed
 from horae.contracts.evals import EvalAssertion, EvalCase
+from horae.contracts.plugin import PluginManifest
 from horae.evals import (
     EvalError,
+    SkillUnderEval,
     load_case,
     load_cases,
     load_recorded,
+    request_digest,
     resolve,
     unified,
 )
 from horae.evals._harness import _ABSENT, assertion_check
 from horae.llm.backends import AnthropicBackend
+from horae.skills import load_skill
 from horae.store import Store
 
 runner = CliRunner()
@@ -289,15 +293,17 @@ def test_targets_fill_routed_fields(pack: Path) -> None:
     assert code == 0
 
 
-def test_a_stale_recording_is_a_warning(pack: Path) -> None:
+def test_a_stale_recording_is_an_error_naming_the_case(pack: Path) -> None:
     prompt = pack / "skills" / "daily-brief" / "rank-and-word" / "prompt.md"
     prompt.write_text(prompt.read_text() + "\nBe brief.\n")
     code, document, output = _invoke(SKILL, "--plugin-dir", str(pack), "--json")
-    assert code == 0
+    assert code == 1
     assert all(case["stale"] == ["skill", "prompt"] for case in document["cases"])
+    assert all(case["error"]["kind"] == "stale_recording" for case in document["cases"])
     assert document["summary"]["stale"] == 3
     code, _, output = _invoke(SKILL, "--plugin-dir", str(pack))
-    assert "stale recording (skill, prompt changed)" in output
+    assert code == 1
+    assert "(skill, prompt changed since it was recorded)" in output
     assert "(3 stale)" in output
 
 
@@ -1368,12 +1374,28 @@ def _task_pack(pack: Path) -> None:
     _edit_json(folder / "output.schema.json", schema)
 
 
+def _refresh_recording(pack: Path, case: str) -> None:
+    """Make the recording of `case` current (its request digest and the skill's), as a
+    re-record would: a stale one is an error (#134)."""
+    plugin = PluginManifest.model_validate(yaml.safe_load((pack / "plugin.yaml").read_text()))
+    skill = load_skill(pack, SKILL, allowed_intents=plugin.permissions.intents)
+    (loaded,) = load_cases(_evals(pack), case)
+    digest = request_digest(SkillUnderEval(skill, plugin), loaded)
+
+    def change(data: Any) -> None:
+        data["request"] = digest.model_dump()
+        data["skill_digest"], data["skill_version"] = skill.digest, skill.version
+
+    _edit_json(_recorded(pack, case), change)
+
+
 def test_a_hallucinated_task_fingerprint_is_reported(pack: Path) -> None:
     _task_pack(pack)
     case = yaml.safe_load((_evals(pack) / "tasks-only.yaml").read_text())
     case["input"]["tasks"][0]["title"] = "task-1"
     case["expect"] = {}
     (_evals(pack) / "tasks-only.yaml").write_text(yaml.safe_dump(case))
+    _refresh_recording(pack, "tasks-only")
 
     def answer(task: str) -> Callable[[Any], None]:
         def change(data: Any) -> None:

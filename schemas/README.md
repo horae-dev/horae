@@ -2408,7 +2408,7 @@ loosened later without breaking a valid file.
       `{usd: 0.05, tokens_out: 1024}`) and `expect`: `schema_valid` (default `true`), the exact
       `output` (without its reserved `intents`), `assertions` (each a JSON pointer, RFC 6901, into
       `{"output": ..., "intents": [...]}` with exactly one of `equals`, `length`, `contains` (a
-      substring, or an array element) and `exists`), the exact raw `intents` or `intent_counts`
+      substring, or an array element), `not_contains` and `matches` (decision 64) and `exists`), the exact raw `intents` or `intent_counts`
       per type, and `guard` (`pass`, the default, or `violation` for a case that proves a hostile
       output is refused). Equality is canonical JSON equality;
     - **(C) a recording is provider-agnostic** (maintainer's preference): the parsed JSON
@@ -3562,3 +3562,66 @@ loosened later without breaking a valid file.
       `plugin-calendar` (`allowed_hosts`) are to call `call.host_allowed(url)` /
       `request.host_allowed(url)` in follow-ups, treating `False` as a refusal and `None` as
       "use my own config".
+
+### Provisional decisions (#134, pending maintainer review)
+
+64. **A public replay backend, a request digest of a case, and the `not_contains` / `matches`
+    assertions (#134).** Provisional. Changes `eval-case/v1.json` (two optional checks; an
+    older case file stays valid, and `schema_version` stays 1). Decision 62 is taken by open
+    PR #155 and 63 is merged.
+    - **A, the replay backend is public.** `horae.llm.replay.ReplayBackend(inner, source)`
+      replaces the private `horae.evals._harness._Replay`: its `render` is the real backend's
+      (same payload, same digests, same cost bound) and its `send` returns a recording, so
+      nothing leaves the host and no secret is read. `source` is one `CompletionResult` (what
+      the eval harness uses) or `Recordings`, a library looked up by **request digest**.
+      `replay_backends(models, source)` builds the `ModelBackends` over it. `_Replay` stays
+      as a subclass of `ReplayBackend` (same constructor), so the packs that import it keep
+      working; it is deprecated and is removed once the packs have switched.
+    - **B, `horae run --llm-replay <recordings>`.** `<recordings>` is a recording file, or a
+      folder searched (at most 6 levels, 4096 files, dotfiles and symbolic links skipped) for
+      `*.json` recordings in the format of decision 48 C, e.g. a skill's `evals/recorded/`.
+      Every `llm` step renders its request with the real backend of its alias, and the
+      recording whose request digest (prompt, viewed input, output schema) matches answers
+      it, preferring one recorded for the alias' backend. The answer goes through the same
+      validator, intent split, redaction, routing and guard as a live one. A request no
+      recording answers fails the step with `replay_miss` (the run is `degraded`, the message
+      names the digests and whether a recording shares the prompt or the schema): **never a
+      live call**. Two recordings of one request and backend with different outputs are
+      refused when loaded. A recordings path that cannot be read is exit 1,
+      `replay_unavailable`. The cache lookup is skipped (as `--no-cache`); an accepted output
+      is cached like any other, so a replay that must leave the cache alone is a `--dry-run`
+      or a scratch instance. No new instance setting: the flag is the only switch, so a
+      replay can never be configured by mistake into a production instance.
+    - **C, the request digest of a case.** `horae.evals.request_digest(sue, loaded)` returns
+      the `RecordedRequest` (SHA-256 of the prompt, of the canonical viewed input and of the
+      canonical output schema) that `horae eval --live --record` would store and that
+      `--llm-replay` looks up, rendered offline through the real backend (the digests do not
+      depend on the backend or the model; the skill's input is de-identified as for a cloud
+      alias unless a local `backend` is given). It raises `EvalError` for a case that cannot
+      be rendered.
+    - **D, a stale recording fails `horae eval`.** Offline, a recording whose request digest
+      (or skill digest) no longer matches is the case error `stale_recording` (exit 1), with
+      the message `case <name>: the recording for backend <b> is stale (<prompt|input|schema|
+      skill> changed since it was recorded); re-record it with horae eval --live --record`.
+      Before, it was a warning and the stale answer was still judged. Live, a stale recording
+      stays a note (the new answer is what gets recorded). `stale` stays in the JSON report.
+    - **E, `not_contains`.** The opposite of `contains`: a string holds no such substring, an
+      array no such element. Something must be there: a missing value fails (`nothing there`;
+      use `exists: false` to assert absence), so a mistyped pointer cannot make the check pass
+      vacuously. A non-string needle on a string fails.
+    - **F, `matches` and ReDoS.** A regular expression (Python `re` syntax, `re.search`,
+      unanchored, flags inline such as `(?i)`) that must be found in the string at the pointer.
+      The core has no user-supplied regex elsewhere; its pattern for untrusted work that can
+      run long is the killable worker of the output validator (`horae.llm.validate`, decision
+      44), and `matches` uses it: the pattern is at most 256 characters and must compile (checked
+      when the case loads); the searched string at most 65536 characters (a longer one fails the
+      assertion); the search runs in a short-lived `python -I -B` child (empty environment,
+      `cwd` `/`, new session, CPU and memory ceilings) that is killed after 2 seconds. A search
+      that does not finish fails the assertion (`the pattern could not be searched`), never
+      passes and never hangs the eval. A non-string value fails. Nothing else changes: the
+      worker imports nothing of Horae.
+    - **G, what the packs switch to.** `pack-daily-brief`'s `tests/test_pipeline_e2e.py`
+      (`Recorded`) to `horae.llm.replay.ReplayBackend` or `replay_backends`;
+      `scripts/sync_recordings.py` (`_offline_backends`, `deidentify`, `recorded_request`,
+      `request_for`, `viewed_input`) to `horae.evals.request_digest`; `pack-reminders` uses no
+      private replay. Pipelines can be tested with `horae run --llm-replay`.
