@@ -494,3 +494,20 @@ def test_a_name_version_or_sha_that_is_not_valid_is_refused(
         PluginInstaller(tmp_path / "plugins").install(name, version, PLUGIN_URL, sha)
     assert not (tmp_path / "evil").exists()
     assert _left(tmp_path / "plugins") == []
+
+
+def test_the_lock_entry_carries_the_manifest_personal_fields(tmp_path: Path) -> None:
+    import dataclasses
+
+    repo, sha = plugin_repo(tmp_path / "src")
+    installed = _installer(tmp_path, repo).install("demo", "1.0.0", PLUGIN_URL, sha)
+    assert installed.lock_entry(installed.manifest.permissions).personal_fields == {}
+    ref = installed.manifest.provides.sources[0]
+    provides = installed.manifest.provides.model_copy(
+        update={"personal_fields": {ref: ["people[].name"]}}
+    )
+    declared = dataclasses.replace(
+        installed, manifest=installed.manifest.model_copy(update={"provides": provides})
+    )
+    entry = declared.lock_entry(declared.manifest.permissions)
+    assert entry.personal_fields == {ref: ["people[].name"]}

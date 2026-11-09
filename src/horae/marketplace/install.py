@@ -106,9 +106,15 @@ class Installed:
 
     def lock_entry(self, permissions: Permissions) -> LockedPlugin:
         """The `horae.lock` entry of this plugin with the permissions the user approved
-        (#46 writes it; until then the plugin host does not load the plugin)."""
+        (#46 writes it; until then the plugin host does not load the plugin). The manifest's
+        `provides.personal_fields` are copied as they are: a declaration only adds protection,
+        so it needs no approval (decision 68)."""
         return LockedPlugin(
-            version=self.version, repo=self.repo, commit=self.commit, permissions=permissions
+            version=self.version,
+            repo=self.repo,
+            commit=self.commit,
+            permissions=permissions,
+            personal_fields=self.manifest.provides.personal_fields,
         )
 
 
