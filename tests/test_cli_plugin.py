@@ -13,7 +13,7 @@ from typer.testing import CliRunner
 from horae import cli_plugin
 from horae.cli import app
 from horae.contracts import PluginManifest
-from horae.marketplace import MarketplaceClient, PluginEnvironment, PluginInstaller
+from horae.marketplace import MarketplaceClient, PluginEnvironment, PluginInstaller, approval
 from marketplace_fixtures import (
     PLUGIN_URL,
     A,
@@ -59,8 +59,8 @@ def _configure(instance: Path) -> Path:
     return instance
 
 
-def _run(instance: Path, *args: str) -> tuple[int, str, str]:
-    result = runner.invoke(app, ["plugin", *args, "-i", str(instance)])
+def _run(instance: Path, *args: str, answer: str | None = None) -> tuple[int, str, str]:
+    result = runner.invoke(app, ["plugin", *args, "-i", str(instance)], input=answer)
     return result.exit_code, result.stdout, result.stderr
 
 
@@ -197,6 +197,8 @@ def demo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     monkeypatch.setattr(
         cli_plugin, "make_installer", lambda where: LocalInstaller(where, {PLUGIN_URL: repo})
     )
+    monkeypatch.setattr(cli_plugin, "interactive", lambda: True)  # approval: tests answer
+    monkeypatch.setattr(approval, "FIRST_PARTY_INDEXES", frozenset({A}))
     prepared: dict[str, str] = {}
 
     def make_environment(cache_dir: Path) -> Any:
@@ -220,27 +222,28 @@ def test_add_installs_into_the_plugin_dir_and_says_what_is_left(
     instance_dir: Path, demo: dict[str, Any]
 ) -> None:
     _configure_a(instance_dir)
-    code, out, _ = _run(instance_dir, "add", "demo@1.0.0")
+    code, out, _ = _run(instance_dir, "add", "demo@1.0.0", answer="y\n")
     assert code == 0, out
     assert "installed demo@1.0.0 into plugins/demo" in out
     assert demo["good"] in out
-    assert "not enabled yet" in out
-    assert "horae.lock" in out
+    assert "approved: horae.lock pins it" in out
+    assert "dependencies are installed in its own venv" in out
     assert (instance_dir / "plugins" / "demo" / "plugin.yaml").is_file()
-    code, out, _ = _run(instance_dir, "add", "demo@1.0.0", "--json")
+    code, out, _ = _run(instance_dir, "add", "demo@1.0.0", "--json", answer="y\n")
     assert code == 3
     assert json.loads(out)["error"]["kind"] == "already_installed"
 
 
 def test_add_json_reports_the_install_record(instance_dir: Path, demo: dict[str, Any]) -> None:
     _configure_a(instance_dir)
-    code, out, _ = _run(instance_dir, "add", "demo@1.0.0", "--json")
+    code, out, _ = _run(instance_dir, "add", "demo@1.0.0", "--json", answer="y\n")
     assert code == 0
-    report = json.loads(out)
+    report = json.loads(out[out.index("{") :])  # CliRunner echoes the typed answer
     assert report["commit"] == demo["good"]
     assert report["path"] == "plugins/demo"
+    assert report["approved"] is True
     assert report["enabled"] is False
-    assert report["pending"] == ["approve_permissions"]
+    assert report["pending"] == []
     # Its venv was built in the verified tree, with uv's cache in the state directory (#45).
     assert demo["prepared"] == {
         "cache": str(instance_dir / "state" / "uv-cache"),
@@ -254,11 +257,13 @@ def test_add_refuses_a_plugin_without_a_lock_file_and_leaves_nothing(
 ) -> None:
     monkeypatch.setattr(cli_plugin, "make_environment", PluginEnvironment)
     _configure_a(instance_dir)
-    code, out, _ = _run(instance_dir, "add", "demo@1.0.0", "--json")
-    assert code == 3
-    error = json.loads(out)["error"]
+    # Approved first (decision 70), then the venv step refuses the tree (decision 69).
+    code, out, err = _run(instance_dir, "add", "demo@1.0.0", "--json", answer="y\n")
+    assert code == 3, (out, err)
+    error = json.loads(out[out.index("{") :])["error"]  # the runner echoes the typed "y"
     assert error["kind"] == "install_refused"
     assert "no pyproject.toml" in error["message"]
+    assert not (instance_dir / "horae.lock").read_text(encoding="utf-8").count("demo:")
     assert not list((instance_dir / "plugins").iterdir())
 
 

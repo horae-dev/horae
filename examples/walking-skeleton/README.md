@@ -21,11 +21,12 @@ lines.
 
 ## The lock
 
-`horae.lock` is hand-written until `horae plugin add` (M4) writes locks:
+`horae.lock` here is hand-written (`horae plugin add` writes the entries of marketplace
+plugins, schemas decision 70):
 
 - `commit` is a placeholder (40 zeros): the plugins ship inside the core, and a commit of the
-  core repository cannot name the commit that contains it. Nothing fetches it; M4's fetch and
-  verify (#44, #46) must special-case built-in plugins;
+  core repository cannot name the commit that contains it. Nothing fetches it; built-in plugins
+  have no install record, so the host checks them by their manifest only (decision 70 F);
 - `file-sink`'s `paths.write` is the vault, `/srv/horae/vault` here: set it to your vault's
   absolute path (in your copy, see below). The end-to-end test builds its lock from this
   file at test time, replacing only that path with its temporary vault;

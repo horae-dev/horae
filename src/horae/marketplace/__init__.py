@@ -5,13 +5,17 @@ names, and install what a name resolves to (#44) with its own venv (#45)."""
 from horae.marketplace.environment import PluginEnvironment
 from horae.marketplace.errors import (
     AlreadyInstalled,
+    ApprovalRefused,
     ConflictError,
     FetchError,
     InstallError,
     InstallRefused,
     InvalidReference,
+    LockBusy,
+    LockInvalid,
     MarketplaceError,
     NoCacheError,
+    TierRefused,
     UnknownPlugin,
     UnknownVersion,
 )
@@ -21,6 +25,7 @@ from horae.marketplace.resolve import Found, Resolved, parse_ref, resolve, searc
 
 __all__ = [
     "AlreadyInstalled",
+    "ApprovalRefused",
     "ConflictError",
     "FetchError",
     "Found",
@@ -30,6 +35,8 @@ __all__ = [
     "InvalidReference",
     "Loaded",
     "LoadedIndex",
+    "LockBusy",
+    "LockInvalid",
     "MarketplaceClient",
     "MarketplaceError",
     "NoCacheError",
@@ -37,6 +44,7 @@ __all__ = [
     "PluginInstaller",
     "Prepare",
     "Resolved",
+    "TierRefused",
     "UnknownPlugin",
     "UnknownVersion",
     "parse_ref",

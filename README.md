@@ -54,9 +54,15 @@ uv run horae usage -i ~/horae-demo             # LLM cost per pipeline and day (
 uv run horae cache purge --all -i ~/horae-demo # forget cached LLM outputs (the next run asks again)
 uv run horae plugin search -i ~/horae-demo     # plugins of the `marketplaces` in horae.yaml (cached; --offline works)
 uv run horae plugin resolve github@0.2.0 -i ~/horae-demo   # -> repo and pinned commit
-uv run horae plugin add github@0.2.0 -i ~/horae-demo       # clone, verify tag and SHA, install into plugins/ (not enabled yet: #45, #46)
+uv run horae plugin add github@0.2.0 -i ~/horae-demo       # clone, verify tag and SHA, show and approve permissions, pin in horae.lock (deps: #45)
 uv run horae eval daily-brief/rank-and-word --plugin-dir tests/fixtures/plugins  # golden cases, offline
 ```
+
+`horae plugin add` installs only `first-party` plugins before M5, shows the permissions the
+plugin declares and asks you to approve them before pinning it in `horae.lock`.
+`--allow-host HOST` and `--allow-local HOST:PORT` grant more (your own Home Assistant, say);
+`--yes` re-installs, without asking, only what `horae.lock` already approves (a Docker build
+from a committed lock). Details: [schemas decision 70](schemas/README.md#decisions).
 
 `-i` defaults to the current directory (or `HORAE_INSTANCE`). Every command takes `--json`
 for scripting (one JSON document on stdout, `schema_version: 1`, errors too) and prints no
