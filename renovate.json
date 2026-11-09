@@ -10,7 +10,7 @@
     {
       "customType": "regex",
       "description": "Tool versions pinned in workflow env vars (gitleaks, uv, cosign): a `# renovate:` comment line followed by NAME_VERSION: x.y.z (no leading v). A gitleaks bump also needs GITLEAKS_SHA256 updated by hand; until then the checksum step fails closed.",
-      "managerFilePatterns": ["/^\\.github/workflows/(ci|image)\\.yml$/"],
+      "managerFilePatterns": ["/^\\.github/workflows/(ci|image|release)\\.yml$/"],
       "matchStrings": [
         "# renovate: datasource=(?<datasource>[a-z-]+) depName=(?<depName>[^\\s]+)\\n\\s*[A-Z_]+_VERSION: (?<currentValue>[\\w.-]+)"
       ],

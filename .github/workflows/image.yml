@@ -1,7 +1,8 @@
 name: Image release
 
-# Release tags only. Nothing is built here: a v* tag adds the semver tags to the digest that the
-# `publish` job of ci.yml already built, smoke-tested, signed and tagged `sha-<short>` for that
+# Called by release.yml for a `v*` tag (reusable workflow; it has no trigger of its own, so a tag
+# never starts it twice). Nothing is built here: the call adds the semver tags to the digest that
+# the `publish` job of ci.yml already built, smoke-tested, signed and tagged `sha-<short>` for that
 # commit on main. The commit must be on main and that digest must exist and carry a valid
 # signature from ci.yml on main for that exact commit; otherwise the release fails.
 #
@@ -9,15 +10,10 @@ name: Image release
 #   vX.Y.Z -> X.Y.Z and X.Y; X too, but only from 1.0 (no floating `0`).
 # A tag that is not plain semver (e.g. v0.2.0rc1) yields no tags and fails.
 #
-# No workflow_dispatch: the only thing this workflow does is publish tags, so a dry run would
-# have nothing left to do. Dispatching ci.yml on a branch is the build-and-smoke dry run.
+# No concurrency group here: the caller's group (per tag) covers it, and a group of the same name
+# in a called workflow would cancel the caller. The dry run is release.yml's `dry_run` input.
 on:
-  push:
-    tags: ["v*"]
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
+  workflow_call:
 
 permissions:
   contents: read
