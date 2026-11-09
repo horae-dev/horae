@@ -4312,10 +4312,15 @@ loosened later without breaking a valid file.
       under its `paths`, and the run history in the store: listed under `kept`. No flag deletes
       the files under its paths (they are the user's vault) or the run history (shared by
       every pipeline). `--delete-secrets` deletes `<secrets.dir>/<file>` of each of its secrets
-      that nothing else uses (no other locked plugin, model alias, push monitor or core
-      secret, and no other secret's `{file:}` reference to the same file), only as a regular
-      file (`lstat` through a descriptor of the directory, `O_NOFOLLOW`); a secret read from an
-      environment variable, a symlink, or a file that cannot be deleted is kept and listed.
+      that nothing else uses: no other locked plugin, no manifest under `plugins/` (locked or
+      not, built-in included), no `secrets.refs` name (a secret with an explicit reference is
+      kept: delete it there by hand), model alias, push monitor or core secret, and no other
+      `{file:}` reference or the de-identification vocabulary naming the same file, compared
+      case-insensitively and by device and inode (a symlink or a second hard link to it keeps
+      it). Only a regular file with one link is deleted (`lstat` through a descriptor of the
+      directory, `O_NOFOLLOW`). **Fail closed**: a manifest under `plugins/` that cannot be read
+      keeps every secret. A secret read from an environment variable, a symlink, or a file that
+      cannot be deleted is kept too; each is listed with the reason.
       Values are never read or printed.
     - **K, `horae plugin audit`** (`--json`). One row per plugin of `horae.lock` or of
       `plugins/` (hidden entries apart): version locked and installed, source (`marketplace`,

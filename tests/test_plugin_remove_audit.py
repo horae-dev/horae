@@ -308,7 +308,84 @@ def test_an_environment_secret_is_kept(inst: Path, market: Market) -> None:  # n
     code, out, _ = cli(inst, "remove", "demo", "--delete-secrets", "--json")
     assert code == 0, out
     reasons = {s["name"]: s["reason"] for s in as_json(out)["kept"]["secrets"]}
-    assert reasons == {"DEMO_TOKEN": "it is read from an environment variable"}
+    assert reasons["DEMO_TOKEN"] == FROM_ENV
+
+
+def _add_ref(instance: Path, line: str) -> None:
+    config = instance / "horae.yaml"
+    text = config.read_text(encoding="utf-8")
+    config.write_text(text.replace("  refs:\n", f"  refs:\n    {line}\n"), "utf-8")
+
+
+SHARED = "its file is shared with another secret"
+FROM_ENV = "it is read from an environment variable"
+
+
+def _kept(out: str) -> dict[str, str]:
+    report = as_json(out)
+    return {s["name"]: s["reason"] for s in report["kept"]["secrets"]}
+
+
+def test_a_secret_declared_by_an_unlocked_plugin_is_kept(inst: Path, market: Market) -> None:  # noqa: F811
+    add(inst)
+    directory = _secrets(inst)
+    other = inst / "plugins" / "other"
+    other.mkdir()
+    data = json.loads(manifest("1.0.0"))
+    data.update(name="other", provides={"sources": ["other.fetch"]})
+    data["permissions"] = {"secrets": ["DEMO_TOKEN"], "optional_secrets": ["DEMO_EXTRA"]}
+    (other / "plugin.yaml").write_text(json.dumps(data), encoding="utf-8")
+    code, out, _ = cli(inst, "remove", "demo", "--delete-secrets", "--json")
+    assert code == 0, out
+    assert set(_kept(out)) == {"DEMO_TOKEN", "DEMO_EXTRA"}
+    assert (directory / "DEMO_TOKEN").is_file()
+
+
+def test_an_unreadable_manifest_keeps_every_secret(inst: Path, market: Market) -> None:  # noqa: F811
+    add(inst)
+    _secrets(inst)
+    (inst / "plugins" / "broken").mkdir()
+    (inst / "plugins" / "broken" / "plugin.yaml").write_text("{not: valid", encoding="utf-8")
+    code, out, _ = cli(inst, "remove", "demo", "--delete-secrets", "--json")
+    assert code == 0, out
+    assert all("cannot tell whether broken uses it" in r for r in _kept(out).values())
+
+
+def test_a_secret_named_in_secrets_refs_is_kept(inst: Path, market: Market) -> None:  # noqa: F811
+    add(inst)
+    directory = _secrets(inst)
+    _add_ref(inst, "DEMO_TOKEN: { file: DEMO_TOKEN }")
+    _add_ref(inst, "OTHER_KEY: { file: DEMO_EXTRA }")  # another secret reads DEMO_EXTRA's file
+    code, out, _ = cli(inst, "remove", "demo", "--delete-secrets", "--json")
+    assert code == 0, out
+    reasons = _kept(out)
+    assert "secrets.refs" in reasons["DEMO_TOKEN"]
+    assert reasons["DEMO_EXTRA"] == SHARED
+    assert (directory / "DEMO_EXTRA").is_file()
+
+
+def test_a_case_collision_keeps_the_secret(inst: Path, market: Market) -> None:  # noqa: F811
+    add(inst)
+    _secrets(inst)
+    _add_ref(inst, "OTHER_KEY: { file: demo_token }")  # the same file on a case-blind disk
+    code, out, _ = cli(inst, "remove", "demo", "--delete-secrets", "--json")
+    assert code == 0, out
+    assert _kept(out)["DEMO_TOKEN"] == SHARED
+    assert as_json(out)["removed"]["secrets"] == ["DEMO_EXTRA"]  # not shared: deleted
+
+
+def test_an_alias_of_the_file_keeps_the_secret(inst: Path, market: Market) -> None:  # noqa: F811
+    add(inst)
+    directory = _secrets(inst)
+    _add_ref(inst, "OTHER_KEY: { file: other_key }")
+    (directory / "other_key").symlink_to(directory / "DEMO_TOKEN")  # reaches the same inode
+    os.link(directory / "DEMO_EXTRA", directory / "extra_copy")  # a second hard link
+    code, out, _ = cli(inst, "remove", "demo", "--delete-secrets", "--json")
+    assert code == 0, out
+    reasons = _kept(out)
+    assert reasons["DEMO_TOKEN"] == SHARED
+    assert reasons["DEMO_EXTRA"] == "its file has other hard links"
+    assert (directory / "DEMO_TOKEN").is_file()
 
 
 # --- upgrade of a pipeline pack ----------------------------------------------------------------

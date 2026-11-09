@@ -541,39 +541,93 @@ def _secret_file(config: InstanceConfig, name: str) -> str | None:
     return name if ref is None else ref.file
 
 
+def _manifest_secrets(directory: Path, removed: str) -> tuple[set[str], str | None]:
+    """Every secret a manifest under `plugins/` declares (locked or not, built-in included),
+    but those of `removed`; with the first plugin whose manifest cannot be read (then the
+    usage is unknown and nothing may be deleted)."""
+    names: set[str] = set()
+    try:
+        entries = sorted(directory.iterdir())
+    except FileNotFoundError:
+        return names, None
+    except OSError:
+        return names, str(directory)
+    for entry in entries:
+        if entry.name.startswith(".") or entry.name == removed:
+            continue
+        manifest = entry / MANIFEST_FILE
+        if not os.path.lexists(manifest):
+            continue
+        try:
+            declared = validate(read_yaml(manifest), PluginManifest).permissions
+        except (ProblemsError, OSError, ValueError):
+            return names, entry.name
+        names.update(declared.all_secrets)
+    return names, None
+
+
+def _used(
+    instance: Path, config: InstanceConfig, remaining: Lockfile, removed: str
+) -> tuple[set[str], set[str], str | None]:
+    """`(names, files, unknown)`: every secret name the instance still references (core
+    secrets, `horae.lock`, every manifest under `plugins/`, `secrets.refs`, model aliases, push
+    monitors) and every secrets-directory file they or the configuration name (`{file:}`
+    references, the de-identification vocabulary); `unknown` says why usage cannot be told."""
+    names = set(CORE_SECRET_NAMES)
+    for plugin in remaining.plugins.values():
+        names.update(plugin.permissions.all_secrets)
+    declared, unreadable = _manifest_secrets(plugins_dir(instance), removed)
+    names.update(declared)
+    names.update(config.secrets.refs)
+    names.update(spec.secret for spec in config.models.values() if spec.secret)
+    names.update(monitor.secret for monitor in config.scheduler.monitors.values())
+    files = {f for f in (_secret_file(config, n) for n in names) if f is not None}
+    files.update(
+        ref.file for ref in config.secrets.refs.values() if not isinstance(ref, EnvSecretRef)
+    )
+    if config.deidentification.vocabulary is not None:
+        files.add(config.deidentification.vocabulary)
+    unknown = None
+    if unreadable is not None:
+        unknown = f"cannot tell whether {unreadable} uses it (its manifest cannot be read)"
+    return names, files, unknown
+
+
 def _secrets(
     instance: Path,
     config: InstanceConfig,
     removed: LockedPlugin,
     remaining: Lockfile,
     delete: bool,
+    plugin: str,
 ) -> tuple[list[str], list[dict[str, str]]]:
     """`(deleted, kept)`: the secrets of `removed` deleted (with `delete`), and those kept with
-    the reason. Only a regular file in the secrets directory that nothing else uses is deleted,
-    never through a symlink; values are never read."""
+    the reason. Only a regular file of the secrets directory, with a single link, that no other
+    name or reference of the instance reaches (by name, case-insensitively, or by device and
+    inode) is deleted, never through a symlink; when usage cannot be told, nothing is. Values
+    are never read."""
     names = sorted(removed.permissions.all_secrets)
     if not delete:
         return [], [{"name": n, "reason": "pass --delete-secrets to delete it"} for n in names]
-    used = set(CORE_SECRET_NAMES)
-    for plugin in remaining.plugins.values():
-        used.update(plugin.permissions.all_secrets)
-    used.update(spec.secret for spec in config.models.values() if spec.secret)
-    used.update(monitor.secret for monitor in config.scheduler.monitors.values())
-    used_files = {f for f in (_secret_file(config, n) for n in used) if f is not None}
+    used, used_files, unknown = _used(instance, config, remaining, plugin)
     directory = instance / config.secrets.dir
     deleted: list[str] = []
     kept: list[dict[str, str]] = []
     for name in names:
         file = _secret_file(config, name)
         reason = None
-        if name in used:
-            reason = "another plugin or the configuration uses it"
+        if unknown is not None:
+            reason = unknown
         elif file is None:
             reason = "it is read from an environment variable"
-        elif file in used_files:
+        elif name in config.secrets.refs:
+            reason = "secrets.refs in horae.yaml names it: delete it there and by hand"
+        elif name in used:
+            reason = "another plugin or the configuration uses it"
+        elif file.casefold() in {f.casefold() for f in used_files}:
             reason = "its file is shared with another secret"
         else:
-            reason = _delete_secret_file(directory, file)
+            reason = _delete_secret_file(directory, file, used_files)
         if reason is None:
             deleted.append(name)
         elif reason != "absent":
@@ -581,10 +635,20 @@ def _secrets(
     return deleted, kept
 
 
-def _delete_secret_file(directory: Path, file: str) -> str | None:
-    """Delete `<directory>/<file>` if it is a regular file (checked through a descriptor of the
-    directory opened without following a symlink); the reason it was kept, `"absent"`, or
-    `None` when deleted."""
+def _identity(fd: int, file: str) -> tuple[int, int] | None:
+    """`(device, inode)` of what `file` reaches in the directory `fd` (following a link, so a
+    symlink to another secret's file counts as that file), `None` when it reaches nothing."""
+    try:
+        info = os.stat(file, dir_fd=fd)
+    except OSError:
+        return None
+    return info.st_dev, info.st_ino
+
+
+def _delete_secret_file(directory: Path, file: str, used_files: set[str]) -> str | None:
+    """Delete `<directory>/<file>` if it is a regular file with one link that no file of
+    `used_files` reaches (checked through a descriptor of the directory opened without
+    following a symlink); the reason it was kept, `"absent"`, or `None` when deleted."""
     try:
         fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     except FileNotFoundError:
@@ -596,8 +660,15 @@ def _delete_secret_file(directory: Path, file: str) -> str | None:
             info = os.lstat(file, dir_fd=fd)
         except FileNotFoundError:
             return "absent"
+        except OSError as exc:
+            return f"its file cannot be checked ({exc.strerror})"
         if not stat.S_ISREG(info.st_mode):
             return "its file is not a regular file (a symlink?)"
+        if info.st_nlink != 1:
+            return "its file has other hard links"
+        mine = (info.st_dev, info.st_ino)
+        if any(_identity(fd, other) == mine for other in used_files):
+            return "its file is shared with another secret"
         try:
             os.unlink(file, dir_fd=fd)
         except OSError as exc:
@@ -669,7 +740,7 @@ def _remove_locked(
         if str(pack / f"{p}.yaml") not in kept_pipelines
     ]
     deleted, kept_secrets = (
-        _secrets(instance, config, entry, remaining, delete_secrets) if entry else ([], [])
+        _secrets(instance, config, entry, remaining, delete_secrets, name) if entry else ([], [])
     )
     kept_data = sorted(entry.permissions.paths.write) if entry else []
     for warning in warnings:
