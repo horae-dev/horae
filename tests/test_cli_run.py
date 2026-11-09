@@ -519,7 +519,7 @@ def test_a_signal_while_waiting_for_the_apply_lock_applies_nothing(
     fake.sinks = StaticSinks(default=sink)
     held = try_acquire_apply_lock(root / "state")
     assert held is not None
-    real_try = runner_module.try_acquire_apply_lock
+    real_try = try_acquire_apply_lock
     signalled: list[bool] = []
 
     def try_then_signal(state_dir: Path) -> Any:
