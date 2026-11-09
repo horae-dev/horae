@@ -40,6 +40,8 @@ from test_llm_anthropic import SCHEMA, SYSTEM
 runner = CliRunner()
 PACK = Path(__file__).resolve().parent / "fixtures" / "plugins" / "pack-daily-brief"
 SKILL = "daily-brief/rank-and-word"
+NESTED = "".join(["(", "a", "+)", "+$"])
+"""A nested quantifier (exponential in `re`), spelled out in pieces: it is test data."""
 ANTHROPIC = {"backend": "anthropic", "model": "claude-fixture-1", "secret": "ANTHROPIC_API_KEY"}
 
 
@@ -114,7 +116,7 @@ def test_matches_is_bounded_against_redos() -> None:
     (never hangs, never passes)."""
     hostile = "a" * 40 + "b"
     started = time.monotonic()
-    ok, message = check_text(r"(a+)+$", hostile)
+    ok, message = check_text(NESTED, hostile)
     assert time.monotonic() - started < match.MATCH_TIMEOUT_S + 5
     assert not ok
     assert message is not None
@@ -133,8 +135,8 @@ def test_matches_bounds_the_text_and_the_worker() -> None:
     assert (ok, message) == (False, f"the text is longer than {match.MAX_SUBJECT_CHARS} characters")
     assert check_text("a", "a" * match.MAX_SUBJECT_CHARS) == (True, None)
     with pytest.raises(match.MatchTimeout):
-        match.search(r"(a+)+$", "a" * 40 + "b", timeout_s=0.5)
-    assert match.search(r"(a+)+$", "aaa") is True
+        match.search(NESTED, "a" * 40 + "b", timeout_s=0.5)
+    assert match.search(NESTED, "aaa") is True
 
 
 def test_the_exported_schema_has_the_new_checks() -> None:
