@@ -2,18 +2,22 @@
 """`horae plugin add` installs a pack's pipelines (#133, schemas decision 71), over local
 fixture repositories (no network)."""
 
+import hashlib
 import json
 import os
 from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 from typer.testing import CliRunner
 
 from horae import cli_plugin
 from horae.cli import app
-from horae.config import load_instance
+from horae.config import InstanceError, load_instance
+from horae.contracts.lockfile import LockedPlugin
 from horae.marketplace import approval
+from horae.marketplace.approval import lock_mismatch
 from horae.marketplace.install import INSTALL_RECORD
 from marketplace_fixtures import (
     PLUGIN_URL,
@@ -101,6 +105,18 @@ def _add(instance: Path, *args: str) -> tuple[int, str]:
     return result.exit_code, result.stdout
 
 
+def _enable(instance: Path) -> None:
+    config = instance / "horae.yaml"
+    text = config.read_text(encoding="utf-8")
+    config.write_text(text.replace("plugins:\n", "plugins:\n  demo-pack: {}\n", 1), "utf-8")
+
+
+def _disable(instance: Path) -> None:
+    config = instance / "horae.yaml"
+    text = config.read_text(encoding="utf-8")
+    config.write_text(text.replace("  demo-pack: {}\n", ""), encoding="utf-8")
+
+
 def _nothing_left(instance: Path) -> None:
     plugins = instance / "plugins"
     assert not plugins.exists() or not list(plugins.iterdir())
@@ -136,7 +152,9 @@ def test_a_packs_pipelines_are_installed_in_its_own_directory(
     ]
     record = json.loads((inst / "plugins" / "demo-pack" / INSTALL_RECORD).read_text("utf-8"))
     assert record["pipelines"] == expected
-    # The instance loader reads them, next to its own.
+    # Not enabled yet: the loader skips them (point 3).
+    assert set(load_instance(inst).pipelines) == {"remind", "daily-brief"}
+    _enable(inst)
     loaded = load_instance(inst)
     assert {"weekly-review", "nightly-check", "remind", "daily-brief"} == set(loaded.pipelines)
     assert loaded.pipeline_files["weekly-review"] == directory / "weekly-review.yaml"
@@ -277,11 +295,128 @@ def test_the_loader_ignores_dot_directories_and_symlinked_directories(
     assert set(load_instance(instance_dir).pipelines) == {"daily-brief", "remind"}
 
 
-def test_the_same_name_in_two_places_is_a_loader_problem(instance_dir: Path) -> None:
-    pack_dir = instance_dir / "pipelines" / "some-pack"
-    pack_dir.mkdir()
-    (pack_dir / "remind.yaml").write_text(PIPELINE.format(name="remind"), encoding="utf-8")
-    from horae.config import InstanceError
-
+def test_the_same_name_in_two_places_is_a_loader_problem(inst: Path, pack: dict[str, Any]) -> None:
+    pack["publish"](_manifest(["weekly-review"]), {k: v for k, v in GOOD.items() if "weekly" in k})
+    assert _add(inst)[0] == 0
+    _enable(inst)
+    mine = inst / "pipelines" / "weekly-review.yaml"
+    mine.write_text(PIPELINE.format(name="weekly-review"), encoding="utf-8")
     with pytest.raises(InstanceError, match="defined twice"):
-        load_instance(instance_dir)
+        load_instance(inst)
+
+
+# --- review: the approval shows the pipelines, the lock pins them, only an enabled pack runs --
+
+
+def test_the_approval_prompt_lists_each_pipeline_and_warns_about_other_plugins(
+    inst: Path, pack: dict[str, Any]
+) -> None:
+    files = {
+        **GOOD,
+        "pipelines/nightly-check.yaml": GOOD["pipelines/nightly-check.yaml"].replace(
+            "- collect: [demo.fetch]", "- collect: [demo-pack.own, github.review_requests]"
+        ),
+    }
+    pack["publish"](_manifest(["weekly-review", "nightly-check"]), files)
+    code, out = _add(inst)
+    assert code == 0, out
+    assert "weekly-review: scheduled, cron */10 * * * *" in out
+    assert "tools: demo-pack.own, demo.alert, github.review_requests" in out
+    assert "warning: calls plugins other than demo-pack (demo, github)" in out
+    assert "warning: calls plugins other than demo-pack (demo);" in out  # weekly-review
+    assert out.index("weekly-review:") < out.index("Approve these permissions")
+
+
+def test_a_pipeline_without_a_trigger_and_with_a_skill_is_described(
+    inst: Path, pack: dict[str, Any]
+) -> None:
+    text = (
+        "name: weekly-review\nsteps:\n"
+        "  - llm:\n      skill: demo-pack/word\n      model: default\n"
+        "      budget: { usd: 0.01, tokens_out: 100 }\n"
+    )
+    pack["publish"](_manifest(["weekly-review"]), {"pipelines/weekly-review.yaml": text})
+    code, out = _add(inst)
+    assert code == 0, out
+    assert "weekly-review: manual (horae run) or external trigger only" in out
+    assert "skills: demo-pack/word" in out
+    assert "warning" not in out
+
+
+def test_the_lock_records_a_digest_per_pipeline(inst: Path, pack: dict[str, Any]) -> None:
+    pack["publish"](_manifest(["weekly-review", "nightly-check"]), GOOD)
+    assert _add(inst)[0] == 0
+    lock = yaml.safe_load((inst / "horae.lock").read_text(encoding="utf-8"))
+    expected = {
+        name: hashlib.sha256(GOOD[f"pipelines/{name}.yaml"].encode()).hexdigest()
+        for name in ("weekly-review", "nightly-check")
+    }
+    assert lock["plugins"]["demo-pack"]["pipelines"] == dict(sorted(expected.items()))
+    assert "pipelines" not in lock["plugins"]["github"]
+
+
+def test_yes_refuses_changed_pipelines() -> None:
+    base = {
+        "version": "1.0.0",
+        "repo": "https://example.org/x/plugin-demo",
+        "commit": "a" * 40,
+        "permissions": {},
+        "pipelines": {"weekly-review": "b" * 64},
+    }
+    old, same = LockedPlugin.model_validate(base), LockedPlugin.model_validate(base)
+    assert lock_mismatch(old, same) is None
+    for changed in (
+        {"weekly-review": "c" * 64},
+        {"weekly-review": "b" * 64, "extra": "d" * 64},
+        {},
+    ):
+        new = LockedPlugin.model_validate({**base, "pipelines": changed})
+        assert "different pipelines" in (lock_mismatch(old, new) or "")
+
+
+def test_yes_reinstalls_the_same_pipelines(inst: Path, pack: dict[str, Any]) -> None:
+    pack["publish"](_manifest(["weekly-review", "nightly-check"]), GOOD)
+    assert _add(inst)[0] == 0
+    import shutil
+
+    shutil.rmtree(inst / "plugins" / "demo-pack")
+    shutil.rmtree(inst / "pipelines" / "demo-pack")
+    code, out = _add(inst, "--yes")
+    assert code == 0, out
+
+
+def test_a_pack_runs_only_when_enabled_and_locked(inst: Path, pack: dict[str, Any]) -> None:
+    pack["publish"](_manifest(["weekly-review", "nightly-check"]), GOOD)
+    assert _add(inst)[0] == 0
+    assert "weekly-review" not in load_instance(inst).pipelines  # installed, not enabled
+    _enable(inst)
+    assert {"weekly-review", "nightly-check"} <= set(load_instance(inst).pipelines)
+    _disable(inst)  # disabling deactivates them
+    assert "weekly-review" not in load_instance(inst).pipelines
+
+
+def test_a_pack_directory_without_a_lock_entry_is_not_loaded(
+    inst: Path, pack: dict[str, Any]
+) -> None:
+    directory = inst / "pipelines" / "ghost-pack"
+    directory.mkdir()
+    (directory / "ghost.yaml").write_text(PIPELINE.format(name="ghost"), encoding="utf-8")
+    config = inst / "horae.yaml"
+    text = config.read_text(encoding="utf-8")
+    # Not listed in horae.lock: even listed in plugins:, nothing of it may load.
+    assert "ghost" not in load_instance(inst).pipelines
+    config.write_text(text.replace("plugins:\n", "plugins:\n  ghost-pack: {}\n", 1), "utf-8")
+    with pytest.raises(InstanceError, match="not installed"):
+        load_instance(inst)
+
+
+def test_a_pipeline_edited_after_approval_is_refused_by_the_loader(
+    inst: Path, pack: dict[str, Any]
+) -> None:
+    pack["publish"](_manifest(["weekly-review", "nightly-check"]), GOOD)
+    assert _add(inst)[0] == 0
+    _enable(inst)
+    edited = inst / "pipelines" / "demo-pack" / "weekly-review.yaml"
+    edited.write_text(edited.read_text(encoding="utf-8") + "# edited\n", encoding="utf-8")
+    with pytest.raises(InstanceError, match="approves"):
+        load_instance(inst)

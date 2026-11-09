@@ -117,6 +117,7 @@ def describe(
     asked: Permissions,
     granted: Permissions,
     personal_fields: dict[str, list[str]],
+    pipelines: Sequence[str] = (),
 ) -> list[str]:
     """The approval text: what `name@version` asks for (`granted`, with what the user adds
     beyond `asked` marked), grouped; then its personal fields as information."""
@@ -141,6 +142,9 @@ def describe(
     _group(lines, "paths (read and write)", granted.paths.write, set())
     if len(lines) == 1:
         lines.append("  nothing: no network, secret, intent or path")
+    if pipelines:
+        lines.append("pipelines it installs (they run once the plugin is enabled in horae.yaml):")
+        lines.extend(f"  {line}" for line in pipelines)
     if personal_fields:
         lines.append("personal fields (information only, no approval needed):")
         lines.append(f"  {PERSONAL_NOTE}:")
@@ -170,6 +174,13 @@ def lock_mismatch(existing: LockedPlugin | None, wanted: LockedPlugin) -> str | 
             "horae.lock approves different permissions "
             f"({', '.join(fields)} differ from what is asked)"
         )
+    if existing.pipelines != wanted.pipelines:
+        changed = sorted(
+            name
+            for name in {*existing.pipelines, *wanted.pipelines}
+            if existing.pipelines.get(name) != wanted.pipelines.get(name)
+        )
+        return f"horae.lock approves different pipelines ({', '.join(changed)} differ)"
     return None
 
 

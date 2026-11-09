@@ -25,6 +25,7 @@ The files are written to a scratch directory in `pipelines/` and renamed into pl
 pack's directory is absent or complete. A failure later in the add (the lock write) removes it.
 """
 
+import hashlib
 import json
 import os
 import shutil
@@ -35,7 +36,7 @@ from pathlib import Path
 from pydantic import TypeAdapter
 
 from horae.config.documents import ProblemsError, parse_yaml, validate
-from horae.contracts.pipeline import Pipeline
+from horae.contracts.pipeline import LlmStep, Pipeline, call_parts
 from horae.contracts.plugin import PluginManifest
 from horae.contracts.types import PipelineName
 from horae.marketplace.errors import InstallRefused
@@ -83,7 +84,7 @@ def _read(plugin: str, tree: Path, name: str) -> bytes:
     return raw
 
 
-def _validated(plugin: str, name: str, raw: bytes) -> None:
+def _validated(plugin: str, name: str, raw: bytes) -> Pipeline:
     relative = f"{PIPELINES_DIR}/{name}{SUFFIX}"
     try:
         doc = parse_yaml(raw.decode("utf-8"), Path(relative))
@@ -97,6 +98,47 @@ def _validated(plugin: str, name: str, raw: bytes) -> None:
         raise InstallRefused(
             f"{plugin}: {relative} defines pipeline {pipeline.name!r}, not {name!r}"
         )
+    return pipeline
+
+
+def digest(raw: bytes) -> str:
+    """The digest the lock records for a pipeline file."""
+    return hashlib.sha256(raw).hexdigest()
+
+
+def tools_and_skills(pipeline: Pipeline) -> tuple[list[str], list[str]]:
+    """The tool refs and the skills a pipeline calls, sorted, without duplicates."""
+    tools: set[str] = set()
+    skills: set[str] = set()
+    for step in pipeline.steps:
+        if isinstance(step, LlmStep):
+            skills.add(step.llm.skill)
+            continue
+        calls = getattr(step, next(iter(type(step).model_fields)))
+        tools.update(call_parts(call)[0] for call in calls)
+    return sorted(tools), sorted(skills)
+
+
+def _summary(plugin: str, pipeline: Pipeline) -> list[str]:
+    trigger = pipeline.trigger
+    if trigger is None:
+        when = "manual (horae run) or external trigger only"
+    else:
+        zone = f" ({trigger.timezone})" if trigger.timezone else ""
+        when = f"scheduled, cron {trigger.cron}{zone}"
+    tools, skills = tools_and_skills(pipeline)
+    lines = [f"{pipeline.name}: {when}"]
+    lines.append(f"    tools: {', '.join(tools) or 'none'}")
+    if skills:
+        lines.append(f"    skills: {', '.join(skills)}")
+    foreign = sorted({t.split(".", 1)[0] for t in tools} - {plugin})
+    foreign += sorted({s.split("/", 1)[0] for s in skills} - {plugin} - set(foreign))
+    if foreign:
+        lines.append(
+            f"    warning: calls plugins other than {plugin} ({', '.join(foreign)}); "
+            "they run with those plugins' own approved permissions"
+        )
+    return lines
 
 
 def _stems(directory: Path) -> set[str]:
@@ -129,6 +171,7 @@ class PackPipelines:
         self.instance = instance
         self.plugin: str | None = None
         self.files: dict[str, bytes] = {}
+        self.parsed: dict[str, Pipeline] = {}
         self.written: Path | None = None
 
     @property
@@ -137,6 +180,18 @@ class PackPipelines:
         if self.plugin is None:
             return []
         return [pack_path(self.plugin, name) for name in sorted(self.files)]
+
+    @property
+    def digests(self) -> dict[str, str]:
+        """Pipeline name -> digest of its file, for the lock entry."""
+        return {name: digest(raw) for name, raw in sorted(self.files.items())}
+
+    def approval_lines(self) -> list[str]:
+        """What the approval prompt shows for each pipeline: name, trigger, tools, skills."""
+        lines: list[str] = []
+        for name in sorted(self.parsed):
+            lines.extend(_summary(self.plugin or "", self.parsed[name]))
+        return lines
 
     def __call__(self, tree: Path, manifest: PluginManifest) -> None:
         plugin = manifest.name
@@ -148,8 +203,7 @@ class PackPipelines:
                 f"provides {sorted(declared) or 'no pipeline'}: they must be the same"
             )
         files = {name: _read(plugin, tree, name) for name in declared}
-        for name, raw in files.items():
-            _validated(plugin, name, raw)
+        parsed = {name: _validated(plugin, name, raw) for name, raw in files.items()}
         pipelines = self.instance / PIPELINES_DIR
         target = pipelines / plugin
         if _lstat(target) is not None:
@@ -165,7 +219,7 @@ class PackPipelines:
             )
         if not files:
             return  # not a pipeline pack: nothing to install
-        self.plugin, self.files = plugin, files
+        self.plugin, self.files, self.parsed = plugin, files, parsed
         self._record(tree)
 
     def _listing(self, plugin: str, tree: Path) -> set[str]:

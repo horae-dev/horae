@@ -68,7 +68,10 @@ A **pipeline pack** (a plugin whose `plugin.yaml` lists `provides.pipelines`) al
 pipelines installed: `pipelines/<name>.yaml` of the pack is validated and copied to
 `<instance>/pipelines/<plugin>/<name>.yaml`, and the paths are recorded in
 `plugins/<plugin>/.horae-install.json`. The install is refused, and nothing is written, if any
-file is invalid, is a symlink, or would replace a file or pipeline of yours
+file is invalid, is a symlink, or would replace a file or pipeline of yours. The approval
+prompt lists each pipeline (trigger, tools, skills; a warning for tools of other plugins) and
+`horae.lock` pins their digests; they run only once the plugin is listed under `plugins:` in
+`horae.yaml`
 ([schemas decision 71](schemas/README.md#provisional-decisions-133-pending-maintainer-review)).
 
 `-i` defaults to the current directory (or `HORAE_INSTANCE`). Every command takes `--json`

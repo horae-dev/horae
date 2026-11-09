@@ -241,7 +241,9 @@ class _Approval:
         *,
         yes: bool,
         json_output: bool,
+        pipelines: PackPipelines | None = None,
     ) -> None:
+        self.pipelines = pipelines
         self.lock = lock
         self.found = found
         self.hosts, self.local = grants
@@ -257,6 +259,7 @@ class _Approval:
             commit=self.found.sha,
             permissions=granted,
             personal_fields=manifest.provides.personal_fields,
+            pipelines=self.pipelines.digests if self.pipelines is not None else {},
         )
         existing = self.lock.plugins.get(self.found.name)
         err = self.json_output
@@ -266,6 +269,7 @@ class _Approval:
             manifest.permissions,
             granted,
             manifest.provides.personal_fields,
+            self.pipelines.approval_lines() if self.pipelines is not None else (),
         ):
             echo(safe(line), err=err)
         if self.yes:
@@ -319,21 +323,29 @@ def _add(
         require_installable(found.name, found.tier, found.index)
         with guard(loaded_instance.state_dir):
             lock, header = read_lock(lock_path)
-            approval = _Approval(lock, found, grants, yes=yes, json_output=json_output)
             pipelines = PackPipelines(instance)
+            approval = _Approval(
+                lock, found, grants, yes=yes, json_output=json_output, pipelines=pipelines
+            )
             installed = make_installer(plugins_dir(instance)).install(
                 found.name,
                 found.version,
                 found.repo,
                 found.sha,
                 prepare=_chain(
+                    pipelines,  # checked first: the approval shows what it found
                     approval,
                     make_environment(loaded_instance.state_dir / UV_CACHE_DIR),
-                    pipelines,
                 ),
             )
             entry = approval.entry
-            if entry is None or installed.lock_entry(entry.permissions) != entry:
+            if (
+                entry is None
+                or installed.lock_entry(entry.permissions).model_copy(
+                    update={"pipelines": entry.pipelines}
+                )
+                != entry
+            ):
                 # The install record and the approved entry must be the same plugin.
                 shutil.rmtree(installed.path, ignore_errors=True)
                 raise ApprovalRefused("the installed plugin is not the one approved; removed")
@@ -380,6 +392,8 @@ def _add(
     for path in pipelines.paths:
         echo(f"  pipeline  {path}")
     echo(PENDING)
+    if pipelines.paths:
+        echo(f"its pipelines run once `{installed.name}` is listed under plugins: in horae.yaml.")
     return EXIT_OK
 
 

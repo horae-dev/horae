@@ -28,9 +28,11 @@ from horae.contracts.types import (
     CommitSha,
     Contract,
     JsonSchemaExtra,
+    PipelineName,
     PluginName,
     SchemaVersion1,
     SemVer,
+    Sha256Hex,
 )
 
 _REPO_DOT_SEGMENT = r"/\.\.?(/|$)"
@@ -92,6 +94,15 @@ class LockedPlugin(Contract):
     Left out when empty (paths sorted when written), so a lock without any is written exactly
     as before and an older core still reads it."""
 
+    pipelines: Annotated[dict[PipelineName, Sha256Hex], Field(max_length=MAX_ITEMS)] = Field(
+        default_factory=dict
+    )
+    """For a pipeline pack (decision 71): the pipelines `horae plugin add` installed from it, by
+    name, each with the SHA-256 of the file as approved. The approval prompt showed them; the
+    loader (`horae.config.loader`) runs a pack's pipeline only if its file still has this
+    digest, and `--yes` refuses a pack whose pipelines differ. Left out when empty (names
+    sorted when written), so a lock without any is written exactly as before."""
+
     @field_serializer("permissions", mode="wrap")
     def _canonical_permissions(
         self, value: Permissions, handler: SerializerFunctionWrapHandler
@@ -111,9 +122,17 @@ class LockedPlugin(Contract):
     @model_serializer(mode="wrap")
     def _omit_empty(self, handler: SerializerFunctionWrapHandler) -> Any:
         data = handler(self)
-        if isinstance(data, dict) and not data.get("personal_fields"):
-            data.pop("personal_fields", None)
+        if isinstance(data, dict):
+            for key in ("personal_fields", "pipelines"):
+                if not data.get(key):
+                    data.pop(key, None)
         return data
+
+    @field_serializer("pipelines", mode="wrap")
+    def _canonical_pipelines(
+        self, value: dict[str, str], handler: SerializerFunctionWrapHandler
+    ) -> Any:
+        return dict(sorted(handler(value).items()))
 
 
 class Lockfile(Contract):

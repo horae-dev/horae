@@ -62,6 +62,22 @@
           "title": "Personal Fields",
           "type": "object",
           "additionalProperties": false
+        },
+        "pipelines": {
+          "description": "For a pipeline pack (decision 71): the pipelines `horae plugin add` installed from it, by\nname, each with the SHA-256 of the file as approved. The approval prompt showed them; the\nloader (`horae.config.loader`) runs a pack's pipeline only if its file still has this\ndigest, and `--yes` refuses a pack whose pipelines differ. Left out when empty (names\nsorted when written), so a lock without any is written exactly as before.",
+          "maxProperties": 256,
+          "patternProperties": {
+            "^[a-z][a-z0-9-]*$": {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            }
+          },
+          "propertyNames": {
+            "maxLength": 64
+          },
+          "title": "Pipelines",
+          "type": "object",
+          "additionalProperties": false
         }
       },
       "required": [
