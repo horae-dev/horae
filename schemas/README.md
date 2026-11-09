@@ -11,6 +11,7 @@ All schemas use JSON Schema **draft 2020-12**. `$id` values below are relative t
 | Intent (any) | [`intent/v1.json`](intent/v1.json) | `intent/v1.json` | one intent, `oneOf` tagged by a `type` const |
 | One intent | `intents/<type>/v1.json` | `intents/<type>/v1.json` | `note.create`, `note.append_section`, `note.replace_owned_block`, `task.create`, `task.update_status`, `notify.push`, `http.post` |
 | Lockfile | [`lockfile/v1.json`](lockfile/v1.json) | `lockfile/v1.json` | `horae.lock` (§4) |
+| Marketplace index | [`marketplace/v1.json`](marketplace/v1.json) | `marketplace/v1.json` | `marketplace.json` of a marketplace repository (§4) |
 | Run record | [`run-record/v1.json`](run-record/v1.json) | `run-record/v1.json` | one run (§3.1, §2.1.6) |
 | Instance configuration | [`instance/v1.json`](instance/v1.json) | `instance/v1.json` | `horae.yaml` (§3.1, §3.4, §7) |
 | Skill | [`skill/v1.json`](skill/v1.json) | `skill/v1.json` | `skills/<namespace>/<skill>/skill.yaml` of a plugin (§2.1, §3.4) |
@@ -3451,3 +3452,51 @@ loosened later without breaking a valid file.
     - **D, compatibility.** Pipelines that never had an off-prefix link are unchanged; ones
       that did now succeed with a violation instead of failing. A consumer must accept the new
       `kind`; per "Versioning" a new enum value is a compatible addition.
+
+### Provisional decisions (#43, pending maintainer review)
+
+61. **Marketplace resolution (#43).** New schema `marketplace/v1.json` (a marketplace's
+    `marketplace.json`) and two optional `horae.yaml` keys, `marketplaces` and
+    `marketplace_pins`. The number may be renumbered against other open PRs.
+    - **A, the index contract.** `MarketplaceIndex` (`horae.contracts.marketplace`) mirrors
+      `schema/marketplace.schema.json` of `horae-dev/marketplace`, strict and `extra=forbid`:
+      `{plugins: [{name, repo, versions: {<semver>: <40-hex sha>}, tier}]}`, names unique.
+      Name, semver and `repo` (`GitRepoUrl`: https only) are the lockfile's types. The index pins
+      a 40-hex SHA-1 only, as the marketplace schema does (the lockfile also takes 64-hex).
+      Unique names are checked by the model, not by JSON Schema (as in the marketplace verifier).
+    - **B, config.** `marketplaces`: an ordered list of 1 to 16 `https://` git URLs, highest
+      priority first, default `["https://github.com/horae-dev/marketplace"]`; no duplicate.
+      `marketplace_pins`: plugin name -> one of the `marketplaces`.
+    - **C, fetch and cache.** `horae plugin search|resolve` clone (shallow, `--depth=1`, not
+      `--filter`) or update each index into `<state_dir>/marketplaces/<hash of the URL>/repo.git`,
+      read `marketplace.json` from the fetched `HEAD` (at most 4 MiB), validate it, and store the
+      validated copy and when it was fetched beside the clone. A copy that fails validation never
+      replaces the cache. Git is hardened as the marketplace verifier's `_git`:
+      `protocol.allow=never` and only `https`, `GIT_CONFIG_GLOBAL`/`SYSTEM` off, no prompt, an
+      empty environment but `PATH`, `HOME`, `LANG`, `TMPDIR`, a 120 s timeout, `--` before the
+      URL. The transport is a constructor argument of `MarketplaceClient`, never a setting;
+      only tests pass `file`, to clone local fixture repositories.
+    - **D, resolution.** `name[@version]`. Indexes are searched in `marketplaces` order. Without
+      a version, the highest semver by semver.org precedence; **pre-releases are skipped** unless
+      `--pre` (a version named explicitly may be one; a plugin with only pre-releases is an error
+      that says so). A name listed by several indexes under the **same** repository (a mirror)
+      comes from the highest-priority one, entirely. Under **different** repositories it is a
+      **conflict**: an error that names every index with its repository (priority order) and
+      suggests `marketplace_pins`. Unknown name or version are errors that list where it looked
+      or the available versions.
+    - **E, disambiguation: a pin in config.** Chosen over an `index-name/plugin` syntax: an index
+      is any git URL and has no short name that is unique (two `marketplace` repositories of
+      different owners are likely), a pin is explicit, reviewable in `horae.yaml`, and keeps
+      `name@version` the only reference grammar (also the lockfile's and #44's). A pin to an
+      index that does not list the plugin is an unknown-plugin error.
+    - **F, offline.** When a refresh fails, the cached copy of that index is used and a warning
+      names the index, the reason and the copy's date. `--offline` skips the fetch. An index with
+      no cache (fetch failed, or `--offline`) is an error, never skipped: skipping a
+      higher-priority index could hide a conflict. The cache is validated again when read.
+    - **G, CLI.** `horae plugin search [QUERY]` and `horae plugin resolve NAME[@VERSION]`
+      (`--offline`, `--pre`, `--json`, `-i`). Exit 0 ok; 1 configuration problem or no
+      cache; 2 malformed reference; 3 unknown plugin or version, or conflict. They install
+      nothing (#44).
+    - **H, trust.** An index is untrusted data ([security.md](../docs/security.md), B6): it can
+      only point to a repository and a SHA. #44 re-verifies the tag and the SHA, #46 shows the
+      permissions.

@@ -1,0 +1,3 @@
+# Marketplaces are cloned over https only.
+marketplaces:
+  - file:///srv/marketplace

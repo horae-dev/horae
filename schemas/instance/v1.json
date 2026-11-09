@@ -845,6 +845,55 @@
     "http": {
       "$ref": "#/$defs/HttpConfig",
       "description": "The HTTP API's public origin and trusted proxies (`/act` links, #38)."
+    },
+    "marketplaces": {
+      "description": "Marketplace indexes, as `https://` git URLs, highest priority first (#43). Each holds a\n`marketplace.json`. Default: `https://github.com/horae-dev/marketplace`.",
+      "items": {
+        "maxLength": 512,
+        "not": {
+          "anyOf": [
+            {
+              "pattern": "/\\.\\.?(/|$)"
+            },
+            {
+              "pattern": "^https://([^/]*\\.)?localhost/"
+            }
+          ]
+        },
+        "pattern": "^https://([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)*[a-z]([a-z0-9-]{0,61}[a-z0-9])?(/[A-Za-z0-9._-]+)+$",
+        "type": "string"
+      },
+      "maxItems": 16,
+      "minItems": 1,
+      "title": "Marketplaces",
+      "type": "array"
+    },
+    "marketplace_pins": {
+      "description": "Plugin name -> the one `marketplaces` entry that resolves it, when several indexes list\nthe same plugin under different repositories (schemas decision 61).",
+      "maxProperties": 256,
+      "patternProperties": {
+        "^[a-z][a-z0-9-]*$": {
+          "maxLength": 512,
+          "not": {
+            "anyOf": [
+              {
+                "pattern": "/\\.\\.?(/|$)"
+              },
+              {
+                "pattern": "^https://([^/]*\\.)?localhost/"
+              }
+            ]
+          },
+          "pattern": "^https://([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)*[a-z]([a-z0-9-]{0,61}[a-z0-9])?(/[A-Za-z0-9._-]+)+$",
+          "type": "string"
+        }
+      },
+      "propertyNames": {
+        "maxLength": 64
+      },
+      "title": "Marketplace Pins",
+      "type": "object",
+      "additionalProperties": false
     }
   },
   "title": "Horae instance configuration (horae.yaml)",

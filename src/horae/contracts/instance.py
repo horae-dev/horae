@@ -21,6 +21,7 @@ from pydantic import (
     model_validator,
 )
 
+from horae.contracts.lockfile import GitRepoUrl
 from horae.contracts.types import (
     _PORT,
     _URL_REST,
@@ -539,6 +540,7 @@ IpNetwork = Annotated[
 at least /8 for IPv4, /32 for IPv6)."""
 
 MAX_TRUSTED_PROXIES = 16
+MAX_MARKETPLACES = 16
 
 
 class HttpConfig(Contract):
@@ -620,6 +622,10 @@ class DeidentificationConfig(Contract):
     file (a regular file of at most 64 KiB, UTF-8)."""
 
 
+DEFAULT_MARKETPLACE = "https://github.com/horae-dev/marketplace"
+"""The marketplace an instance uses unless `marketplaces` says otherwise."""
+
+
 class InstanceConfig(Contract):
     """An instance's `horae.yaml`."""
 
@@ -651,6 +657,25 @@ class InstanceConfig(Contract):
     """De-identification of declared fields before a cloud model (#34)."""
     http: HttpConfig = Field(default_factory=HttpConfig)
     """The HTTP API's public origin and trusted proxies (`/act` links, #38)."""
+    marketplaces: Annotated[list[GitRepoUrl], Field(min_length=1, max_length=MAX_MARKETPLACES)] = (
+        Field(default_factory=lambda: [DEFAULT_MARKETPLACE])
+    )
+    """Marketplace indexes, as `https://` git URLs, highest priority first (#43). Each holds a
+    `marketplace.json`. Default: `https://github.com/horae-dev/marketplace`."""
+    marketplace_pins: Annotated[dict[PluginName, GitRepoUrl], Field(max_length=MAX_ITEMS)] = Field(
+        default_factory=dict
+    )
+    """Plugin name -> the one `marketplaces` entry that resolves it, when several indexes list
+    the same plugin under different repositories (schemas decision 61)."""
+
+    @model_validator(mode="after")
+    def _check_marketplaces(self) -> Self:
+        if len(set(self.marketplaces)) != len(self.marketplaces):
+            raise ValueError("marketplaces lists the same URL twice")
+        for name, url in self.marketplace_pins.items():
+            if url not in self.marketplaces:
+                raise ValueError(f"marketplace_pins.{name} is not one of `marketplaces`")
+        return self
 
     def plugin_timeouts(self, plugin: str) -> PluginDefaults:
         """The effective timeouts of `plugin`: its own settings, else `plugin_defaults`."""
