@@ -127,7 +127,9 @@ _LOCAL_HOST = re.compile(
 )
 _PORT = re.compile(r"[1-9][0-9]{0,4}")
 _U_LABEL_CATEGORIES = frozenset({"Ll", "Lo", "Lm", "Mn", "Mc", "Nd"})
-_METADATA = frozenset({"169.254.169.254", "169.254.170.2", "[fd00:ec2::254]"})
+_METADATA = frozenset(
+    {"169.254.169.254", "169.254.170.2", "169.254.170.23", "[fd00:ec2::254]", "[fd00:ec2::23]"}
+)
 _METADATA_LABELS = frozenset({"metadata", "instance-data"})
 """A name whose first label is one of these (`metadata.google.internal`,
 `instance-data.ec2.internal`) is a cloud metadata service, never a local endpoint."""

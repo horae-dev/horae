@@ -3684,7 +3684,7 @@ loosened later without breaking a valid file.
       no IPv4-mapped form), so one service has one spelling and exact matching is sound.
       Never a public address or name, `localhost`, a single-label name, a wildcard, a scheme or a
       path. Cloud metadata services are refused even as an explicit grant: the addresses
-      169.254.169.254, 169.254.170.2 and fd00:ec2::254, and every name whose first label is
+      169.254.169.254, 169.254.170.2, 169.254.170.23, fd00:ec2::254 and fd00:ec2::23, and every name whose first label is
       `metadata` or `instance-data` (`metadata.google.internal`, `metadata.internal`,
       `instance-data.ec2.internal`). The JSON Schema checks the shape (suffixes, private
       prefixes, port, the metadata `not`); the model adds the ranges and the canonical form.

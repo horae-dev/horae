@@ -75,6 +75,8 @@ INVALID = [
     "169.254.169.254:80",  # cloud metadata
     "169.254.170.2:80",
     "[fd00:ec2::254]:80",
+    "169.254.170.23:80",
+    "[fd00:ec2::23]:80",
     "localhost:80",
     "foo.localhost:80",
     "lan:80",  # a bare suffix
@@ -105,6 +107,11 @@ INVALID = [
 _ADAPTER = TypeAdapter(LocalEndpoint)
 
 METADATA_NAMES = [
+    "169.254.169.254:80",  # the addresses too, EKS Pod Identity (169.254.170.23) included
+    "169.254.170.2:80",
+    "169.254.170.23:80",
+    "[fd00:ec2::254]:80",
+    "[fd00:ec2::23]:80",
     "metadata.google.internal:80",
     "metadata:80",
     "metadata.internal:80",

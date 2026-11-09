@@ -343,15 +343,15 @@ loopback or link-local IPv4 literal, or a bracketed loopback, ULA or link-local 
 The model also requires the canonical form of an IP literal (see `_check_local`)."""
 _LOCAL_ENDPOINT = rf"^{LOCAL_HOST}:{_PORT}$"
 _METADATA = (
-    r"^(169\.254\.169\.254|169\.254\.170\.2|\[fd00:ec2::254\]"
+    r"^(169\.254\.169\.254|169\.254\.170\.2|169\.254\.170\.23|\[fd00:ec2::(254|23)\]"
     r"|(metadata|instance-data)(\.[^:]*)?):"
 )
 """Cloud instance metadata services: never a home service, and the classic SSRF target.
 Refused even as an explicit grant: the addresses (169.254.169.254, 169.254.170.2,
-fd00:ec2::254) and every name whose first label is `metadata` or `instance-data`
-(`metadata.google.internal`, `metadata.internal`, `instance-data.ec2.internal`...). A name
-can still *resolve* to a metadata address: refusing that at connect time is the M5 egress
-proxy's job (#50)."""
+169.254.170.23, fd00:ec2::254, fd00:ec2::23) and every name whose first label is `metadata`
+or `instance-data` (`metadata.google.internal`, `metadata.internal`,
+`instance-data.ec2.internal`...). A name can still *resolve* to a metadata address: refusing
+that at connect time is the M5 egress proxy's job (#50)."""
 
 _LOCAL_V4_NETS = tuple(
     ipaddress.IPv4Network(net)
@@ -399,7 +399,8 @@ The host is one of: a lowercase name ending in `.local`, `.lan`, `.internal` or 
 fe80::/10 (link-local, no zone id). IP literals must be canonical (`str(ipaddress.ip_address)`:
 no leading zeros, compressed lowercase IPv6, no IPv4-mapped form), so one service has one
 spelling. Never a public address, a public name, `localhost`, a wildcard, a scheme or a path;
-the cloud metadata addresses (169.254.169.254, 169.254.170.2, fd00:ec2::254) and names whose
+the cloud metadata addresses (169.254.169.254, 169.254.170.2, 169.254.170.23, fd00:ec2::254,
+fd00:ec2::23) and names whose
 first label is `metadata` or `instance-data` (`metadata.google.internal`,
 `instance-data.ec2.internal`) are refused. The
 range and canonical-form checks are made by the model only; the JSON Schema checks the shape."""
