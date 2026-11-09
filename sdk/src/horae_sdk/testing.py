@@ -17,7 +17,8 @@ must answer:
 `params` are the trusted parameters, `input` a transform's input (the previous step's data,
 as a run record stores it), `paths` the locked path permissions, `network` the locked host
 names (`[]` when absent, as a core sends for a plugin with no approved host; `null` sends no
-list at all, as a core older than horae-sdk 0.5 does); all optional. `expect` holds
+list at all, as a core older than horae-sdk 0.5 does), `network_local` the locked local
+endpoints (`host:port`; `[]` when absent); all optional. `expect` holds
 the `data` and `intents` (both compared exactly) or an `error` (a substring of the tool
 error's message). A recording is replayed **through MCP** (an in-process client, the same
 requests, `_meta` keys and result reading as the core's host), so what passes here is what
@@ -60,11 +61,17 @@ from mcp.client import Client
 from mcp_types import CallToolResult
 
 from horae_sdk.plugin import Plugin
-from horae_sdk.protocol import INPUT_META, INTENTS_META, NETWORK_META, PATHS_META
+from horae_sdk.protocol import (
+    INPUT_META,
+    INTENTS_META,
+    NETWORK_LOCAL_META,
+    NETWORK_META,
+    PATHS_META,
+)
 
 RECORD_ENV = "HORAE_SDK_RECORD"
 CI_ENVS = ("CI", "GITHUB_ACTIONS")
-_KEYS = {"tool", "params", "input", "paths", "network", "expect"}
+_KEYS = {"tool", "params", "input", "paths", "network", "network_local", "expect"}
 _EXPECT_KEYS = {"data", "intents"}
 
 
@@ -127,18 +134,31 @@ async def call(
     input: Any = None,
     paths: Mapping[str, Any] | None = None,
     network: Sequence[str] | None = (),
+    network_local: Sequence[str] | None = None,
 ) -> Replayed:
-    """Call `tool` as the core does: `params` as arguments, `input`, `paths` and `network`
-    (`None`: an older core, no list) in `_meta`.
+    """Call `tool` as the core does: `params` as arguments, `input`, `paths`, `network`
+    (`None`: an older core, no list) and `network_local` (the approved `host:port` local
+    endpoints; `None`: `[]` when `network` is sent, as the core does) in `_meta`.
     Only a provided source or transform can be called this way."""
     if tool not in plugin.tools:
         raise ReplayMismatch(f"{tool} is not a source or transform of {plugin.name}")
     meta: dict[str, Any] = {PATHS_META: {"read": [], "write": [], **(paths or {})}}
-    if network is not None:
-        meta[NETWORK_META] = list(network)
+    meta.update(_network_meta(network, network_local))
     if input is not None:
         meta[INPUT_META] = input
     return read_result(await _call_tool(plugin, tool, dict(params or {}), meta))
+
+
+def _network_meta(
+    network: Sequence[str] | None, network_local: Sequence[str] | None
+) -> dict[str, Any]:
+    meta: dict[str, Any] = {}
+    if network is not None:
+        meta[NETWORK_META] = list(network)
+        meta[NETWORK_LOCAL_META] = list(network_local or ())
+    elif network_local is not None:
+        meta[NETWORK_LOCAL_META] = list(network_local)
+    return meta
 
 
 async def operation(
@@ -147,14 +167,15 @@ async def operation(
     arguments: Mapping[str, Any],
     *,
     network: Sequence[str] | None = (),
+    network_local: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Call sink operation `tool` (`<ns>.apply`…) as the core does; its result object (or
     `{"error": {...}}`). `arguments` should include `paths`; `network` is the locked host
-    list in `_meta` (`None`: an older core, no list)."""
+    list in `_meta` (`None`: an older core, no list), `network_local` as for `call`."""
     namespace = tool.split(".", 1)[0]
     if namespace not in plugin.sinks:
         raise ReplayMismatch(f"{namespace} is not a sink namespace of {plugin.name}")
-    meta: dict[str, Any] = {} if network is None else {NETWORK_META: list(network)}
+    meta = _network_meta(network, network_local)
     replayed = read_result(await _call_tool(plugin, tool, dict(arguments), meta))
     if replayed.error is not None or not isinstance(replayed.data, dict):
         raise ReplayMismatch(f"{tool} did not return an object: {replayed.error}")
@@ -244,6 +265,7 @@ async def areplay(plugin: Plugin, path: Path, *, record: bool | None = None) -> 
         input=document.get("input"),
         paths=document.get("paths"),
         network=document.get("network", []),
+        network_local=document.get("network_local"),
     )
     if recording:
         document["expect"] = replayed.expectation()

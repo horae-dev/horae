@@ -470,6 +470,7 @@ def test_input_travels_in_meta_and_text_json_is_accepted(tmp_path: Path) -> None
         "input": {"items": [1]},
         "revealed": None,
         "meta_network": [],
+        "meta_network_local": [],
     }
     assert echoed.violations == ()
     assert text.data == {"a": [1, 2]}

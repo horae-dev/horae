@@ -26,6 +26,7 @@ from typing import Any
 import yaml
 
 from horae_sdk.intents import INTENT_TYPES
+from horae_sdk.protocol import local_endpoint
 
 SINK_OPERATIONS = ("read", "apply", "restore", "restore_status", "parent_exists", "identity")
 """The operations the core calls on a sink or notifier namespace (`horae.contracts.plugin`)."""
@@ -62,6 +63,9 @@ class Permissions:
 
     intents: Sequence[str] = ()
     network: Sequence[str] = ()
+    network_local: Sequence[str] = ()
+    """Local-network endpoints, `host:port` (`127.0.0.1:1143`, `[::1]:1143`,
+    `homeassistant.local:8123`; decision 66). Plain `http` is allowed on them only."""
     secrets: Sequence[str] = ()
     optional_secrets: Sequence[str] = ()
     """Injected when they resolve; the plugin still starts without them."""
@@ -73,6 +77,7 @@ class Permissions:
         rules = (
             ("intents", self.intents, lambda v: v in INTENT_TYPES),
             ("network", self.network, lambda v: bool(_HOST.fullmatch(v)) and len(v) <= 253),
+            ("network_local", self.network_local, lambda v: local_endpoint(v) is not None),
             ("secrets", self.secrets, lambda v: bool(_SECRET.fullmatch(v))),
             (
                 "optional_secrets",
@@ -99,7 +104,7 @@ class Permissions:
     def to_dict(self) -> dict[str, Any]:
         """The `permissions` mapping, empty lists left out (they are the default)."""
         data: dict[str, Any] = {}
-        for key in ("network", "secrets", "optional_secrets"):
+        for key in ("network", "network_local", "secrets", "optional_secrets"):
             if getattr(self, key):
                 data[key] = list(getattr(self, key))
         paths = {key: list(getattr(self, key)) for key in ("read", "write") if getattr(self, key)}

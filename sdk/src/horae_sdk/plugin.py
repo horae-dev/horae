@@ -53,6 +53,7 @@ from horae_sdk.protocol import (
     MAX_INTENTS,
     MAX_MESSAGE_BYTES,
     MESSAGE_MARGIN,
+    NETWORK_LOCAL_META,
     NETWORK_META,
     PATHS_META,
     Network,
@@ -83,8 +84,9 @@ class Call:
     paths: Paths = field(default_factory=Paths)
     """The path permissions approved in `horae.lock` (trusted)."""
     network: Network = field(default_factory=Network)
-    """The network allow-list approved in `horae.lock` (trusted; horae-sdk 0.5). Unknown
-    (`network.known` is false) when the core is older and sent none."""
+    """The network allow-list approved in `horae.lock` (trusted; horae-sdk 0.5), with its
+    local-network endpoints (`network.local`, horae-sdk 0.6). Unknown (`network.known` is
+    false) when the core is older and sent none."""
 
     @property
     def allowed_hosts(self) -> tuple[str, ...] | None:
@@ -92,10 +94,22 @@ class Call:
         older core): then fall back to the plugin's own configuration."""
         return self.network.hosts
 
+    @property
+    def local_endpoints(self) -> tuple[str, ...] | None:
+        """The approved local-network endpoints (`host:port`, decision 66), `()` when none,
+        `None` when unknown (an older core)."""
+        return self.network.local if self.network.known else None
+
     def host_allowed(self, url: str) -> bool | None:
-        """Whether `url` (https) is on the approved list: `True`/`False`, or `None` when the
+        """Whether `url` is approved: an `https` URL on an approved host, or an `http(s)` URL
+        on an approved local endpoint (exact host and port). `True`/`False`, or `None` when the
         core sent no list (unknown: the plugin decides). See `Network.allows`."""
         return self.network.allows(url)
+
+    def address_allowed(self, host: str, port: int) -> bool | None:
+        """Like `host_allowed` for a protocol that is not HTTP (IMAP, SMTP...). See
+        `Network.address_allowed`."""
+        return self.network.address_allowed(host, port)
 
 
 @dataclass(frozen=True)
@@ -277,7 +291,7 @@ class Plugin:
                 dict(arguments),
                 meta.get(INPUT_META),
                 Paths.from_wire(meta.get(PATHS_META)),
-                Network.from_wire(meta.get(NETWORK_META)),
+                Network.from_wire(meta.get(NETWORK_META), meta.get(NETWORK_LOCAL_META)),
             )
             try:
                 return self.result(tool.ref, await _maybe_await(tool.fn(call, **arguments)))
@@ -359,7 +373,8 @@ class Plugin:
             ctx: Context,
         ) -> CallToolResult:
             """Apply one intent routed to this sink."""
-            network = Network.from_wire(meta_of(ctx.request_context.meta).get(NETWORK_META))
+            meta = meta_of(ctx.request_context.meta)
+            network = Network.from_wire(meta.get(NETWORK_META), meta.get(NETWORK_LOCAL_META))
 
             async def run() -> dict[str, Any]:
                 if intent.get("type") not in declared:
