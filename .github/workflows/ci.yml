@@ -276,7 +276,7 @@ jobs:
   # Publishing lives here rather than in a workflow_run-triggered workflow: it runs only after
   # CI OK passed for this very commit and event, it checks out exactly github.sha, and no
   # cross-workflow trust (artifacts or head_sha of another run) is involved. It never runs on
-  # pull requests. Release tags are handled by image.yml, which only adds tags to the digest
+  # pull requests. Release tags are handled by image.yml (called by release.yml), which only adds tags to the digest
   # built, tested and signed here.
   publish:
     name: Image (publish, sign, verify)

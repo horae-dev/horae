@@ -1,0 +1,25 @@
+# Categories of the generated release notes (GitHub "Generate release notes", used by
+# scripts/changelog.sh). A pull request lands in the first category one of its labels matches.
+# See docs/operations/releasing.md. Commits here have no conventional prefix, so labels decide.
+changelog:
+  exclude:
+    labels:
+      - skip-changelog
+    authors:
+      - renovate[bot]
+  categories:
+    - title: Security
+      labels:
+        - security
+    - title: Features
+      labels:
+        - enhancement
+    - title: Fixes
+      labels:
+        - bug
+    - title: Documentation
+      labels:
+        - documentation
+    - title: Other changes
+      labels:
+        - "*"

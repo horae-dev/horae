@@ -24,7 +24,8 @@ How they are made:
   QEMU), the multi-platform image is pushed **by digest, untagged**, its layers are checked to be
   the tested ones, its SBOM is checked, it is signed and the signature verified, and only then
   are `edge` and `sha-<short>` added. A tag never points at an untested or unsigned digest.
-- **Tag `vX.Y.Z`**: `.github/workflows/image.yml` builds nothing. The tagged commit must be on
+- **Tag `vX.Y.Z`**: `.github/workflows/image.yml`, called by `release.yml` (see
+  [releasing](releasing.md)), builds nothing. The tagged commit must be on
   `main`; the workflow takes the `sha-<short>` digest of that commit, checks its revision label
   and its signature, smoke-tests it (its `horae --version` must report `X.Y.Z`), then adds the
   release tags to that same digest. If `main` never published that commit (for instance its CI
