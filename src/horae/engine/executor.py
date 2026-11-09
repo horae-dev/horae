@@ -107,7 +107,10 @@ entry of a later step, which is recorded in `ProposedIntent.applied_by` (the ent
    one with the longest matching prefix wins (a tie is `intent_ambiguous`). When a `tasks`
    entry would take a `task.create` but for its link, that one intent is **skipped** and the
    rest flow: the step records an `intent_skipped` violation (positions and the fixed text
-   `task link not under a trusted link_prefix`; no link is echoed), schemas decision 60;
+   `task link not under a trusted link_prefix`; no link is echoed), schemas decision 60. A
+   `notify.push` whose `link` no `notify` entry takes is skipped the same way (reason
+   `notification link not under a trusted link_prefix`; a `notify.push` without a link is
+   unaffected);
 4. a `task.update_status` is routed only if its `task` fingerprint appears, as an exact string
    value, in the data collected so far in the run (so is a `notify.push` with buttons,
    `actions`: the `task` of each, #38) (`RunRecord.inputs`, and the current
@@ -1055,7 +1058,7 @@ class _Run:
         seen = ([snap.data for snap in self.inputs], collected) if shown is None else shown
         unknown = set(check_task_fingerprints(typed, seen))
         routed: list[ProposedIntent] = []
-        skipped: list[int] = []
+        skipped: list[tuple[int, str]] = []
         for position, intent in enumerate(typed):
             if position in unknown:
                 unroutable.append(("intent_unrouted", position, intent.type, ""))
@@ -1069,8 +1072,8 @@ class _Run:
             if len(takers) != 1:
                 code = "intent_unrouted" if not takers else "intent_ambiguous"
                 reason = "" if takers else _unrouted_reason(intent, entries)
-                if reason == TASK_LINK_UNROUTED:
-                    skipped.append(position)  # one unroutable item never fails the step
+                if reason in {TASK_LINK_UNROUTED, NOTIFY_LINK_UNROUTED}:
+                    skipped.append((position, reason))  # one unroutable item never fails the step
                     continue
                 unroutable.append((code, position, intent.type, reason))
                 continue
@@ -1091,16 +1094,16 @@ class _Run:
             self._note_skipped(source, skipped, len(typed))
         return routed, None
 
-    def _note_skipped(self, source: str, skipped: list[int], total: int) -> None:
-        """Record, as one `intent_skipped` violation (and a log warning), the `task.create`
-        intents of one proposal left out because their link is under no trusted prefix.
-        Closed-set values only: positions and a fixed reason, never a link."""
-        positions = ", ".join(f"#{position}" for position in skipped[:20])
+    def _note_skipped(self, source: str, skipped: list[tuple[int, str]], total: int) -> None:
+        """Record, as one `intent_skipped` violation (and a log warning), the `task.create` and
+        `notify.push` intents of one proposal left out because their link is under no trusted
+        prefix. Closed-set values only: positions and fixed reasons, never a link."""
+        reasons = "; ".join(dict.fromkeys(reason for _, reason in skipped))
+        positions = ", ".join(f"#{position}" for position, _ in skipped[:20])
         more = f" and {len(skipped) - 20} more" if len(skipped) > 20 else ""
         which = "all" if len(skipped) == total else f"{len(skipped)} of {total}"
         detail = _cap(
-            f"{source}: skipped {which} proposed intent(s) ({positions}{more}): "
-            f"{TASK_LINK_UNROUTED}"
+            f"{source}: skipped {which} proposed intent(s) ({positions}{more}): {reasons}"
         )
         _log.warning("intents skipped: %s", detail)
         if len(self.violations) < MAX_ITEMS:
@@ -1198,16 +1201,18 @@ MAX_LINK_PREFIXES = 32
 TASK_LINK_UNROUTED = "task link not under a trusted link_prefix"
 """Why a `task.create` with a `link` that a `tasks` entry would otherwise take is unrouted."""
 
+NOTIFY_LINK_UNROUTED = "notification link not under a trusted link_prefix"
+"""Why a `notify.push` with a `link` that a `notify` entry would otherwise take is unrouted
+(#149, decision 60)."""
+
 
 def _unrouted_reason(intent: Intent, entries: Sequence[_Entry]) -> str:
     """A fixed reason when nothing takes `intent` only because of its `link`, else `""`."""
-    if (
-        isinstance(intent, TaskCreate)
-        and intent.link is not None
-        and any(intent.type in entry.types for entry in entries)
-    ):
-        return TASK_LINK_UNROUTED
-    return ""
+    if not isinstance(intent, (TaskCreate, NotifyPush)) or intent.link is None:
+        return ""
+    if not any(intent.type in entry.types for entry in entries):
+        return ""
+    return TASK_LINK_UNROUTED if isinstance(intent, TaskCreate) else NOTIFY_LINK_UNROUTED
 
 
 def _route_error(source: str, unroutable: list[tuple[str, int, str, str]]) -> StepError:

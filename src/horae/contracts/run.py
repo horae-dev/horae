@@ -308,8 +308,9 @@ class Violation(Contract):
     it was refused before it was sent and the step degraded (T10, #34; `detail` names the
     secrets, never their values).
     `intent_skipped`: the core left out `task.create` intents whose `link` is under no trusted
-    `link_prefix` of the `tasks` entry (positions and a fixed reason, never a link); the
-    other intents of the run flowed (#135, decision 60)."""
+    `link_prefix` of the `tasks` entry, and `notify.push` intents whose `link` is under none of
+    the `notify` entry (positions and a fixed reason, never a link); the other intents of the
+    run flowed (#135, #149, decision 60)."""
     detail: Message
 
 

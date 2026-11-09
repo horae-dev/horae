@@ -20,7 +20,9 @@ them):
   `horae undo` (`content=None` removes the note). `force` is true only for the user's explicit
   `horae undo --force` (horae-sdk 0.4, optional: a `restore` without that parameter is still
   called, without it): the sink may then also restore a note it would refuse because the user
-  edited it outside Horae's owned block; it never lifts the compare-and-swap;
+  edited it outside Horae's owned block; it never lifts the compare-and-swap. A sink with no
+  such rule (the built-in `file-sink`) accepts `force` and ignores it. Override it with the
+  `force` keyword: without it mypy rejects the override;
 - `<ns>.restore_status(paths, details, force=False)` -> whether it wrote: undo a
   `task.update_status` the sink applied. `details` are the `Applied.details` it answered (the
   core journals them when they say `changed: true`, and hands them back untouched), so a sink

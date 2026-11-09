@@ -43,7 +43,7 @@ calls (they are not in `provides`, so no pipeline step can):
 |---|---|
 | `file-sink.read` | the note's bytes (base64), or `null` |
 | `file-sink.apply` | writes the core's bytes if the note still has the planned SHA-256 (`target_changed` otherwise) |
-| `file-sink.restore` | the same for `horae undo`; `content: null` removes the note |
+| `file-sink.restore` | the same for `horae undo`; `content: null` removes the note. It accepts `force` (sent only for `horae undo --force`) and **ignores it**: it has no owned-block rule to lift, and the compare-and-swap always holds |
 | `file-sink.parent_exists` | whether the note's directory exists |
 | `file-sink.identity` | `local:<st_dev>:<st_ino>:<real path>` of the vault, so undo refuses another vault |
 

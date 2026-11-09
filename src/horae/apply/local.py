@@ -432,8 +432,12 @@ class LocalFileSink(LocalSink):
         expected_sha256: str | None,
         force: bool = False,
     ) -> None:
-        # `force` changes nothing here: the local sink has no owned-block rule of its own (the
-        # core already decided what `--force` may overwrite) and keeps the compare-and-swap.
+        """Make `target` hold `content` (`None`: remove it) if it still has `expected_sha256`.
+
+        `force` is accepted for the `RestorableSink` contract and **ignored**: this sink has no
+        owned-block rule of its own, so there is nothing for `--force` to lift (the core already
+        decided what `--force` may overwrite). The compare-and-swap always holds, forced or not.
+        """
         vault = self._vault()
         if content is None:
             await asyncio.to_thread(_delete, vault, target, expected_sha256)
