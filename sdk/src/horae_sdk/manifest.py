@@ -8,7 +8,11 @@ a plugin may not provide (`<ns>.read`, `<ns>.apply`, `<ns>.restore`, `<ns>.resto
 permissions. The core's loader is the judge; the SDK's tests validate what this module writes
 against the generated JSON Schema and the pydantic model.
 
-`Plugin.manifest()` fills `provides` from the plugin's registered tools and sinks.
+`Plugin.manifest()` fills `provides` from the plugin's registered tools and sinks, and
+`provides.personal_fields` from the `personal_fields` given when registering a source or a
+transform (horae-sdk 0.7, schemas decision 68): the view paths of the tool's output that hold
+personal data (`children[].first_name`), which the core de-identifies before any cloud model
+whatever the skill declares.
 
 The runtime is `mcp-stdio` with an argument list (no shell). The host resolves `argv[0]`: an
 absolute path is kept, a bare name is looked up on the child's fixed `PATH`
@@ -44,6 +48,10 @@ _SEMVER = re.compile(
 _SECRET = re.compile(r"[A-Z][A-Z0-9_]{0,127}")
 _HOST = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*")
 _ABSOLUTE = re.compile(r"(/[^/\\\x00-\x1f\x7f]{1,255})+")
+_VIEW_NAME = r"[A-Za-z_][A-Za-z0-9_-]*"
+_VIEW_PATH = re.compile(rf"({_VIEW_NAME}|\[\])(\.{_VIEW_NAME}|\[\])*")
+MAX_PERSONAL_FIELDS = 64
+"""Most personal fields one tool declares (the core's `MAX_PERSONAL_FIELDS`)."""
 
 
 def _is_str(value: object) -> bool:
@@ -130,12 +138,64 @@ def _refs(kind: str, refs: Iterable[str], pattern: re.Pattern[str]) -> list[str]
     return listed
 
 
+def _steps(path: str) -> tuple[str, ...]:
+    steps: list[str] = []
+    for part in path.split("."):
+        name, _, rest = part.partition("[]")
+        if name:
+            steps.append(name)
+        if part.endswith("[]"):
+            steps.extend("[]" for _ in range(1 + rest.count("[]")))
+    return tuple(steps)
+
+
+def _personal_fields(
+    declared: Mapping[str, Sequence[str]], tools: set[str]
+) -> dict[str, list[str]]:
+    """`provides.personal_fields`, checked: each key a source or transform of the plugin,
+    each value 1 to `MAX_PERSONAL_FIELDS` distinct view paths, none under another and none
+    disagreeing with another on a value's shape."""
+    checked: dict[str, list[str]] = {}
+    for ref, paths in declared.items():
+        if ref not in tools:
+            raise ManifestError(f"provides.personal_fields: {ref!r} is not a source or transform")
+        if isinstance(paths, str):
+            raise ManifestError(f"provides.personal_fields.{ref} must be a list, not a string")
+        listed = list(paths)
+        if not 1 <= len(listed) <= MAX_PERSONAL_FIELDS:
+            raise ManifestError(f"provides.personal_fields.{ref}: 1 to {MAX_PERSONAL_FIELDS} paths")
+        for path in listed:
+            if not (_is_str(path) and len(path) <= 256 and _VIEW_PATH.fullmatch(path)):
+                raise ManifestError(f"provides.personal_fields.{ref}: {path!r} is not a path")
+        if len(set(listed)) != len(listed):
+            raise ManifestError(f"provides.personal_fields.{ref} lists a path twice")
+        steps = [_steps(path) for path in listed]
+        for one in steps:
+            for other in steps:
+                common = 0
+                while common < min(len(one), len(other)) and one[common] == other[common]:
+                    common += 1
+                if one != other and common == len(one):
+                    raise ManifestError(f"provides.personal_fields.{ref}: overlapping paths")
+                if (
+                    common < len(one)
+                    and common < len(other)
+                    and (one[common] == "[]") != (other[common] == "[]")
+                ):
+                    raise ManifestError(
+                        f"provides.personal_fields.{ref}: two paths disagree on a value's shape"
+                    )
+        checked[ref] = listed
+    return checked
+
+
 def manifest(
     *,
     name: str,
     version: str,
     provides: Mapping[str, Iterable[str]],
     permissions: Permissions | None = None,
+    personal_fields: Mapping[str, Sequence[str]] | None = None,
     command: Sequence[str] | None = None,
     horae: str = DEFAULT_HORAE,
     description: str | None = None,
@@ -143,7 +203,9 @@ def manifest(
     homepage: str | None = None,
 ) -> dict[str, Any]:
     """A `plugin.yaml` document (see the module docstring). `command` is the `mcp-stdio`
-    argument list; without one the manifest has no runtime (a skill or pipeline pack)."""
+    argument list; without one the manifest has no runtime (a skill or pipeline pack).
+    `personal_fields` (`{<source or transform ref>: [view paths]}`, horae-sdk 0.7) becomes
+    `provides.personal_fields`, left out when empty."""
     if not (_is_str(name) and _NAME.fullmatch(name)):
         raise ManifestError(f"name {name!r} must match ^[a-z][a-z0-9-]*$ (at most 64)")
     if not (_is_str(version) and _SEMVER.fullmatch(version)):
@@ -172,6 +234,9 @@ def manifest(
             raise ManifestError("homepage must be an https:// URL")
         data["homepage"] = homepage
     data["provides"] = {kind: refs for kind, refs in listed.items() if refs}
+    personal = _personal_fields(personal_fields or {}, {*listed["sources"], *listed["transforms"]})
+    if personal:
+        data["provides"]["personal_fields"] = personal
     data["permissions"] = permissions.to_dict()
     if command is not None:
         argv = list(command)
@@ -193,6 +258,7 @@ def write_manifest(path: Path, data: Mapping[str, Any]) -> None:
 
 __all__ = [
     "DEFAULT_HORAE",
+    "MAX_PERSONAL_FIELDS",
     "SINK_OPERATIONS",
     "TOOL_KINDS",
     "ManifestError",

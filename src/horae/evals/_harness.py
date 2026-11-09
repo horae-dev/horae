@@ -43,8 +43,11 @@ from horae.contracts.intents import IntentType
 from horae.contracts.pipeline import Budget
 from horae.contracts.plugin import PluginManifest
 from horae.contracts.run import Usage
+from horae.contracts.skill import outermost
 from horae.engine import TARGET_FIELDS, check_task_fingerprints, fill_target, secrets_in_viewed
 from horae.engine.guard import check_intents
+from horae.engine.personal import COLLECT_ROOT, merged_options, under
+from horae.engine.personal import values as personal_values
 from horae.engine.ports import DeidUnavailable, LlmError, LlmRequest, LlmResponse
 from horae.evals._cases import EvalError, LoadedCase
 from horae.evals._match import MatchTimeout
@@ -398,13 +401,56 @@ def judge_intents(sue: SkillUnderEval, loaded: LoadedCase, viewed: Any, result: 
 # --- requests ---------------------------------------------------------------------------------
 
 
-def classified(sue: SkillUnderEval) -> bool:
-    """Whether the skill's input view names a field class (#34)."""
+@dataclass(frozen=True)
+class CasePersonal:
+    """The personal fields of a case (decision 68), read as the engine reads a `collect`
+    step's output: the elements of a list input whose `source` is a tool of the skill's own
+    plugin that declares `personal_fields`."""
+
+    paths: tuple[str, ...] = ()
+    """The declared paths, under `[].data`."""
+    values: tuple[str, ...] = ()
+    """The values found at them."""
+    problems: tuple[str, ...] = ()
+    """`<ref>: <path>` of a declared field whose shape the element's `data` contradicts."""
+
+
+def case_personal(sue: SkillUnderEval, case_input: Any) -> CasePersonal:
+    """The personal fields of `case_input` (`CasePersonal`). Only the skill's own plugin is
+    known to `horae eval`: a source of another plugin is not recognised (decision 68 F)."""
+    declared = sue.plugin.provides.personal_fields
+    if not declared or not isinstance(case_input, list):
+        return CasePersonal()
+    paths: list[str] = []
+    found: dict[str, None] = {}
+    problems: list[str] = []
+    for item in case_input:
+        if not isinstance(item, dict) or not isinstance(item.get("source"), str):
+            continue
+        ref = item["source"]
+        fields = declared.get(ref, [])
+        paths.extend(under(COLLECT_ROOT, path) for path in fields)
+        values, mismatched = personal_values(item.get("data"), fields)
+        found.update(dict.fromkeys(values))
+        problems.extend(f"{ref}: {path}" for path in mismatched)
+    return CasePersonal(outermost(paths), tuple(found), tuple(problems))
+
+
+def classified(sue: SkillUnderEval, personal: CasePersonal | None = None) -> bool:
+    """Whether the skill's input view names a field class (#34), or the case holds personal
+    fields (decision 68)."""
+    if personal is not None and (personal.paths or personal.values):
+        return True
     return bool(field_classes(sue.skill.view_options))
 
 
 def deidentify(
-    sue: SkillUnderEval, policy: Deidentifier, alias: str, viewed: Any, result: CaseResult
+    sue: SkillUnderEval,
+    policy: Deidentifier,
+    alias: str,
+    viewed: Any,
+    result: CaseResult,
+    personal: CasePersonal | None = None,
 ) -> tuple[bool, Pseudonymized | None]:
     """`(ok, pseudonymized viewed input)` as the engine's `llm` step makes it before a cloud
     alias (schemas decision 47; `None`: a local alias, or a skill without classes); not ok
@@ -420,8 +466,18 @@ def deidentify(
         )
         result.fail("secret_in_request", message)
         return False, None
+    personal = personal or CasePersonal()
+    options = merged_options(sue.skill.view_options, personal.paths)
+    if personal.problems and policy.applies(alias):
+        message = (
+            f"{sue.skill.name}: the output of {personal.problems[0]} does not have the shape of "
+            "its declared personal field, so it cannot be de-identified: refused before "
+            "anything is sent"
+        )
+        result.fail("deid_unavailable", message)
+        return False, None
     try:
-        return True, policy.pseudonymize(alias, sue.skill.view_options, viewed)
+        return True, policy.pseudonymize(alias, options, viewed, personal.values)
     except DeidUnavailable as error:
         result.fail("deid_unavailable", f"{sue.skill.name}: {str(error)[:200]}")
         return False, None
@@ -459,7 +515,7 @@ def request_for(
         output_schema=skill.output_schema,
         skill_version=skill.version,
         skill_digest=skill.digest,
-        classified=classified(sue),
+        classified=classified(sue, case_personal(sue, loaded.case.input)),
         deidentified=None if pseudo is None else pseudo.summary(),
     )
 
@@ -536,7 +592,8 @@ def request_digest(
         raise EvalError(f"case {loaded.name}: {(result.error or {}).get('message', 'invalid')}")
     alias = offline_alias(backend, model)
     policy = Deidentifier({"eval": alias}) if deid is None else deid
-    ok, pseudo = deidentify(sue, policy, "eval", viewed, result)
+    personal = case_personal(sue, loaded.case.input)
+    ok, pseudo = deidentify(sue, policy, "eval", viewed, result, personal)
     if not ok:
         raise EvalError(f"case {loaded.name}: {(result.error or {}).get('message', 'refused')}")
     backends = ModelBackends(
@@ -673,7 +730,8 @@ async def _offline_case(
         return result
     name, spec = alias if alias is not None else ("eval", offline_alias(backend, recorded.model))
     policy = Deidentifier({name: spec}) if deid is None else deid
-    ok, pseudo = deidentify(sue, policy, name, viewed, result)
+    personal = case_personal(sue, loaded.case.input)
+    ok, pseudo = deidentify(sue, policy, name, viewed, result, personal)
     if not ok:
         return result
     backends = _offline_backends(name, spec, recorded, factories, validate)
@@ -795,7 +853,8 @@ def plan_live(
         if viewed is None:
             errors.append(result)
             continue
-        ok, pseudo = deidentify(sue, policy, live.alias, viewed, result)
+        personal = case_personal(sue, loaded.case.input)
+        ok, pseudo = deidentify(sue, policy, live.alias, viewed, result, personal)
         if not ok:
             errors.append(result)
             continue

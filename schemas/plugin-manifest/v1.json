@@ -233,6 +233,29 @@
           "title": "Pipelines",
           "type": "array",
           "uniqueItems": true
+        },
+        "personal_fields": {
+          "description": "Fields of a source's or transform's output that hold personal data (decision 68), by\ntool ref, as view paths relative to that tool's output, e.g.\n`{school-fr.homework: [\"children[].first_name\", \"homework[].teacher\"]}`. Whenever that\noutput reaches an `llm` step on a cloud model alias, the core de-identifies these fields\nas `person` and looks for their values in every string, whatever the skill declares. Each\nkey must be one of `sources` or `transforms` (pydantic-only rule).",
+          "maxProperties": 256,
+          "patternProperties": {
+            "^[a-z][a-z0-9-]*\\.[a-z][a-z0-9_]*$": {
+              "items": {
+                "maxLength": 256,
+                "pattern": "^([A-Za-z_][A-Za-z0-9_-]*|\\[\\])(\\.[A-Za-z_][A-Za-z0-9_-]*|\\[\\])*$",
+                "type": "string"
+              },
+              "maxItems": 64,
+              "minItems": 1,
+              "type": "array",
+              "uniqueItems": true
+            }
+          },
+          "propertyNames": {
+            "maxLength": 128
+          },
+          "title": "Personal Fields",
+          "type": "object",
+          "additionalProperties": false
         }
       },
       "title": "Provides",

@@ -107,6 +107,7 @@ from horae.contracts.plugin import (
     Permissions,
     PluginManifest,
     StdioRuntime,
+    merge_personal_fields,
     reserved_tools,
     sink_namespaces,
 )
@@ -185,7 +186,22 @@ class HostRegistry:
             extra = _exceeds(manifest.permissions, locked.permissions)
             if extra:
                 raise RegistryError(f"plugin {name}: permissions not approved ({'; '.join(extra)})")
-            effective = manifest.model_copy(update={"permissions": locked.permissions})
+            # Decision 68 B: the personal fields in force are those of the manifest and of
+            # the lock together, so neither an edited manifest nor a stale lock drops one.
+            provided = {
+                ref
+                for kind in ("sources", "transforms")
+                for ref in getattr(manifest.provides, kind)
+            }
+            personal = merge_personal_fields(
+                manifest.provides.personal_fields, locked.personal_fields, tools=provided
+            )
+            effective = manifest.model_copy(
+                update={
+                    "permissions": locked.permissions,
+                    "provides": manifest.provides.model_copy(update={"personal_fields": personal}),
+                }
+            )
             root = (roots or {}).get(name)
             self._plugins[name] = InstalledPlugin(effective, locked.commit, root)
             provides = manifest.provides

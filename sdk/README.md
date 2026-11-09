@@ -193,6 +193,24 @@ access is a bug, and blocked from M5. The SDK checks the usual mistakes (`Manife
 the core's loader is the judge. The SDK's tests validate what it writes against
 `schemas/plugin-manifest/v1.json` and the core's model.
 
+### Personal fields (0.7)
+
+Declare which fields of a source's (or transform's) output hold personal data, as view paths
+relative to that output (the syntax of a skill's `input_view`):
+
+```python
+@plugin.source("school.homework", personal_fields=["children[].first_name", "homework[].teacher"])
+def homework(call: Call) -> Output: ...
+```
+
+The manifest then lists them under `provides.personal_fields` (left out when none), the lock
+records them, and whenever that output reaches an `llm` step on a **cloud** model alias the
+core replaces those values, and every other string that mentions one (accent- and
+case-folded, whole words), with `[PERSON_n]`, whatever the skill declares, and refuses the
+step if it cannot (schemas decision 68). A transform that moves such data must declare where
+its own output holds it. Limits: names of fewer than 3 letters in text, nicknames, initials
+and typos are not matched.
+
 **The command.** The host starts the plugin with an empty working directory and a fixed
 `PATH` (`/usr/local/bin:/usr/bin:/bin`). Until Horae installs plugins into their own
 environments (M4), pin the command to an **absolute** interpreter that has `horae-sdk` and an

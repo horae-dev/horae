@@ -124,3 +124,51 @@ def test_plugin_registration_rules() -> None:
     plugin.source("dup.a")(lambda call: {})
     with pytest.raises(ValueError, match="twice"):
         plugin.source("dup.a")(lambda call: {})
+
+
+def test_personal_fields_reach_the_manifest_the_core_accepts() -> None:
+    plugin = Plugin("school", version="0.1.0")
+
+    @plugin.source(
+        "school.homework", personal_fields=["children[].first_name", "homework[].teacher"]
+    )
+    def homework(call: Any) -> Any:  # pragma: no cover - never called
+        return {}
+
+    @plugin.transform("school.clean")
+    def clean(call: Any) -> Any:  # pragma: no cover - never called
+        return {}
+
+    data = plugin.manifest(command=["python3", "-m", "school"])
+    assert data["provides"]["personal_fields"] == {
+        "school.homework": ["children[].first_name", "homework[].teacher"]
+    }
+    model = accepted(data)
+    assert model.provides.personal_fields["school.homework"] == [
+        "children[].first_name",
+        "homework[].teacher",
+    ]
+    bare = manifest(name="ok", version="0.1.0", provides={"sources": ["ok.read"]})
+    assert "personal_fields" not in bare["provides"]
+
+
+@pytest.mark.parametrize(
+    ("declared", "message"),
+    [
+        ({"ok.other": ["a"]}, "not a source or transform"),
+        ({"ok.read": "a"}, "not a string"),
+        ({"ok.read": []}, "1 to 64"),
+        ({"ok.read": ["a..b"]}, "not a path"),
+        ({"ok.read": ["a", "a"]}, "twice"),
+        ({"ok.read": ["a", "a.b"]}, "overlapping"),
+        ({"ok.read": ["a.b", "a[]"]}, "shape"),
+    ],
+)
+def test_bad_personal_fields_are_refused(declared: dict[str, Any], message: str) -> None:
+    with pytest.raises(ManifestError, match=message):
+        manifest(
+            name="ok",
+            version="0.1.0",
+            provides={"sources": ["ok.read"]},
+            personal_fields=declared,
+        )
