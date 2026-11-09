@@ -84,9 +84,14 @@ def read_lock(path: Path) -> tuple[Lockfile, str]:
     return lock, header_of(text)
 
 
-def write_lock(path: Path, lock: Lockfile, header: str = DEFAULT_HEADER) -> None:
+def write_lock(path: Path, lock: Lockfile, header: str = DEFAULT_HEADER) -> str | None:
     """Replace `path` with the canonical text of `lock`, atomically (temporary file in the
-    same directory, `fsync`, rename, `fsync` of the directory). The caller holds `guard()`."""
+    same directory, `fsync`, rename, `fsync` of the directory). The caller holds `guard()`.
+
+    The rename is the **commit point**: an error before it leaves the old file and raises.
+    The `fsync` of the directory after it only makes the rename durable, so its failure does
+    not raise (the new lock is in place and is what a reader sees): it is returned as a
+    warning to print, `None` when everything went through."""
     text = dump_lock(lock, header)
     mode = _MODE
     if path.is_file() and not path.is_symlink():
@@ -102,11 +107,33 @@ def write_lock(path: Path, lock: Lockfile, header: str = DEFAULT_HEADER) -> None
     except BaseException:
         Path(temp).unlink(missing_ok=True)
         raise
-    directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    return _sync_directory(path.parent)
+
+
+def _sync_directory(directory: Path) -> str | None:
+    """Best effort: `fsync` the directory so a rename in it survives a crash."""
     try:
-        os.fsync(directory)
-    finally:
-        os.close(directory)
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        return (
+            f"{directory / LOCK_FILE} is written, but it could not be flushed to disk "
+            f"({exc.strerror or exc}): it may be lost on a crash"
+        )
+    return None
+
+
+def lock_is(path: Path, lock: Lockfile) -> bool:
+    """Whether `path` now holds `lock` (after an error that may have come after the rename
+    of `write_lock`): the caller then treats the change as committed, never undoes it."""
+    try:
+        current, _header = read_lock(path)
+    except LockInvalid:
+        return False
+    return current == lock
 
 
 @contextmanager
@@ -135,6 +162,7 @@ __all__ = [
     "dump_lock",
     "guard",
     "header_of",
+    "lock_is",
     "read_lock",
     "write_lock",
 ]

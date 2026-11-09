@@ -95,7 +95,7 @@ from horae.marketplace.approval import (
 )
 from horae.marketplace.direct import is_direct, parse_direct
 from horae.marketplace.errors import DowngradeRefused, NotInstalled, PluginEnabled
-from horae.marketplace.lock import LOCK_FILE, guard, read_lock, write_lock
+from horae.marketplace.lock import LOCK_FILE, guard, lock_is, read_lock, write_lock
 from horae.marketplace.pipelines import PackPipelines
 
 MARKETPLACES_DIR = "marketplaces"
@@ -379,9 +379,14 @@ def _install_and_lock(
         except MarketplaceError:
             shutil.rmtree(installed.path, ignore_errors=True)
             raise
+        new_lock = Lockfile(schema_version=1, plugins=plugins)
         try:
-            write_lock(lock_path, Lockfile(schema_version=1, plugins=plugins), header)
+            if durability := write_lock(lock_path, new_lock, header):
+                echo(f"warning: {durability}", err=True)
         except OSError as exc:
+            if lock_is(lock_path, new_lock):  # renamed into place: committed, not undone
+                echo(f"warning: the install is committed, but: {exc}", err=True)
+                return installed, entry, pipelines.paths
             pipelines.remove()
             shutil.rmtree(installed.path, ignore_errors=True)
             raise CommandFailed(

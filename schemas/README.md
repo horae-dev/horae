@@ -4285,6 +4285,11 @@ loosened later without breaking a valid file.
       A kill between the two tree renames leaves no `plugins/<name>` (the host refuses to run,
       `plugins_invalid`) and the old tree in `.upgrade-old-*`, never swept: `audit` reports it.
       The venv is relocatable (decision 69 C), so the rename keeps it working.
+      `write_lock`'s commit point is its rename: the `fsync` of the directory after it is best
+      effort, and its failure is a warning, never a rollback. An error (or Ctrl-C) that
+      arrives once the lock write has started is checked against the file: if the new lock is
+      in place, the upgrade (or a `remove`, or an `add`) is treated as committed and finished,
+      so a lock and a tree never disagree while the message says nothing changed.
     - **G, a pack's pipelines at upgrade.** `pipelines/<plugin>/` may exist only as a real
       directory holding nothing but the old version's own files: regular `<name>.yaml` files
       the lock approves for the plugin, each still with its locked digest. A file edited after

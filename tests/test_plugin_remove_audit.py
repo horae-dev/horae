@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import sqlite3
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,8 @@ import pytest
 import yaml
 
 from horae import cli_plugin_manage
+from horae.contracts.lockfile import Lockfile
+from horae.marketplace import lock as lock_module
 from horae.marketplace.pipelines import delete_own, digest
 from horae.store import Store
 from upgrade_fixtures import (
@@ -613,3 +616,70 @@ def test_audit_on_an_empty_instance(inst: Path) -> None:  # noqa: F811
     code, out, _ = cli(inst, "audit")
     assert code == 0
     assert "no plugin installed" in out
+
+
+# --- the lock is renamed into place, then flushing its directory fails -----------------------
+
+
+def _directory_fsync_raises(monkeypatch: pytest.MonkeyPatch, error: BaseException) -> None:
+    """`fsync` of a directory raises `error` (that of the lock's temporary file works): the
+    rename of `write_lock`, its commit point, has happened."""
+    real = os.fsync
+
+    def fsync(fd: int) -> None:
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise error
+        real(fd)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+
+
+def test_write_lock_reports_a_failed_flush_as_a_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _directory_fsync_raises(monkeypatch, OSError(5, "Input/output error"))
+    path = tmp_path / "horae.lock"
+    warning = lock_module.write_lock(path, Lockfile(schema_version=1))
+    assert warning is not None
+    assert "could not be flushed" in warning
+    assert lock_module.lock_is(path, Lockfile(schema_version=1))
+
+
+@pytest.mark.parametrize("error", [OSError(5, "Input/output error"), KeyboardInterrupt()])
+def test_an_upgrade_whose_lock_landed_is_committed(
+    inst: Path,  # noqa: F811
+    market: Market,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+    error: BaseException,
+) -> None:
+    add(inst)
+    second = market.release("1.1.0", manifest("1.1.0"))
+    _directory_fsync_raises(monkeypatch, error)
+    code, out, err = cli(inst, "upgrade", "demo", "--yes")
+    # the lock and the tree agree on the new version, whatever the exit
+    assert code == (0 if isinstance(error, OSError) else 130), out + err
+    locked = lock(inst)["plugins"]["demo"]
+    assert (locked["version"], locked["commit"]) == ("1.1.0", second)
+    installed = json.loads((inst / "plugins" / "demo" / ".horae-install.json").read_text())
+    assert (installed["version"], installed["commit"]) == ("1.1.0", second)
+    assert "previous version is kept" not in out + err
+    assert "warning:" in err
+    assert hidden(inst) == []
+
+
+@pytest.mark.parametrize("error", [OSError(5, "Input/output error"), KeyboardInterrupt()])
+def test_a_remove_whose_lock_landed_is_committed(
+    inst: Path,  # noqa: F811
+    pack: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error: BaseException,
+) -> None:
+    _directory_fsync_raises(monkeypatch, error)
+    code, out, err = cli(inst, "remove", "demo")
+    assert code == (0 if isinstance(error, OSError) else 130), out + err
+    assert "demo" not in lock(inst)["plugins"]
+    assert not (inst / "plugins" / "demo").exists()
+    assert not pack.exists()
+    assert "nothing was removed" not in out + err
+    assert "warning:" in err
+    assert hidden(inst) == []

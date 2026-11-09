@@ -23,7 +23,7 @@ import os
 import stat
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, NoReturn
 
 import click
 import typer
@@ -76,7 +76,7 @@ from horae.marketplace.audit import (
 from horae.marketplace.direct import is_direct
 from horae.marketplace.errors import DowngradeRefused, NotInstalled, PluginEnabled
 from horae.marketplace.install import MANIFEST_FILE
-from horae.marketplace.lock import LOCK_FILE, guard, read_lock, write_lock
+from horae.marketplace.lock import LOCK_FILE, guard, lock_is, read_lock, write_lock
 from horae.marketplace.pipelines import PIPELINES_DIR, PackPipelines, delete_own, pack_path
 from horae.marketplace.semver import compare
 from horae.marketplace.upgrade import (
@@ -366,32 +366,33 @@ def _upgrade_locked(
         delete_tree(staged)
         raise ApprovalRefused("the staged plugin is not the one approved; nothing changed")
     swap = Swap()
+    new_lock = Lockfile(schema_version=1, plugins={**lock.plugins, name: entry})
+    warnings = list(loaded.warnings)
+    old_tree: Path | None = None
+    writing = False
+    interrupted: BaseException | None = None
     try:
         old_tree = swap.aside(root, OLD_PREFIX)
         swap.move(staged, root)
         pipelines.write()
         swap.also_undo(pipelines.remove)
-        write_lock(
-            lock_path, Lockfile(schema_version=1, plugins={**lock.plugins, name: entry}), header
-        )
+        writing = True  # from here the lock may land before an error
+        if durability := write_lock(lock_path, new_lock, header):
+            warnings.append(durability)
     except BaseException as exc:
-        failed = swap.rollback()
-        delete_tree(staged)
-        if failed:
-            echo(f"warning: could not undo everything: {'; '.join(failed)}", err=True)
-        if isinstance(exc, OSError):
-            raise CommandFailed(
-                EXIT_PROBLEMS,
-                "upgrade_failed",
-                f"cannot upgrade {name}: {exc.strerror or exc}; the previous version is kept",
-            ) from None
-        raise
-    warnings = list(loaded.warnings)
-    if not delete_tree(old_tree):
+        if not writing or not lock_is(lock_path, new_lock):
+            _undo_upgrade(swap, staged, name, exc)
+        # The lock was renamed into place before the error: the upgrade is committed (the new
+        # tree is in place too, the lock being written last). Finish it, never undo half.
+        warnings.append(f"the upgrade is committed, but an error followed the lock write: {exc}")
+        interrupted = None if isinstance(exc, Exception) else exc
+    if old_tree is not None and not delete_tree(old_tree):
         warnings.append(f"the previous tree is left in {old_tree}; delete it")
     warnings += [f"kept {path} (not this pack's own file)" for path in pipelines.commit()]
     for warning in warnings:
         echo(f"warning: {safe(warning)}", err=True)
+    if interrupted is not None:
+        raise interrupted
     return _report_upgrade(
         name,
         old,
@@ -403,6 +404,21 @@ def _upgrade_locked(
         warnings,
         json_output,
     )
+
+
+def _undo_upgrade(swap: Swap, staged: Path, name: str, exc: BaseException) -> NoReturn:
+    """Undo the swap of a failed upgrade whose lock was not written, and raise."""
+    failed = swap.rollback()
+    delete_tree(staged)
+    if failed:
+        echo(f"warning: could not undo everything: {'; '.join(failed)}", err=True)
+    if isinstance(exc, OSError):
+        raise CommandFailed(
+            EXIT_PROBLEMS,
+            "upgrade_failed",
+            f"cannot upgrade {name}: {exc.strerror or exc}; the previous version is kept",
+        ) from None
+    raise exc
 
 
 def _report_current(name: str, old: LockedPlugin, json_output: bool, warnings: list[str]) -> int:
@@ -718,17 +734,25 @@ def _remove_locked(
     remaining = Lockfile(
         schema_version=1, plugins={k: v for k, v in lock.plugins.items() if k != name}
     )
+    warnings: list[str] = []
+    interrupted: BaseException | None = None
     if entry is not None:
         try:
-            write_lock(lock_path, remaining, header)
-        except OSError as exc:
-            swap.rollback()
-            raise CommandFailed(
-                EXIT_PROBLEMS,
-                "lock_write_failed",
-                f"cannot write {lock_path}: {exc.strerror or exc}; nothing was removed",
-            ) from None
-    warnings: list[str] = []
+            if durability := write_lock(lock_path, remaining, header):
+                warnings.append(durability)
+        except BaseException as exc:
+            if not lock_is(lock_path, remaining):
+                swap.rollback()
+                if not isinstance(exc, OSError):
+                    raise
+                raise CommandFailed(
+                    EXIT_PROBLEMS,
+                    "lock_write_failed",
+                    f"cannot write {lock_path}: {exc.strerror or exc}; nothing was removed",
+                ) from None
+            # The lock no longer names the plugin: the remove is committed; finish it.
+            warnings.append(f"the remove is committed, but an error followed the lock write: {exc}")
+            interrupted = None if isinstance(exc, Exception) else exc
     if aside is not None and not delete_tree(aside):
         warnings.append(f"could not delete {aside} entirely; delete it by hand")
     pack = instance / PIPELINES_DIR / name
@@ -745,6 +769,8 @@ def _remove_locked(
     kept_data = sorted(entry.permissions.paths.write) if entry else []
     for warning in warnings:
         echo(f"warning: {safe(warning)}", err=True)
+    if interrupted is not None:
+        raise interrupted
     if json_output:
         echo_json(
             {
