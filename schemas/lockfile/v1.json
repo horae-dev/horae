@@ -39,6 +39,29 @@
         "permissions": {
           "$ref": "#/$defs/Permissions",
           "description": "The permissions the user approved at install or upgrade time (sorted when written).\n`network_local` (decision 66) is left out when empty, so a lock without a local grant\nis written exactly as before and an older core still reads it."
+        },
+        "personal_fields": {
+          "description": "The personal fields of the plugin's sources and transforms (`provides.personal_fields`\nof its manifest, decision 68), recorded with the approved plugin: the core enforces the\nunion of these and the installed manifest's, so an upgrade can never drop one silently.\nLeft out when empty (paths sorted when written), so a lock without any is written exactly\nas before and an older core still reads it.",
+          "maxProperties": 256,
+          "patternProperties": {
+            "^[a-z][a-z0-9-]*\\.[a-z][a-z0-9_]*$": {
+              "items": {
+                "maxLength": 256,
+                "pattern": "^([A-Za-z_][A-Za-z0-9_-]*|\\[\\])(\\.[A-Za-z_][A-Za-z0-9_-]*|\\[\\])*$",
+                "type": "string"
+              },
+              "maxItems": 64,
+              "minItems": 1,
+              "type": "array",
+              "uniqueItems": true
+            }
+          },
+          "propertyNames": {
+            "maxLength": 128
+          },
+          "title": "Personal Fields",
+          "type": "object",
+          "additionalProperties": false
         }
       },
       "required": [

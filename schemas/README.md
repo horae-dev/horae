@@ -123,6 +123,9 @@ JSON Schema cannot express these; the models enforce them and the tests pin the 
   no tool in `provides` is a sink operation of the plugin's own sink or notifier namespaces
   (`<ns>.read`, `<ns>.apply`, `<ns>.restore`, `<ns>.parent_exists`, `<ns>.identity`,
   decision 36).
+  Each key of `provides.personal_fields` is one of `sources` or `transforms`, and a tool's
+  paths may not overlap or disagree on a value's shape (decision 68; the same rule for the
+  lock's `personal_fields`).
 - Hosts (`permissions.network`, every `https` URL): a label starting with `xn--` must be a valid
   IDNA A-label. It must round-trip through Python's `idna` codec (IDNA2003, so no runtime
   dependency) and decode to letters, marks, digits and `-` only. The second rule rejects what
@@ -3819,3 +3822,109 @@ loosened later without breaking a valid file.
       `examples/triage-mail.pipeline.yaml`, replace `on_unchanged_input: skip` by (keeping it
       is harmless) `skip_when_empty: ["[].data.needs_interpretation"]`, and say in the prompt
       that a task's `fingerprint` is `gmail:` + the mail `id`.
+
+### Provisional decisions (#162, pending maintainer review)
+
+68. **Accent folding, and plugin-declared personal fields the core enforces (#162).**
+    Provisional. Found by plugin-school-fr#4 (plugin-school-fr PR #7). Compatible additions:
+    an optional `provides.personal_fields` in `plugin-manifest/v1.json` and an optional
+    `plugins.<name>.personal_fields` in `lockfile/v1.json` (both regenerated; `skill/v1.json`
+    is unchanged). Decision 62 is taken by open PR #155; 63 to 67 are merged. It amends
+    decision 47 C (matching) and E (when de-identification runs).
+    - **A, accent folding.** The matcher compares letters **accent-folded** on both sides,
+      the known value and the scanned text: case-folded, decomposed (NFD), nonspacing marks
+      (`Mn`) dropped (`horae.llm.deid.fold`). `Zoe`, `ZOE`, `zoé` and an NFD `Zoé` all match
+      a known `Zoé`, and a known `Zoe` matches all of them. A letter run now also holds the
+      combining marks that follow a letter (the main combining blocks), so a mark NFKC could
+      not compose (`Zo̱e`) does not cut a name in two; a token made of marks only folds to
+      itself (a symbol is never empty). Whole letter runs only, as before: `Léo` never
+      matches inside `Léonard`, unless `Léonard` is itself a known value. The **span** of the
+      text is replaced, whatever its spelling; **re-identification puts back the canonical
+      text** (the classed leaf, personal value or vocabulary term first registered for
+      those folded tokens), never the span as written: `ZOE` comes back as `Zoé`, as `ALICE`
+      already came back as `Alice` (decision 47 G). Two classed values that fold alike
+      (`Zoé`, `Zoe`) share a pseudonym. `DEID_VERSION` is 3 (part of the cloud cache key:
+      older entries are a miss once).
+    - **B, the declaration.** `provides.personal_fields: {<tool ref>: [view paths]}`, e.g.
+      `{school-fr.homework: ["children[].first_name", "homework[].teacher"]}`. A key is one
+      of the plugin's `sources` or `transforms`; the paths use the `ViewPath` syntax of a
+      skill's `input_view`, **relative to that tool's output** (not to the step input), 1 to
+      `MAX_PERSONAL_FIELDS` (64) per tool, none under another and none disagreeing with
+      another on a value's shape (pydantic-only rules). A mapping keyed by ref, not
+      `sources[]` objects: `provides.sources` stays a list of refs that every reader (host,
+      replay, marketplace, SDK) already uses. **The lock** records it with the approved
+      plugin (`LockedPlugin.personal_fields`, paths sorted, left out when empty, so a lock
+      without any is written exactly as before and an older core still reads it). The
+      installer (#46, after PR #155's `Installed.lock_entry`) copies the manifest's
+      declaration; no approval is needed, since a declaration only adds protection. **In
+      force** is the union of the installed manifest's and the lock's (each tool's paths
+      reduced to the outermost ones, `merge_personal_fields`): a manifest edited after
+      approval, or a stale lock, can never drop a field. `horae replay` reads the lock's
+      (`LockRegistry`), so a replay de-identifies as the run did.
+    - **C, which output reaches which step.** One value flows through a run (the engine's
+      "data between steps"); the plan follows the declared paths along it:
+      - after a `collect` step, each declared path `p` of a source of that step is at
+        `[].data.p` of the step's output (`[].data[].x` for `[].x`). The class applies to
+        **every** element of the list, so another source's field at the same path is
+        protected too (over-protection, never under);
+      - a later `collect` step starts a new value: its own sources' paths replace them;
+      - a `transform` that declares `personal_fields` replaces them with its own paths,
+        relative to its output: it takes responsibility for where personal data went; a
+        `transform` that declares none, when personal paths are in force, **loses** them
+        (the core cannot know where it put them); one that runs before any personal path
+        changes nothing;
+      - every tool that ran adds the **values** found at its declared paths (every string
+        leaf and object key at or below them, NFC, non-empty) to the run's personal values,
+        whichever step it ran in;
+      - at the `llm` step, the located paths are added to the skill's input view options as
+        `{class: person}`, applied to the **viewed** input (the view keeps the input's shape):
+        a skill class `person`, `email`, `phone`, `place` or `amount` at or above a path
+        already hides it and is kept; a `free_text` class at or above it (which means the same
+        as no class) and any class below it are dropped, so no classed path lies under another.
+        The personal values are known `person` values (with their name parts, decision 47 C)
+        looked for in every string and key of the viewed input. So a skill **without
+        classes** is protected, and so is a name mentioned in a description the skill views
+        while it does not view the field itself.
+      - A personal path the skill's view does **not** select is not an error: that field is
+        not sent at all, and its values are still looked for in what is sent.
+    - **D, cloud only.** As decision 47: a local alias is sent the viewed input unchanged. The
+      request is marked `classified` whenever personal paths or values reach the step, so
+      without a policy `ModelBackends` refuses it for a cloud alias (`deid_required`).
+    - **E, fail closed** (nothing is sent, nothing is billed; the messages name a tool and a
+      path, never a value), only for a cloud alias:
+      - while planning, an `llm` step after a transform that lost personal paths fails with
+        `deid_unavailable` before any plugin is called (an alias the policy cannot classify
+        counts as cloud);
+      - at the step, an output that contradicts the shape of its declared path (an object
+        where the path reads an array, a scalar where it reads either; an absent key or
+        `null` is fine) degrades it with `deid_unavailable`: the field cannot be located;
+      - the pseudonymizer refuses (`deid_unavailable`) more than `MAX_PERSONAL_VALUES` (4096)
+        values, a value longer than 1 KiB or 48 tokens (it could not be found in text), and,
+        after rewriting, any personal value still found **in clear** in a string or key of
+        what would be sent (pseudonyms put aside; a check against its own bugs).
+      The cache, a replay's reuse and the repair retry all use the same de-identified input
+      (decision 47 E: an entry is reused only with the same de-identified digest).
+    - **F, `horae eval`.** A case's input is read as a `collect` output: an element whose
+      `source` is a tool of the skill's own plugin with `personal_fields` gets the same paths
+      and values, offline and live. `horae eval` knows only that plugin's manifest: a source
+      of another plugin is not recognised (a limit).
+    - **G, limits.** Not matched: a value of fewer than 2 characters in text, a name part of
+      fewer than 3 letters (`Al` of `Al Martin`), nicknames, initials, typos and
+      transliterations (`Zoë` is `Zoe` by folding, `Zoja` is not). A number under a personal
+      path is protected where the path is located, not in text. Folding over-matches (`Zoe`
+      and `Zoé` are one name). The declaration is as good as the plugin that writes it.
+    - **H, SDK 0.7.0.** `Plugin.source(ref, personal_fields=[...])`,
+      `Plugin.transform(ref, personal_fields=[...])` (also the `personal_fields=` argument of
+      `Source` / `Transform`), and `manifest(..., personal_fields={ref: [paths]})`, written as
+      `provides.personal_fields` only when non-empty and checked like the core (a tool of the
+      plugin, a path, 1 to 64, no duplicate, overlap or shape disagreement).
+    - **I, what plugin-school-fr changes.** Require `horae-sdk>=0.7`; register each source
+      that returns `normalize(...)` data with
+      `personal_fields=list(DEIDENTIFIED_FIELDS)` (`children[].first_name`,
+      `homework[].teacher`, `grades[].teacher`) and regenerate `plugin.yaml`
+      (`python -m horae_school_fr --manifest`), which then holds
+      `provides.personal_fields: {<source ref>: [...]}`; keep `input_view()` as guidance;
+      drop `NameScrubber` (the core now folds accents) or keep it as harmless defence in
+      depth, and flip `tests/test_deid.py`'s accent test from documenting the gap to asserting
+      that `Zoe` is caught, plus a test that a skill **without** classes sends no name; update
+      the README's "Limits" (accent folding done, a skill without classes is now protected).

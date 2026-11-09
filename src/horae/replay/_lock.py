@@ -12,8 +12,9 @@ not hold the manifest's `provides`, so which plugin serves a tool or skill comes
    plugin `github`); a ref that neither resolves is `unresolved`.
 
 A plugin is taken to provide each ref resolved to it, in the kind of step that uses it (the
-lock cannot say otherwise). Its permissions are the locked ones. Nothing is read but the two
-documents given: no file, no process, no network.
+lock cannot say otherwise). Its permissions are the locked ones, and so are the personal
+fields of its sources and transforms (decision 68), so a replay de-identifies as the run did.
+Nothing is read but the two documents given: no file, no process, no network.
 """
 
 from horae.contracts.lockfile import Lockfile
@@ -26,7 +27,7 @@ from horae.contracts.pipeline import (
     TransformStep,
     call_parts,
 )
-from horae.contracts.plugin import PluginManifest, Provides
+from horae.contracts.plugin import PluginManifest, Provides, merge_personal_fields
 from horae.contracts.run import RunRecord
 from horae.engine.ports import ResolvedPlugin, UnknownPlugin
 
@@ -87,11 +88,13 @@ class LockRegistry:
                 (self._skills if field == "skills" else self._tools)[ref] = name
         self._plugins: dict[str, ResolvedPlugin] = {}
         for name, locked in lock.plugins.items():
+            tools = {*provided[name]["sources"], *provided[name]["transforms"]}
+            personal = merge_personal_fields(locked.personal_fields, tools=tools)
             manifest = PluginManifest(
                 name=name,
                 version=locked.version,
                 horae=">=0",
-                provides=Provides.model_validate(provided[name]),
+                provides=Provides.model_validate({**provided[name], "personal_fields": personal}),
                 permissions=locked.permissions,
             )
             self._plugins[name] = ResolvedPlugin(manifest, locked.commit)

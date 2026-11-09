@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """De-identification before a cloud model (#34, schemas decision 47, threat T10).
 
-A skill declares **field classes** in its input view (`skill.yaml`, #27):
+A skill declares **field classes** in its input view (`skill.yaml`, #27), and a plugin may
+declare **personal fields** of its sources' and transforms' output (`provides.personal_fields`,
+#162, schemas decision 68), which the engine adds as `person` classes and whose values it
+passes as known `person` values (`personal`), whatever the skill declares:
 
 ```yaml
 input_view:
@@ -14,7 +17,8 @@ When the step's model alias is a **cloud** alias (`ModelAlias.is_local` false: e
 but `ollama` unless the alias says `local:`), the engine sends the model a pseudonymized copy
 of the viewed input (`Deidentifier.pseudonymize`), and puts real values back into the
 accepted output and intents (`Pseudonymized.reidentify`) before they are validated, routed
-and applied. A local alias, or a skill without classes, is sent the viewed input unchanged.
+and applied. A local alias, or a skill without classes and without personal fields upstream,
+is sent the viewed input unchanged.
 
 **Transforms** (a pure function of the viewed input, the classes and the vocabulary):
 
@@ -34,8 +38,10 @@ and applied. A local alias, or a skill without classes, is sent the viewed input
 
 **Matching** (decision 47 C). A scanned string is NFKC-normalized and stripped of format
 characters (zero-width spaces, bidi controls, soft hyphens) and cut into tokens: runs of
-letters, runs of digits, runs of white space, single other characters. A known value is the
-same token sequence, letters compared case-folded (`STRAUSS` is `Strauß`), any white-space
+letters (with the combining marks that follow a letter), runs of digits, runs of white space,
+single other characters. A known value is the same token sequence, letters compared
+**accent-folded** (`fold`: case-folded, NFD, nonspacing marks dropped, decision 68 A: `Zoe`,
+`ZOÉ` and a decomposed `zoé` are `Zoé`; `STRAUSS` is `Strauß`), any white-space
 run equal to any other (`Bob  Martin`, `Bob\\nMartin`, a no-break space): so a value
 matches only whole letter runs (`Alice` in `alice_smith`, `user_alice` or `alice123`, not
 in `Malice`). Leftmost, then longest, first. A trie over the tokens: linear in the text,
@@ -61,10 +67,23 @@ issued, or one the model mangled (`Person 1`, `PERSON1`), is left as it is and n
 re-identification adds, so the engine refuses an output that would grow past its bound
 before substituting (`output_too_large`).
 
-**Limits** (documented, decision 47): values in fields the skill did not classify are only
-caught when they equal a known value (the input view is the primary control); matching
-misses nicknames, initials and typos, and over-matches a known value that is also a common
-word; a name part maps to the whole name (privacy over meaning).
+Re-identification puts back the **canonical** text of the value (the classed leaf, personal
+value or vocabulary term first registered for those folded tokens), never the span as the
+input wrote it: `ZOE` in a description comes back as `Zoé`, as `ALICE` came back as `Alice`.
+
+**Personal values** (decision 68 E). With `personal`, a value longer than `MAX_VALUE_CHARS`
+or `MAX_TERM_TOKENS` tokens, or more than `MAX_PERSONAL_VALUES` values, fails closed
+(`DeidError`: it could not be found in text); after rewriting, every string and key of what
+would be sent is scanned again for the personal values (pseudonyms put aside), and one still
+found in clear fails closed too.
+
+**Limits** (documented, decisions 47 and 68): values in fields the skill did not classify are
+only caught when they equal a known value (the input view is the primary control); matching
+misses nicknames, initials, typos and transliterations, and over-matches a known value that is
+also a common word (and folding makes `Zoe`, `Zoé` and `Zoë` one name); a value shorter than
+`MIN_TERM_CHARS` characters is never looked for in text, nor is a name part shorter than
+`MIN_NAME_PART_LETTERS` letters (`Al` of `Al Martin`); a name part maps to the whole name
+(privacy over meaning).
 """
 
 import hashlib
@@ -73,7 +92,7 @@ import json
 import math
 import re
 import unicodedata
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -84,7 +103,7 @@ from horae.engine.ports import DeidUnavailable
 from horae.secrets import SecretError, SecretResolver
 from horae.secrets.redact import current as current_redactor
 
-DEID_VERSION = 2
+DEID_VERSION = 3
 """The version of the transforms and of the pseudonym format: part of the LLM cache's stored
 key for a cloud alias (decision 47 F)."""
 
@@ -157,8 +176,12 @@ _FORMAT = re.compile(
 )
 """Format characters dropped before matching (soft hyphen, zero-width and bidi controls)."""
 _SPACE = "\\s\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000"
-_TOKENS = re.compile(rf"[^\W\d_]+|\d+|[{_SPACE}]+|.", re.DOTALL)
-"""A letter run, a digit run, a white-space run, or one other character."""
+_MARKS = "\u0300-\u036f\u1ab0-\u1aff\u1dc0-\u1dff\u20d0-\u20ff\ufe20-\ufe2f"
+"""The combining-mark blocks a letter run may hold after its first letter (a mark NFKC
+could not compose, `Zo\u0331é`, must not cut a name in two)."""
+_TOKENS = re.compile(rf"[^\W\d_](?:[^\W\d_]|[{_MARKS}])*|\d+|[{_SPACE}]+|.", re.DOTALL)
+"""A letter run (with its combining marks), a digit run, a white-space run, or one other
+character."""
 _PHONE_RUN = re.compile(rf"\+?\(?\d[\d{_SPACE}.\-()]*\d")
 """A run of digits and phone separators (`[\\s.\\-()]`)."""
 _PHONE_SEPARATORS = frozenset(".-()+")
@@ -169,8 +192,17 @@ def _clean(text: str) -> str:
     return _FORMAT.sub("", unicodedata.normalize("NFKC", text))
 
 
+def fold(text: str) -> str:
+    """`text` accent-folded (#162, decision 68 A): case-folded, decomposed (NFD) and stripped
+    of its nonspacing marks (`Zoé`, `ZOE`, a decomposed `zoe\u0301` all fold to `zoe`). A text
+    made of marks only folds to its case-folded self, so a symbol is never empty."""
+    decomposed = unicodedata.normalize("NFD", text.casefold())
+    folded = "".join(char for char in decomposed if unicodedata.category(char) != "Mn")
+    return folded or text.casefold()
+
+
 def _symbol(token: str) -> str:
-    return " " if token[0].isspace() else token.casefold()
+    return " " if token[0].isspace() else fold(token)
 
 
 def _symbols(text: str) -> tuple[str, ...]:
@@ -378,7 +410,10 @@ def _name_parts(text: str) -> list[str]:
         part
         for part in parts
         if sum(char.isalpha() for char in part) >= MIN_NAME_PART_LETTERS
-        and all(char.isalpha() or char in "'\u2019" for char in part)
+        and all(
+            char.isalpha() or char in "'\u2019" or unicodedata.category(char) == "Mn"
+            for char in part
+        )
     ]
 
 
@@ -547,9 +582,12 @@ class _Trie:
 
 
 class _Pseudonymizer:
-    def __init__(self, tree: _Node, vocabulary: Vocabulary | None) -> None:
+    def __init__(
+        self, tree: _Node, vocabulary: Vocabulary | None, personal: Sequence[str] = ()
+    ) -> None:
         self.tree = tree
         self.vocabulary = vocabulary
+        self.personal = personal
         self.assigner = _Assigner()
         self.counts: dict[str, int] = {}
         self.known: list[_Known] = []
@@ -597,9 +635,12 @@ class _Pseudonymizer:
         self.assigner.token(known)
 
     def build(self) -> None:
-        """The trie and the phone keys: classed values first, then the vocabulary, then name
-        parts, then amount renderings (the first one inserted for a sequence wins)."""
+        """The trie and the phone keys: classed values first, then the personal values
+        (decision 68), then the vocabulary, then name parts, then amount renderings (the first
+        one inserted for a sequence wins)."""
         terms = list(self.known)
+        for value in self.personal:
+            terms.append(_Known("person", _symbols(value), value))
         for name, term in () if self.vocabulary is None else self.vocabulary.terms:
             terms.append(_Known(name, _symbols(term), term))
         for known in terms:
@@ -746,17 +787,61 @@ def _overlaps(start: int, end: int, spans: list[tuple[int, int, str]]) -> bool:
     return any(start < span_end and span_start < end for span_start, span_end, _ in spans)
 
 
+MAX_PERSONAL_VALUES = 4096
+"""Most distinct personal values (decision 68) looked for in one step's input."""
+
+
+def personal_problem(values: Sequence[str]) -> str | None:
+    """Why the personal values (decision 68) cannot all be looked for in text, or `None`: too
+    many, or one longer than `MAX_VALUE_CHARS` characters or `MAX_TERM_TOKENS` tokens (it
+    could be sent in part). The message never holds a value."""
+    if len(values) > MAX_PERSONAL_VALUES:
+        return f"more than {MAX_PERSONAL_VALUES} personal values to look for"
+    for value in values:
+        if len(value) > MAX_VALUE_CHARS or len(_symbols(value)) > MAX_TERM_TOKENS:
+            return (
+                f"a personal value is longer than {MAX_VALUE_CHARS} characters or "
+                f"{MAX_TERM_TOKENS} words, so it cannot be found in text"
+            )
+    return None
+
+
+def _leaked(sent: Any, personal: Sequence[str]) -> bool:
+    """Whether a personal value of at least `MIN_TERM_CHARS` characters is still found, in
+    clear, in a string or object key of `sent` (pseudonyms put aside): the fail-closed check
+    after pseudonymizing (decision 68 E)."""
+    trie = _Trie()
+    for value in personal:
+        if len(value) >= MIN_TERM_CHARS:
+            trie.add(_symbols(value), value)
+    if not trie.size:
+        return False
+    for text in _strings(sent):
+        tokens = _TOKENS.findall(_clean(TOKEN.sub(" ", text)))
+        if next(trie.matches([_symbol(token) for token in tokens]), None) is not None:
+            return True
+    return False
+
+
 def pseudonymize(
     data: Any,
     view_options: Mapping[str, Mapping[str, Any]],
     vocabulary: Vocabulary | None = None,
+    personal: Sequence[str] = (),
 ) -> Pseudonymized:
     """`data` (the viewed input) with its classed fields pseudonymized and its other strings
-    scanned for known values (module docstring). Raises `DeidError`."""
-    work = _Pseudonymizer(_tree(view_options), vocabulary)
+    scanned for known values (module docstring). `personal` are the values of the personal
+    fields the plugins declared upstream (decision 68): known `person` values, looked for in
+    every string; one still found in clear afterwards fails closed. Raises `DeidError`."""
+    problem = personal_problem(personal)
+    if problem is not None:
+        raise DeidError(problem)
+    work = _Pseudonymizer(_tree(view_options), vocabulary, personal)
     work.collect(data, work.tree, None)
     work.build()
     sent = work.rewrite(data, work.tree, None)
+    if personal and _leaked(sent, personal):
+        raise DeidError("a declared personal value would be sent in clear: refused")
     counts = dict(work.counts)
     for name, number in work.assigner.numbers.items():
         if number:
@@ -804,15 +889,20 @@ class Deidentifier:
         return {"version": DEID_VERSION, "vocabulary": digest}
 
     def pseudonymize(
-        self, model_alias: str, view_options: Mapping[str, Mapping[str, Any]], data: Any
+        self,
+        model_alias: str,
+        view_options: Mapping[str, Mapping[str, Any]],
+        data: Any,
+        personal: Sequence[str] = (),
     ) -> Pseudonymized | None:
         """`data` pseudonymized for `model_alias`, or `None` when nothing is to be done (a
-        local alias, or no field class declared). Raises `DeidError`."""
-        if not field_classes(view_options) or not self.applies(model_alias):
+        local alias, or neither a field class nor a personal value, decision 68). Raises
+        `DeidError`."""
+        if not (field_classes(view_options) or personal) or not self.applies(model_alias):
             return None
         if self.vocabulary_error is not None:
             raise DeidError(self.vocabulary_error)
-        return pseudonymize(data, view_options, self.vocabulary)
+        return pseudonymize(data, view_options, self.vocabulary, personal)
 
 
 def load_deidentifier(
@@ -852,6 +942,7 @@ __all__ = [
     "DEID_NOTE",
     "DEID_VERSION",
     "FREE_TEXT",
+    "MAX_PERSONAL_VALUES",
     "MAX_VALUE_CHARS",
     "TOKEN",
     "TOKEN_CLASSES",
@@ -862,7 +953,9 @@ __all__ = [
     "amount_renderings",
     "bucket",
     "field_classes",
+    "fold",
     "load_deidentifier",
+    "personal_problem",
     "pseudonymize",
     "vocabulary_problem",
 ]
