@@ -15,7 +15,9 @@ must answer:
 ```
 
 `params` are the trusted parameters, `input` a transform's input (the previous step's data,
-as a run record stores it), `paths` the locked path permissions; all optional. `expect` holds
+as a run record stores it), `paths` the locked path permissions, `network` the locked host
+names (`[]` when absent, as a core sends for a plugin with no approved host; `null` sends no
+list at all, as a core older than horae-sdk 0.5 does); all optional. `expect` holds
 the `data` and `intents` (both compared exactly) or an `error` (a substring of the tool
 error's message). A recording is replayed **through MCP** (an in-process client, the same
 requests, `_meta` keys and result reading as the core's host), so what passes here is what
@@ -48,7 +50,7 @@ import json
 import os
 import sys
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -58,11 +60,11 @@ from mcp.client import Client
 from mcp_types import CallToolResult
 
 from horae_sdk.plugin import Plugin
-from horae_sdk.protocol import INPUT_META, INTENTS_META, PATHS_META
+from horae_sdk.protocol import INPUT_META, INTENTS_META, NETWORK_META, PATHS_META
 
 RECORD_ENV = "HORAE_SDK_RECORD"
 CI_ENVS = ("CI", "GITHUB_ACTIONS")
-_KEYS = {"tool", "params", "input", "paths", "expect"}
+_KEYS = {"tool", "params", "input", "paths", "network", "expect"}
 _EXPECT_KEYS = {"data", "intents"}
 
 
@@ -124,24 +126,36 @@ async def call(
     *,
     input: Any = None,
     paths: Mapping[str, Any] | None = None,
+    network: Sequence[str] | None = (),
 ) -> Replayed:
-    """Call `tool` as the core does: `params` as arguments, `input` and `paths` in `_meta`.
+    """Call `tool` as the core does: `params` as arguments, `input`, `paths` and `network`
+    (`None`: an older core, no list) in `_meta`.
     Only a provided source or transform can be called this way."""
     if tool not in plugin.tools:
         raise ReplayMismatch(f"{tool} is not a source or transform of {plugin.name}")
     meta: dict[str, Any] = {PATHS_META: {"read": [], "write": [], **(paths or {})}}
+    if network is not None:
+        meta[NETWORK_META] = list(network)
     if input is not None:
         meta[INPUT_META] = input
     return read_result(await _call_tool(plugin, tool, dict(params or {}), meta))
 
 
-async def operation(plugin: Plugin, tool: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
+async def operation(
+    plugin: Plugin,
+    tool: str,
+    arguments: Mapping[str, Any],
+    *,
+    network: Sequence[str] | None = (),
+) -> dict[str, Any]:
     """Call sink operation `tool` (`<ns>.apply`…) as the core does; its result object (or
-    `{"error": {...}}`). `arguments` should include `paths`."""
+    `{"error": {...}}`). `arguments` should include `paths`; `network` is the locked host
+    list in `_meta` (`None`: an older core, no list)."""
     namespace = tool.split(".", 1)[0]
     if namespace not in plugin.sinks:
         raise ReplayMismatch(f"{namespace} is not a sink namespace of {plugin.name}")
-    replayed = read_result(await _call_tool(plugin, tool, dict(arguments), {}))
+    meta: dict[str, Any] = {} if network is None else {NETWORK_META: list(network)}
+    replayed = read_result(await _call_tool(plugin, tool, dict(arguments), meta))
     if replayed.error is not None or not isinstance(replayed.data, dict):
         raise ReplayMismatch(f"{tool} did not return an object: {replayed.error}")
     return replayed.data
@@ -229,6 +243,7 @@ async def areplay(plugin: Plugin, path: Path, *, record: bool | None = None) -> 
         document.get("params"),
         input=document.get("input"),
         paths=document.get("paths"),
+        network=document.get("network", []),
     )
     if recording:
         document["expect"] = replayed.expectation()

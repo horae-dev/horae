@@ -3523,3 +3523,42 @@ loosened later without breaking a valid file.
     - **H, trust.** An index is untrusted data ([security.md](../docs/security.md), B6): it can
       only point to a repository and a SHA. #44 re-verifies the tag and the SHA, #46 shows the
       permissions.
+
+### Provisional decisions (#131, pending maintainer review)
+
+63. **The locked network list travels in every plugin call's `_meta` (#131).** No schema
+    changes: it is a wire addition of the plugin host (`horae.plugins.host.session`) and the
+    SDK (horae-sdk 0.5.0). Decision 62 is taken by open PR #155.
+    - **A, the key.** Every request to a plugin (a source, a transform, a sink operation) carries
+      `_meta["horae/network"]`: the plugin's `permissions.network` **as approved in
+      `horae.lock`** (the host's effective manifest, never the manifest's declared list), a list
+      of host names in the lock's order. A plugin the lock grants no host sends `[]`: an empty
+      list is never "everything allowed", and the key is always present from a core that has
+      this decision. The key has no `dev.` prefix on purpose: it names a core capability a
+      plain MCP server never sets, and `horae/` is reserved for the core (the earlier keys,
+      `dev.horae/input`, `dev.horae/paths` and `dev.horae/intents`, are unchanged).
+    - **B, trust.** The core builds `_meta` itself; a transform's untrusted input travels under
+      `dev.horae/input` and parameters are arguments, so neither can set or shadow the key.
+      Before M5 it is **advice the plugin enforces on itself**, not isolation: a malicious
+      plugin simply ignores it (T05 stays open until the egress proxy, #50). It protects
+      against a configuration that points a good plugin at a host the user did not approve
+      (a `server` or `allowed_hosts` from trusted pipeline config, a redirect, a hostile URL).
+    - **C, matching.** `horae_sdk.Network.allows(url)` uses the lock's semantics and nothing
+      looser. A host matches only if it is written exactly as listed: names are lowercase
+      (`Hostname`) and compared without case folding, trailing dot, wildcard or implicit
+      subdomain; an internationalised name is its `xn--` A-label; any port is accepted on an
+      approved host (decision 10). The URL must satisfy the shape of `HttpsUrl`: `https` only,
+      no user info (`https://allowed@evil/` and `https://evil\@allowed/` never match), no
+      backslash, whitespace, control character, fragment or IP literal. A list entry that is not
+      a valid `Hostname` matches nothing. The core's helper `horae.contracts.url_host` stays the
+      core's reading; the SDK has no dependency on the core, so it carries its own copy, and the
+      SDK tests assert the two agree.
+    - **D, compatibility.** A core older than this decision sends no key; the SDK then reports
+      the list as **unknown** (`allowed_hosts is None`, `host_allowed(url) is None`), which is
+      not "refused": the plugin decides, and falls back to its own configuration. A present but
+      malformed value is read as an empty list (fail closed). An SDK older than 0.5 ignores the
+      key. The list is repeated on every call (a few names), not sent once.
+    - **E, scope.** Plugins are not changed here: `plugin-ntfy` (`server`) and
+      `plugin-calendar` (`allowed_hosts`) are to call `call.host_allowed(url)` /
+      `request.host_allowed(url)` in follow-ups, treating `False` as a refusal and `None` as
+      "use my own config".

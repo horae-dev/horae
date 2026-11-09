@@ -52,7 +52,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Literal
 
-from horae_sdk.protocol import MAX_NOTE_BYTES, Paths
+from horae_sdk.protocol import MAX_NOTE_BYTES, Network, Paths
 
 SinkRole = Literal["sinks", "notifiers"]
 _KIND = re.compile(r"[a-z_]{1,32}")
@@ -128,6 +128,14 @@ class ApplyRequest:
     an ntfy `http` action `{"action": "http", "label", "url", "method": "POST"}`. Render these,
     never the intent's own `actions`; each `url` is a single-use credential: send it to the
     push service only, never log it."""
+    network: Network = field(default_factory=Network)
+    """The network allow-list approved in `horae.lock` (trusted; horae-sdk 0.5); unknown when
+    the core is older. `host_allowed(url)` checks a URL against it."""
+
+    def host_allowed(self, url: str) -> bool | None:
+        """Whether `url` (https) is on the approved list: `True`/`False`, or `None` when the
+        core sent no list (unknown: fall back to the sink's own configuration)."""
+        return self.network.allows(url)
 
 
 @dataclass(frozen=True)

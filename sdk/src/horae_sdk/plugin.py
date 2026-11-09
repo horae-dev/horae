@@ -53,7 +53,9 @@ from horae_sdk.protocol import (
     MAX_INTENTS,
     MAX_MESSAGE_BYTES,
     MESSAGE_MARGIN,
+    NETWORK_META,
     PATHS_META,
+    Network,
     Paths,
     meta_of,
 )
@@ -80,6 +82,20 @@ class Call:
     """A transform's input, the previous step's data (untrusted; `None` for a source)."""
     paths: Paths = field(default_factory=Paths)
     """The path permissions approved in `horae.lock` (trusted)."""
+    network: Network = field(default_factory=Network)
+    """The network allow-list approved in `horae.lock` (trusted; horae-sdk 0.5). Unknown
+    (`network.known` is false) when the core is older and sent none."""
+
+    @property
+    def allowed_hosts(self) -> tuple[str, ...] | None:
+        """The approved host names, `()` when the lock grants none, `None` when unknown (an
+        older core): then fall back to the plugin's own configuration."""
+        return self.network.hosts
+
+    def host_allowed(self, url: str) -> bool | None:
+        """Whether `url` (https) is on the approved list: `True`/`False`, or `None` when the
+        core sent no list (unknown: the plugin decides). See `Network.allows`."""
+        return self.network.allows(url)
 
 
 @dataclass(frozen=True)
@@ -261,6 +277,7 @@ class Plugin:
                 dict(arguments),
                 meta.get(INPUT_META),
                 Paths.from_wire(meta.get(PATHS_META)),
+                Network.from_wire(meta.get(NETWORK_META)),
             )
             try:
                 return self.result(tool.ref, await _maybe_await(tool.fn(call, **arguments)))
@@ -338,8 +355,11 @@ class Plugin:
             input_hash: str | None = None,
             dedupe_key: str | None = None,
             actions: list[dict[str, Any]] | None = None,
+            *,
+            ctx: Context,
         ) -> CallToolResult:
             """Apply one intent routed to this sink."""
+            network = Network.from_wire(meta_of(ctx.request_context.meta).get(NETWORK_META))
 
             async def run() -> dict[str, Any]:
                 if intent.get("type") not in declared:
@@ -358,6 +378,7 @@ class Plugin:
                     decode(content),
                     expected_before_sha256,
                     _actions(actions),
+                    network,
                 )
                 applied = await _maybe_await(sink.apply(request))
                 if not isinstance(applied, Applied):

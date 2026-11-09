@@ -108,6 +108,43 @@ text is data. See [`examples/tasks_file/tasks_file_sink.py`](examples/tasks_file
   when it is loaded**: rename that tool, and implement `Sink.restore_status` instead if you want
   `horae undo` to put a task status back.
 
+## Checking the approved hosts
+
+Since 0.5 the core sends the plugin's `permissions.network` **as approved in `horae.lock`**
+(not the manifest's declared list) with every call, so a plugin can refuse a host the user did
+not approve, even before M5 isolation (the egress proxy) exists. In a source or transform:
+
+```python
+@plugin.source("web.fetch")
+def fetch(call: Call, url: str) -> Output:
+    allowed = call.host_allowed(url)  # True, False, or None
+    if allowed is False:
+        raise PluginError("that host is not approved in horae.lock")
+    ...
+```
+
+In a sink or notifier, `request.host_allowed(url)` on the `ApplyRequest` does the same.
+`call.allowed_hosts` (`request.network.hosts`) is the list itself: a tuple, `()` when the lock
+grants no host.
+
+- `True`: `url` is an `https` URL whose host is one of the approved names. `False`: anything
+  else, including an empty list.
+- **`None` means unknown**: the core is older than this SDK and sent no list. That is not
+  "refused": the plugin decides. Fall back to what you did before, your own configuration
+  (the server or hosts the pipeline's trusted parameters name), and never treat `None` as
+  "approved by the user".
+- The matching is the lock's, nothing looser: names are lowercase and compared as written
+  (no case folding, no trailing dot, no wildcard, no implicit subdomains); a non-ASCII name
+  must be written as its `xn--` A-label; any port is accepted on an approved host; user info
+  (`user@host`), a backslash, whitespace, a fragment, an IP literal, `localhost` and any scheme
+  but `https` never match. Check the URL you are about to connect to, after any redirect.
+- A plugin cannot influence the list: it travels in the request's `_meta["horae/network"]`,
+  which the core sets, and a transform's input is under another key.
+
+`horae_sdk.testing.call(..., network=[...])` (and a recording's `"network"` key) sends a list;
+the default is `[]`, as the core sends for a plugin with no approved host, and `network=None`
+(`"network": null`) sends none, as an older core does.
+
 ## Manifest
 
 ```python
