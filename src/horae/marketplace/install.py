@@ -37,6 +37,7 @@ tree before it is moved into place). What was installed is recorded in the insta
 fields of a `horae.lock` entry but the permissions (`Installed.lock_entry`).
 """
 
+import errno
 import json
 import os
 import posixpath
@@ -55,7 +56,7 @@ from horae.contracts.lockfile import GitRepoUrl, LockedPlugin
 from horae.contracts.plugin import Permissions, PluginManifest
 from horae.contracts.types import CommitSha, PluginName, SemVer
 from horae.marketplace.errors import AlreadyInstalled, InstallError, InstallRefused
-from horae.marketplace.git import GIT_TIMEOUT_S, HTTPS, GitError, run_git
+from horae.marketplace.git import GIT_TIMEOUT_S, HTTPS, GitError, GitTooLarge, run_git
 
 MANIFEST_FILE = "plugin.yaml"
 INSTALL_RECORD = ".horae-install.json"
@@ -67,6 +68,8 @@ MAX_FETCH_BYTES = 200 * 1024 * 1024
 MAX_FILES = 5000
 MAX_TREE_BYTES = 100 * 1024 * 1024
 MAX_LINK_BYTES = 4096
+MAX_DEPTH = 32
+MAX_PATH_CHARS = 1024
 MAX_PROBLEMS = 3
 _CHECKOUT_OPTIONS = ("core.symlinks=false", "core.protectHFS=true", "core.protectNTFS=true")
 
@@ -117,7 +120,12 @@ def _refused_problems(exc: ProblemsError) -> str:
 
 def _bad_path(path: str) -> bool:
     parts = path.split("/")
-    return any(p in ("", ".", "..") or p.lower() == ".git" for p in parts)
+    return (
+        len(parts) > MAX_DEPTH
+        or len(path) > MAX_PATH_CHARS
+        or "\0" in path
+        or any(p in ("", ".", "..") or p.lower() == ".git" for p in parts)
+    )
 
 
 def _escapes(path: str, target: str) -> bool:
@@ -198,18 +206,44 @@ class PluginInstaller:
                 prepare(tree, manifest)
             if os.path.lexists(target):
                 raise AlreadyInstalled(f"plugin {name!r} is already installed in {target}")
-            tree.rename(target)
+            self._place(tree, target, name)
         except OSError as exc:
             raise InstallError(f"cannot install {name}: {exc.strerror or exc}") from None
         finally:
             shutil.rmtree(scratch, ignore_errors=True)
         return installed
 
+    def _place(self, tree: Path, target: Path, name: str) -> None:
+        """Rename `tree` to `target`, which must not exist. `rename` onto a non-empty directory
+        fails, so an install that lost a race never replaces the winner's (a plugin directory
+        always holds `plugin.yaml`)."""
+        try:
+            tree.rename(target)
+        except OSError as exc:
+            if exc.errno in (errno.ENOTEMPTY, errno.EEXIST):
+                raise AlreadyInstalled(
+                    f"plugin {name!r} is already installed in {target}"
+                ) from None
+            raise
+
     # --- steps ---------------------------------------------------------------------------
 
-    def _git(self, cwd: Path, *args: str, options: tuple[str, ...] = ()) -> str:
+    def _git(
+        self, cwd: Path, *args: str, options: tuple[str, ...] = (), watch: Path | None = None
+    ) -> str:
+        if watch is None:
+            return run_git(
+                cwd, *args, allow=self.allow_protocol, timeout_s=self.timeout_s, options=options
+            )
+        # A download is killed once the scratch directory holds more than the budget.
         return run_git(
-            cwd, *args, allow=self.allow_protocol, timeout_s=self.timeout_s, options=options
+            cwd,
+            *args,
+            allow=self.allow_protocol,
+            timeout_s=self.timeout_s,
+            options=options,
+            watch=watch,
+            max_bytes=MAX_FETCH_BYTES,
         )
 
     def _fetch(self, scratch: Path, git_dir: Path, repo: str, version: str, sha: str) -> None:
@@ -229,7 +263,10 @@ class PluginInstaller:
                 "--",
                 url,
                 str(git_dir),
+                watch=scratch,
             )
+        except GitTooLarge:
+            raise InstallRefused(f"{repo} is more than {MAX_FETCH_BYTES} bytes") from None
         except GitError as exc:
             raise InstallError(f"cannot clone {repo} at tag {tag}: {exc}") from None
         try:
@@ -246,7 +283,10 @@ class PluginInstaller:
                 url,
                 sha,
                 f"+refs/tags/{tag}:refs/tags/{tag}",
+                watch=scratch,
             )
+        except GitTooLarge:
+            raise InstallRefused(f"{repo} at {sha} is more than {MAX_FETCH_BYTES} bytes") from None
         except GitError as exc:
             raise InstallError(
                 f"cannot fetch commit {sha} and tag {tag} from {repo}: {exc}"
@@ -303,8 +343,10 @@ class PluginInstaller:
                 raise InstallRefused(f"the tree has an invalid path: {path!r}")
             if path == INSTALL_RECORD:
                 raise InstallRefused(f"the tree has a file named {INSTALL_RECORD}")
-            if kind != "blob":
-                continue  # a submodule (gitlink): never fetched, checked out empty
+            if kind != "blob" or mode == "160000":
+                # A gitlink (submodule) is never fetched; refused rather than checked out empty,
+                # so what is installed is exactly what the commit holds.
+                raise InstallRefused(f"the tree has a submodule (gitlink): {path!r}")
             total += int(size)
             if total > MAX_TREE_BYTES:
                 raise InstallRefused(f"the tree is larger than {MAX_TREE_BYTES} bytes")

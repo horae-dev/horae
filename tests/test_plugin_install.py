@@ -176,7 +176,7 @@ def test_no_hook_runs_even_from_a_planted_template(
     assert not marker.exists()
 
 
-def test_a_submodule_is_never_fetched(tmp_path: Path) -> None:
+def test_a_submodule_is_refused_and_never_fetched(tmp_path: Path) -> None:
     inner, inner_sha = plugin_repo(tmp_path / "inner", files={"secret-payload": "x\n"}, tag=None)
     repo, _ = plugin_repo(tmp_path / "src", tag=None)
     (repo / ".gitmodules").write_text(
@@ -187,10 +187,52 @@ def test_a_submodule_is_never_fetched(tmp_path: Path) -> None:
     git(repo, "commit", "-q", "-m", "submodule")
     git(repo, "tag", "-f", "v1.0.0")
     sha = git(repo, "rev-parse", "HEAD")
-    installed = _installer(tmp_path, repo).install("demo", "1.0.0", PLUGIN_URL, sha)
-    sub = installed.path / "sub"
-    assert not sub.exists() or list(sub.iterdir()) == []
-    assert not list(installed.path.rglob("secret-payload"))
+    with pytest.raises(InstallRefused, match="submodule"):
+        _installer(tmp_path, repo).install("demo", "1.0.0", PLUGIN_URL, sha)
+    assert _left(tmp_path / "plugins") == []
+
+
+def test_a_tree_too_deep_is_refused(tmp_path: Path) -> None:
+    deep = "/".join(["d"] * (install_module.MAX_DEPTH + 1)) + "/f.txt"
+    repo, sha = plugin_repo(tmp_path / "src", files={deep: "x"})
+    with pytest.raises(InstallRefused, match="invalid path"):
+        _installer(tmp_path, repo).install("demo", "1.0.0", PLUGIN_URL, sha)
+
+
+def test_losing_the_rename_race_never_replaces_the_winner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, sha = plugin_repo(tmp_path / "src")
+    plugins = tmp_path / "plugins"
+    real = os.path.lexists
+    calls = {"n": 0}
+
+    def racy(path: str | os.PathLike[str]) -> bool:
+        if Path(path) == plugins / "demo":
+            calls["n"] += 1
+            if calls["n"] == 2:  # after the last check, before the rename: the winner lands
+                (plugins / "demo").mkdir()
+                (plugins / "demo" / "plugin.yaml").write_text("winner", encoding="utf-8")
+                return False
+        return real(path)
+
+    monkeypatch.setattr(os.path, "lexists", racy)
+    with pytest.raises(AlreadyInstalled):
+        _installer(tmp_path, repo).install("demo", "1.0.0", PLUGIN_URL, sha)
+    assert (plugins / "demo" / "plugin.yaml").read_text(encoding="utf-8") == "winner"
+    assert _left(plugins) == ["demo"]
+
+
+def test_a_download_is_killed_when_it_outgrows_its_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    script = "head -c 3000000 /dev/zero > big; sleep 60"
+    monkeypatch.setattr(git_module, "git_command", lambda *a, **k: ["sh", "-c", script])
+    monkeypatch.setattr(git_module, "WATCH_INTERVAL_S", 0.05)
+    started = time.monotonic()
+    with pytest.raises(git_module.GitTooLarge):
+        git_module.run_git(tmp_path, "clone", timeout_s=30, watch=tmp_path, max_bytes=1000)
+    assert time.monotonic() - started < 20
 
 
 def test_a_filter_named_by_gitattributes_never_runs(tmp_path: Path) -> None:
