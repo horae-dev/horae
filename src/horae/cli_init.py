@@ -42,7 +42,6 @@ from pathlib import Path
 from typing import Annotated, Any
 
 import typer
-import yaml
 from pydantic import ValidationError
 
 from horae.cli_host import PLUGINS_DIR
@@ -59,6 +58,7 @@ from horae.cli_output import (
 )
 from horae.config import CONFIG_FILE
 from horae.contracts import Lockfile, PluginManifest
+from horae.marketplace.lock import dump_lock
 from horae.plugins.builtin import BUILTIN, InstallError, install, manifest_data
 
 TEMPLATE = Path(__file__).resolve().parent / "init_template"
@@ -168,7 +168,9 @@ def _build(where: Path, lock: dict[str, Any]) -> list[str]:
     for name in _TEMPLATE_FILES:
         _write(where / name, (TEMPLATE / name).read_text(encoding="utf-8"))
     _write(where / ".gitignore", _GITIGNORE)
-    _write(where / LOCK_FILE, _LOCK_HEADER + yaml.safe_dump(lock, sort_keys=False))
+    # The canonical text `horae plugin add` rewrites (decision 70 C): adding a plugin later
+    # changes only the lines of its own entry.
+    _write(where / LOCK_FILE, dump_lock(Lockfile.model_validate(lock), _LOCK_HEADER))
     (where / VAULT_DIR).mkdir()
     (where / STATE_DIR).mkdir(mode=0o700)
     os.chmod(where / STATE_DIR, 0o700)

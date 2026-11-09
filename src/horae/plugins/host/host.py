@@ -4,8 +4,13 @@
 **Registry.** `HostRegistry` resolves tools and skills from `horae.lock` and the installed
 manifests (`plugin.yaml`). A manifest must be pinned in the lock at the same version, and may
 not ask for more than the user approved there (`network`, `secrets`, `paths`, `intents`): the
-**locked** permissions are the ones in force. A tool or skill resolves to the plugin whose
-manifest `provides` it (decision 11: the namespace need not be the plugin's name); two plugins
+**locked** permissions are the ones in force. A plugin installed by `horae plugin add` also
+has an install record (`.horae-install.json`, decision 62 F): its name, version, repo and
+commit must be the lock entry's, else the plugin is refused (an installed tree that is not
+the approved one, decision 70 D). A plugin without a record (the built-in ones `horae init`
+installs, a plugin copied by hand) is checked against the lock by its manifest only. A tool
+or skill resolves to the plugin whose manifest `provides` it (decision 11: the namespace need
+not be the plugin's name); two plugins
 providing the same ref is an error, and so is providing a sink operation name
 (`<ns>.<operation>` of any plugin's sink or notifier namespace, #25). Resolution reads only
 the documents given (#23).
@@ -86,6 +91,7 @@ import json
 import logging
 import os
 import shutil
+import stat
 import tempfile
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -100,7 +106,7 @@ import mcp_types
 from horae.config import Instance
 from horae.config.documents import read_yaml, validate
 from horae.contracts.instance import PluginDefaults
-from horae.contracts.lockfile import Lockfile
+from horae.contracts.lockfile import LockedPlugin, Lockfile
 from horae.contracts.plugin import (
     SINK_OPERATIONS,
     TOOL_KINDS,
@@ -113,6 +119,7 @@ from horae.contracts.plugin import (
 )
 from horae.contracts.run import Violation
 from horae.engine.ports import ResolvedPlugin, ToolResult, UnknownPlugin
+from horae.marketplace.install import INSTALL_RECORD
 from horae.plugins.host import logs
 from horae.plugins.host.capture import StderrCapture
 from horae.plugins.host.env import BASE_PATH, build_env, check_names
@@ -160,6 +167,44 @@ def _exceeds(asked: Permissions, approved: Permissions) -> list[str]:
         if wanted:
             extra.append(f"paths.{access}: {', '.join(sorted(wanted))}")
     return extra
+
+
+_MAX_RECORD_BYTES = 64 * 1024
+
+
+def check_install_record(name: str, locked: LockedPlugin, root: Path) -> None:
+    """`RegistryError` when `<root>/.horae-install.json` exists and does not name the plugin,
+    version, repo and commit that `horae.lock` pins (decision 70 D). No record: nothing to
+    compare (a built-in or hand-copied plugin)."""
+    path = root / INSTALL_RECORD
+    try:
+        status = os.lstat(path)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise RegistryError(f"plugin {name}: cannot read {INSTALL_RECORD}: {exc}") from None
+    if not stat.S_ISREG(status.st_mode) or status.st_size > _MAX_RECORD_BYTES:
+        raise RegistryError(f"plugin {name}: {INSTALL_RECORD} is not a small regular file")
+    try:
+        record = json.loads(path.read_bytes())
+    except (OSError, ValueError):
+        raise RegistryError(f"plugin {name}: {INSTALL_RECORD} cannot be read") from None
+    if not isinstance(record, dict):
+        raise RegistryError(f"plugin {name}: {INSTALL_RECORD} is not an object")
+    expected = {
+        "name": name,
+        "version": locked.version,
+        "repo": locked.repo,
+        "commit": locked.commit,
+    }
+    differ = sorted(key for key, value in expected.items() if record.get(key) != value)
+    if differ:
+        found = ", ".join(f"{key} {record.get(key)!r}" for key in differ)
+        pinned = ", ".join(f"{key} {expected[key]!r}" for key in differ)
+        raise RegistryError(
+            f"plugin {name}: installed with {found} but horae.lock pins {pinned} "
+            "(the installed tree is not the approved one: reinstall it with `horae plugin add`)"
+        )
 
 
 class HostRegistry:
@@ -228,13 +273,14 @@ class HostRegistry:
         """Read `<directory>/<name>/plugin.yaml` for every plugin in `lock`.
 
         Raises `ProblemsError` for an invalid manifest, `RegistryError` for one that does not
-        match the lock. (Where `horae plugin add` installs plugins is M4's; this is the layout
-        it is expected to produce.)"""
+        match the lock, or an install record that does not (`check_install_record`). This is
+        the layout `horae plugin add` produces."""
         manifests: dict[str, PluginManifest] = {}
         roots: dict[str, Path] = {}
         for name in sorted(lock.plugins):
             root = directory / name
             manifests[name] = validate(read_yaml(root / MANIFEST_FILE), PluginManifest)
+            check_install_record(name, lock.plugins[name], root)
             roots[name] = root
         return cls(lock, manifests, roots)
 

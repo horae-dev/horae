@@ -57,8 +57,8 @@ def _configure(instance: Path) -> Path:
     return instance
 
 
-def _run(instance: Path, *args: str) -> tuple[int, str, str]:
-    result = runner.invoke(app, ["plugin", *args, "-i", str(instance)])
+def _run(instance: Path, *args: str, answer: str | None = None) -> tuple[int, str, str]:
+    result = runner.invoke(app, ["plugin", *args, "-i", str(instance)], input=answer)
     return result.exit_code, result.stdout, result.stderr
 
 
@@ -195,6 +195,7 @@ def demo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
     monkeypatch.setattr(
         cli_plugin, "make_installer", lambda where: LocalInstaller(where, {PLUGIN_URL: repo})
     )
+    monkeypatch.setattr(cli_plugin, "interactive", lambda: True)  # approval: tests answer
     return {"good": good, "moved": moved}
 
 
@@ -208,27 +209,28 @@ def test_add_installs_into_the_plugin_dir_and_says_what_is_left(
     instance_dir: Path, demo: dict[str, str]
 ) -> None:
     _configure_a(instance_dir)
-    code, out, _ = _run(instance_dir, "add", "demo@1.0.0")
+    code, out, _ = _run(instance_dir, "add", "demo@1.0.0", answer="y\n")
     assert code == 0, out
     assert "installed demo@1.0.0 into plugins/demo" in out
     assert demo["good"] in out
-    assert "not enabled yet" in out
-    assert "horae.lock" in out
+    assert "approved: horae.lock pins it" in out
+    assert "dependencies are not installed by horae yet" in out
     assert (instance_dir / "plugins" / "demo" / "plugin.yaml").is_file()
-    code, out, _ = _run(instance_dir, "add", "demo@1.0.0", "--json")
+    code, out, _ = _run(instance_dir, "add", "demo@1.0.0", "--json", answer="y\n")
     assert code == 3
     assert json.loads(out)["error"]["kind"] == "already_installed"
 
 
 def test_add_json_reports_the_install_record(instance_dir: Path, demo: dict[str, str]) -> None:
     _configure_a(instance_dir)
-    code, out, _ = _run(instance_dir, "add", "demo@1.0.0", "--json")
+    code, out, _ = _run(instance_dir, "add", "demo@1.0.0", "--json", answer="y\n")
     assert code == 0
-    report = json.loads(out)
+    report = json.loads(out[out.index("{") :])  # CliRunner echoes the typed answer
     assert report["commit"] == demo["good"]
     assert report["path"] == "plugins/demo"
+    assert report["approved"] is True
     assert report["enabled"] is False
-    assert report["pending"] == ["approve_permissions", "install_dependencies"]
+    assert report["pending"] == ["install_dependencies"]
 
 
 def test_add_refuses_a_moved_tag_with_exit_3(instance_dir: Path, demo: dict[str, str]) -> None:

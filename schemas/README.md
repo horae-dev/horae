@@ -157,7 +157,9 @@ JSON Schema cannot express these; the models enforce them and the tests pin the 
 ## Lockfile canonical form
 
 Serializing a `Lockfile` sorts plugins by name and every permission list, so a diff of two lockfiles
-shows only real changes. Reading accepts any order.
+shows only real changes. Reading accepts any order. The file's text is block-style YAML with sorted
+keys and a trailing newline, after the file's own leading comment lines (`horae.marketplace.lock`,
+[decision 70](#decisions)): the same lock is always the same bytes.
 
 ## Examples
 
@@ -3976,3 +3978,58 @@ loosened later without breaking a valid file.
       depth, and flip `tests/test_deid.py`'s accent test from documenting the gap to asserting
       that `Zoe` is caught, plus a test that a skill **without** classes sends no name; update
       the README's "Limits" (accent folding done, a skill without classes is now protected).
+
+### Provisional decisions (#46, pending maintainer review)
+
+70. **Permission approval at install, and `horae.lock` written by `horae plugin add` (#46).**
+    No schema change (`lockfile/v1.json` is as decision 68 left it). Decision 69 is left to
+    #45. It completes decision 62 F: an install is now approved and pinned in one command.
+    - **A, the prompt.** After the verified install (decision 62 A to D), before the tree is
+      moved into place (the `prepare` hook), `horae plugin add` shows what `plugin.yaml` asks
+      for, grouped and labelled: network (https hosts); **local network (plain http allowed)**
+      on its own (decision 66); secrets, required and optional; intents, each with a one-line
+      meaning (`horae.marketplace.approval.INTENT_MEANINGS`, one for every intent of the
+      closed set, tested); paths, read and read-and-write. `provides.personal_fields` are
+      shown as information ("de-identified before cloud models"), never approved (decision
+      68 B). With `--json` the prompt goes to stderr and stdout keeps one JSON document.
+    - **B, approval.** Interactive confirmation, default **no** (an empty answer, end of input
+      or Ctrl-C is a no). `--yes` / `-y` approves **only** when `horae.lock` already has an
+      entry for this name with the same version and commit and permissions identical to what
+      is asked (canonical comparison, extra grants included), e.g. a Docker build from a
+      committed lock; otherwise it is refused, naming the difference. No terminal (stdin is not
+      a TTY) and no `--yes` is refused. Every refusal is exit 3 (`approval_refused`) and
+      leaves nothing in `plugins/` and `horae.lock` unchanged. An interactive approval of a
+      plugin whose lock entry differs (another version, from a lock with no installed tree)
+      replaces that entry, and says so first.
+    - **C, extra grants.** `--allow-host HOST` (a `Hostname`) and `--allow-local HOST:PORT` (a
+      `LocalEndpoint`), repeatable, add grants beyond the manifest; they are shown "(added by
+      you)" and written to the lock. A lock may grant more than a manifest declares (the host
+      refuses only less, decision 66): this is how a user approves their own school or Home
+      Assistant host. An invalid value is a usage error (exit 2). With `--yes` they must be
+      given again (the request must be identical to the lock). Nothing else can be added
+      (paths, secrets, intents come from the manifest only).
+    - **D, the lock file.** `horae.marketplace.lock`: the whole lock is rewritten **atomically**
+      (temporary file in the instance directory, `fsync`, `rename`, `fsync` of the directory,
+      the file's mode kept) under an exclusive, non-blocking `flock` on
+      `<state_dir>/horae.lock.guard` held for the whole add (read, install, prompt, write); a
+      second writer is refused with exit 5 (`lock_busy`). Canonical text: the contract's
+      serialization (plugins and lists sorted, empty `network_local` / `personal_fields`
+      omitted), then block-style YAML with sorted keys, no wrapping, a trailing newline,
+      after the leading comment lines of the existing file (a new file gets a short default
+      header). Re-serializing is byte-stable, and adding a plugin adds only its own lines
+      (tested). `horae init` writes its lock with the same function. A `horae.lock` that does
+      not validate is never rewritten. The entry is `Installed.lock_entry(approved)`; it must
+      equal the approved one or the install is undone. If the lock cannot be written, the
+      placed tree is removed (exit 1, `lock_write_failed`).
+    - **E, tier (docs/security.md T04).** Before M5, `horae plugin add` refuses a plugin whose
+      marketplace tier is not `first-party`, before anything is fetched (exit 3,
+      `tier_refused`, pointing to M5). `require_installable(name, tier)` is the one check;
+      a direct install from a git URL (#48) passes `tier=None`, which is refused the same way.
+    - **F, at run.** `HostRegistry.from_directory` already refuses a manifest asking for more
+      than the lock grants and a version other than the locked one. It now also reads the
+      install record `plugins/<name>/.horae-install.json` (decision 62 F) when there is one: its
+      name, version, repo and commit must be the lock entry's, else the plugin is refused
+      (`plugins_invalid`): an installed tree that is not the approved one. The record must be a
+      regular file (no symlink) of at most 64 KiB holding a JSON object. A plugin **without** a
+      record (the built-in ones `horae init` installs, a plugin copied by hand) is checked by
+      its manifest only: an accepted gap until the files of a plugin are pinned (#47 or M5).

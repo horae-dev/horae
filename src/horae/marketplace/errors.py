@@ -54,3 +54,21 @@ class InstallRefused(InstallError):
 
 class AlreadyInstalled(InstallRefused):
     """The instance already has a plugin of that name (upgrading is `horae plugin upgrade`)."""
+
+
+class TierRefused(InstallRefused):
+    """The plugin's trust tier may not be installed yet: before M5 only `first-party`
+    marketplace plugins install (docs/security.md T04, decision 70 E)."""
+
+
+class ApprovalRefused(InstallRefused):
+    """The permissions were not approved (declined, no terminal, or `--yes` without a
+    matching `horae.lock` entry). Nothing is installed."""
+
+
+class LockInvalid(MarketplaceError):
+    """`horae.lock` exists but cannot be read or does not validate: it is never rewritten."""
+
+
+class LockBusy(MarketplaceError):
+    """Another command holds the instance's `horae.lock` writer lock."""
