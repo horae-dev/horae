@@ -25,3 +25,4 @@ state/
 # Planning tooling: local IDs and generated repo trees
 tools/planning/state.json
 tools/planning/repos/
+site/
