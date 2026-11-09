@@ -591,3 +591,32 @@ def test_a_hidden_name_that_survives_fails_closed(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(deid._Pseudonymizer, "_finds", lambda self, text: False)
     with pytest.raises(DeidError, match="in clear"):
         pseudonymize({"text": "Zo%C3%A9"}, {}, None, ("Zoé",))
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["q=Zo%25C3%25A9", "Zo&amp;eacute;", "Zo&amp;#233;", "Zo%26eacute%3B", "%255A%256F%25C3%25A9"],
+)
+def test_a_name_encoded_twice_is_found(text: str) -> None:
+    sent = _personal(text, "Zoé")
+    assert "[PERSON_1]" in sent
+    assert "%" not in sent
+    assert "&" not in sent
+
+
+def test_a_string_encoded_too_many_times_fails_closed() -> None:
+    with pytest.raises(DeidError, match="too many times"):
+        _personal("%2525252525C3%2525252525A9", "Zoé")
+
+
+def test_every_decoded_form_is_rechecked(monkeypatch: pytest.MonkeyPatch) -> None:
+    from horae.llm import deid
+
+    monkeypatch.setattr(deid._Pseudonymizer, "_finds", lambda self, text: False)
+    with pytest.raises(DeidError, match="in clear"):
+        pseudonymize({"text": "Zo%25C3%25A9"}, {}, None, ("Zoé",))
+
+
+def test_name_parts_are_taken_next_to_an_address() -> None:
+    assert _personal("Zoé et Martin", "Zoé Martin <zoe@example.org>") == "[PERSON_1] et [PERSON_1]"
+    assert _personal("example", "Zoé Martin <zoe@example.org>") == "example"

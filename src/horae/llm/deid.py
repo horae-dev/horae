@@ -212,14 +212,32 @@ def _clean(text: str) -> str:
     return _FORMAT.sub("", unicodedata.normalize("NFKC", text)).translate(_PUNCTUATION)
 
 
-def _reveal(text: str) -> str:
-    """`text` with its percent-escapes (`Zo%C3%A9`) and HTML entities (`Zo&eacute;`)
-    decoded: how a name hides in a URL or in markup."""
-    if "%" in text:
-        text = unquote(text)
-    if "&" in text:
-        text = html.unescape(text)
-    return text
+MAX_DECODE_ROUNDS = 4
+"""Most rounds of percent and entity decoding applied to a string (`%255A`, `&amp;#90;`)."""
+
+
+def _forms(text: str) -> list[str]:
+    """`text` and each form it takes as its percent-escapes (`Zo%C3%A9`) and HTML entities
+    (`Zo&eacute;`) are decoded, round after round (a name hides in a URL or in markup, and
+    may be encoded twice). Raises `DeidError` when it still changes after
+    `MAX_DECODE_ROUNDS` rounds: it cannot be read."""
+    forms = [text]
+    for _ in range(MAX_DECODE_ROUNDS):
+        decoded = text
+        if "%" in decoded:
+            decoded = unquote(decoded)
+        if "&" in decoded:
+            decoded = html.unescape(decoded)
+        decoded = _clean(decoded)
+        if decoded == text:
+            return forms
+        text = decoded
+        forms.append(text)
+    if (unquote(text) if "%" in text else text) != text or (
+        html.unescape(text) if "&" in text else text
+    ) != text:
+        raise DeidError("a string is encoded too many times to be read: refused")
+    return forms
 
 
 def fold(text: str) -> str:
@@ -437,11 +455,10 @@ def _name_parts(text: str) -> list[str]:
     """The parts of a person's name matched on their own: letter (and apostrophe) parts of
     at least `MIN_NAME_PART_LETTERS` letters, split at white space, hyphens and the
     punctuation that sets names apart (`Dupont, Marie`, `Quillard/Lopez`), without the dots
-    and apostrophes at their ends (`Mme.`). An address or a URL is not split."""
+    and apostrophes at their ends (`Mme.`). A word that is an address or a URL is left out."""
     cleaned = _clean(text)
-    if "@" in cleaned or "://" in cleaned:
-        return []
-    parts = [part.strip(".'") for part in _PART_SEPARATORS.split(cleaned)]
+    words = [word for word in cleaned.split() if "@" not in word and "://" not in word]
+    parts = [part.strip(".'") for part in _PART_SEPARATORS.split(" ".join(words))]
     return [
         part
         for part in parts
@@ -738,9 +755,9 @@ class _Pseudonymizer:
         """`text` with its known values replaced (module docstring); `text` itself when
         nothing is found."""
         cleaned = _clean(text)
-        revealed = _clean(_reveal(cleaned))
-        if revealed != cleaned and self._finds(revealed):
-            cleaned = revealed  # a known value hidden by escapes is found, and replaced
+        forms = _forms(cleaned)
+        if len(forms) > 1 and any(self._finds(form) for form in forms[1:]):
+            cleaned = forms[-1]  # a known value hidden by escapes is found, and replaced
         cleaned, neutralized = _TOKEN_SHAPED.subn(r"(\1_\2)", cleaned)
         if neutralized:
             self.count("neutralized", neutralized)
@@ -865,7 +882,7 @@ def _leaked(sent: Any, personal: Sequence[str]) -> bool:
         return False
     for text in _strings(sent):
         cleaned = _clean(TOKEN.sub(" ", text))
-        for seen in {cleaned, _clean(_reveal(cleaned))}:
+        for seen in _forms(cleaned):
             tokens = _TOKENS.findall(seen)
             if next(trie.matches([_symbol(token) for token in tokens]), None) is not None:
                 return True
