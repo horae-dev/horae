@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""`horae plugin search|resolve` (#43), over local fixture repositories (no network)."""
+"""`horae plugin search|resolve` (#43) and `horae plugin add` (#44), over local fixture
+repositories (no network)."""
 
 import json
 import shutil
@@ -10,8 +11,18 @@ from typer.testing import CliRunner
 
 from horae import cli_plugin
 from horae.cli import app
-from horae.marketplace import MarketplaceClient
-from marketplace_fixtures import A, B, LocalClient, entry, publish, sha
+from horae.marketplace import MarketplaceClient, PluginInstaller
+from marketplace_fixtures import (
+    PLUGIN_URL,
+    A,
+    B,
+    LocalClient,
+    LocalInstaller,
+    entry,
+    plugin_repo,
+    publish,
+    sha,
+)
 
 runner = CliRunner()
 
@@ -161,3 +172,76 @@ def test_http_marketplaces_in_the_config_are_refused(instance_dir: Path) -> None
     code, _, err = _run(instance_dir, "search")
     assert code == 1
     assert "marketplaces" in err
+
+
+# --- plugin add (#44) ----------------------------------------------------------------------------
+
+
+@pytest.fixture
+def demo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
+    """An index listing `demo` (the good release and one whose tag was moved) and its repo."""
+    repo, good = plugin_repo(tmp_path / "plugin-demo")
+    _, moved = plugin_repo(repo, version="2.0.0")
+    plugin_repo(repo, version="2.0.0", files={"server.py": "print('evil')\n"})
+    index = publish(
+        tmp_path / "index",
+        [entry("demo", {"1.0.0": good, "2.0.0": moved}, repo=PLUGIN_URL, tier="first-party")],
+    )
+
+    def make_client(cache_dir: Path, urls: list[str]) -> MarketplaceClient:
+        return LocalClient(cache_dir, urls, {A: index})
+
+    monkeypatch.setattr(cli_plugin, "make_client", make_client)
+    monkeypatch.setattr(
+        cli_plugin, "make_installer", lambda where: LocalInstaller(where, {PLUGIN_URL: repo})
+    )
+    return {"good": good, "moved": moved}
+
+
+def _configure_a(instance: Path) -> None:
+    config = instance / "horae.yaml"
+    text = config.read_text(encoding="utf-8")
+    config.write_text(f"{text}\nmarketplaces: [{A}]\n", encoding="utf-8")
+
+
+def test_add_installs_into_the_plugin_dir_and_says_what_is_left(
+    instance_dir: Path, demo: dict[str, str]
+) -> None:
+    _configure_a(instance_dir)
+    code, out, _ = _run(instance_dir, "add", "demo@1.0.0")
+    assert code == 0, out
+    assert "installed demo@1.0.0 into plugins/demo" in out
+    assert demo["good"] in out
+    assert "not enabled yet" in out
+    assert "horae.lock" in out
+    assert (instance_dir / "plugins" / "demo" / "plugin.yaml").is_file()
+    code, out, _ = _run(instance_dir, "add", "demo@1.0.0", "--json")
+    assert code == 3
+    assert json.loads(out)["error"]["kind"] == "already_installed"
+
+
+def test_add_json_reports_the_install_record(instance_dir: Path, demo: dict[str, str]) -> None:
+    _configure_a(instance_dir)
+    code, out, _ = _run(instance_dir, "add", "demo@1.0.0", "--json")
+    assert code == 0
+    report = json.loads(out)
+    assert report["commit"] == demo["good"]
+    assert report["path"] == "plugins/demo"
+    assert report["enabled"] is False
+    assert report["pending"] == ["approve_permissions", "install_dependencies"]
+
+
+def test_add_refuses_a_moved_tag_with_exit_3(instance_dir: Path, demo: dict[str, str]) -> None:
+    _configure_a(instance_dir)
+    code, out, _ = _run(instance_dir, "add", "demo", "--json")  # 2.0.0, the moved tag
+    assert code == 3
+    error = json.loads(out)["error"]
+    assert error["kind"] == "install_refused"
+    assert "tag v2.0.0" in error["message"]
+    assert not (instance_dir / "plugins").exists() or not list((instance_dir / "plugins").iterdir())
+
+
+def test_add_uses_the_https_installer_by_default(tmp_path: Path) -> None:
+    installer = cli_plugin.make_installer(tmp_path)
+    assert type(installer) is PluginInstaller
+    assert installer.allow_protocol == "https"

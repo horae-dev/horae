@@ -1,15 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
-"""`horae plugin search [QUERY]` and `horae plugin resolve NAME[@VERSION]` (#43).
+"""`horae plugin search [QUERY]`, `horae plugin resolve NAME[@VERSION]` (#43) and
+`horae plugin add NAME[@VERSION]` (#44).
 
-Both read the marketplace indexes of `horae.yaml` (`marketplaces`, highest priority first),
+All read the marketplace indexes of `horae.yaml` (`marketplaces`, highest priority first),
 refreshing each into the instance's cache (`<state_dir>/marketplaces`) unless `--offline`.
-When an index cannot be refreshed its cached copy is used, with a warning on stderr. They
-install nothing (`horae plugin add` is #44).
+When an index cannot be refreshed its cached copy is used, with a warning on stderr. `add`
+then installs the resolved commit into `<instance>/plugins/<name>`
+(`horae.marketplace.install`, schemas decision 62); the plugin is not enabled until it is in
+`horae.lock` with approved permissions (#46) and its dependencies are installed (#45).
 
-Exit codes (`horae.cli_output`): 0 ok; 1 configuration problem, or an index that cannot be
-fetched and has no cache; 2 usage error (a malformed reference); 3 unknown plugin or
-version, or a name listed by several marketplaces (a conflict); 70 internal error. With
-`--json` the report carries `warnings`; an error is {schema_version, error}.
+Exit codes (`horae.cli_output`): 0 ok; 1 configuration problem, an index that cannot be
+fetched and has no cache, or a plugin that cannot be fetched; 2 usage error (a malformed
+reference); 3 unknown plugin or version, a name listed by several marketplaces (a conflict),
+an install refused (tag and SHA disagree, invalid tree or `plugin.yaml`) or a plugin already
+installed; 70 internal error. With `--json` the report carries `warnings`; an error is
+{schema_version, error}.
 """
 
 from pathlib import Path
@@ -17,7 +22,7 @@ from typing import Annotated, Any
 
 import typer
 
-from horae.cli_host import load
+from horae.cli_host import PLUGINS_DIR, load, plugins_dir
 from horae.cli_output import (
     EXIT_OK,
     EXIT_PROBLEMS,
@@ -33,13 +38,17 @@ from horae.cli_output import (
     safe,
 )
 from horae.marketplace import (
+    AlreadyInstalled,
     ConflictError,
     FetchError,
+    InstallError,
+    InstallRefused,
     InvalidReference,
     Loaded,
     MarketplaceClient,
     MarketplaceError,
     NoCacheError,
+    PluginInstaller,
     UnknownPlugin,
     UnknownVersion,
     resolve,
@@ -51,7 +60,7 @@ MARKETPLACES_DIR = "marketplaces"
 
 plugin_app = typer.Typer(
     name="plugin",
-    help="Find plugins in the configured marketplaces.",
+    help="Find and install plugins from the configured marketplaces.",
     no_args_is_help=True,
     add_completion=False,
     cls=JsonUsageGroup,
@@ -75,6 +84,9 @@ OfflineOption = Annotated[
 JsonOption = Annotated[bool, typer.Option("--json", help="Print the result as JSON.")]
 
 _KINDS: tuple[tuple[type[MarketplaceError], int, str], ...] = (
+    (AlreadyInstalled, EXIT_REFUSED, "already_installed"),
+    (InstallRefused, EXIT_REFUSED, "install_refused"),
+    (InstallError, EXIT_PROBLEMS, "install_failed"),
     (ConflictError, EXIT_REFUSED, "conflict"),
     (UnknownPlugin, EXIT_REFUSED, "unknown_plugin"),
     (UnknownVersion, EXIT_REFUSED, "unknown_version"),
@@ -87,6 +99,19 @@ _KINDS: tuple[tuple[type[MarketplaceError], int, str], ...] = (
 def make_client(cache_dir: Path, urls: list[str]) -> MarketplaceClient:
     """The client the commands use: https only. Tests replace this to clone local fixtures."""
     return MarketplaceClient(cache_dir, urls)
+
+
+def make_installer(directory: Path) -> PluginInstaller:
+    """The installer `add` uses: https only. Tests replace this to clone local fixtures."""
+    return PluginInstaller(directory)
+
+
+PENDING = (
+    "not enabled yet: Horae loads a plugin only once horae.lock lists it with the permissions "
+    "you approved, and its dependencies are not installed. Review the permissions in "
+    "{manifest} before enabling it (permission approval and dependency install are not "
+    "automated yet)."
+)
 
 
 def _failed(exc: MarketplaceError) -> CommandFailed:
@@ -134,6 +159,38 @@ def _resolve(instance: Path, ref: str, offline: bool, pre: bool, json_output: bo
     echo(f"  sha    {found.sha}")
     echo(f"  tier   {found.tier}")
     echo(f"  index  {found.index}")
+    return EXIT_OK
+
+
+def _add(instance: Path, ref: str, offline: bool, pre: bool, json_output: bool) -> int:
+    config, loaded = _indexes(instance, offline)
+    try:
+        found = resolve(ref, loaded.indexes, pins=config.marketplace_pins, allow_prerelease=pre)
+        installed = make_installer(plugins_dir(instance)).install(
+            found.name, found.version, found.repo, found.sha
+        )
+    except MarketplaceError as exc:
+        raise _failed(exc) from None
+    where = f"{PLUGINS_DIR}/{installed.name}"
+    if json_output:
+        echo_json(
+            {
+                "schema_version": SCHEMA_VERSION,
+                **installed.record(),
+                "tier": found.tier,
+                "index": found.index,
+                "path": where,
+                "enabled": False,
+                "pending": ["approve_permissions", "install_dependencies"],
+                "warnings": list(loaded.warnings),
+            }
+        )
+        return EXIT_OK
+    echo(f"installed {installed.name}@{installed.version} into {where}")
+    echo(f"  repo    {installed.repo}")
+    echo(f"  commit  {installed.commit} (tag v{installed.version} points to it)")
+    echo(f"  tier    {found.tier}")
+    echo(PENDING.format(manifest=f"{where}/plugin.yaml"))
     return EXIT_OK
 
 
@@ -191,6 +248,34 @@ def resolve_command(
     )
 
 
+@plugin_app.command("add", cls=JsonUsageCommand)
+def add_command(
+    ref: Annotated[str, typer.Argument(metavar="NAME[@VERSION]", help="Plugin to install.")],
+    instance: InstanceOption = Path(),
+    offline: OfflineOption = False,
+    pre: Annotated[
+        bool, typer.Option("--pre", help="Also consider pre-releases when no version is named.")
+    ] = False,
+    json_output: JsonOption = False,
+) -> None:
+    """Install a plugin at the commit its marketplace pins, into the instance's plugins/.
+
+    The name is resolved as `horae plugin resolve` does. The repository is cloned over https
+    and the pinned commit checked out; the install is refused when the tag v<version> and the
+    pinned commit disagree, or when plugin.yaml is invalid or names another plugin or version.
+    Nothing is half-installed. The plugin is not enabled: it must still be added to horae.lock
+    with the permissions you approve, and its dependencies installed.
+
+    Exit codes: 0 installed, 1 configuration problem, unreachable marketplace without cache,
+    or a repository that cannot be fetched, 2 malformed reference, 3 unknown plugin or
+    version, a conflict, a refused install or a plugin already installed, 70 internal."""
+    run_command(
+        "plugin add",
+        json_output,
+        lambda: _add(instance, ref, offline, pre, json_output),
+    )
+
+
 @plugin_app.command("search", cls=JsonUsageCommand)
 def search_command(
     query: Annotated[str, typer.Argument(help="Part of a plugin name (default: all).")] = "",
@@ -207,4 +292,4 @@ def search_command(
     )
 
 
-__all__ = ["MARKETPLACES_DIR", "make_client", "plugin_app"]
+__all__ = ["MARKETPLACES_DIR", "make_client", "make_installer", "plugin_app"]

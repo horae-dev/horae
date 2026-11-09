@@ -161,7 +161,10 @@ def test_git_allows_one_protocol_and_ignores_config() -> None:
         "GIT_CONFIG_SYSTEM",
         "GIT_CONFIG_NOSYSTEM",
         "GIT_TERMINAL_PROMPT",
+        "GIT_LFS_SKIP_SMUDGE",
     }
+    assert env["GIT_LFS_SKIP_SMUDGE"] == "1"
+    assert cmd[5:7] == ["-c", "core.hooksPath=/dev/null"]
 
 
 def test_real_git_refuses_file_and_ext_by_default(tmp_path: Path) -> None:

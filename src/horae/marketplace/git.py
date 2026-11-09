@@ -5,12 +5,15 @@ An index is any git URL the user configures, and a clone is a network read of un
 only the named protocol is allowed (`https`; tests may name `file`), the user's and the
 system's git configuration are ignored, nothing may prompt, nothing inherits the environment
 (no `GIT_SSH_COMMAND`, `GIT_PROXY_COMMAND`, `GIT_EXEC_PATH`, ...), and every call has a timeout.
+No hook ever runs (`core.hooksPath=/dev/null`) and Git LFS never smudges
+(`GIT_LFS_SKIP_SMUDGE=1`): a plugin checkout (#44) runs nothing from the repository.
 Clones are shallow (the tip of HEAD only) but not partial (`--filter` made a later `git show`
 fetch lazily over a protocol the other calls block).
 """
 
 import os
 import subprocess
+from collections.abc import Sequence
 from pathlib import Path
 
 GIT_TIMEOUT_S = 120
@@ -24,9 +27,20 @@ class GitError(Exception):
     """A git call failed, timed out, or git is missing."""
 
 
-def git_command(*args: str, allow: str = HTTPS) -> list[str]:
-    """The argv of one git call: every protocol is off except `allow`."""
-    return ["git", "-c", "protocol.allow=never", "-c", f"protocol.{allow}.allow=always", *args]
+def git_command(*args: str, allow: str = HTTPS, options: Sequence[str] = ()) -> list[str]:
+    """The argv of one git call: every protocol is off except `allow`, no hook runs.
+    `options` are global options placed before the subcommand (`-c key=value`, `--git-dir`)."""
+    return [
+        "git",
+        "-c",
+        "protocol.allow=never",
+        "-c",
+        f"protocol.{allow}.allow=always",
+        "-c",
+        "core.hooksPath=/dev/null",
+        *options,
+        *args,
+    ]
 
 
 def git_env() -> dict[str, str]:
@@ -37,16 +51,23 @@ def git_env() -> dict[str, str]:
         GIT_CONFIG_SYSTEM="/dev/null",
         GIT_CONFIG_NOSYSTEM="1",
         GIT_TERMINAL_PROMPT="0",
+        GIT_LFS_SKIP_SMUDGE="1",
         LC_ALL="C",
     )
     return env
 
 
-def run_git(cwd: Path, *args: str, allow: str = HTTPS, timeout_s: float = GIT_TIMEOUT_S) -> str:
+def run_git(
+    cwd: Path,
+    *args: str,
+    allow: str = HTTPS,
+    timeout_s: float = GIT_TIMEOUT_S,
+    options: Sequence[str] = (),
+) -> str:
     """Run git in `cwd` and return its stripped stdout; `GitError` on any failure."""
     try:
         done = subprocess.run(  # noqa: S603
-            git_command(*args, allow=allow),
+            git_command(*args, allow=allow, options=options),
             cwd=cwd,
             env=git_env(),
             capture_output=True,
