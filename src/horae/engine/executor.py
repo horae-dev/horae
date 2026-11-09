@@ -205,6 +205,15 @@ repaired; and of one cancelled by the deadline while its output was being valida
 `horae.engine.ports.attached_usage`);
 a backend's cached response costs nothing and counts towards neither the cost nor the budget.
 
+**Skipping on an empty input** (schemas decision 67). With `skip_when_empty` (`true`, or a list
+of input view paths) on the `llm` step and an empty viewed input (`horae.engine.viewpath`),
+the step makes no call, looks nothing up and caches nothing: it is recorded `skipped` with
+the output `{"skipped": "empty_input", "skill": ...}`, no `llm[]` entry, and the run goes on
+(`noop` if it proposes nothing). A listed path outside the skill's input view is
+`params_invalid` while planning. A skill's `task_fingerprint` rule is checked by the action
+guard (`horae.engine.guard`): a proposed `task.create` fingerprint must be its prefix and an id
+of the viewed input, else a `guard_violation`.
+
 **De-identification** (#34, schemas decision 47). With a `deid` policy, a skill whose input
 view declares field classes and a cloud model alias, the order is: input view, then
 pseudonymize (`deid.pseudonymize`, deterministic from the viewed input, run in a worker thread
@@ -320,6 +329,7 @@ from horae.contracts.run import (
     Usage,
     Violation,
 )
+from horae.contracts.skill import view_steps
 from horae.contracts.types import MAX_ITEMS, HttpsUrl, NotePath, Sha256Hex, Token
 from horae.engine.canonical import canonical_json, canonical_pipeline, pipeline_digest, sha256_hex
 from horae.engine.guard import GUARD_ERROR, guard_for
@@ -345,6 +355,7 @@ from horae.engine.ports import (
     attached_usage,
 )
 from horae.engine.template import TemplateError, render, variables
+from horae.engine.viewpath import is_empty, values_at
 from horae.intents import MAX_BODY_DEPTH, IntentRejected, safe_excerpt, validate_intents
 from horae.secrets.redact import current as current_redactor
 
@@ -820,6 +831,8 @@ def _plan(
             skill = None if skills is None else _load_skill(skills, step.llm.skill, skill_plugin)
             if isinstance(skill, StepError):
                 fail(skill.kind, skill.message)
+            if skill is not None and (why := _skip_paths_problem(step.llm, skill)):
+                fail("params_invalid", why)
             if not has_llm:
                 fail("llm_unavailable", "the pipeline has an `llm` step and no LLM backend")
             planned.append(
@@ -862,6 +875,20 @@ def _plan(
                 calls.append(_Call(ref, rendered, plugin, position, planned_call.timeout_s))
         planned.append(_Planned(index, kind, calls=tuple(calls), entries=tuple(entries)))
     return tuple(planned)
+
+
+def _skip_paths_problem(spec: LlmSpec, skill: LoadedSkill) -> str | None:
+    """Why the `skip_when_empty` paths do not fit the skill's input view (a path the model is
+    never shown would read as empty and skip every run), or `None`."""
+    wanted = spec.skip_when_empty
+    if not isinstance(wanted, list):
+        return None
+    shown = [view_steps(path) for path in skill.view_paths]
+    for path in wanted:
+        steps = view_steps(path)
+        if not any(steps[: len(one)] == one or one[: len(steps)] == steps for one in shown):
+            return _cap(f"{spec.skill}: skip_when_empty path {path} is not in the input view")
+    return None
 
 
 def _load_skill(skills: SkillSource, ref: str, plugin: ResolvedPlugin) -> LoadedSkill | StepError:
@@ -1389,6 +1416,17 @@ async def _apply_step(run: _Run, step: _Planned) -> _Outcome:
     return _Outcome("ok", output=output)
 
 
+def _empty_input(spec: LlmSpec, viewed: Any) -> bool:
+    """Whether `spec.skip_when_empty` says to skip the step: the whole viewed input is empty
+    (`true`), or the values at every listed view path are (`viewed.is_empty`)."""
+    wanted = spec.skip_when_empty
+    if wanted is None or wanted is False:
+        return False
+    if wanted is True:
+        return is_empty(viewed)
+    return all(is_empty(value) for path in wanted for value in values_at(viewed, path))
+
+
 def _cache_key(
     run: _Run, spec: LlmSpec, plugin: ResolvedPlugin, skill: LoadedSkill | None, viewed: Any
 ) -> str:
@@ -1570,7 +1608,8 @@ def _shown(step: _Planned, viewed: Any, source: str) -> dict[str, Any]:
     fingerprints must also come from the viewed input."""
     limits = None if step.skill is None else step.skill.intent_limits
     links = "input" if step.skill is None else step.skill.links
-    guard = {"guard": guard_for(viewed, source, limits, links)}
+    rule = None if step.skill is None else getattr(step.skill, "task_fingerprint", None)
+    guard = {"guard": guard_for(viewed, source, limits, links, rule)}
     return guard if step.skill is None else {**guard, "shown": (viewed,)}
 
 
@@ -1600,6 +1639,11 @@ async def _llm_step(run: _Run, step: _Planned) -> _Outcome:
         # Nothing of the input matches the view's shape: no call is made.
         message = f"{spec.skill}: the step input does not have the shape of the input view"
         return _Outcome("degraded", StepError(kind="input_invalid", message=message), stop=True)
+    if _empty_input(spec, viewed):
+        # Opt-in (schemas decision 67): no model call, no cache lookup, nothing cached. Like
+        # an unchanged-input reuse the run goes on (and is `noop` if it proposes nothing).
+        run.reused = True
+        return _Outcome("skipped", output={"skipped": "empty_input", "skill": spec.skill})
 
     def degraded(kind: str, message: str) -> _Outcome:
         return _Outcome("degraded", StepError(kind=kind, message=_cap(message)), stop=True)

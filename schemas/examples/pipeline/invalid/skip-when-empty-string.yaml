@@ -1,0 +1,8 @@
+# `skip_when_empty` is `true` or a list of input view paths.
+name: triage-mail
+steps:
+  - llm:
+      skill: gmail/triage-mail
+      model: default
+      budget: { usd: 0.05, tokens_out: 2000 }
+      skip_when_empty: "yes"

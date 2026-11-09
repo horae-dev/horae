@@ -98,8 +98,9 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from typing import Any
 
 from horae.contracts.intents import Intent, IntentType, NotifyPush, TaskCreate
-from horae.contracts.skill import SkillLinks
+from horae.contracts.skill import SkillLinks, TaskFingerprintRule
 from horae.contracts.types import PLUGIN_NAME
+from horae.engine.viewpath import ids_at
 
 GUARD_ERROR = "guard_violation"
 """The `StepError.kind` of a step whose proposals the guard refused (the run record's
@@ -685,13 +686,16 @@ def check_intents(
     source: str,
     limits: Mapping[str, int] | None = None,
     links: SkillLinks = "input",
+    task_fingerprint: TaskFingerprintRule | None = None,
 ) -> str | None:
     """`None` when the guard accepts every intent of the batch; else the content-free detail
     of the first violation. `shown` is what the model was shown (the viewed input), `source`
     the proposer: `skill:` and the pipeline's `SkillRef` (`<namespace>/<skill>`, a validated
     configuration value, never model or input text), else `ValueError`, so a detail and its
     log line stay content-free. `limits` is the most intents of each type; `links` the skill's
-    `links` option (`none`: no link at all in note text)."""
+    `links` option (`none`: no link at all in note text); `task_fingerprint`: the skill's opt-in
+    rule (schemas decision 67), under which every `task.create` fingerprint must be the rule's
+    prefix and an id found in `shown`, else a violation (no fingerprint is echoed)."""
     if len(source) > 134 or _SOURCE.fullmatch(source) is None:
         raise ValueError("the guard's source must be `skill:<namespace>/<skill>`")
     for intent_type, most in sorted((limits or {}).items()):
@@ -701,8 +705,19 @@ def check_intents(
             return _detail(message)
     input_set = _Known(shown)
     known = input_set.__contains__
+    allowed = (
+        None
+        if task_fingerprint is None
+        else {task_fingerprint.prefix + one for one in ids_at(shown, task_fingerprint.ids)}
+    )
     for position, intent in enumerate(intents):
         where = f"{source} proposed {intent.type} #{position}"
+        if (
+            allowed is not None
+            and isinstance(intent, TaskCreate)
+            and intent.fingerprint not in allowed
+        ):
+            return _detail(f"{where} with a fingerprint not from the input in `fingerprint`")
         link = intent.link if isinstance(intent, (NotifyPush, TaskCreate)) else None
         if link is not None and not known(link):
             return _detail(f"{where} with a link not in the input in `link`")
@@ -727,11 +742,18 @@ def guard_for(
     source: str,
     limits: Mapping[str, int] | None = None,
     links: SkillLinks = "input",
+    task_fingerprint: TaskFingerprintRule | None = None,
 ) -> Callable[[Iterable[Intent]], str | None]:
-    """`check_intents` bound to one step's viewed input, proposer, limits and links option."""
+    """`check_intents` bound to one step's viewed input, proposer, limits, links option and
+    `task_fingerprint` rule."""
     bound = dict(limits or {})
     return lambda intents: check_intents(
-        tuple(intents), shown=shown, source=source, limits=bound, links=links
+        tuple(intents),
+        shown=shown,
+        source=source,
+        limits=bound,
+        links=links,
+        task_fingerprint=task_fingerprint,
     )
 
 

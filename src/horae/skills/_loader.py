@@ -25,7 +25,7 @@ from pydantic import TypeAdapter, ValidationError
 
 from horae.config.documents import ProblemsError, parse_yaml, validate
 from horae.contracts.intents import IntentType
-from horae.contracts.skill import SkillLinks, SkillManifest
+from horae.contracts.skill import SkillLinks, SkillManifest, TaskFingerprintRule
 from horae.contracts.types import SkillRef
 from horae.engine.canonical import canonical_json, sha256_hex
 from horae.engine.ports import ResolvedPlugin, SkillUnavailable
@@ -118,6 +118,11 @@ class Skill:
     def links(self) -> SkillLinks:
         """The `links` option (`none`: no link in note text, schemas decision 55)."""
         return self.manifest.links
+
+    @property
+    def task_fingerprint(self) -> TaskFingerprintRule | None:
+        """The opt-in `task.create` fingerprint rule (schemas decision 67)."""
+        return self.manifest.task_fingerprint
 
     @property
     def view_paths(self) -> tuple[str, ...]:
@@ -299,6 +304,8 @@ def _digest(manifest: SkillManifest, prompt: str, schema: dict[str, Any]) -> str
         content["view_options"] = manifest.view_options
     if manifest.intent_limits:
         content["intent_limits"] = manifest.intent_limits
+    if manifest.task_fingerprint is not None:
+        content["task_fingerprint"] = manifest.task_fingerprint.model_dump(mode="json")
     return sha256_hex(content)
 
 

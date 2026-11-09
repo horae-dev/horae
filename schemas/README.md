@@ -116,7 +116,9 @@ JSON Schema cannot express these; the models enforce them and the tests pin the 
   presence, the model also rejects an explicit `null` next to a value); `pipeline_definition`
   is a valid pipeline named `pipeline`, at most 64 KiB as compact JSON (decision 33).
 - `skill`: two `input_view` paths may not overlap (one a prefix of the other) or disagree on
-  whether a value is an object or an array (decision 39).
+  whether a value is an object or an array (decision 39). `task_fingerprint.ids` is an
+  `input_view` path (or lies below one), and `task_fingerprint` needs `task.create` in
+  `intents` (decision 67).
 - `plugin-manifest`: the host of an `mcp-http` `runtime.url` is listed in `permissions.network`;
   no tool in `provides` is a sink operation of the plugin's own sink or notifier namespaces
   (`<ns>.read`, `<ns>.apply`, `<ns>.restore`, `<ns>.parent_exists`, `<ns>.identity`,
@@ -3661,3 +3663,71 @@ loosened later without breaking a valid file.
     - **E, exit and logging.** stdout carries the protocol only; problems go to stderr. Exit 0
       when the client closes the connection, 1 configuration problem, 2 usage error, 70
       internal error (decision 37).
+
+### Provisional decisions (#160, pending maintainer review)
+
+67. **An `llm` step can be skipped on an empty input, and a skill can bind `task.create`
+    fingerprints to the viewed input (#160).** Provisional. Two compatible, opt-in additions:
+    an optional `llm.skip_when_empty` in `pipeline/v1.json` and an optional `task_fingerprint`
+    in `skill/v1.json`. Neither is in a pipeline or skill that does not write it, and the
+    pipeline digest is unchanged for one that omits `skip_when_empty` (`null` is left out of
+    the canonical form). Decision 66 is added by PR #159 and 62 by PR #155. Found building
+    plugin-gmail#3 (plugin-gmail PR #5). A `task.create` link built from the fingerprint
+    (item 3 of the issue) is **not** part of this decision; see F.
+    - **A, `skip_when_empty`.** On an `llm` step, `true`, or a list of 1 to 16 input view
+      paths (`ViewPath`, the syntax of a skill's `input_view`). It is evaluated on the
+      **viewed** input (after the skill's view, before de-identification, the cache lookup and
+      any model call). `true`: the whole viewed input is empty. A list: the values the paths
+      reach are all empty (a path that reaches nothing is empty), so one non-empty listed
+      field runs the step. A list path must lie on the skill's input view (be a prefix of a
+      view path or extend one), else the plan fails with `params_invalid`: a path the model is
+      never shown would be empty on every run.
+    - **B, what empty means.** `null`, `""`, `[]`, `{}`, and a list or object whose members
+      are all empty in this sense, recursively. Any other string, any number (`0` too) and any
+      boolean (`false` too) is **not** empty. A view that does not match the input at all is
+      still `input_invalid` (a degraded step), not an empty skip. A pipeline whose collect
+      source also returns a label (`source: "gmail.triage"`) is therefore not empty as a whole:
+      list the field that matters (`[].data.needs_interpretation`), or drop the label from the
+      skill's view.
+    - **C, how a skip is recorded.** No `llm[]` entry (no call was made, so there is no
+      backend, model or usage to state): the step is recorded with status `skipped`, no error,
+      and `output: {"skipped": "empty_input", "skill": "<skill>"}`. Later steps run, as after
+      an unchanged-input reuse; a `skipped` step is `ok` for the run's status, and a run that
+      proposes no intent at all ends `noop` (the same rule as a reuse). `RunRecord.input_hash`
+      stays unset and nothing is written to the LLM cache (no accepted output exists, and the
+      cache is not even looked up). Cost is zero. A replay re-evaluates the same rule on the
+      same recorded input.
+    - **D, `task_fingerprint`.** A skill may declare
+      `task_fingerprint: {ids: <ViewPath>, prefix: <text>}`. `ids` is an `input_view` path (or
+      below one) whose string values (or the strings of a list value) are the ids; `prefix` is
+      1 to 64 characters of the fingerprint alphabet (`A-Z a-z 0-9 . _ : -`), e.g. `gmail:`. A
+      `task.create` the skill proposes must carry a fingerprint **equal to** `prefix` + one of
+      those ids, as exact strings in the viewed input; anything else (an id the input never
+      held, the id without its prefix, a different prefix) refuses the whole batch. The
+      manifest is invalid if `ids` is not in the input view or if `task.create` is not in
+      `intents` (pydantic-only rules). Without the rule a `task.create` fingerprint stays free
+      text, as before; the rule's content joins the skill digest (so the cache key) only when
+      declared. Only strings are ids: a numeric id is never matched.
+    - **E, a refusal is a guard violation.** The rule is part of the action guard
+      (`horae.engine.guard.check_intents`, `task_fingerprint`), so a refusal is the existing
+      `guard` violation and a `guard_violation` step error (the step is `degraded`, nothing of
+      the batch is routed), and a cached output is re-guarded on reuse and dropped when refused
+      (decision 46). The detail is fixed text with the position and the field, never the
+      fingerprint: `skill:<skill> proposed task.create #<n> with a fingerprint not from the
+      input in `fingerprint``. Skill evals run the same check (`judge_intents`). It does not
+      reuse `check_task_fingerprints` (the `task.update_status` check, routing rule 4, which
+      lives in `horae.engine.executor` and fails as `intent_unrouted`): the executor imports
+      the guard, and the issue asks for a guard violation. Both read the viewed input as exact
+      strings; `horae.engine.viewpath` holds the path reading the new code shares.
+    - **F, not done: a link template.** Item 3 (`link_template` under `links: none`, built by
+      the core from the fingerprint) is left out. Routing picks the `tasks` entry from the
+      task's link, so an entry-owned template would have to choose the entry before the link
+      exists; that circularity is not small. A skill under `links: none` proposes tasks
+      without a link for now. A follow-up could add the template to the `act` entry
+      (`link_template` + `link_fingerprint_prefix`, id URL-encoded, result checked against the
+      entry's own `link_prefix`).
+    - **G, what plugin-gmail changes.** In `skills/gmail/triage-mail/skill.yaml`, add
+      `task_fingerprint: {ids: "[].data.needs_interpretation[].id", prefix: "gmail:"}`; in
+      `examples/triage-mail.pipeline.yaml`, replace `on_unchanged_input: skip` by (keeping it
+      is harmless) `skip_when_empty: ["[].data.needs_interpretation"]`, and say in the prompt
+      that a task's `fingerprint` is `gmail:` + the mail `id`.

@@ -41,7 +41,7 @@ from horae.contracts.intents import IntentType
 from horae.contracts.pipeline import Budget
 from horae.contracts.plugin import PluginManifest
 from horae.contracts.run import ErrorKind, Usage, Violation
-from horae.contracts.skill import SkillLinks
+from horae.contracts.skill import SkillLinks, TaskFingerprintRule
 
 LlmBackendName = Literal["claude-cli", "anthropic", "openai-compatible", "ollama"]
 
@@ -363,6 +363,11 @@ class LoadedSkill(Protocol):
     def links(self) -> SkillLinks:
         """The skill's `links` option: `none` refuses every link in its note text (the action
         guard, schemas decision 55)."""
+        ...
+
+    @property
+    def task_fingerprint(self) -> TaskFingerprintRule | None:
+        """The skill's opt-in `task.create` fingerprint rule (schemas decision 67)."""
         ...
 
     @property

@@ -142,6 +142,30 @@
           "title": "On Unchanged Input",
           "type": "string"
         },
+        "skip_when_empty": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "items": {
+                "maxLength": 256,
+                "pattern": "^([A-Za-z_][A-Za-z0-9_-]*|\\[\\])(\\.[A-Za-z_][A-Za-z0-9_-]*|\\[\\])*$",
+                "type": "string"
+              },
+              "maxItems": 16,
+              "minItems": 1,
+              "type": "array",
+              "uniqueItems": true
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Opt-in (decision 67): skip the step, with no model call and no cache entry, when its\nviewed input is empty. `true`: the whole viewed input; a list of input view paths: the\nvalues at every one of them. Empty means `null`, an empty string, a list or object with\nnothing but empty members (a number or boolean is never empty). The skip is recorded as a\nstep with status `skipped`. Omitted (the default): the step always runs.",
+          "title": "Skip When Empty"
+        },
         "timeout_s": {
           "anyOf": [
             {
