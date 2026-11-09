@@ -2,8 +2,12 @@
 """Install a plugin from git at a pinned commit (#44, schemas decision 62).
 
 `PluginInstaller.install(name, version, repo, sha)` is the whole install: the marketplace
-resolves a name to `(repo, sha)` first (`horae plugin add`), a direct install from a git URL
-(#48) calls it the same way. A repository is untrusted, so:
+resolves a name to `(repo, sha)` first (`horae plugin add`). A direct install from a git URL
+(#48) calls `install_commit(repo, sha)`: the same steps, but no tag is checked: the repository's
+own branches and tags are fetched and the full SHA must be reachable from one of them (never
+from a fork's objects a forge serves through the same URL); the name and version are those of
+its `plugin.yaml`. A repository is
+untrusted, so:
 
 - **git** is the marketplace's hardened runner (`horae.marketplace.git`): `https` only, no
   user or system config, an allow-listed environment, a timeout, `--` before every URL, no
@@ -45,6 +49,7 @@ import errno
 import json
 import os
 import posixpath
+import re
 import shutil
 import tempfile
 import time
@@ -75,6 +80,14 @@ MAX_LINK_BYTES = 4096
 MAX_DEPTH = 32
 MAX_PATH_CHARS = 1024
 MAX_PROBLEMS = 3
+MAX_DIRECT_REFS = 1000
+"""A direct install (#48): at most this many branches and tags are fetched to prove the
+commit is the repository's own."""
+MAX_REACH_DEPTH = 1000
+"""A direct install: how many commits of each branch and tag are fetched; a commit further
+from every tip cannot be proven reachable and is refused."""
+_REACH_PATTERNS = ("refs/heads/*", "refs/tags/*")
+_TIP_REF = re.compile(r"^refs/(heads|tags)/[A-Za-z0-9._/-]{1,200}$")
 _CHECKOUT_OPTIONS = ("core.symlinks=false", "core.protectHFS=true", "core.protectNTFS=true")
 
 _name: TypeAdapter[str] = TypeAdapter(PluginName)
@@ -185,14 +198,42 @@ class PluginInstaller:
             raise InstallRefused(
                 f"{name!r}@{version!r} at {sha!r}: not a plugin name, version and full commit SHA"
             ) from None
+        self._check_repo(repo)
+        target = self.plugins_dir / name
+        if os.path.lexists(target):
+            raise AlreadyInstalled(f"plugin {name!r} is already installed in {target}")
+        return self._install(repo, sha, (name, version), prepare)
+
+    def install_commit(self, repo: str, sha: str, *, prepare: Prepare | None = None) -> Installed:
+        """A direct install from a git URL (#48): fetch the branches and tags of `repo`, require
+        the commit `sha` to be reachable from one of them (no tag is compared: the full SHA is
+        the pin) and install its tree as
+        `plugins/<name>`, the name and version being those of its `plugin.yaml`. The same
+        limits and checks as `install`; the name is checked against `plugins/` once the
+        manifest is read, before `prepare` runs."""
+        try:
+            sha = _sha.validate_python(sha)
+        except ValidationError:
+            raise InstallRefused(f"{sha!r} is not a full commit SHA") from None
+        self._check_repo(repo)
+        return self._install(repo, sha, None, prepare)
+
+    def _check_repo(self, repo: str) -> None:
         if self.allow_protocol == HTTPS:
             try:
                 _repo.validate_python(repo)
             except ValidationError:
                 raise InstallRefused(f"{repo!r} is not an https git URL") from None
-        target = self.plugins_dir / name
-        if os.path.lexists(target):
-            raise AlreadyInstalled(f"plugin {name!r} is already installed in {target}")
+
+    def _install(
+        self,
+        repo: str,
+        sha: str,
+        expected: tuple[str, str] | None,
+        prepare: Prepare | None,
+    ) -> Installed:
+        """The install of `sha` from `repo`: at the tag of `expected = (name, version)`, or,
+        when `expected` is `None`, a direct install of the commit alone."""
         try:
             self.plugins_dir.mkdir(parents=True, exist_ok=True)
             self._sweep()
@@ -201,13 +242,20 @@ class PluginInstaller:
             raise InstallError(f"cannot write {self.plugins_dir}: {exc.strerror}") from None
         try:
             git_dir, tree = scratch / "repo.git", scratch / "tree"
-            self._fetch(scratch, git_dir, repo, version, sha)
-            self._verify(git_dir, version, sha)
+            if expected is None:
+                self._fetch_commit(scratch, git_dir, repo, sha)
+            else:
+                self._fetch(scratch, git_dir, repo, expected[1], sha)
+                self._verify(git_dir, expected[1], sha)
             self._check_tree(git_dir, sha)
             tree.mkdir()
             self._checkout(scratch, git_dir, tree, sha)
             self._check_checkout(tree)
-            manifest = self._manifest(tree, name, version)
+            manifest = self._manifest(tree, expected)
+            name, version = manifest.name, manifest.version
+            target = self.plugins_dir / name
+            if expected is None and os.path.lexists(target):
+                raise AlreadyInstalled(f"plugin {name!r} is already installed in {target}")
             installed = Installed(name, version, repo, sha, target, manifest)
             (tree / INSTALL_RECORD).write_text(
                 json.dumps(installed.record(), indent=2) + "\n", encoding="utf-8"
@@ -218,7 +266,8 @@ class PluginInstaller:
                 raise AlreadyInstalled(f"plugin {name!r} is already installed in {target}")
             self._place(tree, target, name)
         except OSError as exc:
-            raise InstallError(f"cannot install {name}: {exc.strerror or exc}") from None
+            what = repo if expected is None else expected[0]
+            raise InstallError(f"cannot install {what}: {exc.strerror or exc}") from None
         finally:
             shutil.rmtree(scratch, ignore_errors=True)
         return installed
@@ -304,6 +353,81 @@ class PluginInstaller:
         fetched = self._fetched_bytes(git_dir)
         if fetched > MAX_FETCH_BYTES:
             raise InstallRefused(f"{repo} at {sha} is {fetched} bytes, more than {MAX_FETCH_BYTES}")
+
+    def _fetch_commit(self, scratch: Path, git_dir: Path, repo: str, sha: str) -> None:
+        """A direct install (#48): fetch the repository's own branches and tags, never the
+        commit by its id, and require `sha` to be reachable from one of them.
+
+        A forge may serve, through a repository's URL, objects that exist only in a fork (or
+        in a pull request's `refs/pull/*`): fetching `sha` directly would then install a
+        fork's code under the trusted repository's name. So `git ls-remote` lists the tips of
+        `refs/heads/*` and `refs/tags/*` (at most `MAX_DIRECT_REFS`), those refs alone are
+        fetched (shallow, `MAX_REACH_DEPTH` commits, the same byte budget and hardening), and
+        `merge-base --is-ancestor <sha> <tip>` must hold for one of them. Anything that cannot
+        be proven reachable is refused."""
+        url = self.remote(repo)
+        try:
+            self._git(scratch, "init", "--bare", "--quiet", str(git_dir))
+        except GitError as exc:
+            raise InstallError(f"cannot create a repository: {exc}") from None
+        try:
+            listing = self._git(scratch, "ls-remote", "--refs", "--", url, *_REACH_PATTERNS)
+        except GitError as exc:
+            raise InstallError(f"cannot list the branches and tags of {repo}: {exc}") from None
+        refs = sorted(
+            {
+                ref
+                for line in listing.splitlines()
+                for _oid, _, ref in [line.partition("\t")]
+                if _TIP_REF.match(ref)
+            }
+        )
+        if not refs:
+            raise InstallRefused(f"{repo} has no branch or tag to prove that {sha} is its own")
+        if len(refs) > MAX_DIRECT_REFS:
+            raise InstallRefused(
+                f"{repo} has more than {MAX_DIRECT_REFS} branches and tags: cannot check "
+                f"that {sha} is reachable from them"
+            )
+        try:
+            self._git(
+                git_dir,
+                "fetch",
+                "--quiet",
+                "--force",
+                f"--depth={MAX_REACH_DEPTH}",
+                "--no-tags",
+                "--no-recurse-submodules",
+                "--no-write-fetch-head",
+                "--",
+                url,
+                *(f"+{ref}:{ref}" for ref in refs),
+                watch=scratch,
+            )
+        except GitTooLarge:
+            raise InstallRefused(
+                f"the branches and tags of {repo} are more than {MAX_FETCH_BYTES} bytes"
+            ) from None
+        except GitError as exc:
+            raise InstallError(f"cannot fetch the branches and tags of {repo}: {exc}") from None
+        fetched = self._fetched_bytes(git_dir)
+        if fetched > MAX_FETCH_BYTES:
+            raise InstallRefused(f"{repo} is {fetched} bytes, more than {MAX_FETCH_BYTES}")
+        if self._commit_of(git_dir, sha) != sha or not any(
+            self._is_ancestor(git_dir, sha, ref) for ref in refs
+        ):
+            raise InstallRefused(
+                f"commit {sha} is not reachable from a branch or tag of {repo} (within "
+                f"{MAX_REACH_DEPTH} commits of its tip): refusing (a commit of a fork or a "
+                "pull request is not the repository's own)"
+            )
+
+    def _is_ancestor(self, git_dir: Path, sha: str, ref: str) -> bool:
+        try:
+            self._git(git_dir, "merge-base", "--is-ancestor", sha, f"{ref}^{{commit}}")
+        except GitError:
+            return False
+        return True
 
     def _fetched_bytes(self, git_dir: Path) -> int:
         try:
@@ -403,7 +527,7 @@ class PluginInstaller:
                 if os.path.islink(os.path.join(root, entry)):
                     raise InstallRefused(f"the checkout holds a symlink: {entry!r}")
 
-    def _manifest(self, tree: Path, name: str, version: str) -> PluginManifest:
+    def _manifest(self, tree: Path, expected: tuple[str, str] | None) -> PluginManifest:
         path = tree / MANIFEST_FILE
         if not path.is_file():
             raise InstallRefused(f"the plugin has no {MANIFEST_FILE}")
@@ -411,10 +535,10 @@ class PluginInstaller:
             manifest = validate(read_yaml(path), PluginManifest)
         except ProblemsError as exc:
             raise InstallRefused(f"{MANIFEST_FILE} is invalid: {_refused_problems(exc)}") from None
-        if manifest.name != name or manifest.version != version:
+        if expected is not None and (manifest.name, manifest.version) != expected:
             raise InstallRefused(
                 f"{MANIFEST_FILE} declares {manifest.name}@{manifest.version}, "
-                f"but {name}@{version} was asked"
+                f"but {expected[0]}@{expected[1]} was asked"
             )
         return manifest
 

@@ -63,6 +63,8 @@ plugin declares and asks you to approve them before pinning it in `horae.lock`.
 `--allow-host HOST` and `--allow-local HOST:PORT` grant more (your own Home Assistant, say);
 `--yes` re-installs, without asking, only what `horae.lock` already approves (a Docker build
 from a committed lock). Details: [schemas decision 70](schemas/README.md#decisions).
+A direct install without a marketplace, `horae plugin add https://<host>/<owner>/<repo>@<full
+commit SHA>`, has no tier and is refused before M5 ([decision 71](schemas/README.md#decisions)).
 
 A **pipeline pack** (a plugin whose `plugin.yaml` lists `provides.pipelines`) also gets its
 pipelines installed: `pipelines/<name>.yaml` of the pack is validated and copied to

@@ -3,7 +3,7 @@
 
 - `require_installable(name, tier, index)`: before M5 only `first-party` marketplace plugins install
   (docs/security.md T04); a direct install from a git URL (#48) has no tier and passes `None`,
-  which is refused the same way. One check for both.
+  which is refused the same way while `DIRECT_INSTALLS` is `False`. One check for both.
 - `with_grants(asked, hosts, local)`: what the manifest asks for, plus the hosts and
   local-network endpoints the user adds at approval (`--allow-host`, `--allow-local`). A lock
   may grant more than a manifest declares (the plugin host refuses only less, decision 66);
@@ -25,6 +25,10 @@ from horae.contracts.marketplace import Tier
 from horae.contracts.plugin import Permissions
 from horae.contracts.types import Hostname, LocalEndpoint
 from horae.marketplace.errors import InvalidReference, TierRefused
+
+DIRECT_INSTALLS = False
+"""Whether a direct install from a git URL (#48, no marketplace tier) may install. `False`
+before M5 (docs/security.md T04); lifting the gate is setting this to `True`."""
 
 INSTALLABLE_TIERS: frozenset[str] = frozenset({"first-party"})
 """The tiers that install while plugins run as plain subprocesses (before M5)."""
@@ -57,6 +61,8 @@ def require_installable(name: str, tier: Tier | None, index: str | None) -> None
     """`TierRefused` unless `tier`, claimed by the index `index`, may be installed now. `None`
     is a direct install (#48). `first-party` counts only from `FIRST_PARTY_INDEXES`."""
     if tier in INSTALLABLE_TIERS and index in FIRST_PARTY_INDEXES:
+        return
+    if tier is None and DIRECT_INSTALLS:
         return
     if tier is None:
         what = "a direct install (no marketplace tier)"
@@ -185,6 +191,7 @@ def lock_mismatch(existing: LockedPlugin | None, wanted: LockedPlugin) -> str | 
 
 
 __all__ = [
+    "DIRECT_INSTALLS",
     "INSTALLABLE_TIERS",
     "INTENT_MEANINGS",
     "PERSONAL_NOTE",
