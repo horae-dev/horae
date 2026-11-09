@@ -91,6 +91,14 @@ The note lands in the volume's `vault/Daily/`. Compose equivalent: `read_only: t
 
 The image has no pip, no ensurepip, no uv and no compiler.
 
+Plugins run without uv: each installed plugin has its own venv, built at install time from its
+`uv.lock` and linked to the image's Python (schemas decision 69), and the host sets
+`UV_OFFLINE=1` and `PIP_NO_INDEX=1`. Installing one (`horae plugin add`) needs uv, which the
+image does not ship: inside the container it fails with "uv is not installed" (exit 1). The
+venv links to the interpreter that built it (`/usr/local/bin/python3.12` here), so it must be
+built by this image's Python; giving the image an install-time uv (or an installer variant of
+the image) is a follow-up. The built-in plugins are unaffected: they run from `/opt/venv`.
+
 ### `horae serve`, the HTTP API and the health check
 
 The default command is `horae serve` ([#37](https://github.com/horae-dev/horae/issues/37),

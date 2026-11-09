@@ -12,6 +12,10 @@ copied from `os.environ`, and Horae never puts a resolved secret into its own en
 | `TMPDIR` | an empty per-run directory |
 | `LANG` | `C.UTF-8` |
 | `TZ` | the instance time zone (`horae.yaml` `timezone`) |
+| `UV_OFFLINE`, `PIP_NO_INDEX` | `1` (with `UV_PYTHON_DOWNLOADS=never`): no fetch at run (#45) |
+
+A plugin installed with its own venv (`<plugin>/.venv`, #45, decision 69) also gets
+`VIRTUAL_ENV=<plugin>/.venv`, and `PATH` starts with `<plugin>/.venv/bin`.
 
 **Deny list** (schemas decisions 8, 28 and 35): a declared secret may not be one of the base
 keys or a variable that changes how a runtime, its loader, its TLS stack or its package manager
@@ -28,6 +32,7 @@ behaves (compared case-insensitively):
 Such a plugin is refused at spawn with `env_unsafe`; a value with a NUL character too.
 """
 
+import os
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -35,8 +40,14 @@ from horae.plugins.host.errors import PluginCallError
 from horae.secrets import Secret
 
 BASE_PATH = "/usr/local/bin:/usr/bin:/bin"
-"""The child's `PATH` (M4: the plugin venv's `bin` goes first)."""
+"""The child's `PATH` (a plugin venv's `bin` goes first, #45)."""
 BASE_KEYS = frozenset({"PATH", "HOME", "TMPDIR", "LANG", "TZ"})
+OFFLINE_ENV = {"UV_OFFLINE": "1", "UV_PYTHON_DOWNLOADS": "never", "PIP_NO_INDEX": "1"}
+"""In every plugin child: a package manager it runs fetches nothing (#45)."""
+PLUGIN_KEYS = BASE_KEYS | frozenset(OFFLINE_ENV)
+"""The keys of every plugin child's environment, but its secrets and `VIRTUAL_ENV`."""
+VENV_DIR = ".venv"
+"""A plugin's own venv, in its directory (#45, decision 69)."""
 
 _DENIED = BASE_KEYS | {
     "NODE_OPTIONS",
@@ -108,6 +119,16 @@ def base_env(*, home: Path, tmpdir: Path, timezone: str) -> dict[str, str]:
     }
 
 
+def plugin_venv(root: Path | None) -> Path | None:
+    """`<root>/.venv` when the plugin has a venv there (its `pyvenv.cfg` and `bin/python`)."""
+    if root is None:
+        return None
+    venv = root / VENV_DIR
+    if (venv / "pyvenv.cfg").is_file() and os.path.isfile(venv / "bin" / "python"):
+        return venv
+    return None
+
+
 def check_names(plugin: str, names: list[str]) -> None:
     """`env_unsafe` if one of the declared secret `names` is on the deny list."""
     bad = sorted(name for name in names if unsafe_name(name))
@@ -126,10 +147,17 @@ def build_env(
     tmpdir: Path,
     timezone: str,
     secrets: Mapping[str, Secret],
+    venv: Path | None = None,
 ) -> dict[str, str]:
-    """The child environment: `base_env` plus each declared secret, revealed here only."""
+    """The child environment: `base_env`, `OFFLINE_ENV`, the plugin's `venv` if any, and each
+    declared secret, revealed here only."""
     check_names(plugin, list(secrets))
-    env = base_env(home=home, tmpdir=tmpdir, timezone=timezone)
+    env = base_env(home=home, tmpdir=tmpdir, timezone=timezone) | OFFLINE_ENV
+    if venv is not None:
+        if ":" in str(venv):
+            raise PluginCallError("spawn_failed", f"plugin {plugin}: its venv path holds a ':'")
+        env["PATH"] = f"{venv / 'bin'}:{BASE_PATH}"
+        env["VIRTUAL_ENV"] = str(venv)
     for name, secret in secrets.items():
         value = secret.reveal()
         if "\x00" in value:
@@ -139,4 +167,15 @@ def build_env(
     return env
 
 
-__all__ = ["BASE_KEYS", "BASE_PATH", "base_env", "build_env", "check_names", "unsafe_name"]
+__all__ = [
+    "BASE_KEYS",
+    "BASE_PATH",
+    "OFFLINE_ENV",
+    "PLUGIN_KEYS",
+    "VENV_DIR",
+    "base_env",
+    "build_env",
+    "check_names",
+    "plugin_venv",
+    "unsafe_name",
+]

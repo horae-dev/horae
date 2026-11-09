@@ -65,7 +65,7 @@ def git_env() -> dict[str, str]:
     return env
 
 
-def _tree_bytes(root: Path) -> int:
+def tree_bytes(root: Path) -> int:
     """Bytes in the files under `root` (links are not followed); what vanishes is skipped."""
     total, pending = 0, [str(root)]
     while pending:
@@ -84,7 +84,7 @@ def _tree_bytes(root: Path) -> int:
     return total
 
 
-def _kill(proc: "subprocess.Popen[bytes]") -> None:
+def kill_session(proc: "subprocess.Popen[bytes]") -> None:
     """Kill git and the helpers it started (`git-remote-https`, `index-pack`): one session."""
     try:
         os.killpg(proc.pid, signal.SIGKILL)
@@ -129,13 +129,13 @@ def run_git(
         except subprocess.TimeoutExpired:
             pass
         except BaseException:
-            _kill(proc)
+            kill_session(proc)
             raise
-        if watch is not None and max_bytes is not None and _tree_bytes(watch) > max_bytes:
-            _kill(proc)
+        if watch is not None and max_bytes is not None and tree_bytes(watch) > max_bytes:
+            kill_session(proc)
             raise GitTooLarge(f"git {args[0]} wrote more than {max_bytes} bytes")
         if time.monotonic() >= deadline:
-            _kill(proc)
+            kill_session(proc)
             raise GitError(f"git {args[0]} timed out after {timeout_s:g}s")
     if proc.returncode != 0:
         reason = " ".join(stderr.decode("utf-8", errors="replace").split())[:MAX_ERROR_CHARS]

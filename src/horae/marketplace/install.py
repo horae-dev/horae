@@ -31,10 +31,14 @@ resolves a name to `(repo, sha)` first (`horae plugin add`), a direct install fr
 
 An installed plugin is **not enabled**: the plugin host loads only the plugins of
 `horae.lock` (`HostRegistry.from_directory`), and writing that entry with the approved
-permissions is #46; its dependencies are #45 (`prepare` is the hook that runs on the verified
-tree before it is moved into place). What was installed is recorded in the install directory,
-`plugins/<name>/.horae-install.json`: `{schema_version, name, version, repo, commit}`, the
-fields of a `horae.lock` entry but the permissions (`Installed.lock_entry`).
+permissions is #46. Its dependencies are #45: `prepare` is the hook that runs on the verified
+tree before it is moved into place, and `horae plugin add` passes
+`horae.marketplace.environment.PluginEnvironment`, which builds the plugin's venv in
+`<tree>/.venv` from its committed `uv.lock` (decision 69). So the venv belongs to the tree: an
+upgrade (#47) installs a new tree, with a fresh venv, through this same atomic path. What was
+installed is recorded in the install directory, `plugins/<name>/.horae-install.json`:
+`{schema_version, name, version, repo, commit}`, the fields of a `horae.lock` entry but the
+permissions (`Installed.lock_entry`).
 """
 
 import errno

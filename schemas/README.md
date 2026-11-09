@@ -3976,3 +3976,75 @@ loosened later without breaking a valid file.
       depth, and flip `tests/test_deid.py`'s accent test from documenting the gap to asserting
       that `Zoe` is caught, plus a test that a skill **without** classes sends no name; update
       the README's "Limits" (accent folding done, a skill without classes is now protected).
+
+### Provisional decisions (#45, pending maintainer review)
+
+69. **Per-plugin virtual environments (#45).** No schema change. `horae plugin add` passes
+    `horae.marketplace.environment.PluginEnvironment` as `install(..., prepare=)` (decision
+    62 G): it builds the plugin's own venv in the verified scratch tree, `<tree>/.venv`,
+    before the atomic rename, so `plugins/<name>/.venv` exists exactly when the plugin does,
+    and a failure leaves nothing. Plugins never share a dependency.
+    - **A, what a plugin ships.** A `pyproject.toml` with a `[project]` name and a committed
+      `uv.lock`, else the install is **refused** before uv runs. In the lock, every package
+      from an index or URL has a `sha256` hash for each of its files; any other package is a
+      directory, editable or path **inside** the tree (no `..`, not absolute); a `git` source
+      (no hash) is refused. A committed `.venv` is refused.
+    - **B, the build backend allow-list.** `build-system.build-backend` must be one of
+      `hatchling.build`, `setuptools.build_meta`, `uv_build`, `flit_core.buildapi`,
+      `pdm.backend`; `build-system.requires` may name only that backend's distribution (and
+      `wheel` for setuptools), never with a direct URL; `backend-path` (an in-tree backend) and
+      `tool.uv.package = false` (a virtual project, which would not be installed) are refused.
+      This narrows, but does not remove, code execution at install time: a backend runs the
+      project's own build code (`setup.py`, a hatch build hook) as the Horae user, before #46
+      shows the permissions, and the backend's own version is not hash-pinned (uv resolves
+      build requirements, which are not in `uv.lock`). `uv_build` is recommended: uv carries
+      it, nothing is fetched. Isolation is M5 (#51, #52); accepted for first-party plugins
+      meanwhile (T04, `docs/security.md` T39).
+    - **C, the commands.** `uv venv --relocatable --no-project --python <python> .venv`, then
+      `uv sync --locked --no-dev --no-editable --python .venv/bin/python`, both with
+      `--no-config`. `--locked` reads the lock and fails if it no longer matches
+      `pyproject.toml` (never re-resolves, never writes; `--frozen` is not used, it would skip
+      that check); uv checks every file against its hash; the project is built and installed
+      **non-editable**, so the tree's sources are not imported at run time. The venv is
+      **relocatable** (its scripts find their interpreter relative to themselves), so it works
+      after the rename; the install checks `pyvenv.cfg` still says so.
+    - **D, the interpreter.** `<python>` is Horae's own interpreter (`sys.executable`; in the
+      image `/opt/venv/bin/python`, i.e. the image's CPython), a constructor argument.
+      `requires-python` is honoured: a plugin that does not accept it is refused. No Python is
+      ever downloaded (`UV_PYTHON_DOWNLOADS=never`), so what the venv links to is on the
+      machine at run time too.
+    - **E, uv's environment.** Built from scratch: `PATH=/usr/local/bin:/usr/bin:/bin`, an
+      empty temporary `HOME`/`TMPDIR`, `LANG=C.UTF-8`, `UV_NO_CONFIG=1`,
+      `UV_PYTHON_DOWNLOADS=never`, `UV_LINK_MODE=copy`, `UV_PROJECT_ENVIRONMENT=<tree>/.venv`,
+      `UV_CACHE_DIR=<state_dir>/uv-cache`. Only the proxy and CA variables (`*_PROXY`,
+      `SSL_CERT_FILE`, `SSL_CERT_DIR`) are inherited: they say how to reach the network, never
+      what to fetch. No `UV_*`/`PIP_*` index setting is inherited; the index is uv's default
+      or the plugin's own `pyproject.toml`, and the hashes pin the bytes either way.
+      `index_url` (`--default-index`) is a constructor argument only, never a `horae.yaml`
+      setting: tests pass a local `file://` index.
+    - **F, limits.** Each uv call at most 600 s; the venv at most 1 GiB, measured while uv
+      runs (killed past it); `pyproject.toml` and `uv.lock` at most 4 MiB each. uv's failures
+      are `InstallRefused` (exit 3) when the lock, a hash or `requires-python` is at fault,
+      else `InstallError` (exit 1); uv missing is `InstallError`.
+    - **G, run time: how `runtime.command` maps onto the venv.** A plugin directory with
+      `.venv/pyvenv.cfg` and `.venv/bin/python` has a venv (`horae.plugins.host.env.
+      plugin_venv`). For such a plugin, a **bare** `command[0]` (`python`, `python3`, or a
+      console script the project declares) is looked up in `<plugin>/.venv/bin` first, then
+      on the base `PATH`, and kept as found (not symlink-resolved: the venv's `python` is a
+      symlink its interpreter needs as `argv[0]`). So a plugin writes
+      `command: [python, -m, <module>]` or `command: [<console-script>]`. An **absolute**
+      command and a **relative** path are unchanged (the contract before #45; a relative
+      `.venv/bin/python` resolves outside the plugin and stays refused). The child's `PATH`
+      starts with `<plugin>/.venv/bin` and `VIRTUAL_ENV` names the venv. Every plugin child,
+      with a venv or not, gets `UV_OFFLINE=1`, `UV_PYTHON_DOWNLOADS=never` and
+      `PIP_NO_INDEX=1` (`OFFLINE_ENV`; they were already denied as secret names). Running a
+      plugin needs neither uv nor the network.
+    - **H, upgrade.** The venv belongs to the installed tree. An upgrade (#47) installs the new
+      version through the same `install(..., prepare=PluginEnvironment(...))` into its own
+      scratch directory, so it gets a fresh venv from its own lock, and swaps the tree; a venv
+      is never updated in place. #48 (install from a git URL) passes the same `prepare`.
+    - **I, the container image.** The image ships no uv (decision for #40: no package manager
+      at run time) and needs none to run plugins. `horae plugin add` inside the container fails
+      with "uv is not installed" (exit 1). A venv links to the interpreter that built it, so
+      it must be built by the image's own Python: giving the image an install-time uv (or an
+      installer variant) is a follow-up. The built-in plugins run from `/opt/venv`, unaffected.
