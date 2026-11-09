@@ -7,6 +7,8 @@ and puts the index entry back. Without `--force` a task edited since is refused;
 the user's alone and reaches the sink only then."""
 
 import asyncio
+import hashlib
+import json
 from collections.abc import Iterator
 from datetime import date
 from pathlib import Path
@@ -309,3 +311,26 @@ def test_journal_details_only_for_a_status_change(store: Store) -> None:
         store.journal_mark_applied(entry.id, status_details=b"{}")
     with pytest.raises(UnknownJournalEntry):
         store.journal_mark_applied(9999, status_details=b"{}")
+
+
+def test_the_index_snapshot_of_another_task_is_never_written(store: Store) -> None:
+    store.upsert_task(TaskEntry(fingerprint="fp-other", title="Other", status="todo"), at=START)
+    run, sink = _run([DONE], "run-foreign"), _sink()
+    _apply(store, run, sink)
+    entry = next(e for e in store.journal(run.id) if e.intent_type == "task.update_status")
+    assert entry.before_sha256 is not None
+    snapshot = store.blob(entry.before_sha256)
+    assert snapshot is not None
+    forged = json.dumps(json.loads(snapshot) | {"fingerprint": "fp-other", "status": "done"})
+    forged_sha = hashlib.sha256(forged.encode()).hexdigest()
+    with store.transaction():
+        store._put_blob(forged.encode())
+        store._conn.execute(
+            "UPDATE journal SET before_sha256 = ? WHERE id = ?", (forged_sha, entry.id)
+        )
+    result = _undo(store, run.id, sink)
+    assert result.tasks[0].index_restored is False
+    other = store.get_task("fp-other")
+    assert other is not None
+    assert other.status == "todo"
+    assert _status(store) == "done"

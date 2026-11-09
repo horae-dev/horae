@@ -567,7 +567,8 @@ async def undo_run(
             snapshot = load_snapshot(
                 None if entry.before_sha256 is None else store.blob(entry.before_sha256)
             )
-            if snapshot is not None:
+            # The snapshot is the core's own, of this very task: never write another's entry.
+            if snapshot is not None and snapshot.fingerprint == entry.target:
                 try:
                     store.restore_task_status(snapshot, at=clock())
                     restored_index = True

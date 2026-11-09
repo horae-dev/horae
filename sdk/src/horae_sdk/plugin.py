@@ -380,7 +380,7 @@ class Plugin:
                 # `force` is passed only when true and the sink's `restore` takes it: a sink
                 # written before horae-sdk 0.4 is called exactly as before.
                 if force is True and _accepts(sink.restore, "force"):
-                    await _maybe_await(sink.restore(where, path, data, expected_sha256, True))
+                    await _maybe_await(sink.restore(where, path, data, expected_sha256, force=True))
                 else:
                     await _maybe_await(sink.restore(where, path, data, expected_sha256))
                 return {}
@@ -395,7 +395,7 @@ class Plugin:
             async def run() -> dict[str, Any]:
                 where = Paths.from_wire(paths)
                 if force is True and _accepts(sink.restore_status, "force"):
-                    wrote = await _maybe_await(sink.restore_status(where, details, True))
+                    wrote = await _maybe_await(sink.restore_status(where, details, force=True))
                 else:
                     wrote = await _maybe_await(sink.restore_status(where, details))
                 return {"restored": bool(wrote)}

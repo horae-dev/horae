@@ -5,7 +5,7 @@ import asyncio
 import base64
 import hashlib
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -258,6 +258,31 @@ def test_a_sink_written_before_force_is_still_called_without_it() -> None:
     status = {"paths": paths, "details": {"changed": True}, "force": True}
     answer = run(operation(plugin, "notes.restore_status", status))
     assert answer["error"]["kind"] == "not_supported"
+
+
+class Keyword(Notes):
+    """A sink whose `restore` takes `force` only as a keyword (or through `**kwargs`)."""
+
+    forced: ClassVar[list[bool]] = []
+
+    def restore(  # type: ignore[override]
+        self,
+        paths: Paths,
+        path: str,
+        content: bytes | None,
+        expected_sha256: str | None,
+        **options: Any,
+    ) -> None:
+        self.forced.append(options.get("force", False))
+
+
+def test_force_is_passed_as_a_keyword() -> None:
+    plugin = Plugin("notes", permissions=Permissions(intents=["note.create"]))
+    plugin.add(Keyword())
+    paths = {"read": [], "write": ["/vault"]}
+    restore = {"paths": paths, "path": "x.md", "content": None, "force": True}
+    assert run(operation(plugin, "notes.restore", restore)) == {}
+    assert Keyword.forced == [True]
 
 
 class Push(Notifier):
