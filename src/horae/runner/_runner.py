@@ -623,7 +623,6 @@ class Runner:
                     notified=notified,
                     known_task=self.store.get_task,
                     call_timeout_s=timeout_s,
-                    timezone=self.instance.config.timezone,
                 )
                 result = await apply_changes(
                     record,

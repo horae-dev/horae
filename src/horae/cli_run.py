@@ -223,7 +223,6 @@ async def execute_run(
                     notified=notified,
                     known_task=store.get_task,
                     call_timeout_s=instance.config.plugin_defaults.call_timeout_s,
-                    timezone=instance.config.timezone,
                 )
             return record
 

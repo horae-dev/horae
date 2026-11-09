@@ -49,7 +49,6 @@ import hashlib
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Any, Literal
-from zoneinfo import ZoneInfo
 
 from horae.apply.notes import NoteIntent, note_after
 from horae.apply.sink import (
@@ -265,7 +264,7 @@ def _identity(record: RunRecord, proposed: ProposedIntent) -> dict[str, Any]:
     }
 
 
-def dedupe_key(record: RunRecord, index: int, timezone: str = "UTC") -> str:
+def dedupe_key(record: RunRecord, index: int) -> str:
     """The deduplication key of the notification at `index` in `record.intents`.
 
     The SHA-256 (canonical JSON) of the pipeline, the routing entry (`applied_by` and its
@@ -274,16 +273,15 @@ def dedupe_key(record: RunRecord, index: int, timezone: str = "UTC") -> str:
     reused input re-proposes the same keys, while two identical notifications in one run get
     two keys (both are sent).
 
-    A notification with a `key` (#137) is scoped instead to (pipeline, entry, key, the local
-    date of the run's start in `timezone`): the same keyed notification proposed by many runs
-    on one day is one key, whatever the input, the run or the text; the next local day it is a
-    new key."""
+    A notification with a `key` (#137) is scoped instead to (pipeline, entry, key), with no
+    date: the key is the identity, whatever the input, the run, the text or the day. A proposer
+    that wants "once a day" puts the day in the key. Sent keys are never pruned (the store keeps
+    `notifications` rows for good), so a repeated old key is not resent."""
     mine = _identity(record, record.intents[index])
     key = getattr(record.intents[index].intent, "key", None)
     if key is not None:
-        day = record.started_at.astimezone(ZoneInfo(timezone)).date().isoformat()
         entry = {"applied_by": mine["applied_by"], "params": mine["params"]}
-        return sha256_hex({"pipeline": record.pipeline, **entry, "key": key, "day": day})
+        return sha256_hex({"pipeline": record.pipeline, **entry, "key": key})
     occurrence = sum(1 for p in record.intents[:index] if _identity(record, p) == mine)
     scope = {"input_hash": record.input_hash} if record.input_hash else {"run_id": record.id}
     return sha256_hex({"pipeline": record.pipeline, **scope, **mine, "occurrence": occurrence})
@@ -335,7 +333,6 @@ async def plan_changes(
     *,
     notified: Callable[[str], bool] | None = None,
     call_timeout_s: float | None = None,
-    timezone: str = "UTC",
     known_task: Callable[[str], TaskEntry | None] | None = None,
 ) -> ChangeSet:
     """Plan every routed intent of `record`; never applies anything.
@@ -346,8 +343,7 @@ async def plan_changes(
 
     Only `Sink.read` is called, for `note.*` intents, each bounded by `call_timeout_s`
     (`None`: unbounded; past it the intent is a `timeout` problem). `notified(key)` says
-    whether a notification's `dedupe_key` was already sent; `timezone` (the instance's) sets the
-    local day of a keyed notification's key."""
+    whether a notification's `dedupe_key` was already sent."""
     base = ChangeSet(record.id, record.pipeline, record.status, record.dry_run)
     if record.status in _REFUSED_STATUSES:
         return replace(base, refused=_REFUSED_STATUSES[record.status])
@@ -399,7 +395,7 @@ async def plan_changes(
             tasks.append(TaskItem(index, tool, described))
             continue
         if isinstance(described, Notification):
-            key = dedupe_key(record, index, timezone)
+            key = dedupe_key(record, index)
             duplicate = None if notified is None else notified(key)
             if key in planned_keys:
                 duplicate = True
