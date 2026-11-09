@@ -49,6 +49,9 @@ run's `ToolCaller`:
   as the manifest contract does), else `tool_missing`;
 - **trusted paths**: every request carries the plugin's path permissions as approved in
   `horae.lock` in `_meta["dev.horae/paths"]` (`horae.plugins.host.session`, #25);
+- **trusted network**: and its network allow-list as approved in `horae.lock` (not the
+  manifest's declared one) in `_meta["horae/network"]`, a list that is empty when the lock
+  grants no host (#131), so a plugin can refuse a host the user did not approve before M5;
 - **runtime.command is not pinned** against the lock in v1: the lock pins the plugin's
   version, commit and permissions, and the installed manifest's command is used as it is.
   Pinning it (and the plugin's files) is M4's install and verify work (#44, #46);
@@ -526,10 +529,13 @@ class PluginHost:
         if ref not in process.tools:
             raise PluginCallError("tool_missing", f"{name} does not list {ref} in tools/list")
         timeout = timeout_s or self._timeouts(name).call_timeout_s
-        locked = entry.installed.manifest.permissions.paths
+        permissions = entry.installed.manifest.permissions  # the locked ones (`HostRegistry`)
+        locked = permissions.paths
         paths = {"read": list(locked.read), "write": list(locked.write)}
         try:
-            result = await process.call(ref, params, input, timeout, paths=paths)
+            result = await process.call(
+                ref, params, input, timeout, paths=paths, network=permissions.network
+            )
         except CallFailed as failed:
             await process.stop(forced=True)
             self._lost(entry)
