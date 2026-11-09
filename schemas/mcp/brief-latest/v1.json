@@ -1,0 +1,214 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/horae-dev/horae/main/schemas/mcp/brief-latest/v1.json",
+  "$defs": {
+    "BriefTarget": {
+      "additionalProperties": false,
+      "properties": {
+        "intent_type": {
+          "maxLength": 64,
+          "title": "Intent Type",
+          "type": "string"
+        },
+        "target": {
+          "description": "UNTRUSTED. What the run changed (a note path). Its content is not returned.",
+          "maxLength": 256,
+          "title": "Target",
+          "type": "string",
+          "x-untrusted": true
+        },
+        "applied": {
+          "title": "Applied",
+          "type": "boolean"
+        },
+        "undone": {
+          "title": "Undone",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "intent_type",
+        "target",
+        "applied",
+        "undone"
+      ],
+      "title": "BriefTarget",
+      "type": "object"
+    },
+    "McpCost": {
+      "additionalProperties": false,
+      "properties": {
+        "usd": {
+          "minimum": 0,
+          "title": "Usd",
+          "type": "number"
+        },
+        "tokens_in": {
+          "minimum": 0,
+          "title": "Tokens In",
+          "type": "integer"
+        },
+        "tokens_out": {
+          "minimum": 0,
+          "title": "Tokens Out",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "usd",
+        "tokens_in",
+        "tokens_out"
+      ],
+      "title": "McpCost",
+      "type": "object"
+    },
+    "McpRun": {
+      "additionalProperties": false,
+      "description": "One run as `horae runs --json` and the HTTP API's `/runs` show it\n(`horae.run_view.run_json`): the indexed columns, never the record.",
+      "properties": {
+        "id": {
+          "pattern": "^[A-Za-z0-9._:-]{1,128}$",
+          "title": "Id",
+          "type": "string"
+        },
+        "pipeline": {
+          "pattern": "^[A-Za-z0-9._:-]{1,128}$",
+          "title": "Pipeline",
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "running",
+            "ok",
+            "noop",
+            "degraded",
+            "failed",
+            "undone"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "stale": {
+          "title": "Stale",
+          "type": "boolean"
+        },
+        "dry_run": {
+          "title": "Dry Run",
+          "type": "boolean"
+        },
+        "abandoned": {
+          "title": "Abandoned",
+          "type": "boolean"
+        },
+        "started_at": {
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+          "title": "Started At",
+          "type": "string"
+        },
+        "finished_at": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Finished At"
+        },
+        "duration_s": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Duration S"
+        },
+        "cost": {
+          "$ref": "#/$defs/McpCost"
+        },
+        "error": {
+          "anyOf": [
+            {
+              "maxLength": 500,
+              "type": "string",
+              "x-untrusted": true
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "UNTRUSTED. Why the run failed, as a plugin or the core worded it (clipped).",
+          "title": "Error"
+        }
+      },
+      "required": [
+        "id",
+        "pipeline",
+        "status",
+        "stale",
+        "dry_run",
+        "abandoned",
+        "started_at",
+        "finished_at",
+        "duration_s",
+        "cost",
+        "error"
+      ],
+      "title": "McpRun",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Result of `brief.latest`: the latest run of the brief pipeline and what it wrote.",
+  "properties": {
+    "schema_version": {
+      "const": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "pipeline": {
+      "description": "The pipeline the server was told is the daily brief.",
+      "pattern": "^[A-Za-z0-9._:-]{1,128}$",
+      "title": "Pipeline",
+      "type": "string"
+    },
+    "run": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/McpRun"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "`null` when that pipeline never ran."
+    },
+    "targets": {
+      "items": {
+        "$ref": "#/$defs/BriefTarget"
+      },
+      "maxItems": 20,
+      "title": "Targets",
+      "type": "array"
+    },
+    "truncated": {
+      "title": "Truncated",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "schema_version",
+    "pipeline",
+    "run",
+    "targets",
+    "truncated"
+  ],
+  "title": "Horae MCP tool result: brief.latest",
+  "type": "object"
+}

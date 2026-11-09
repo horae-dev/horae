@@ -26,6 +26,7 @@ from horae.contracts.instance import InstanceConfig
 from horae.contracts.intents import INTENT_MODELS, Intent
 from horae.contracts.lockfile import Lockfile
 from horae.contracts.marketplace import MarketplaceIndex
+from horae.contracts.mcp import BriefLatest, RunsRecent, TasksToday
 from horae.contracts.pipeline import Pipeline
 from horae.contracts.plugin import PluginManifest
 from horae.contracts.run import RunRecord
@@ -118,6 +119,9 @@ SCHEMAS: tuple[SchemaSpec, ...] = (
         RecordedResponse,
         "Horae skill eval recorded response (evals/recorded/<backend>/<case>.json)",
     ),
+    SchemaSpec("mcp/tasks-today", 1, TasksToday, "Horae MCP tool result: tasks.today"),
+    SchemaSpec("mcp/brief-latest", 1, BriefLatest, "Horae MCP tool result: brief.latest"),
+    SchemaSpec("mcp/runs-recent", 1, RunsRecent, "Horae MCP tool result: runs.recent"),
 )
 
 

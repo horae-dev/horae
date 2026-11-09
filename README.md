@@ -144,6 +144,13 @@ the lock, or run `horae init` in the new place.
 | 70 | internal error (only its type is printed) |
 | 130 / 143 | `horae run` interrupted by SIGINT / SIGTERM |
 
+## MCP server (read-only)
+
+`horae mcp serve -i <instance>` serves `tasks.today`, `brief.latest` and `runs.recent` to an MCP
+client over stdio, read-only (#54). Add it to Claude Code with
+`claude mcp add horae -- horae mcp serve -i <instance>`; setup, the tool schemas and the
+manual check are in [docs/mcp.md](docs/mcp.md).
+
 ## Deployment
 
 The container image is `ghcr.io/horae-dev/horae`
