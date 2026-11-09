@@ -2,6 +2,8 @@
 """Load an instance: `horae.yaml`, `pipelines/*.yaml` and `horae.lock` (PLAN.md §3.1)."""
 
 import functools
+import hashlib
+import logging
 import os
 import stat
 import zoneinfo
@@ -12,7 +14,14 @@ from pathlib import Path
 from pydantic import BaseModel
 
 from horae.config.cron import cron_problem
-from horae.config.documents import Problem, ProblemsError, YamlDocument, read_yaml, validate
+from horae.config.documents import (
+    Problem,
+    ProblemsError,
+    YamlDocument,
+    parse_yaml,
+    read_yaml,
+    validate,
+)
 from horae.config.schedule import ModeError, scheduler_mode
 from horae.contracts.instance import (
     InstanceConfig,
@@ -33,12 +42,15 @@ from horae.secrets import (
     redact,
 )
 
+_log = logging.getLogger("horae.config")
+
 CONFIG_FILE = "horae.yaml"
 LOCK_FILE = "horae.lock"
 PIPELINES_DIR = "pipelines"
 STORE_FILE = "horae.db"
 """The SQLite store's file name, inside the state directory (ADR 0006)."""
 PIPELINE_SUFFIXES = (".yaml", ".yml")
+MAX_PACK_PIPELINE_BYTES = 1024 * 1024
 
 
 class InstanceError(ProblemsError):
@@ -177,9 +189,12 @@ class _Loaded:
     lock_invalid: bool = False
     pipelines: dict[str, tuple[Pipeline, YamlDocument]] = field(default_factory=dict)
 
-    def load[M: BaseModel](self, path: Path, model: type[M]) -> tuple[M, YamlDocument] | None:
+    def load[M: BaseModel](
+        self, path: Path, model: type[M], raw: bytes | None = None
+    ) -> tuple[M, YamlDocument] | None:
+        """Load `path`, or parse `raw` (bytes already read and verified) as if it were."""
         try:
-            doc = read_yaml(path)
+            doc = read_yaml(path) if raw is None else _parse_bytes(raw, path)
             return validate(doc, model), doc
         except ProblemsError as exc:
             self.problems.extend(exc.problems)
@@ -206,8 +221,10 @@ def _timezone_exists(name: str) -> bool:
     return name in _timezones()
 
 
-def _pipeline_files(state: "_Loaded", directory: Path) -> list[Path]:
-    """The pipeline files in `directory`; unreadable or non-regular entries are problems."""
+def _pipeline_files(state: "_Loaded", directory: Path, *, nested: bool = True) -> list[Path]:
+    """The pipeline files in `directory`, and (`nested`) in each pack directory
+    `directory/<pack>/` one level down (decision 72); unreadable or non-regular entries are
+    problems."""
     try:
         info = os.stat(directory)
     except FileNotFoundError:
@@ -229,7 +246,12 @@ def _pipeline_files(state: "_Loaded", directory: Path) -> list[Path]:
         return []
     files = []
     for path in entries:
-        if path.suffix not in PIPELINE_SUFFIXES or path.name.startswith("."):
+        if path.name.startswith("."):
+            continue
+        if path.suffix not in PIPELINE_SUFFIXES:
+            # A pack directory: a real directory (never a symlink to one) named like a plugin.
+            if nested and path.suffix == "" and _is_real_directory(path):
+                files.extend(_pipeline_files(state, path, nested=False))
             continue
         try:
             regular = stat.S_ISREG(path.stat().st_mode)
@@ -245,6 +267,68 @@ def _pipeline_files(state: "_Loaded", directory: Path) -> list[Path]:
     return files
 
 
+def _is_real_directory(path: Path) -> bool:
+    try:
+        return stat.S_ISDIR(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
+def sha256_bytes(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _parse_bytes(raw: bytes, path: Path) -> YamlDocument:
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ProblemsError([Problem(str(path), None, None, "not valid UTF-8")]) from None
+    return parse_yaml(text, path)
+
+
+def _pack_pipeline_bytes(state: "_Loaded", path: Path) -> bytes | None:
+    """The bytes of the pipeline file `pipelines/<pack>/<name>.yaml` may run (decision 72): its pack
+    is listed under `plugins:` in horae.yaml and has an entry in horae.lock, and the file is
+    the one the lock approved (same SHA-256). A pack that is not enabled is skipped without a
+    word (removing it from `plugins:` deactivates its pipelines); a file that is not the
+    approved one is a problem. The bytes returned are the ones hashed: the caller parses them,
+    never the file again, so a swap after the check is not loaded."""
+    pack = path.parent.name
+    if state.config is None or state.lock is None or pack not in state.config.plugins:
+        return None
+    entry = state.lock.plugins.get(pack)
+    if entry is None:
+        return None
+    if not entry.pipelines:
+        # Locked before decision 72 (or not a pack): ignored, as such a directory always was.
+        _log.warning(
+            "ignoring %s: the %s entry of %s approves no pipeline (reinstall the plugin)",
+            path,
+            pack,
+            LOCK_FILE,
+        )
+        return None
+    approved = entry.pipelines.get(path.stem)
+    try:
+        with path.open("rb") as handle:
+            raw = handle.read(MAX_PACK_PIPELINE_BYTES + 1)
+    except OSError as exc:
+        state.problems.append(Problem(str(path), None, None, f"cannot be read ({exc.strerror})"))
+        return None
+    if approved is None or len(raw) > MAX_PACK_PIPELINE_BYTES or sha256_bytes(raw) != approved:
+        state.problems.append(
+            Problem(
+                str(path),
+                None,
+                None,
+                f"not the pipeline of {pack} that {LOCK_FILE} approves: reinstall the plugin "
+                "or remove the file",
+            )
+        )
+        return None
+    return raw
+
+
 def _load(root: Path) -> _Loaded:
     state = _Loaded(root)
     if loaded := state.load(root / CONFIG_FILE, InstanceConfig):
@@ -258,7 +342,15 @@ def _load(root: Path) -> _Loaded:
             state.lock_invalid = True
 
     for path in _pipeline_files(state, root / PIPELINES_DIR):
-        if (loaded_pipeline := state.load(path, Pipeline)) is None:
+        raw: bytes | None = None
+        # A pack's file is any file below a directory other than `pipelines/` itself: decided by
+        # structure, never by a plugin's name.
+        if (
+            path.parent != root / PIPELINES_DIR
+            and (raw := _pack_pipeline_bytes(state, path)) is None
+        ):
+            continue
+        if (loaded_pipeline := state.load(path, Pipeline, raw)) is None:
             continue
         pipeline, doc = loaded_pipeline
         if pipeline.name != path.stem:

@@ -66,6 +66,16 @@ from a committed lock). Details: [schemas decision 70](schemas/README.md#decisio
 A direct install without a marketplace, `horae plugin add https://<host>/<owner>/<repo>@<full
 commit SHA>`, has no tier and is refused before M5 ([decision 71](schemas/README.md#decisions)).
 
+A **pipeline pack** (a plugin whose `plugin.yaml` lists `provides.pipelines`) also gets its
+pipelines installed: `pipelines/<name>.yaml` of the pack is validated and copied to
+`<instance>/pipelines/<plugin>/<name>.yaml`, and the paths are recorded in
+`plugins/<plugin>/.horae-install.json`. The install is refused, and nothing is written, if any
+file is invalid, is a symlink, or would replace a file or pipeline of yours. The approval
+prompt lists each pipeline (trigger, tools, skills; a warning for tools of other plugins) and
+`horae.lock` pins their digests; they run only once the plugin is listed under `plugins:` in
+`horae.yaml`
+([schemas decision 72](schemas/README.md#provisional-decisions-133-pending-maintainer-review)).
+
 `-i` defaults to the current directory (or `HORAE_INSTANCE`). Every command takes `--json`
 for scripting (one JSON document on stdout, `schema_version: 1`, errors too) and prints no
 colour unless asked. `horae run` has no LLM backend in M1: a pipeline with an `llm` step

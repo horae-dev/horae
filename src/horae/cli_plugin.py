@@ -12,7 +12,9 @@ with its own venv built from its committed `uv.lock` (`horae.marketplace.environ
 decision 69; uv's cache is `<state_dir>/uv-cache`), shows the permissions its manifest asks
 for and, once the user approves them, writes its entry to `horae.lock`
 (`horae.marketplace.approval` and `horae.marketplace.lock`, decision 70). Approval runs
-before the venv is built, so a refused plugin's dependencies are never installed.
+before the venv is built, so a refused plugin's dependencies are never installed. A pipeline
+pack's `pipelines/*.yaml` are then validated and copied to `<instance>/pipelines/<name>/`
+(`horae.marketplace.pipelines`, decision 72); any invalid file refuses the whole install.
 
 A direct install (a git URL pinned to a full commit SHA, `horae.marketplace.direct`) reads no
 marketplace and has no tier: before M5 it is refused before anything is fetched
@@ -93,6 +95,7 @@ from horae.marketplace.approval import (
 )
 from horae.marketplace.direct import is_direct, parse_direct
 from horae.marketplace.lock import LOCK_FILE, guard, read_lock, write_lock
+from horae.marketplace.pipelines import PackPipelines
 
 MARKETPLACES_DIR = "marketplaces"
 """Under the state directory: one folder per index."""
@@ -251,7 +254,9 @@ class _Approval:
         *,
         yes: bool,
         json_output: bool,
+        pipelines: PackPipelines | None = None,
     ) -> None:
+        self.pipelines = pipelines
         self.lock = lock
         self.repo = repo
         self.sha = sha
@@ -269,11 +274,17 @@ class _Approval:
             commit=self.sha,
             permissions=granted,
             personal_fields=manifest.provides.personal_fields,
+            pipelines=self.pipelines.digests if self.pipelines is not None else {},
         )
         existing = self.lock.plugins.get(name)
         err = self.json_output
         for line in describe(
-            name, version, manifest.permissions, granted, manifest.provides.personal_fields
+            name,
+            version,
+            manifest.permissions,
+            granted,
+            manifest.provides.personal_fields,
+            self.pipelines.approval_lines() if self.pipelines is not None else (),
         ):
             echo(safe(line), err=err)
         if self.yes:
@@ -318,38 +329,58 @@ def _install_and_lock(
     *,
     yes: bool,
     json_output: bool,
-) -> tuple[Installed, LockedPlugin]:
+) -> tuple[Installed, LockedPlugin, list[str]]:
     """Under the lock guard: install with approval then the venv (`_chain`) as `prepare`,
     and write the approved entry to `horae.lock`. Raises `MarketplaceError`."""
     lock_path = instance / LOCK_FILE
     with guard(loaded_instance.state_dir):
         lock, header = read_lock(lock_path)
-        approval = _Approval(lock, repo, sha, grants, yes=yes, json_output=json_output)
+        pipelines = PackPipelines(instance)
+        approval = _Approval(
+            lock, repo, sha, grants, yes=yes, json_output=json_output, pipelines=pipelines
+        )
         installed = install(
             make_installer(plugins_dir(instance)),
-            _chain(approval, make_environment(loaded_instance.state_dir / UV_CACHE_DIR)),
+            _chain(
+                pipelines,  # checked first: the approval shows what it found
+                approval,
+                make_environment(loaded_instance.state_dir / UV_CACHE_DIR),
+            ),
         )
         entry = approval.entry
-        if entry is None or installed.lock_entry(entry.permissions) != entry:
+        if (
+            entry is None
+            or installed.lock_entry(entry.permissions).model_copy(
+                update={"pipelines": entry.pipelines}
+            )
+            != entry
+        ):
             # The install record and the approved entry must be the same plugin.
             shutil.rmtree(installed.path, ignore_errors=True)
             raise ApprovalRefused("the installed plugin is not the one approved; removed")
         plugins = {**lock.plugins, installed.name: entry}
         try:
+            pipelines.write()
+        except MarketplaceError:
+            shutil.rmtree(installed.path, ignore_errors=True)
+            raise
+        try:
             write_lock(lock_path, Lockfile(schema_version=1, plugins=plugins), header)
         except OSError as exc:
+            pipelines.remove()
             shutil.rmtree(installed.path, ignore_errors=True)
             raise CommandFailed(
                 EXIT_PROBLEMS,
                 "lock_write_failed",
                 f"cannot write {lock_path}: {exc.strerror or exc}; the install was undone",
             ) from None
-    return installed, entry
+    return installed, entry, pipelines.paths
 
 
 def _report(
     installed: Installed,
     entry: LockedPlugin,
+    paths: list[str],
     tier: str | None,
     index: str | None,
     warnings: list[str],
@@ -364,6 +395,7 @@ def _report(
                 "tier": tier,
                 "index": index,
                 "path": where,
+                "pipelines": paths,
                 "permissions": entry.model_dump(mode="json")["permissions"],
                 "approved": True,
                 "enabled": False,
@@ -379,7 +411,11 @@ def _report(
     else:
         echo(f"  commit  {installed.commit} (tag v{installed.version} points to it)")
         echo(f"  tier    {tier}")
+    for path in paths:
+        echo(f"  pipeline  {path}")
     echo(PENDING)
+    if paths:
+        echo(f"its pipelines run once `{installed.name}` is listed under plugins: in horae.yaml.")
     return EXIT_OK
 
 
@@ -413,7 +449,7 @@ def _add(
     try:
         found = resolve(ref, loaded.indexes, pins=config.marketplace_pins, allow_prerelease=pre)
         require_installable(found.name, found.tier, found.index)
-        installed, entry = _install_and_lock(
+        installed, entry, paths = _install_and_lock(
             loaded_instance,
             instance,
             found.repo,
@@ -427,7 +463,9 @@ def _add(
         )
     except MarketplaceError as exc:
         raise _failed(exc) from None
-    return _report(installed, entry, found.tier, found.index, list(loaded.warnings), json_output)
+    return _report(
+        installed, entry, paths, found.tier, found.index, list(loaded.warnings), json_output
+    )
 
 
 def _add_direct(
@@ -445,7 +483,7 @@ def _add_direct(
     loaded_instance = load(instance)
     try:
         require_installable(repo, None, None)
-        installed, entry = _install_and_lock(
+        installed, entry, paths = _install_and_lock(
             loaded_instance,
             instance,
             repo,
@@ -457,7 +495,7 @@ def _add_direct(
         )
     except MarketplaceError as exc:
         raise _failed(exc) from None
-    return _report(installed, entry, None, None, [], json_output)
+    return _report(installed, entry, paths, None, None, [], json_output)
 
 
 def _search(instance: Path, query: str, offline: bool, json_output: bool) -> int:

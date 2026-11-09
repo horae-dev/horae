@@ -4161,3 +4161,69 @@ loosened later without breaking a valid file.
       install (`LockedPlugin.commit` is documented as the commit the version's tag points to,
       which a direct install does not check). `upgrade` (#47) will need to tell them apart:
       a `source` field, or "no index lists this repo", is left to it.
+
+### Provisional decisions (#133, pending maintainer review)
+
+72. **A pipeline pack's pipelines are installed by `horae plugin add` into
+    `pipelines/<plugin>/`, approved with the plugin and pinned in `horae.lock` (#133).**
+    One additive schema change: `lockfile/v1.json` gains `plugins.<name>.pipelines` (G). (#48 took 71.)
+    - **A, where.** `<instance>/pipelines/<plugin>/<pipeline>.yaml`, one directory per pack.
+      The instance loader (`horae.config.loader`) reads `pipelines/*.yaml` as before and now
+      also `pipelines/<dir>/*.yaml`, one level down; a directory whose name starts with `.` or
+      has a suffix, and a symlinked directory, are skipped. A pipeline's `name` is still its
+      file's stem and still unique in the whole instance (a second definition is the existing
+      "defined twice" problem). A directory per pack, not a prefix in the file name, because the
+      name of a pipeline is the file's stem and a prefix would change what `horae run` is
+      called by; and so that remove and upgrade (#47) delete exactly one directory.
+    - **B, what is a pack.** A plugin whose manifest lists `provides.pipelines`. The pack's
+      `pipelines/` holds exactly those names as plain `<name>.yaml` files (a missing file, an
+      undeclared one, a `.yml`, a directory or a symlink is a refusal). A plugin that lists none
+      is not a pack and installs nothing here.
+    - **C, when and how.** Inside the existing flow, as a `prepare` step before the tree is
+      moved into place. The check runs first (it only reads, so the approval can show what it
+      found); the approval and the venv build follow: every file is read
+      once (at most 1 MiB, regular file, no symlink, resolving inside the tree), parsed with the
+      loader's safe YAML reader and validated as a `Pipeline`, and its `name` must be its file's.
+      The installer itself refuses a symlink under `pipelines/` in the git tree (a checkout with
+      `core.symlinks=false` would turn it into a file holding the link target). Any failure is
+      `install_refused` (exit 3) and nothing is written. The validated bytes are written to a
+      scratch directory `pipelines/.install-*` and renamed to `pipelines/<plugin>/` after the
+      tree is placed; if that or the `horae.lock` write fails, both are undone.
+    - **D, never overwrite.** The install is refused if `pipelines/<plugin>/` exists (the
+      plugin is not installed at that point, so it is not ours) or if another pipeline of the
+      instance already has the name of one of the pack's. #47 must delete the recorded files
+      before a reinstall, which is what makes "a file this pack installed before" replaceable.
+    - **E, the record.** The relative paths are added to the install record, key `pipelines`
+      (`plugins/<plugin>/.horae-install.json`, decision 62 F), for #47. The host compares only
+      name, version, repo and commit, so the extra key is ignored there. `--json` carries
+      `pipelines` too.
+    - **F, what is not checked.** Instance-level references (a model alias, a tool nobody
+      provides, a time zone) are checked by `horae doctor` and at run time, as for a pipeline
+      written by hand: a pack cannot know the instance.
+    - **G, approval and the lock (security review).** A pipeline is code the core runs on a
+      schedule, so it is approved like a permission. The prompt lists, per pipeline, its name,
+      its trigger (cron and time zone, or "manual or external trigger only") and the tools and
+      skills it calls. `horae.lock` records `pipelines: {<name>: <sha256 of the file>}` for the
+      pack (left out when empty, names sorted); `lock_mismatch` compares it, so `--yes`
+      refuses a pack whose pipelines differ, and the entry written must equal the approved one.
+    - **H, only an enabled, locked pack runs.** The loader reads `pipelines/<plugin>/*.yaml`
+      only if `<plugin>` is listed under `plugins:` in `horae.yaml` and has an entry in
+      `horae.lock`, and a file only if its SHA-256 is the locked one for that name (else a
+      problem naming the file; an unlisted name counts as not approved). So the scheduler, `horae
+      run` and the budgets see no pipeline of a disabled or removed plugin. Installing does not
+      enable: the output says so.
+    - **I, tools of other plugins: warn, not refuse.** A pack's own manifest has no dependency
+      list, and real packs exist to call other plugins (`obsidian.*`, `ntfy.*`), so refusing
+      would make every pack unusable. The prompt instead prints, under each such pipeline, a
+      `warning: calls plugins other than <pack> (<namespaces>)` line; those tools run with the
+      permissions of the plugins that provide them, which `horae.lock` already pins. A pack
+      dependency list is a possible follow-up.
+    - **J, review fixes.** A pack is recognised by structure, never by name: the loader treats a
+      file as a pack's when its directory is not `<instance>/pipelines` itself, so a plugin named
+      `pipelines` (installed to `pipelines/pipelines/`) gets every gate; the name `pipelines` is
+      also refused at install. A `pipelines/<dir>` is a pack's only if the lock entry of that
+      plugin has a non-empty `pipelines` map; otherwise the directory is ignored (as before this
+      decision, so an instance upgraded from an older lock keeps working) with a logged warning.
+      The prompt also prints each call's parameters (act and notify targets: `path`, `mode`,
+      `url`, `link_prefix`, `topic`...; at most 160 characters each) and each `llm` step's model
+      and budget.
