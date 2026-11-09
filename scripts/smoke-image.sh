@@ -108,8 +108,8 @@ esac
 "${run[@]}" --entrypoint sh "$image" -c 'touch /tmp/probe'
 echo "ok: root filesystem read-only (probe checked against a writable control), /tmp writable"
 
-# --- no package manager or compiler ---------------------------------------------------------
-for tool in pip pip3 uv gcc cc make; do
+# --- no pip or compiler ---------------------------------------------------------
+for tool in pip pip3 gcc cc make; do
   if "${run[@]}" --entrypoint sh "$image" -c "command -v ${tool}" > /dev/null 2>&1; then
     fail "${tool} is present in the final image"
   fi
@@ -120,7 +120,29 @@ fi
 if "${run[@]}" --entrypoint python "$image" -m pip --version > /dev/null 2>&1; then
   fail "python -m pip works in the final image"
 fi
-echo "ok: no pip, ensurepip, uv or build tools"
+echo "ok: no pip, ensurepip or build tools"
+
+# --- uv, for install time only (#169) ----------------------------------------------------------
+# `horae plugin add` builds each plugin's venv with the image's uv and git: the venv links to this
+# image's own Python. Neither is used at run time (the plugin host sets UV_OFFLINE=1).
+uv_version="$("${run[@]}" --entrypoint uv "$image" --version)" || fail "uv --version"
+[[ "$uv_version" =~ ^uv\ [0-9]+\.[0-9]+\.[0-9]+ ]] || fail "unexpected uv --version: '${uv_version}'"
+scripts_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+expected_uv="$(sed -n 's|^ARG UV_IMAGE=ghcr.io/astral-sh/uv:\([0-9.]*\)@.*|\1|p' "${scripts_dir}/../Dockerfile")"
+case "$uv_version" in
+  "uv ${expected_uv:?no UV_IMAGE in the Dockerfile} "*) ;;
+  *) fail "uv is '${uv_version}', the Dockerfile pins ${expected_uv}" ;;
+esac
+"${run[@]}" --entrypoint git "$image" --version > /dev/null || fail "git is missing (plugin add clones)"
+# A plugin's venv, built inside the container with no network, from a local file index: lock,
+# `PluginEnvironment` (what `horae plugin add` runs), linked to /usr/local/bin/python3.12, runnable
+# once renamed, uv's cache under the instance volume. Needs tests/ (fixtures) and this script.
+new_volume
+"${run[@]}" -v "${volume}:/instance" -v "${scripts_dir}:/smoke/scripts:ro" \
+  -v "${scripts_dir}/../tests:/smoke/tests:ro" --entrypoint python "$image" \
+  /smoke/scripts/smoke-plugin-env.py /instance/envtest > /dev/null \
+  || fail "building a plugin venv inside the container (see the output above)"
+echo "ok: ${uv_version}; a plugin venv builds offline against the image's Python, uv cache on the volume"
 
 # --- only the core is installed ----------------------------------------------------------------
 # horae-sdk (sdk/, a uv workspace member) is a dev dependency of the core: `uv sync --no-dev`

@@ -476,3 +476,21 @@ def test_the_venv_env(tmp_path: Path) -> None:
     assert env["VIRTUAL_ENV"] == str(venv)
     assert env["UV_OFFLINE"] == "1"
     assert env["PIP_NO_INDEX"] == "1"
+
+
+def test_a_plugin_child_stays_offline_whether_or_not_uv_is_on_the_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The image ships uv for `horae plugin add` (#169); a plugin child must not gain a way to
+    reach the network from it, and the caller's `UV_*` settings never reach the child."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "uv").write_text("#!/bin/sh\n")
+    monkeypatch.setenv("PATH", f"{fake_bin}:{os.environ['PATH']}")
+    monkeypatch.setenv("UV_OFFLINE", "0")
+    monkeypatch.setenv("PIP_NO_INDEX", "0")
+    monkeypatch.setenv("UV_INDEX_URL", "https://example.org/simple")
+    env = build_env("demo", home=tmp_path, tmpdir=tmp_path, timezone="UTC", secrets={})
+    assert env["PATH"] == BASE_PATH
+    assert {k: env[k] for k in OFFLINE_ENV} == OFFLINE_ENV
+    assert "UV_INDEX_URL" not in env

@@ -1,5 +1,6 @@
 # Horae container image (#40). Multi-stage: the builder holds uv and the resolved virtualenv, the
-# final stage holds only the interpreter and that virtualenv (no uv, no pip, no compiler).
+# final stage holds the interpreter, that virtualenv and the uv binary (#169), for `horae plugin
+# add` only (no pip, no compiler). Nothing at run time uses uv or the network.
 #
 # Runtime contract (docs/operations/container-image.md):
 #   - runs as the numeric, non-root user 10001:10001
@@ -51,11 +52,14 @@ LABEL org.opencontainers.image.title="horae" \
       org.opencontainers.image.revision="${REVISION}"
 
 # tini as PID 1 (Debian package, pinned; Renovate does not bump apt pins: bump it with the base
-# image). No package manager is needed at run time: drop pip and friends, and ensurepip, which
+# image). git (#169) is what `horae plugin add` clones marketplace indexes and plugin repositories
+# with (hardened, https only, no hook: horae.marketplace.git); not pinned to a version, because
+# Debian drops superseded security builds and a stale pin would break the build; the base image
+# digest bounds what it can resolve to. No package manager is needed at run time: drop pip and friends, and ensurepip, which
 # bundles a pip wheel (they are what could pull and run code in a compromised container). The
 # venv has no pip of its own.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends tini=0.19.0-1+b3 \
+    && apt-get install -y --no-install-recommends tini=0.19.0-1+b3 git \
     && rm -rf /var/lib/apt/lists/* \
     && (python -m pip uninstall -y pip setuptools wheel >/dev/null 2>&1 || true) \
     && rm -rf /usr/local/lib/python3.12/ensurepip \
@@ -71,6 +75,11 @@ RUN apt-get update \
     && chmod 0700 /instance
 
 COPY --from=builder /opt/venv /opt/venv
+# uv, for install time only (#169): `horae plugin add` builds each plugin's venv with it, against
+# this image's own Python (a venv links to the interpreter that built it). It is the same pinned
+# binary as the builder's (UV_IMAGE, by digest; Renovate bumps both). Pipelines and plugins never
+# run it: the host sets UV_OFFLINE=1 and PIP_NO_INDEX=1 in every plugin child.
+COPY --from=uv /uv /usr/local/bin/uv
 
 ENV PATH=/opt/venv/bin:$PATH \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -83,7 +92,7 @@ ENV PATH=/opt/venv/bin:$PATH \
     HORAE_PORT=8080
 
 # The instance directory (horae.yaml, horae.lock, pipelines/, plugins/, state/, vault/) is the
-# one writable place: mount a named volume (`-v horae:/instance`, which starts owned by 10001) or
+# one writable place; plugins/ (each plugin's venv) and state/uv-cache (uv's cache) live in it: mount a named volume (`-v horae:/instance`, which starts owned by 10001) or
 # a bind mount owned by 10001. No VOLUME instruction: an anonymous volume created behind the
 # user's back would hide a forgotten `-v` until the container is removed with its data.
 # /tmp is expected to be a tmpfs.

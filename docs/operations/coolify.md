@@ -460,6 +460,25 @@ or `docker exec horae-<uuid> horae <command>`: `horae doctor`, `horae runs`, `ho
 <pipeline> --dry-run`. To start again from an empty instance, delete the volume (Coolify:
 *Persistent Storage*) and redeploy: `horae-init` creates a new one.
 
+#### Installing and approving plugins
+
+The image carries uv and git for this one purpose ([container-image.md](container-image.md#installing-plugins-in-the-container)).
+From the Coolify **Terminal** (container `horae`, an interactive shell) or `docker exec -it
+horae-<uuid> horae plugin add obsidian` on the server:
+
+1. The plugin is cloned and its venv is built into the volume (`plugins/<name>`, uv's cache in
+   `state/uv-cache`). This needs outbound network from the container (GitHub, and the package
+   index); nothing else does.
+2. With [#46](https://github.com/horae-dev/horae/issues/46) (PR #168) `plugin add` then shows the
+   permissions and asks you to approve them in the terminal, and records the approval in
+   `horae.lock`. Before #168 is merged the plugin is installed but not enabled; the lock cannot
+   be written by the command yet.
+3. Copy the resulting `horae.lock` out (`docker cp horae-<uuid>:/instance/horae.lock .`) and
+   commit it to your instance repository. For a reproducible redeploy (a fresh volume), put the
+   lock back and run `horae plugin add <name> --yes`, which installs exactly what the lock
+   approves and does not prompt (also #168).
+4. Restart the resource.
+
 ### 4. Scheduled Tasks
 
 With `HORAE_SCHEDULER=external`, `horae serve` fires nothing and Coolify runs the pipelines. In
