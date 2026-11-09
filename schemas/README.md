@@ -221,7 +221,7 @@ conservative option, so loosening one later is a compatible change.
     definition; the canonical form is fixed by the engine, see `horae.engine.canonical`) and `context`
     (`now`, IANA `timezone`, rendered template `vars`). Optional: `lock_digest`, `config_digest`,
     `input_hash`, per-step `error` / timings / capped `stderr`, LLM `attempt` and `schema_valid`,
-    and `violations` (`egress_blocked`, `guard`, `undeclared_secret`, `undeclared_path`). Statuses:
+    and `violations` (`egress_blocked`, `guard`, `undeclared_secret`, `undeclared_path`; `intent_skipped` since decision 60). Statuses:
     run `ok`, `noop`, `degraded`, `failed`, `undone`; step `ok`, `skipped`, `degraded`, `failed`.
     A dry run has no `changes`. Untrusted-content tagging is not part of v1.
     `intents[].proposed_by` is the proposing tool (`<namespace>.<tool>`) or, for intents of the
@@ -3423,3 +3423,31 @@ loosened later without breaking a valid file.
       from the core's journal, which the core cannot supply: it never sees the line), serve
       `<ns>.restore_status` (`tasksink.restore_status` with `force`), and honour `force` in
       `restore` for notes edited outside the owned block.
+
+### Provisional decisions (#135, pending maintainer review)
+
+60. **A `mode: tasks` entry takes several `link_prefix` values; an unroutable task link is
+    skipped, not fatal (#135).** A compatible v1 addition: the `link_prefix` entry parameter
+    is free-form pipeline data, so only `run-record/v1.json` changes (a new `violations[].kind`
+    value, `intent_skipped`).
+    - **A, several prefixes.** On a `mode: tasks` entry, `link_prefix` is either one string
+      (unchanged) or a list of 1 to 32 strings. Each is checked exactly as before
+      (`_check_link_prefix`: `https://`, a host, no user info, query or fragment, a clean path
+      ending in `/`). An empty list, more than 32, or any invalid item is `params_invalid`
+      naming `link_prefix`. A `task.create` link is taken by the entry if it falls under any
+      of them. `notify` entries keep a single string (decision 30).
+    - **B, overlap: the longest prefix wins.** When two entries take the same link (their
+      prefixes overlap, `https://github.com/org/` and `https://github.com/org/app/`), the
+      entry whose matching prefix is longest takes it. Two entries that match with an
+      identical prefix stay `intent_ambiguous`. Within one entry, overlap is moot.
+    - **C, degrade per item.** A `task.create` that a `tasks` entry would take but for its
+      link (no prefix matches, or the entry has none) no longer fails the step with
+      `intent_unrouted`: that one intent is left out, the others are routed, and the step
+      ends `ok`. The run record gets one `intent_skipped` violation per proposing call: the
+      source, the positions and the fixed text `task link not under a trusted link_prefix`
+      (never a link), and the core logs a warning. If every intent of a call is skipped the
+      detail says `skipped all`. Every other routing failure (no entry binds the type, an
+      unknown fingerprint, ambiguity) still fails the step.
+    - **D, compatibility.** Pipelines that never had an off-prefix link are unchanged; ones
+      that did now succeed with a violation instead of failing. A consumer must accept the new
+      `kind`; per "Versioning" a new enum value is a compatible addition.

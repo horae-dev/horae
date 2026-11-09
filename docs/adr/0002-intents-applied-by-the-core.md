@@ -127,6 +127,6 @@ per-type limits hold; a violation degrades the whole step. Plugin proposals are 
 `task.create` takes an optional `https://` `link` ([schemas decision
 52](../../schemas/README.md#decisions)), so the trusted bindings of the #17 amendment gain one:
 like a notification `link`, a task `link` is routed only to a `mode: tasks` entry
-whose trusted `link_prefix` it falls under (no prefix, no route), and an LLM-proposed link must
+whose trusted `link_prefix` (one, or a list, [decision 60](../../schemas/README.md#decisions); an off-prefix task is skipped with a recorded violation) it falls under (no prefix, no route), and an LLM-proposed link must
 be a URL of the viewed input. The host is a name, never an IP literal; the sink writes the link
 inert, after the escaped title, with a fixed label.

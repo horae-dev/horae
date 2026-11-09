@@ -101,9 +101,13 @@ entry of a later step, which is recorded in `ProposedIntent.applied_by` (the ent
    query and fragment. The same rule binds a `task.create` `link` (schemas decision 52): it
    is taken only by a `mode: tasks` entry with a trusted `link_prefix` it falls under, and
    that prefix must be `https://` (a `link_prefix` on an entry of another `mode` is
-   `params_invalid`); a `task.create` without a link needs none. When a `tasks` entry would
-   take a `task.create` but for its link, the `intent_unrouted` message says
-   `task link not under a trusted link_prefix` (a fixed text: no link is echoed);
+   `params_invalid`); a `task.create` without a link needs none. A `tasks` entry's
+   `link_prefix` may also be a list of 1 to `MAX_LINK_PREFIXES` such prefixes (a string is a
+   list of one); the link must fall under any of them, and when several entries take it the
+   one with the longest matching prefix wins (a tie is `intent_ambiguous`). When a `tasks`
+   entry would take a `task.create` but for its link, that one intent is **skipped** and the
+   rest flow: the step records an `intent_skipped` violation (positions and the fixed text
+   `task link not under a trusted link_prefix`; no link is echoed), schemas decision 60;
 4. a `task.update_status` is routed only if its `task` fingerprint appears, as an exact string
    value, in the data collected so far in the run (so is a `notify.push` with buttons,
    `actions`: the `task` of each, #38) (`RunRecord.inputs`, and the current
@@ -572,7 +576,7 @@ class _Entry:
     params: dict[str, Any]
     plugin: ResolvedPlugin
     types: frozenset[IntentType]
-    binds: dict[str, str]
+    binds: dict[str, str | tuple[str, ...]]
 
     def takes(self, intent: Intent) -> bool:
         """Exact string comparison of bound targets (no case folding, Unicode or URL
@@ -580,13 +584,19 @@ class _Entry:
         if intent.type not in self.types:
             return False
         if isinstance(intent, NotifyPush):
-            prefix = self.binds.get("link_prefix")
-            return intent.link is None or (prefix is not None and _link_under(intent.link, prefix))
+            return intent.link is None or self.link_match(intent.link) > 0
         if isinstance(intent, TaskCreate) and intent.link is not None:
-            prefix = self.binds.get("link_prefix")
-            return prefix is not None and _link_under(intent.link, prefix)
+            return self.link_match(intent.link) > 0
         bound = TARGET_FIELDS.get(intent.type)
         return bound is None or self.binds.get(bound) == getattr(intent, bound)
+
+    def link_match(self, link: str) -> int:
+        """The length of the longest trusted `link_prefix` of this entry that `link` falls
+        under; 0 if none does (or the entry has none)."""
+        prefixes = self.binds.get("link_prefix", ())
+        if isinstance(prefixes, str):
+            prefixes = (prefixes,)
+        return max((len(p) for p in prefixes if _link_under(link, p)), default=0)
 
 
 @dataclass(frozen=True)
@@ -703,11 +713,11 @@ def _link_under(link: str, prefix: str) -> bool:
 
 def _entry_binding(
     kind: StepKind, ref: str, params: dict[str, Any], plugin: ResolvedPlugin
-) -> tuple[frozenset[IntentType], dict[str, str]]:
+) -> tuple[frozenset[IntentType], dict[str, str | tuple[str, ...]]]:
     """The intent types and targets an `act` / `notify` entry binds; `ValueError` if its
     binding parameters are invalid."""
     allowed = frozenset(plugin.manifest.permissions.intents)
-    binds: dict[str, str] = {}
+    binds: dict[str, str | tuple[str, ...]] = {}
     if kind == "notify":
         prefix = params.get("link_prefix")
         if prefix is not None:
@@ -730,12 +740,25 @@ def _entry_binding(
     if "link_prefix" in params:
         if mode != "tasks":
             raise ValueError(f"{ref}: only a `mode: tasks` entry takes `link_prefix`")
+        raw = params["link_prefix"]
         try:
-            prefix = _TASK_LINK.validate_python(params["link_prefix"])
-            binds["link_prefix"] = _check_link_prefix(prefix, _TASK_LINK_SCHEMES)
+            if isinstance(raw, list):
+                if not 1 <= len(raw) <= MAX_LINK_PREFIXES:
+                    raise ValueError("bad count")
+                items = raw
+            else:
+                items = [raw]
+            checked = tuple(
+                _check_link_prefix(_TASK_LINK.validate_python(item), _TASK_LINK_SCHEMES)
+                for item in items
+            )
         except (ValidationError, ValueError):
-            message = "must be an https:// link with a clean path ending in /"
+            message = (
+                "must be an https:// link with a clean path ending in /, or a list of "
+                f"1 to {MAX_LINK_PREFIXES} of them"
+            )
             raise ValueError(f"{ref}: `link_prefix` {message}") from None
+        binds["link_prefix"] = checked[0] if isinstance(raw, str) else tuple(dict.fromkeys(checked))
     types = ACT_MODES[mode]
     if not types <= allowed:
         raise ValueError(f"{ref}: plugin may not apply mode {mode} (permissions.intents)")
@@ -1032,14 +1055,23 @@ class _Run:
         seen = ([snap.data for snap in self.inputs], collected) if shown is None else shown
         unknown = set(check_task_fingerprints(typed, seen))
         routed: list[ProposedIntent] = []
+        skipped: list[int] = []
         for position, intent in enumerate(typed):
             if position in unknown:
                 unroutable.append(("intent_unrouted", position, intent.type, ""))
                 continue
             takers = [entry for entry in entries if entry.takes(intent)]
+            if len(takers) > 1 and isinstance(intent, TaskCreate) and intent.link is not None:
+                # Overlapping prefixes: the entry with the longest matching prefix wins; a
+                # tie stays ambiguous (decision 60).
+                best = max(entry.link_match(intent.link) for entry in takers)
+                takers = [entry for entry in takers if entry.link_match(intent.link) == best]
             if len(takers) != 1:
                 code = "intent_unrouted" if not takers else "intent_ambiguous"
                 reason = "" if takers else _unrouted_reason(intent, entries)
+                if reason == TASK_LINK_UNROUTED:
+                    skipped.append(position)  # one unroutable item never fails the step
+                    continue
                 unroutable.append((code, position, intent.type, reason))
                 continue
             entry = takers[0]
@@ -1055,7 +1087,24 @@ class _Run:
             )
         if unroutable:
             return [], _route_error(source, unroutable)
+        if skipped:
+            self._note_skipped(source, skipped, len(typed))
         return routed, None
+
+    def _note_skipped(self, source: str, skipped: list[int], total: int) -> None:
+        """Record, as one `intent_skipped` violation (and a log warning), the `task.create`
+        intents of one proposal left out because their link is under no trusted prefix.
+        Closed-set values only: positions and a fixed reason, never a link."""
+        positions = ", ".join(f"#{position}" for position in skipped[:20])
+        more = f" and {len(skipped) - 20} more" if len(skipped) > 20 else ""
+        which = "all" if len(skipped) == total else f"{len(skipped)} of {total}"
+        detail = _cap(
+            f"{source}: skipped {which} proposed intent(s) ({positions}{more}): "
+            f"{TASK_LINK_UNROUTED}"
+        )
+        _log.warning("intents skipped: %s", detail)
+        if len(self.violations) < MAX_ITEMS:
+            self.violations.append(Violation(kind="intent_skipped", detail=detail))
 
     @staticmethod
     def _fill(
@@ -1142,6 +1191,9 @@ def _strings(*values: Any) -> frozenset[str]:
             stack.extend(item)
     return frozenset(found)
 
+
+MAX_LINK_PREFIXES = 32
+"""The most trusted `link_prefix` values one `mode: tasks` entry may list."""
 
 TASK_LINK_UNROUTED = "task link not under a trusted link_prefix"
 """Why a `task.create` with a `link` that a `tasks` entry would otherwise take is unrouted."""

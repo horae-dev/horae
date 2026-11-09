@@ -300,12 +300,16 @@ class Violation(Contract):
         "undeclared_path",
         "secret_in_output",
         "secret_in_request",
+        "intent_skipped",
     ]
     """`secret_in_output`: a plugin returned the value (or an encoding) of an instance secret in
     its output or intents; the plugin host replaced it with `[REDACTED:<NAME>]` (#24).
     `secret_in_request`: an LLM request held the value (or an encoding) of a resolved secret;
     it was refused before it was sent and the step degraded (T10, #34; `detail` names the
-    secrets, never their values)."""
+    secrets, never their values).
+    `intent_skipped`: the core left out `task.create` intents whose `link` is under no trusted
+    `link_prefix` of the `tasks` entry (positions and a fixed reason, never a link); the
+    other intents of the run flowed (#135, decision 60)."""
     detail: Message
 
 

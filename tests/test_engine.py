@@ -666,18 +666,139 @@ def test_task_links_need_a_trusted_prefix(
     data = [{"id": FINGERPRINT, "url": link or ""}]
     for by_source in (False, True):  # an LLM proposal and a source's: the same routing
         record = _task_run([create], data, by_source=by_source, entry=entry)
-        step = 0 if by_source else 1
         if routed:
             assert record.status == "ok", record.error
             assert record.intents[0].applied_by == "todo.write"
             assert record.intents[0].intent == TaskCreate.model_validate(create)
-        else:
-            assert record.status == "failed"
-            assert _error_kind(record, step) == "intent_unrouted"
-            message = record.steps[step].error.message or ""  # type: ignore[union-attr]
-            assert "evil" not in message
-            assert ("task link not under a trusted link_prefix" in message) == bool(link)
+        else:  # skipped and recorded, never fatal (decision 60)
+            assert record.status == "ok", record.error
             assert record.intents == []
+            (violation,) = record.violations
+            assert violation.kind == "intent_skipped"
+            assert "evil" not in violation.detail
+            assert "task link not under a trusted link_prefix" in violation.detail
+            assert "skipped all" in violation.detail
+
+
+def _link_create(link: str, n: int = 1) -> dict[str, Any]:
+    return {"type": "task.create", "title": f"Item {n}", "fingerprint": f"x:{n}", "link": link}
+
+
+GH = "https://github.com/"
+ORG_A, ORG_B = GH + "org-a/", GH + "org-b/"
+
+
+def test_link_prefix_list_routes_each_item_by_its_prefix() -> None:
+    creates = [_link_create(ORG_A + "app/pull/1", 1), _link_create(ORG_B + "app/pull/2", 2)]
+    for entry in (
+        {"mode": "tasks", "link_prefix": [ORG_A, ORG_B]},
+        {"mode": "tasks", "link_prefix": [ORG_A, ORG_B, ORG_A]},  # a duplicate is harmless
+    ):
+        record = _task_run(creates, by_source=True, entry=entry)
+        assert record.status == "ok", record.error
+        assert [i.intent.type for i in record.intents] == ["task.create", "task.create"]
+        assert not record.violations
+    # A single string still works, and a list of one is the same.
+    for prefix in (ORG_A, [ORG_A]):
+        record = _task_run(
+            creates[:1], by_source=True, entry={"mode": "tasks", "link_prefix": prefix}
+        )
+        assert record.status == "ok", record.error
+        assert len(record.intents) == 1
+
+
+def test_an_unroutable_item_is_skipped_and_the_rest_flow() -> None:
+    creates = [
+        _link_create(ORG_A + "app/pull/1", 1),
+        _link_create(GH + "stranger/app/pull/2", 2),
+        _link_create(ORG_B + "app/pull/3", 3),
+    ]
+    for by_source in (True, False):
+        entry = {"mode": "tasks", "link_prefix": [ORG_A, ORG_B]}
+        data = [{"id": FINGERPRINT, "url": c["link"]} for c in creates]
+        record = _task_run(creates, data, by_source=by_source, entry=entry)
+        assert record.status == "ok", record.error
+        assert [i.intent.title for i in record.intents] == ["Item 1", "Item 3"]  # type: ignore[union-attr]
+        (violation,) = record.violations
+        assert violation.kind == "intent_skipped"
+        assert "#1" in violation.detail
+        assert "1 of 3" in violation.detail
+        assert "stranger" not in violation.detail  # a link is never echoed
+        assert "task link not under a trusted link_prefix" in violation.detail
+
+
+def test_every_item_unroutable_is_reported_and_the_step_still_passes() -> None:
+    creates = [_link_create(GH + "stranger/a", 1), _link_create(GH + "other/b", 2)]
+    record = _task_run(creates, by_source=True, entry={"mode": "tasks", "link_prefix": [ORG_A]})
+    assert record.status == "ok", record.error
+    assert record.intents == []
+    (violation,) = record.violations
+    assert violation.kind == "intent_skipped"
+    assert "skipped all" in violation.detail
+    assert "#0, #1" in violation.detail
+
+
+def test_other_routing_failures_still_fail_the_step() -> None:
+    # Skipping is only for a link under no prefix: an unknown fingerprint is still fatal.
+    done = {"type": "task.update_status", "task": "calendar:nope", "status": "done"}
+    record = _task_run([done], by_source=True, entry={"mode": "tasks", "link_prefix": [ORG_A]})
+    assert record.status == "failed"
+    assert _error_kind(record, 0) == "intent_unrouted"
+
+
+def _two_entry_run(first: Any, second: Any, link: str) -> RunRecord:
+    plugins = _flow_plugins([])
+    plugins.add(_manifest("todo", TASKS, sinks=["todo.write", "todo.other"]))
+    plugins.add(_manifest("src", TASKS, sources=["src.read"]))
+    plugins.handlers["src.read"] = lambda p, i: ToolResult(
+        data=[{"id": FINGERPRINT}], intents=[_link_create(link)]
+    )
+    steps: list[dict[str, Any]] = [
+        {"collect": ["src.read"]},
+        {
+            "act": [
+                {"todo.write": {"mode": "tasks", "link_prefix": first}},
+                {"todo.other": {"mode": "tasks", "link_prefix": second}},
+            ]
+        },
+    ]
+    return _run(_pipeline(*steps), plugins)
+
+
+def test_overlapping_prefixes_the_longest_match_wins() -> None:
+    outer, inner = ORG_A, ORG_A + "app/"
+    for first, second in ((outer, inner), (inner, outer)):
+        record = _two_entry_run(first, second, inner + "pull/1")
+        assert record.status == "ok", record.error
+        assert record.intents[0].applied_by == ("todo.write" if first == inner else "todo.other")
+    # Outside the longer prefix only the shorter one matches.
+    record = _two_entry_run(outer, inner, outer + "elsewhere/pull/1")
+    assert record.intents[0].applied_by == "todo.write"
+    # An identical prefix in two entries stays ambiguous.
+    record = _two_entry_run([outer], outer, outer + "app/pull/1")
+    assert record.status == "failed"
+    assert _error_kind(record, 0) == "intent_ambiguous"
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        [],  # an empty list
+        [ORG_A, "http://github.com/org-b/"],  # one invalid item
+        [ORG_A, 7],
+        [ORG_A, "https://github.com/org-b"],  # no trailing /
+        ["obsidian://vault/Main/"],
+        [GH + f"org-{n}/" for n in range(33)],  # too many
+        {"a": ORG_A},
+    ],
+)
+def test_an_invalid_link_prefix_list_is_a_plan_error(prefix: Any) -> None:
+    record = _task_run([], entry={"mode": "tasks", "link_prefix": prefix})
+    assert record.status == "failed"
+    assert _error_kind(record, 2) == "params_invalid"
+    message = record.steps[2].error.message or ""  # type: ignore[union-attr]
+    assert "link_prefix" in message
+    assert "list of 1 to 32" in message
 
 
 def test_an_llm_task_link_must_come_from_the_input() -> None:
