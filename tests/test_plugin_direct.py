@@ -182,10 +182,30 @@ def test_a_malformed_direct_reference_is_a_usage_error(
     assert _nothing_installed(instance_dir)
 
 
-def test_pre_does_not_apply_to_a_direct_install(instance_dir: Path, repo: tuple[Path, str]) -> None:
-    code, out, _ = _add(instance_dir, f"{URL}@{repo[1]}", "--pre", "--json")
+@pytest.mark.parametrize("flag", ["--pre", "--offline"])
+def test_pre_and_offline_do_not_apply_to_a_direct_install(
+    instance_dir: Path, repo: tuple[Path, str], flag: str
+) -> None:
+    code, out, _ = _add(instance_dir, f"{URL}@{repo[1]}", flag, "--json")
     assert code == 2, out
-    assert "--pre" in _json(out)["error"]["message"]
+    error = _json(out)["error"]
+    assert error["kind"] == "usage"
+    assert flag in error["message"]
+    assert _nothing_installed(instance_dir)
+
+
+@pytest.mark.parametrize(
+    "ref",
+    [
+        f"https://git.example.test/a/plugin?token=s3cr3t-token@{SHA}",
+        f"https://git.example.test/a/plugin#s3cr3t-token@{SHA}",
+        f"https://git.example.test:8443/s3cr3t-token/plugin@{SHA}",
+    ],
+)
+def test_a_refused_url_is_never_repeated(ref: str) -> None:
+    with pytest.raises(InvalidReference, match="not an allowed git URL") as caught:
+        parse_direct(ref)
+    assert "s3cr3t" not in str(caught.value)
 
 
 def test_behind_the_gate_a_direct_install_is_approved_and_locked(
@@ -340,9 +360,67 @@ def test_install_commit_needs_no_tag_and_takes_the_name_from_the_manifest(tmp_pa
 
 def test_install_commit_refuses_a_sha_that_is_not_in_the_repository(tmp_path: Path) -> None:
     source, _ = plugin_repo(tmp_path / "src", tag=None)
-    with pytest.raises(InstallError, match="cannot fetch commit"):
+    with pytest.raises(InstallRefused, match="not reachable from a branch or tag"):
         _installer(tmp_path, source).install_commit(URL, SHA)
     assert _left(tmp_path / "plugins") == []
+
+
+def _unreachable_commit(source: Path) -> str:
+    """A commit in the object store of `source` that no branch or tag reaches, kept alive by
+    a pull-request ref only: what a forge serves for a fork's commit through the parent URL."""
+    stray = plugin_repo(source, version="6.6.6", tag=None, files={"evil.py": "x = 1\n"})[1]
+    git(source, "update-ref", "refs/pull/1/head", stray)
+    git(source, "reset", "-q", "--hard", "HEAD~1")
+    return stray
+
+
+def test_a_commit_no_branch_or_tag_reaches_is_refused(tmp_path: Path) -> None:
+    """Security review of #171: a fork's commit, served through the trusted repository's URL,
+    must never install under that repository's name."""
+    source, _ = plugin_repo(tmp_path / "src", tag=None)
+    stray = _unreachable_commit(source)
+    assert git(source, "cat-file", "-t", stray) == "commit"  # in the object store
+    with pytest.raises(InstallRefused, match="not reachable from a branch or tag"):
+        _installer(tmp_path, source).install_commit(URL, stray)
+    assert _left(tmp_path / "plugins") == []
+
+
+@pytest.mark.parametrize("kind", ["branch", "tag", "annotated-tag"])
+def test_a_commit_a_branch_or_tag_reaches_is_installed(tmp_path: Path, kind: str) -> None:
+    source, _ = plugin_repo(tmp_path / "src", tag=None)
+    stray = _unreachable_commit(source)
+    if kind == "branch":
+        git(source, "branch", "feature", stray)
+    elif kind == "tag":
+        git(source, "tag", "keep", stray)
+    else:
+        git(source, "tag", "-a", "keep", "-m", "keep", stray)
+    installed = _installer(tmp_path, source).install_commit(URL, stray)
+    assert (installed.commit, installed.version) == (stray, "6.6.6")
+
+
+def test_a_commit_beyond_the_reach_depth_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, first = plugin_repo(tmp_path / "src", tag=None)
+    for n in range(3):
+        plugin_repo(source, tag=None, files={f"f{n}.txt": "x\n"})
+    monkeypatch.setattr(install_module, "MAX_REACH_DEPTH", 2)
+    with pytest.raises(InstallRefused, match="within 2 commits"):
+        _installer(tmp_path, source).install_commit(URL, first)
+    monkeypatch.setattr(install_module, "MAX_REACH_DEPTH", 10)
+    assert _installer(tmp_path, source).install_commit(URL, first).commit == first
+
+
+def test_too_many_branches_and_tags_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, sha = plugin_repo(tmp_path / "src", tag=None)
+    for n in range(3):
+        git(source, "tag", f"t{n}")
+    monkeypatch.setattr(install_module, "MAX_DIRECT_REFS", 3)
+    with pytest.raises(InstallRefused, match="more than 3 branches and tags"):
+        _installer(tmp_path, source).install_commit(URL, sha)
 
 
 @pytest.mark.parametrize("sha", ["abc", SHA[:12], SHA.upper(), "v1.0.0"])
@@ -372,7 +450,7 @@ def test_install_commit_refuses_non_https_urls_before_running_git(
         PluginInstaller(tmp_path / "plugins").install_commit(url, SHA)
 
 
-def test_install_commit_fetches_over_https_only_with_the_url_after_dashes(
+def test_install_commit_fetches_only_branches_and_tags_over_https(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     seen: list[tuple[tuple[str, ...], str]] = []
@@ -380,16 +458,28 @@ def test_install_commit_fetches_over_https_only_with_the_url_after_dashes(
 
     def spy(cwd: Path, *args: str, **kwargs: Any) -> str:
         seen.append((args, kwargs["allow"]))
+        if args[0] == "ls-remote":
+            return (
+                f"{SHA}\trefs/heads/main\n{SHA}\trefs/tags/v1.0.0\n"
+                f"{SHA}\trefs/pull/7/head\n{SHA}\trefs/heads/odd name\n"
+            )
         if args[0] == "fetch":
             raise git_module.GitError("offline")
         return real(cwd, *args, **kwargs)
 
     monkeypatch.setattr(install_module, "run_git", spy)
-    with pytest.raises(InstallError, match="cannot fetch commit"):
+    with pytest.raises(InstallError, match="cannot fetch the branches and tags"):
         PluginInstaller(tmp_path / "plugins").install_commit(URL, SHA)
+    listing = next(args for args, _ in seen if args[0] == "ls-remote")
     fetch = next(args for args, _ in seen if args[0] == "fetch")
     assert {allow for _, allow in seen} == {"https"}
-    assert fetch[fetch.index("--") + 1 :] == (URL, SHA)
+    assert listing[listing.index("--") + 1 :] == (URL, "refs/heads/*", "refs/tags/*")
+    # Never the SHA itself, never a pull-request ref: only the repository's own tips.
+    assert fetch[fetch.index("--") + 1 :] == (
+        URL,
+        "+refs/heads/main:refs/heads/main",
+        "+refs/tags/v1.0.0:refs/tags/v1.0.0",
+    )
     assert "--no-recurse-submodules" in fetch
     assert "--no-tags" in fetch
     assert _left(tmp_path / "plugins") == []

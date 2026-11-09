@@ -16,8 +16,9 @@ before the venv is built, so a refused plugin's dependencies are never installed
 
 A direct install (a git URL pinned to a full commit SHA, `horae.marketplace.direct`) reads no
 marketplace and has no tier: before M5 it is refused before anything is fetched
-(`require_installable`, docs/security.md T04). Behind that gate it fetches the one commit
-(`PluginInstaller.install_commit`, the same hardening) and goes through the same approval, venv
+(`require_installable`, docs/security.md T04). Behind that gate it installs the commit only
+when the repository's own branches or tags reach it (`PluginInstaller.install_commit`, the
+same hardening) and goes through the same approval, venv
 and `horae.lock` entry (its repo and commit), with `--yes` only for an identical entry.
 
 Exit codes (`horae.cli_output`): 0 ok; 1 configuration problem, an index that cannot be
@@ -397,8 +398,12 @@ def _add(
         grants = parse_grants(allow_host, allow_local)
         if direct:
             repo, sha = parse_direct(ref)
-            if pre:
-                raise InvalidReference("--pre applies to marketplace names, not to a git URL")
+            if pre or offline:
+                flag = "--pre" if pre else "--offline"
+                raise InvalidReference(
+                    f"{flag} applies to marketplace names, not to a git URL (a direct install "
+                    "reads no marketplace and must fetch the repository)"
+                )
     except MarketplaceError as exc:
         raise _failed(exc) from None
     if direct:
@@ -566,8 +571,8 @@ def add_command(
     dependencies are installed in its own venv.
 
     A direct install, https://HOST/OWNER/REPO@SHA with the full commit SHA (no tag, branch or
-    short SHA; no credentials, http, ssh or file URL), reads no marketplace and is refused
-    before M5 (no tier).
+    short SHA; no credentials, http, ssh or file URL), reads no marketplace (so --pre and
+    --offline do not apply) and is refused before M5 (no tier).
 
     Exit codes: 0 installed and approved, 1 configuration problem, unreachable marketplace
     without cache, a repository that cannot be fetched, or an invalid horae.lock, 2 malformed

@@ -3,8 +3,10 @@
 
 `PluginInstaller.install(name, version, repo, sha)` is the whole install: the marketplace
 resolves a name to `(repo, sha)` first (`horae plugin add`). A direct install from a git URL
-(#48) calls `install_commit(repo, sha)`: the same steps, but only the commit is fetched (by its
-full SHA, no tag), and the name and version are those of its `plugin.yaml`. A repository is
+(#48) calls `install_commit(repo, sha)`: the same steps, but no tag is checked: the repository's
+own branches and tags are fetched and the full SHA must be reachable from one of them (never
+from a fork's objects a forge serves through the same URL); the name and version are those of
+its `plugin.yaml`. A repository is
 untrusted, so:
 
 - **git** is the marketplace's hardened runner (`horae.marketplace.git`): `https` only, no
@@ -47,6 +49,7 @@ import errno
 import json
 import os
 import posixpath
+import re
 import shutil
 import tempfile
 import time
@@ -77,6 +80,14 @@ MAX_LINK_BYTES = 4096
 MAX_DEPTH = 32
 MAX_PATH_CHARS = 1024
 MAX_PROBLEMS = 3
+MAX_DIRECT_REFS = 1000
+"""A direct install (#48): at most this many branches and tags are fetched to prove the
+commit is the repository's own."""
+MAX_REACH_DEPTH = 1000
+"""A direct install: how many commits of each branch and tag are fetched; a commit further
+from every tip cannot be proven reachable and is refused."""
+_REACH_PATTERNS = ("refs/heads/*", "refs/tags/*")
+_TIP_REF = re.compile(r"^refs/(heads|tags)/[A-Za-z0-9._/-]{1,200}$")
 _CHECKOUT_OPTIONS = ("core.symlinks=false", "core.protectHFS=true", "core.protectNTFS=true")
 
 _name: TypeAdapter[str] = TypeAdapter(PluginName)
@@ -194,8 +205,9 @@ class PluginInstaller:
         return self._install(repo, sha, (name, version), prepare)
 
     def install_commit(self, repo: str, sha: str, *, prepare: Prepare | None = None) -> Installed:
-        """A direct install from a git URL (#48): fetch the commit `sha` of `repo` only (no
-        tag is fetched or checked: the full SHA is the pin) and install its tree as
+        """A direct install from a git URL (#48): fetch the branches and tags of `repo`, require
+        the commit `sha` to be reachable from one of them (no tag is compared: the full SHA is
+        the pin) and install its tree as
         `plugins/<name>`, the name and version being those of its `plugin.yaml`. The same
         limits and checks as `install`; the name is checked against `plugins/` once the
         manifest is read, before `prepare` runs."""
@@ -232,8 +244,6 @@ class PluginInstaller:
             git_dir, tree = scratch / "repo.git", scratch / "tree"
             if expected is None:
                 self._fetch_commit(scratch, git_dir, repo, sha)
-                if self._commit_of(git_dir, sha) != sha:
-                    raise InstallRefused(f"commit {sha} is not a commit of the repository")
             else:
                 self._fetch(scratch, git_dir, repo, expected[1], sha)
                 self._verify(git_dir, expected[1], sha)
@@ -345,34 +355,79 @@ class PluginInstaller:
             raise InstallRefused(f"{repo} at {sha} is {fetched} bytes, more than {MAX_FETCH_BYTES}")
 
     def _fetch_commit(self, scratch: Path, git_dir: Path, repo: str, sha: str) -> None:
-        """A direct install (#48): an empty bare repository, then the one commit `sha`
-        fetched by its id (shallow, no tag, no submodule), within the same byte budget."""
+        """A direct install (#48): fetch the repository's own branches and tags, never the
+        commit by its id, and require `sha` to be reachable from one of them.
+
+        A forge may serve, through a repository's URL, objects that exist only in a fork (or
+        in a pull request's `refs/pull/*`): fetching `sha` directly would then install a
+        fork's code under the trusted repository's name. So `git ls-remote` lists the tips of
+        `refs/heads/*` and `refs/tags/*` (at most `MAX_DIRECT_REFS`), those refs alone are
+        fetched (shallow, `MAX_REACH_DEPTH` commits, the same byte budget and hardening), and
+        `merge-base --is-ancestor <sha> <tip>` must hold for one of them. Anything that cannot
+        be proven reachable is refused."""
         url = self.remote(repo)
         try:
             self._git(scratch, "init", "--bare", "--quiet", str(git_dir))
         except GitError as exc:
             raise InstallError(f"cannot create a repository: {exc}") from None
         try:
+            listing = self._git(scratch, "ls-remote", "--refs", "--", url, *_REACH_PATTERNS)
+        except GitError as exc:
+            raise InstallError(f"cannot list the branches and tags of {repo}: {exc}") from None
+        refs = sorted(
+            {
+                ref
+                for line in listing.splitlines()
+                for _oid, _, ref in [line.partition("\t")]
+                if _TIP_REF.match(ref)
+            }
+        )
+        if not refs:
+            raise InstallRefused(f"{repo} has no branch or tag to prove that {sha} is its own")
+        if len(refs) > MAX_DIRECT_REFS:
+            raise InstallRefused(
+                f"{repo} has more than {MAX_DIRECT_REFS} branches and tags: cannot check "
+                f"that {sha} is reachable from them"
+            )
+        try:
             self._git(
                 git_dir,
                 "fetch",
                 "--quiet",
-                "--depth=1",
+                "--force",
+                f"--depth={MAX_REACH_DEPTH}",
                 "--no-tags",
                 "--no-recurse-submodules",
                 "--no-write-fetch-head",
                 "--",
                 url,
-                sha,
+                *(f"+{ref}:{ref}" for ref in refs),
                 watch=scratch,
             )
         except GitTooLarge:
-            raise InstallRefused(f"{repo} at {sha} is more than {MAX_FETCH_BYTES} bytes") from None
+            raise InstallRefused(
+                f"the branches and tags of {repo} are more than {MAX_FETCH_BYTES} bytes"
+            ) from None
         except GitError as exc:
-            raise InstallError(f"cannot fetch commit {sha} from {repo}: {exc}") from None
+            raise InstallError(f"cannot fetch the branches and tags of {repo}: {exc}") from None
         fetched = self._fetched_bytes(git_dir)
         if fetched > MAX_FETCH_BYTES:
-            raise InstallRefused(f"{repo} at {sha} is {fetched} bytes, more than {MAX_FETCH_BYTES}")
+            raise InstallRefused(f"{repo} is {fetched} bytes, more than {MAX_FETCH_BYTES}")
+        if self._commit_of(git_dir, sha) != sha or not any(
+            self._is_ancestor(git_dir, sha, ref) for ref in refs
+        ):
+            raise InstallRefused(
+                f"commit {sha} is not reachable from a branch or tag of {repo} (within "
+                f"{MAX_REACH_DEPTH} commits of its tip): refusing (a commit of a fork or a "
+                "pull request is not the repository's own)"
+            )
+
+    def _is_ancestor(self, git_dir: Path, sha: str, ref: str) -> bool:
+        try:
+            self._git(git_dir, "merge-base", "--is-ancestor", sha, f"{ref}^{{commit}}")
+        except GitError:
+            return False
+        return True
 
     def _fetched_bytes(self, git_dir: Path) -> int:
         try:

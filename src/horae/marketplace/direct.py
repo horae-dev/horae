@@ -6,8 +6,8 @@ commit. A URL is recognised by a `:` or a `/`, which a plugin name never holds, 
 
 - **https** only: `http://`, `file://`, `ssh://`, `git://`, `ext::` and the scp form
   (`git@host:owner/repo`) are refused;
-- **without credentials**: user info (`https://user[:token]@host/...`) is refused, and the
-  message never repeats the URL, so a token typed by mistake is not echoed;
+- **without credentials**: user info (`https://user[:token]@host/...`) is refused. No error
+  repeats the URL (a token may sit in its user info, query or fragment);
 - a `GitRepoUrl` (the contract `horae.lock` stores): a DNS host name (no port, no IP literal,
   no `localhost`), path segments of `A-Z a-z 0-9 . _ -`, none `.` or `..`, no query or
   fragment;
@@ -61,8 +61,9 @@ def parse_direct(ref: str) -> tuple[str, str]:
         _repo.validate_python(repo)
     except ValidationError:
         raise InvalidReference(
-            f"{repo!r} is not an allowed git URL: https, a DNS host name (no port, IP address "
-            "or localhost), path segments of letters, digits, '.', '_' and '-', no query"
+            "not an allowed git URL (the URL is not repeated here): https, a DNS host name (no "
+            "port, IP address or localhost), path segments of letters, digits, '.', '_' and "
+            "'-', no query or fragment"
         ) from None
     return repo, sha
 
