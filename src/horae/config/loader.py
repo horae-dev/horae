@@ -13,7 +13,14 @@ from pathlib import Path
 from pydantic import BaseModel
 
 from horae.config.cron import cron_problem
-from horae.config.documents import Problem, ProblemsError, YamlDocument, read_yaml, validate
+from horae.config.documents import (
+    Problem,
+    ProblemsError,
+    YamlDocument,
+    parse_yaml,
+    read_yaml,
+    validate,
+)
 from horae.config.schedule import ModeError, scheduler_mode
 from horae.contracts.instance import (
     InstanceConfig,
@@ -179,9 +186,12 @@ class _Loaded:
     lock_invalid: bool = False
     pipelines: dict[str, tuple[Pipeline, YamlDocument]] = field(default_factory=dict)
 
-    def load[M: BaseModel](self, path: Path, model: type[M]) -> tuple[M, YamlDocument] | None:
+    def load[M: BaseModel](
+        self, path: Path, model: type[M], raw: bytes | None = None
+    ) -> tuple[M, YamlDocument] | None:
+        """Load `path`, or parse `raw` (bytes already read and verified) as if it were."""
         try:
-            doc = read_yaml(path)
+            doc = read_yaml(path) if raw is None else _parse_bytes(raw, path)
             return validate(doc, model), doc
         except ProblemsError as exc:
             self.problems.extend(exc.problems)
@@ -265,25 +275,34 @@ def sha256_bytes(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
-def _pack_pipeline_active(state: "_Loaded", path: Path) -> bool:
-    """Whether the pipeline file `pipelines/<pack>/<name>.yaml` may run (decision 71): its pack
+def _parse_bytes(raw: bytes, path: Path) -> YamlDocument:
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ProblemsError([Problem(str(path), None, None, "not valid UTF-8")]) from None
+    return parse_yaml(text, path)
+
+
+def _pack_pipeline_bytes(state: "_Loaded", path: Path) -> bytes | None:
+    """The bytes of the pipeline file `pipelines/<pack>/<name>.yaml` may run (decision 71): its pack
     is listed under `plugins:` in horae.yaml and has an entry in horae.lock, and the file is
     the one the lock approved (same SHA-256). A pack that is not enabled is skipped without a
     word (removing it from `plugins:` deactivates its pipelines); a file that is not the
-    approved one is a problem."""
+    approved one is a problem. The bytes returned are the ones hashed: the caller parses them,
+    never the file again, so a swap after the check is not loaded."""
     pack = path.parent.name
     if state.config is None or state.lock is None or pack not in state.config.plugins:
-        return False
+        return None
     entry = state.lock.plugins.get(pack)
     if entry is None:
-        return False
+        return None
     approved = entry.pipelines.get(path.stem)
     try:
         with path.open("rb") as handle:
             raw = handle.read(MAX_PACK_PIPELINE_BYTES + 1)
     except OSError as exc:
         state.problems.append(Problem(str(path), None, None, f"cannot be read ({exc.strerror})"))
-        return False
+        return None
     if approved is None or len(raw) > MAX_PACK_PIPELINE_BYTES or sha256_bytes(raw) != approved:
         state.problems.append(
             Problem(
@@ -294,8 +313,8 @@ def _pack_pipeline_active(state: "_Loaded", path: Path) -> bool:
                 "or remove the file",
             )
         )
-        return False
-    return True
+        return None
+    return raw
 
 
 def _load(root: Path) -> _Loaded:
@@ -311,9 +330,10 @@ def _load(root: Path) -> _Loaded:
             state.lock_invalid = True
 
     for path in _pipeline_files(state, root / PIPELINES_DIR):
-        if path.parent.name != PIPELINES_DIR and not _pack_pipeline_active(state, path):
+        raw: bytes | None = None
+        if path.parent.name != PIPELINES_DIR and (raw := _pack_pipeline_bytes(state, path)) is None:
             continue
-        if (loaded_pipeline := state.load(path, Pipeline)) is None:
+        if (loaded_pipeline := state.load(path, Pipeline, raw)) is None:
             continue
         pipeline, doc = loaded_pipeline
         if pipeline.name != path.stem:

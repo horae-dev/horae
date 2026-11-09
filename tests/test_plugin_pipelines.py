@@ -14,7 +14,7 @@ from typer.testing import CliRunner
 
 from horae import cli_plugin
 from horae.cli import app
-from horae.config import InstanceError, load_instance
+from horae.config import InstanceError, load_instance, loader
 from horae.contracts.lockfile import LockedPlugin
 from horae.marketplace import approval
 from horae.marketplace.approval import lock_mismatch
@@ -420,3 +420,26 @@ def test_a_pipeline_edited_after_approval_is_refused_by_the_loader(
     edited.write_text(edited.read_text(encoding="utf-8") + "# edited\n", encoding="utf-8")
     with pytest.raises(InstanceError, match="approves"):
         load_instance(inst)
+
+
+def test_a_file_swapped_after_the_hash_check_is_not_loaded(
+    inst: Path, pack: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pack["publish"](_manifest(["weekly-review", "nightly-check"]), GOOD)
+    assert _add(inst)[0] == 0
+    _enable(inst)
+    target = inst / "pipelines" / "demo-pack" / "weekly-review.yaml"
+    real = loader.sha256_bytes
+    swapped = PIPELINE.format(name="weekly-review").replace("*/10", "*/1")
+
+    def swap_after_check(raw: bytes) -> str:
+        digest = real(raw)
+        if b"name: weekly-review" in raw:
+            target.write_text(swapped, encoding="utf-8")  # replaced once it has been hashed
+        return digest
+
+    monkeypatch.setattr(loader, "sha256_bytes", swap_after_check)
+    pipeline = load_instance(inst).pipelines["weekly-review"]
+    assert pipeline.trigger is not None
+    assert pipeline.trigger.cron == "*/10 * * * *"  # the verified bytes, not the swapped file
+    assert target.read_text(encoding="utf-8") == swapped
