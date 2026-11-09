@@ -16,9 +16,12 @@ from horae import cli_plugin
 from horae.cli import app
 from horae.config import InstanceError, load_instance, loader
 from horae.contracts.lockfile import LockedPlugin
+from horae.contracts.plugin import PluginManifest
 from horae.marketplace import approval
 from horae.marketplace.approval import lock_mismatch
+from horae.marketplace.errors import InstallRefused
 from horae.marketplace.install import INSTALL_RECORD
+from horae.marketplace.pipelines import PackPipelines
 from marketplace_fixtures import (
     PLUGIN_URL,
     A,
@@ -443,3 +446,66 @@ def test_a_file_swapped_after_the_hash_check_is_not_loaded(
     assert pipeline.trigger is not None
     assert pipeline.trigger.cron == "*/10 * * * *"  # the verified bytes, not the swapped file
     assert target.read_text(encoding="utf-8") == swapped
+
+
+# --- review fixes: structure not names, params in the prompt, old locks ---------------------
+
+
+def test_a_plugin_named_pipelines_is_refused(inst: Path, tmp_path: Path) -> None:
+    data = json.loads(_manifest(["weekly-review"]))
+    data["name"] = "pipelines"
+    tree = tmp_path / "tree"
+    (tree / "pipelines").mkdir(parents=True)
+    (tree / "pipelines" / "weekly-review.yaml").write_text(
+        PIPELINE.format(name="weekly-review"), encoding="utf-8"
+    )
+    with pytest.raises(InstallRefused, match="reserved plugin name"):
+        PackPipelines(inst)(tree, PluginManifest.model_validate(data))
+    assert not (inst / "pipelines" / "pipelines").exists()
+
+
+def test_a_directory_named_pipelines_gets_every_gate(inst: Path) -> None:
+    sneaky = inst / "pipelines" / "pipelines"
+    sneaky.mkdir()
+    (sneaky / "ghost.yaml").write_text(PIPELINE.format(name="ghost"), encoding="utf-8")
+    assert "ghost" not in load_instance(inst).pipelines  # not enabled, not locked: skipped
+    config = inst / "horae.yaml"
+    text = config.read_text(encoding="utf-8")
+    config.write_text(text.replace("plugins:\n", "plugins:\n  pipelines: {}\n", 1), "utf-8")
+    with pytest.raises(InstanceError, match="not installed"):
+        load_instance(inst)
+
+
+def test_the_prompt_shows_call_parameters_model_and_budget(
+    inst: Path, pack: dict[str, Any]
+) -> None:
+    text = (
+        "name: weekly-review\n"
+        "steps:\n"
+        "  - llm:\n      skill: demo-pack/word\n      model: cloud\n"
+        "      budget: { usd: 0.05, tokens_out: 900 }\n"
+        "  - act:\n"
+        "      - demo.write: { path: 'Daily/{{date}}.md', mode: replace-owned }\n"
+        "  - notify:\n"
+        "      - demo.push: { topic: alerts, link_prefix: 'https://example.org/' }\n"
+    )
+    pack["publish"](_manifest(["weekly-review"]), {"pipelines/weekly-review.yaml": text})
+    code, out = _add(inst)
+    assert code == 0, out
+    assert "llm demo-pack/word model=cloud budget=$0.05/900 tokens out" in out
+    assert '"mode": "replace-owned"' in out
+    assert '"path": "Daily/{{date}}.md"' in out
+    assert '"topic": "alerts"' in out
+    assert '"link_prefix": "https://example.org/"' in out
+
+
+def test_a_directory_whose_lock_entry_approves_no_pipeline_is_ignored(
+    inst: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    old = inst / "pipelines" / "github"
+    old.mkdir()
+    (old / "stray.yaml").write_text(PIPELINE.format(name="stray"), encoding="utf-8")
+    with caplog.at_level("WARNING", logger="horae.config"):
+        loaded = load_instance(inst)  # `github` is enabled and locked, with no pipelines
+    assert "stray" not in loaded.pipelines
+    assert any("approves no pipeline" in r.message for r in caplog.records)

@@ -4117,10 +4117,10 @@ loosened later without breaking a valid file.
 
 ### Provisional decisions (#133, pending maintainer review)
 
-71. **A pipeline pack's pipelines are installed by `horae plugin add` into
+72. **A pipeline pack's pipelines are installed by `horae plugin add` into
     `pipelines/<plugin>/`, approved with the plugin and pinned in `horae.lock` (#133).**
-    One additive schema change: `lockfile/v1.json` gains `plugins.<name>.pipelines` (G). (The number is provisional: #48 may take
-    one too.)
+    One additive schema change: `lockfile/v1.json` gains `plugins.<name>.pipelines` (G). (The
+    number is provisional: #48 took 71.)
     - **A, where.** `<instance>/pipelines/<plugin>/<pipeline>.yaml`, one directory per pack.
       The instance loader (`horae.config.loader`) reads `pipelines/*.yaml` as before and now
       also `pipelines/<dir>/*.yaml`, one level down; a directory whose name starts with `.` or
@@ -4172,3 +4172,12 @@ loosened later without breaking a valid file.
       `warning: calls plugins other than <pack> (<namespaces>)` line; those tools run with the
       permissions of the plugins that provide them, which `horae.lock` already pins. A pack
       dependency list is a possible follow-up.
+    - **J, review fixes.** A pack is recognised by structure, never by name: the loader treats a
+      file as a pack's when its directory is not `<instance>/pipelines` itself, so a plugin named
+      `pipelines` (installed to `pipelines/pipelines/`) gets every gate; the name `pipelines` is
+      also refused at install. A `pipelines/<dir>` is a pack's only if the lock entry of that
+      plugin has a non-empty `pipelines` map; otherwise the directory is ignored (as before this
+      decision, so an instance upgraded from an older lock keeps working) with a logged warning.
+      The prompt also prints each call's parameters (act and notify targets: `path`, `mode`,
+      `url`, `link_prefix`, `topic`...; at most 160 characters each) and each `llm` step's model
+      and budget.

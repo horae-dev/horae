@@ -3,6 +3,7 @@
 
 import functools
 import hashlib
+import logging
 import os
 import stat
 import zoneinfo
@@ -40,6 +41,8 @@ from horae.secrets import (
     SecretResolver,
     redact,
 )
+
+_log = logging.getLogger("horae.config")
 
 CONFIG_FILE = "horae.yaml"
 LOCK_FILE = "horae.lock"
@@ -220,7 +223,7 @@ def _timezone_exists(name: str) -> bool:
 
 def _pipeline_files(state: "_Loaded", directory: Path, *, nested: bool = True) -> list[Path]:
     """The pipeline files in `directory`, and (`nested`) in each pack directory
-    `directory/<pack>/` one level down (decision 71); unreadable or non-regular entries are
+    `directory/<pack>/` one level down (decision 72); unreadable or non-regular entries are
     problems."""
     try:
         info = os.stat(directory)
@@ -284,7 +287,7 @@ def _parse_bytes(raw: bytes, path: Path) -> YamlDocument:
 
 
 def _pack_pipeline_bytes(state: "_Loaded", path: Path) -> bytes | None:
-    """The bytes of the pipeline file `pipelines/<pack>/<name>.yaml` may run (decision 71): its pack
+    """The bytes of the pipeline file `pipelines/<pack>/<name>.yaml` may run (decision 72): its pack
     is listed under `plugins:` in horae.yaml and has an entry in horae.lock, and the file is
     the one the lock approved (same SHA-256). A pack that is not enabled is skipped without a
     word (removing it from `plugins:` deactivates its pipelines); a file that is not the
@@ -295,6 +298,15 @@ def _pack_pipeline_bytes(state: "_Loaded", path: Path) -> bytes | None:
         return None
     entry = state.lock.plugins.get(pack)
     if entry is None:
+        return None
+    if not entry.pipelines:
+        # Locked before decision 72 (or not a pack): ignored, as such a directory always was.
+        _log.warning(
+            "ignoring %s: the %s entry of %s approves no pipeline (reinstall the plugin)",
+            path,
+            pack,
+            LOCK_FILE,
+        )
         return None
     approved = entry.pipelines.get(path.stem)
     try:
@@ -331,7 +343,12 @@ def _load(root: Path) -> _Loaded:
 
     for path in _pipeline_files(state, root / PIPELINES_DIR):
         raw: bytes | None = None
-        if path.parent.name != PIPELINES_DIR and (raw := _pack_pipeline_bytes(state, path)) is None:
+        # A pack's file is any file below a directory other than `pipelines/` itself: decided by
+        # structure, never by a plugin's name.
+        if (
+            path.parent != root / PIPELINES_DIR
+            and (raw := _pack_pipeline_bytes(state, path)) is None
+        ):
             continue
         if (loaded_pipeline := state.load(path, Pipeline, raw)) is None:
             continue

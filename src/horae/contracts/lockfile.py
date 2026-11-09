@@ -97,7 +97,7 @@ class LockedPlugin(Contract):
     pipelines: Annotated[dict[PipelineName, Sha256Hex], Field(max_length=MAX_ITEMS)] = Field(
         default_factory=dict
     )
-    """For a pipeline pack (decision 71): the pipelines `horae plugin add` installed from it, by
+    """For a pipeline pack (decision 72): the pipelines `horae plugin add` installed from it, by
     name, each with the SHA-256 of the file as approved. The approval prompt showed them; the
     loader (`horae.config.loader`) runs a pack's pipeline only if its file still has this
     digest, and `--yes` refuses a pack whose pipelines differ. Left out when empty (names

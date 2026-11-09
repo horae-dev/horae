@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Install a pipeline pack's pipelines into the instance (#133, schemas decision 71).
+"""Install a pipeline pack's pipelines into the instance (#133, schemas decision 72).
 
 A plugin whose manifest lists `provides.pipelines` is a pipeline pack: its tree holds one
 `pipelines/<name>.yaml` per listed pipeline. `horae plugin add` copies them to
@@ -119,6 +119,31 @@ def tools_and_skills(pipeline: Pipeline) -> tuple[list[str], list[str]]:
     return sorted(tools), sorted(skills)
 
 
+MAX_PARAMS_SHOWN = 160
+
+
+def _calls(pipeline: Pipeline) -> list[str]:
+    """One line per step element, with parameters: `act obsidian.write_note {...}`; an `llm`
+    step shows its skill, model and budget."""
+    lines: list[str] = []
+    for step in pipeline.steps:
+        if isinstance(step, LlmStep):
+            spec = step.llm
+            lines.append(
+                f"llm {spec.skill} model={spec.model} "
+                f"budget=${spec.budget.usd}/{spec.budget.tokens_out} tokens out"
+            )
+            continue
+        kind = next(iter(type(step).model_fields))
+        for call in getattr(step, kind):
+            ref, params, _ = call_parts(call)
+            shown = json.dumps(params, sort_keys=True, default=str, ensure_ascii=True)
+            if len(shown) > MAX_PARAMS_SHOWN:
+                shown = shown[: MAX_PARAMS_SHOWN - 3] + "..."
+            lines.append(f"{kind} {ref}" + (f" {shown}" if params else ""))
+    return lines
+
+
 def _summary(plugin: str, pipeline: Pipeline) -> list[str]:
     trigger = pipeline.trigger
     if trigger is None:
@@ -131,6 +156,8 @@ def _summary(plugin: str, pipeline: Pipeline) -> list[str]:
     lines.append(f"    tools: {', '.join(tools) or 'none'}")
     if skills:
         lines.append(f"    skills: {', '.join(skills)}")
+    lines.append("    steps:")
+    lines.extend(f"      {call}" for call in _calls(pipeline))
     foreign = sorted({t.split(".", 1)[0] for t in tools} - {plugin})
     foreign += sorted({s.split("/", 1)[0] for s in skills} - {plugin} - set(foreign))
     if foreign:
@@ -195,6 +222,10 @@ class PackPipelines:
 
     def __call__(self, tree: Path, manifest: PluginManifest) -> None:
         plugin = manifest.name
+        if plugin == PIPELINES_DIR:
+            raise InstallRefused(
+                f"{plugin!r} is a reserved plugin name (the instance's pipelines/)"
+            )
         declared = list(manifest.provides.pipelines)
         found = self._listing(plugin, tree)
         if set(declared) != set(found):

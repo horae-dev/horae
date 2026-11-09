@@ -13,7 +13,7 @@ for and, once the user approves them, writes its entry to `horae.lock`
 (`horae.marketplace.approval` and `horae.marketplace.lock`, decision 70). Approval runs
 before the venv is built, so a refused plugin's dependencies are never installed. A pipeline
 pack's `pipelines/*.yaml` are then validated and copied to `<instance>/pipelines/<name>/`
-(`horae.marketplace.pipelines`, decision 71); any invalid file refuses the whole install.
+(`horae.marketplace.pipelines`, decision 72); any invalid file refuses the whole install.
 
 Exit codes (`horae.cli_output`): 0 ok; 1 configuration problem, an index that cannot be
 fetched and has no cache, or a plugin that cannot be fetched; 2 usage error (a malformed

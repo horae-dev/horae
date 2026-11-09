@@ -72,7 +72,7 @@ file is invalid, is a symlink, or would replace a file or pipeline of yours. The
 prompt lists each pipeline (trigger, tools, skills; a warning for tools of other plugins) and
 `horae.lock` pins their digests; they run only once the plugin is listed under `plugins:` in
 `horae.yaml`
-([schemas decision 71](schemas/README.md#provisional-decisions-133-pending-maintainer-review)).
+([schemas decision 72](schemas/README.md#provisional-decisions-133-pending-maintainer-review)).
 
 `-i` defaults to the current directory (or `HORAE_INSTANCE`). Every command takes `--json`
 for scripting (one JSON document on stdout, `schema_version: 1`, errors too) and prints no
