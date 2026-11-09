@@ -13,7 +13,7 @@ from horae import cli_plugin, cli_plugin_manage
 from horae.contracts.lockfile import LockedPlugin
 from horae.contracts.plugin import PluginManifest
 from horae.marketplace import InstallError, approval
-from horae.marketplace.upgrade import permission_diff, user_grants, widens
+from horae.marketplace.upgrade import Swap, permission_diff, user_grants, widens
 from marketplace_fixtures import PLUGIN_URL
 from upgrade_fixtures import (
     PERMISSIONS,
@@ -223,7 +223,8 @@ def test_a_new_grant_at_upgrade_needs_approval(inst: Path, market: Market) -> No
     assert code == 3, out
     code, out, _ = cli(inst, "upgrade", "demo", "--allow-host", "x.example.org", answer="y\n")
     assert code == 0, out
-    assert "x.example.org" in lock(inst)["plugins"]["demo"]["permissions"]["network"]
+    network = lock(inst)["plugins"]["demo"]["permissions"]["network"]
+    assert network == ["api.example.org", "x.example.org"]
 
 
 # --- versions ----------------------------------------------------------------------------------
@@ -406,14 +407,14 @@ def test_a_failed_swap_leaves_the_old_tree(
     add(inst)
     market.release("1.1.0", manifest("1.1.0"))
     before = snapshot(inst)
-    real = cli_plugin_manage.Swap.move
+    real = Swap.move
 
-    def move(self: cli_plugin_manage.Swap, source: Path, target: Path) -> None:
+    def move(self: Swap, source: Path, target: Path) -> None:
         if source.name.startswith(".upgrade-new-"):
             raise OSError(5, "Input/output error")
         real(self, source, target)
 
-    monkeypatch.setattr(cli_plugin_manage.Swap, "move", move)
+    monkeypatch.setattr(Swap, "move", move)
     code, _, _ = cli(inst, "upgrade", "demo", "--yes", "--json")
     assert code == 1
     assert snapshot(inst) == before
