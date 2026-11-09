@@ -3370,3 +3370,56 @@ loosened later without breaking a valid file.
       `adopted` (and not `dismissed`), which indexes the task as `todo` if unknown.
     - **C, compatibility.** `TaskChange.action` gains `existing` and `update`; without
       `known_task` every `task.create` stays `create`.
+
+### Provisional decisions (#139, pending maintainer review)
+
+59. **`horae undo` reverts task status changes; `Sink.restore` takes an optional `force`
+    (#139).** No schema change (the journal's `before` and `after` columns hold the two
+    blobs); the sink operation list gains `restore_status`.
+    - **A, what is journalled.** A `task.update_status` journal entry starts not undoable. Its
+      `before` is the task index entry it replaces (`TaskEntry` as JSON; none for a task the
+      index does not know), taken before the sink is called. When the sink's answer says
+      `details.changed: true` (and the details are JSON of at most 64 KiB) the entry is
+      marked applied with the details as its `after` and becomes undoable, in the same
+      transaction. Any other answer (`changed: false`, no details, a recurring task) leaves it
+      as before: not undoable, listed by `horae undo`. The `/act` buttons (decision 54) journal
+      the same way, so a tick from a notification can be undone too. The details are the sink's
+      own data (the secret gate flags a secret in them, like `after`) and go back only to the
+      sink that produced them (its identity is checked, `sink_mismatch`).
+    - **B, the operation.** `<ns>.restore_status` (`details`, optional `force`) returns
+      `{"restored": bool}`; it joins `SINK_OPERATIONS` (a plugin may not provide a tool of that
+      name, as for the others). In process, the optional `TaskRestorableSink.restore_status`.
+      The sink alone knows how to put the task back; the core never reads the vault. A sink
+      without it (`tool_missing`, or `not_supported` as the SDK default) leaves the change
+      listed under "Not undoable", exactly as before, and a run with nothing else to undo is
+      `nothing_to_undo`.
+    - **C, order, refusal, index.** Status changes are undone first, latest first, then the
+      notes. A task a later run changed too is `newer_run` (undo that run first, or
+      `--force`). A task edited since the run is `SinkError("target_changed")` from the sink:
+      the undo is refused (`changed`, exit 4) with "use --force"; the status changes restored
+      before the refused one stay restored (undo is resumable) and no note was written. For
+      each restored change the task index entry is put back in the transaction that marks the
+      journal entry undone: status, `snoozed_until`, `snooze_tz`, wake time and the run that
+      last wrote it, exactly as journalled (`Store.restore_task_status`). A task the index
+      lost is restored in the sink only. `horae undo --json` gains a `tasks` list
+      (additive; `schema_version` stays 1).
+    - **D, `force`.** `Sink.restore(target, content, *, expected_sha256, force=False)` and
+      `restore_status(details, *, force=False)` get `force`. It is true only when the user
+      passed `horae undo --force`: it is a parameter of `undo_run`, set by the CLI flag, and
+      nothing a plugin or a note returns (details, errors, note content) can set it. The core
+      sends `force` only when true (`<ns>.restore` and `<ns>.restore_status` arguments), so a
+      plugin built before it is called exactly as before; a forced `restore` to a plugin whose
+      tool refuses the argument (`tool_error`) is asked again without it, and an in-process
+      sink without the parameter is called without it (the core's own compare-and-swap on the
+      bytes it read still holds, and `--force` still keeps the overwritten bytes in the
+      journal). `force` never lifts the compare-and-swap, the path rules or the vault boundary
+      (`sink_mismatch`).
+    - **E, compatibility.** horae-sdk 0.4.0: `Sink.restore(..., force=False)` and
+      `Sink.restore_status(paths, details, force=False)` (default `not_supported`); the SDK
+      passes `force` only when true and the sink's method takes it. `file-sink.restore`
+      accepts `force` and ignores it (no owned-block rule of its own).
+    - **Follow-up (plugin-obsidian).** Its task sink must put the replaced line in
+      `Applied.details` (`before_line`; today only digests, and `restore_status` expects it
+      from the core's journal, which the core cannot supply: it never sees the line), serve
+      `<ns>.restore_status` (`tasksink.restore_status` with `force`), and honour `force` in
+      `restore` for notes edited outside the owned block.

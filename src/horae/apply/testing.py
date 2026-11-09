@@ -8,13 +8,16 @@ applies the core's conventions (`horae.apply.notes`); it changes its own memory 
 records what it sent (`sent`, with each notification's `dedupe_key` in `dedupe_keys`): it
 never touches the filesystem or the network. Set `fail` to make the read (and apply) of some
 intent indices raise a given `SinkError`. It is a `RestorableSink` too: `read_target` and
-`restore` (a compare-and-swap on `files`, recorded in `restored`) serve `horae undo` (#22).
+`restore` (a compare-and-swap on `files`, recorded in `restored`) serve `horae undo` (#22);
+with `status_details` it answers a `task.update_status` with details and serves
+`restore_status` too (#139).
 Its `identity` defaults to `"fixture"` (two fixtures with the same identity count as the same
 place); `parent_exists` is `False` for a target whose directory is in `missing_dirs`.
 """
 
 import hashlib
 from dataclasses import dataclass, field
+from typing import Any
 
 from horae.apply.notes import NoteIntent, note_after
 from horae.apply.plan import describe
@@ -33,6 +36,17 @@ class FixtureSink:
     sent: list[Notification | HttpCall] = field(default_factory=list)
     dedupe_keys: list[str | None] = field(default_factory=list)
     restored: list[tuple[str, bytes | None]] = field(default_factory=list)
+    restore_forced: list[bool] = field(default_factory=list)
+    """The `force` of every `restore` call."""
+    task_status: dict[str, str] = field(default_factory=dict)
+    """Fingerprint to the status of a task, kept when `restore_status` is served (#139)."""
+    status_details: bool = False
+    """Answer a `task.update_status` with the details `restore_status` needs (#139)."""
+    status_restored: list[tuple[dict[str, Any], bool]] = field(default_factory=list)
+    """Every `restore_status` call: the details and `force`."""
+    status_changed: dict[str, bool] = field(default_factory=dict)
+    """Fingerprints whose task was edited since its status change: `restore_status` refuses
+    them (`target_changed`) unless forced."""
     identity: str | None = "fixture"
     missing_dirs: set[str] = field(default_factory=set)
 
@@ -43,8 +57,14 @@ class FixtureSink:
         return self.files.get(target)
 
     async def restore(
-        self, target: str, content: bytes | None, *, expected_sha256: str | None
+        self,
+        target: str,
+        content: bytes | None,
+        *,
+        expected_sha256: str | None,
+        force: bool = False,
     ) -> None:
+        self.restore_forced.append(force)
         current = self.files.get(target)
         found = None if current is None else hashlib.sha256(current).hexdigest()
         if found != expected_sha256:
@@ -54,6 +74,22 @@ class FixtureSink:
             self.files.pop(target, None)
         else:
             self.files[target] = content
+
+    async def restore_status(self, details: dict[str, Any], *, force: bool = False) -> bool:
+        """Undo a status change `apply` answered (`details["task"]`, `before_status`)."""
+        self.status_restored.append((dict(details), force))
+        task = details.get("task")
+        if not isinstance(task, str) or not isinstance(details.get("before_status"), str):
+            raise SinkError("not_restorable", "the change did not record what it replaced")
+        if self.status_changed.get(task) and not force:
+            raise SinkError("target_changed", f"task {task} changed since")
+        if self.tasks_status_of(task) == details["before_status"]:
+            return False
+        self.task_status[task] = details["before_status"]
+        return True
+
+    def tasks_status_of(self, task: str) -> str | None:
+        return self.task_status.get(task)
 
     async def read(self, call: SinkCall) -> bytes | None:
         self.reads.append(call)
@@ -80,6 +116,13 @@ class FixtureSink:
         change = describe(intent)
         if isinstance(change, TaskChange):
             self.tasks[change.fingerprint] = change.after
+            if self.status_details and change.action == "update_status":
+                # What a sink that can undo a status change answers (#139).
+                fingerprint = change.fingerprint
+                prior = self.task_status.get(fingerprint, "todo")
+                self.task_status[fingerprint] = str(getattr(intent, "status", ""))
+                details = {"task": fingerprint, "before_status": prior, "changed": True}
+                return Applied(fingerprint, details=details)
             return Applied(change.fingerprint)
         assert change is not None  # noqa: S101 - notes are handled above
         self.sent.append(change)

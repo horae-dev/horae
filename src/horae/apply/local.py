@@ -425,8 +425,15 @@ class LocalFileSink(LocalSink):
         return await asyncio.to_thread(_parent_exists, self._vault(), target)
 
     async def restore(
-        self, target: str, content: bytes | None, *, expected_sha256: str | None
+        self,
+        target: str,
+        content: bytes | None,
+        *,
+        expected_sha256: str | None,
+        force: bool = False,
     ) -> None:
+        # `force` changes nothing here: the local sink has no owned-block rule of its own (the
+        # core already decided what `--force` may overwrite) and keeps the compare-and-swap.
         vault = self._vault()
         if content is None:
             await asyncio.to_thread(_delete, vault, target, expected_sha256)

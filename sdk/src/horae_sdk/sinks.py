@@ -3,7 +3,7 @@
 
 A pipeline's `act` (or `notify`) entry names a tool the plugin lists under `provides.sinks`
 (or `provides.notifiers`), e.g. `vault.write_task`. **The core never calls that tool**: it
-applies the intents routed to the entry through five tools of the entry's namespace `<ns>`,
+applies the intents routed to the entry through six tools of the entry's namespace `<ns>`,
 which the plugin lists in `tools/list` but **not** in `provides` (so no pipeline step can call
 them):
 
@@ -16,8 +16,18 @@ them):
   `None` and the sink applies `request.intent` itself; titles and bodies are untrusted text,
   data only (a Tasks sink uses `horae_sdk.tasks.task_line`);
 - `<ns>.read(paths, path)` -> the note's bytes or `None`;
-- `<ns>.restore(paths, path, content, expected_sha256)`: compare-and-swap for `horae undo`
-  (`content=None` removes the note);
+- `<ns>.restore(paths, path, content, expected_sha256, force=False)`: compare-and-swap for
+  `horae undo` (`content=None` removes the note). `force` is true only for the user's explicit
+  `horae undo --force` (horae-sdk 0.4, optional: a `restore` without that parameter is still
+  called, without it): the sink may then also restore a note it would refuse because the user
+  edited it outside Horae's owned block; it never lifts the compare-and-swap;
+- `<ns>.restore_status(paths, details, force=False)` -> whether it wrote: undo a
+  `task.update_status` the sink applied. `details` are the `Applied.details` it answered (the
+  core journals them when they say `changed: true`, and hands them back untouched), so a sink
+  that wants its status changes undoable puts there what it needs to put the task back (the
+  line it replaced). `force` is as for `restore`: only `horae undo --force`, the user's
+  explicit choice, lets the sink restore a task that was edited since. Not implemented
+  (`not_supported`, the default): the change stays listed as not undoable;
 - `<ns>.parent_exists(paths, path)` -> whether the note's directory exists.
 
 A sink that only handles non-note intents (a notifier) leaves `read`, `restore` and
@@ -169,10 +179,22 @@ class Sink(ABC):
         raise SinkError("not_supported", f"{self.namespace} reads no note")
 
     def restore(
-        self, paths: Paths, path: str, content: bytes | None, expected_sha256: str | None
+        self,
+        paths: Paths,
+        path: str,
+        content: bytes | None,
+        expected_sha256: str | None,
+        force: bool = False,
     ) -> Any:
-        """Make the note hold `content` (`None`: remove it) if it has `expected_sha256`."""
+        """Make the note hold `content` (`None`: remove it) if it has `expected_sha256`.
+        `force`: the user's explicit `horae undo --force` (see the module docstring)."""
         raise SinkError("not_supported", f"{self.namespace} restores no note")
+
+    def restore_status(self, paths: Paths, details: dict[str, Any], force: bool = False) -> Any:
+        """Undo the `task.update_status` whose `Applied.details` are `details`: return whether
+        it wrote (`False`: already restored); `SinkError("target_changed")` when the task was
+        edited since, unless `force` (see the module docstring). May be `async`."""
+        raise SinkError("not_supported", f"{self.namespace} restores no task status")
 
     def parent_exists(self, paths: Paths, path: str) -> Any:
         """Whether the note's directory exists (may be `async`)."""

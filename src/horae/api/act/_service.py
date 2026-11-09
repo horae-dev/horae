@@ -71,6 +71,7 @@ from horae.apply.sink import (
     prepare_sinks,
 )
 from horae.apply.sink import sink_identity as read_identity
+from horae.apply.status import status_details, task_snapshot
 from horae.contracts import Usage
 from horae.contracts.intents import TaskUpdateStatus
 from horae.runner import PipelineLock, new_run_id, recover_pipeline, try_acquire_apply_lock
@@ -287,6 +288,7 @@ class ActService:
                     intent=0,
                     intent_type="task.update_status",
                     target=token.task,
+                    before=task_snapshot(store, token.task),
                     undoable=False,
                     applied_by=self.route.tool,
                     sink_identity=identity,
@@ -350,7 +352,7 @@ class ActService:
             shown_page = page.not_changed(task.title, recurring=recurring)
             return Result(shown_page, "not_changed", token)
         with store.transaction():
-            store.journal_mark_applied(entry.id)
+            store.journal_mark_applied(entry.id, status_details=status_details(intent, applied))
             store.act_set_outcome(token.nonce, "applied")
         index_task(
             store,

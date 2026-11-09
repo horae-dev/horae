@@ -110,11 +110,17 @@ async def apply_op(
 
 
 async def restore_op(
-    paths: dict[str, Any], path: str, content: str | None, expected_sha256: str | None
+    paths: dict[str, Any],
+    path: str,
+    content: str | None,
+    expected_sha256: str | None,
+    force: bool = False,
 ) -> Result:
     try:
         target = _path(path)
-        await _vault(paths).restore(target, decode(content), expected_sha256=expected_sha256)
+        await _vault(paths).restore(
+            target, decode(content), expected_sha256=expected_sha256, force=force
+        )
         return {}
     except SinkError as error:
         return _failed(error)
@@ -170,10 +176,14 @@ async def apply(
 
 @server.tool(name="file-sink.restore")
 async def restore(
-    paths: dict[str, Any], path: str, content: str | None = None, expected_sha256: str | None = None
+    paths: dict[str, Any],
+    path: str,
+    content: str | None = None,
+    expected_sha256: str | None = None,
+    force: bool = False,
 ) -> CallToolResult:
     """Make the note hold `content` (`null`: remove it), compare-and-swap (`horae undo`)."""
-    return _result(await restore_op(paths, path, content, expected_sha256))
+    return _result(await restore_op(paths, path, content, expected_sha256, force))
 
 
 @server.tool(name="file-sink.parent_exists")

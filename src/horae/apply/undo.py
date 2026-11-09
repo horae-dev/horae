@@ -4,9 +4,22 @@
 `undo_run(store, run_id, sinks)` reads the run's journal and puts each note it changed back
 to the bytes it had before the run, through the sink that changed it
 (`JournalEntry.applied_by`; `RestorableSink.read_target` / `restore`). A note the run
-created is removed. Tasks, notifications and HTTP calls cannot be undone: they are listed in
-`UndoResult.not_undoable` (task undo is left to the tasks story; notifications stay sent, and
-their dedupe keys are kept, so an undo never causes a notification to be sent again).
+created is removed. Notifications and HTTP calls cannot be undone, nor can a `task.create`:
+they are listed in `UndoResult.not_undoable` (notifications stay sent, and their dedupe keys
+are kept, so an undo never causes a notification to be sent again).
+
+**Task status changes** (#139, schemas decision 59). A `task.update_status` whose sink said
+`changed: true` is journalled with the sink's `Applied.details` and the task index entry it
+replaced. Undo hands the details back, untouched, to the sink that applied it
+(`TaskRestorableSink.restore_status`) and puts the index entry back (status, snooze and the
+run that last wrote it) in the same transaction that marks the journal entry undone. The
+sink compares the task's note with what it left; a task edited since is *changed since*:
+the undo is refused (`changed`, naming the task) unless `force`, which the sink gets as
+`restore_status(force=True)`. Task changes are restored first, latest first, before any note
+(a refusal there writes no note; the task changes restored before it stay restored, and
+running undo again continues). A task a later run changed too is `newer_run`, as for a note.
+A sink that cannot (`not_supported`, a plugin without `<ns>.restore_status`) leaves the change
+listed in `not_undoable`, as before.
 
 **Sinks first.** The registry's optional `prepare` is awaited with the tools of the journal's
 undoable entries (`horae.apply.sink.prepare_sinks`) before any identity is read: a plugin
@@ -56,6 +69,7 @@ input again asks the model instead of re-applying what was just undone.
 
 import asyncio
 import hashlib
+import json
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
@@ -67,11 +81,17 @@ from horae.apply.sink import (
     Sink,
     SinkError,
     SinkRegistry,
+    TaskRestorableSink,
     error_kind,
     prepare_sinks,
     sink_identity,
 )
-from horae.store import JournalEntry, Store, UnknownRun
+from horae.apply.status import load_snapshot
+from horae.store import JournalEntry, Store, UnknownRun, UnknownTask
+
+_STATUS = "task.update_status"
+_UNSUPPORTED = frozenset({"not_supported", "tool_missing"})
+"""Kinds that say the sink cannot undo a status change (an older plugin, a notifier)."""
 
 UndoRefusalKind = Literal[
     "run_running", "dry_run", "nothing_to_undo", "sink_mismatch", "newer_run", "changed"
@@ -111,6 +131,30 @@ class NoteUndo:
 
 
 @dataclass(frozen=True)
+class TaskUndo:
+    """One `task.update_status` of the run and what undo did (or would do) with it (#139)."""
+
+    task: str
+    """The task's fingerprint."""
+    applied_by: str | None
+    intent: int
+    action: Literal["restore", "already_undone"]
+    status: Literal[
+        "done", "changed", "newer_run", "sink_mismatch", "pending", "failed", "unsupported"
+    ]
+    """As for `NoteUndo.status`: `changed` is a task edited since (refused without `force`);
+    `unsupported`: the sink cannot undo a status change (listed in `not_undoable`)."""
+    forced: bool = False
+    """The sink was asked with `force` (the user's `--force`)."""
+    restored: bool | None = None
+    """What the sink answered: it wrote (`True`), or the task was already as before."""
+    index_restored: bool = False
+    """The task index entry was put back."""
+    later_runs: tuple[str, ...] = ()
+    sink_identity: str | None = None
+
+
+@dataclass(frozen=True)
 class NotUndoable:
     """A change undo cannot revert (a task, a notification, an HTTP call)."""
 
@@ -139,6 +183,7 @@ class UndoResult:
     abandoned: bool
     force: bool
     notes: tuple[NoteUndo, ...] = ()
+    tasks: tuple[TaskUndo, ...] = ()
     not_undoable: tuple[NotUndoable, ...] = ()
     problems: tuple[UndoProblem, ...] = ()
     refused: UndoRefusal | None = None
@@ -152,6 +197,7 @@ class UndoResult:
             self.refused is None
             and not self.problems
             and all(note.status == "done" for note in self.notes)
+            and all(task.status in {"done", "unsupported"} for task in self.tasks)
         )
 
 
@@ -218,7 +264,7 @@ def _groups(entries: list[JournalEntry], sinks: SinkRegistry) -> list[_Group]:
     places: dict[str, _Place] = {}
     groups: dict[tuple[str, str], _Group] = {}
     for entry in entries:
-        if not entry.undoable:
+        if not entry.undoable or entry.intent_type == _STATUS:
             continue
         tool = entry.applied_by or ""
         if tool not in places:
@@ -243,13 +289,13 @@ def _not_undoable(entries: list[JournalEntry]) -> tuple[NotUndoable, ...]:
     )
 
 
-def _later_runs(store: Store, run_id: str, group: _Group) -> tuple[str, ...]:
-    """Later runs with an applied, not undone change of the group's note in the same place."""
-    last = max(entry.id for entry in group.entries)
-    identity = group.place.identity
+def _later_runs(
+    store: Store, run_id: str, target: str, last: int, identity: str | None
+) -> tuple[str, ...]:
+    """Later runs with an applied, not undone change of `target` in the same place."""
     runs = [
         entry.run_id
-        for entry in store.journal_later(run_id, group.target, last)
+        for entry in store.journal_later(run_id, target, last)
         if entry.applied
         and (entry.sink_identity is None or identity is None or entry.sink_identity == identity)
     ]
@@ -282,6 +328,50 @@ def _refusal(kind: UndoRefusalKind, notes: list[NoteUndo], status: str, what: st
     hit = [note for note in notes if note.status == status]
     names = ", ".join(note.target for note in hit[:5])
     return UndoRefusal(kind, f"{len(hit)} note(s) ({names}) {what}")
+
+
+def _tasks(entries: list[JournalEntry], sinks: SinkRegistry) -> list[tuple[JournalEntry, _Place]]:
+    """The undoable status changes with the sink each resolves to now, latest first."""
+    places: dict[str, _Place] = {}
+    found: list[tuple[JournalEntry, _Place]] = []
+    for entry in sorted(entries, key=lambda e: e.id, reverse=True):
+        if not entry.undoable or entry.intent_type != _STATUS:
+            continue
+        tool = entry.applied_by or ""
+        if tool not in places:
+            places[tool] = _place(sinks, tool)
+        found.append((entry, places[tool]))
+    return found
+
+
+def _status_details(store: Store, entry: JournalEntry) -> dict[str, Any]:
+    """The `Applied.details` the sink answered to the change, as journalled."""
+    data = None if entry.after_sha256 is None else store.blob(entry.after_sha256)
+    try:
+        details = None if data is None else json.loads(data)
+    except ValueError:
+        details = None
+    if not isinstance(details, dict):
+        raise _Failed("blob_missing", "the journal lost the details of the status change")
+    return details
+
+
+def _restore(
+    sink: RestorableSink, target: str, content: bytes | None, expected: str | None, force: bool
+) -> Awaitable[None]:
+    """`sink.restore(...)`. `force` (the user's `--force`, never anything else) is passed only
+    when true, and a sink whose `restore` does not take it (one written before it existed) is
+    called without it: its own compare-and-swap is then what the core always relied on."""
+    if force:
+        try:
+            return sink.restore(target, content, expected_sha256=expected, force=True)
+        except TypeError:  # no `force` parameter: raised by the call, before anything ran
+            pass
+    return sink.restore(target, content, expected_sha256=expected)
+
+
+def _names(targets: list[str]) -> str:
+    return ", ".join(targets[:5])
 
 
 async def undo_run(
@@ -333,10 +423,26 @@ async def undo_run(
             if restorable and group.place.problem is None and group.mismatched():
                 note = replace(note, status="sink_mismatch")
         notes.append(note)
-    if any(note.status == "sink_mismatch" for note in notes):
+    units = _tasks(entries, sinks)
+    tasks: list[TaskUndo] = []
+    for entry, place in units:
+        task = TaskUndo(entry.target, entry.applied_by, entry.intent, "restore", "pending", force)
+        task = replace(task, sink_identity=place.identity)
+        if entry.undone_at is not None:
+            task = replace(task, action="already_undone", status="done", forced=False)
+        else:
+            recorded = entry.sink_identity
+            usable = place.problem is None and isinstance(place.sink, TaskRestorableSink)
+            if usable and recorded is not None and recorded != place.identity:
+                task = replace(task, status="sink_mismatch")
+        tasks.append(task)
+    mismatched = [n.target for n in notes if n.status == "sink_mismatch"]
+    mismatched += [t.task for t in tasks if t.status == "sink_mismatch"]
+    if mismatched:
         what = "were changed through another sink or vault than the one given now"
-        refusal = _refusal("sink_mismatch", notes, "sink_mismatch", what)
-        return replace(base, notes=tuple(notes), refused=refusal)
+        message = f"{len(mismatched)} note(s) ({_names(mismatched)}) {what}"
+        refusal = UndoRefusal("sink_mismatch", message)
+        return replace(base, notes=tuple(notes), tasks=tuple(tasks), refused=refusal)
 
     # Phase 1: read every note still to undo, and classify it. Nothing is written.
     todo: list[tuple[int, _Group, RestorableSink, bytes | None]] = []
@@ -388,7 +494,8 @@ async def undo_run(
             note = replace(note, action="already_restored")
         elif found not in expected:
             note = replace(note, status="pending" if force else "changed", forced=force)
-        later = _later_runs(store, run_id, group)
+        last = max(entry.id for entry in group.entries)
+        later = _later_runs(store, run_id, group.target, last, group.place.identity)
         if later:
             note = replace(note, later_runs=later)
             if not force:
@@ -396,16 +503,96 @@ async def undo_run(
         todo.append((position, group, sink, current))
         notes[position] = note
 
+    status_todo: list[tuple[int, JournalEntry, TaskRestorableSink]] = []
+    for position, (entry, place) in enumerate(units):
+        task = tasks[position]
+        if task.action == "already_undone":
+            continue
+        sink = place.sink
+        if sink is None:
+            kind, message = "no_sink", f"no sink can restore tasks for {entry.applied_by}"
+        elif place.problem is not None:
+            kind, message = place.problem
+        elif not isinstance(sink, TaskRestorableSink):
+            tasks[position] = replace(task, status="unsupported")
+            continue
+        else:
+            later = _later_runs(store, run_id, entry.target, entry.id, place.identity)
+            if later:
+                task = replace(task, later_runs=later)
+                tasks[position] = task if force else replace(task, status="newer_run")
+            status_todo.append((position, entry, sink))
+            continue
+        problems.append(UndoProblem(entry.target, entry.applied_by, kind, message))
+        tasks[position] = replace(task, status="failed")
+    state: dict[str, Any] = {"notes": tuple(notes), "tasks": tuple(tasks)}
     if problems:
-        return replace(base, notes=tuple(notes), problems=tuple(problems))
-    if any(note.status == "newer_run" for note in notes):
-        newer = list(dict.fromkeys(run for note in notes for run in note.later_runs))
+        return replace(base, **state, problems=tuple(problems))
+    if any(note.status == "newer_run" for note in notes) or any(
+        task.status == "newer_run" for task in tasks
+    ):
+        newer = [run for note in notes for run in note.later_runs]
+        newer += [run for task in tasks for run in task.later_runs]
+        newer = list(dict.fromkeys(newer))
+        hit = [n.target for n in notes if n.status == "newer_run"]
+        hit += [t.task for t in tasks if t.status == "newer_run"]
         what = f"were changed by a later run too: undo {', '.join(newer[:5])} first, or --force"
-        refusal = _refusal("newer_run", notes, "newer_run", what)
-        return replace(base, notes=tuple(notes), refused=refusal)
+        refusal = UndoRefusal("newer_run", f"{len(hit)} note(s) ({_names(hit)}) {what}")
+        return replace(base, **state, refused=refusal)
     if any(note.status == "changed" for note in notes):
         refusal = _refusal("changed", notes, "changed", "changed since the run; use --force")
-        return replace(base, notes=tuple(notes), refused=refusal)
+        return replace(base, **state, refused=refusal)
+
+    # Phase 2a: restore the status changes, latest first (a refusal here writes no note).
+    for position, entry, status_sink in status_todo:
+        task = tasks[position]
+        try:
+            details = _status_details(store, entry)
+            call = status_sink.restore_status(details, force=force)
+            wrote = await _call(call, "restore_status", call_timeout_s)
+        except _Failed as error:
+            if error.kind in _UNSUPPORTED:
+                tasks[position] = replace(task, status="unsupported")
+                continue
+            if error.kind == "target_changed" and not force:
+                tasks[position] = replace(task, status="changed")
+                what = f"task {entry.target} changed since the run (not restored); use --force"
+                refused = UndoRefusal("changed", what)
+                return replace(base, notes=tuple(notes), tasks=tuple(tasks), refused=refused)
+            problems.append(UndoProblem(entry.target, entry.applied_by, error.kind, error.message))
+            tasks[position] = replace(task, status="failed")
+            return replace(base, notes=tuple(notes), tasks=tuple(tasks), problems=tuple(problems))
+        restored_index = False
+        with store.transaction():
+            snapshot = load_snapshot(
+                None if entry.before_sha256 is None else store.blob(entry.before_sha256)
+            )
+            # The snapshot is the core's own, of this very task: never write another's entry.
+            if snapshot is not None and snapshot.fingerprint == entry.target:
+                try:
+                    store.restore_task_status(snapshot, at=clock())
+                    restored_index = True
+                except UnknownTask:
+                    pass
+            store.journal_mark_undone(entry.id, at=clock())
+        tasks[position] = replace(
+            task,
+            status="done",
+            restored=bool(wrote),
+            index_restored=restored_index,
+        )
+    listed = tuple(
+        NotUndoable(task.intent, _STATUS, task.task, task.applied_by, True)
+        for task in tasks
+        if task.status == "unsupported"
+    )
+    if listed:
+        base = replace(base, not_undoable=base.not_undoable + listed)
+        if not notes and all(t.status == "unsupported" for t in tasks):
+            message = "no sink can undo the task changes of this run: nothing to undo"
+            return replace(
+                base, tasks=tuple(tasks), refused=UndoRefusal("nothing_to_undo", message)
+            )
 
     # Phase 2: restore, latest change first; mark each note's entries undone once written.
     for position, group, sink, current in todo:
@@ -419,7 +606,7 @@ async def undo_run(
                     if content is None:
                         message = "the journal lost the note's original bytes"
                         raise _Failed("blob_missing", message)
-                write = sink.restore(group.target, content, expected_sha256=note.found_sha256)
+                write = _restore(sink, group.target, content, note.found_sha256, force)
                 await _call(write, "restore", call_timeout_s)
         except _Failed as error:
             problems.append(UndoProblem(group.target, group.applied_by, error.kind, error.message))
@@ -431,7 +618,7 @@ async def undo_run(
                     store.journal_mark_undone(entry.id, at=clock(), overwrote=overwrote)
         notes[position] = replace(note, status="done", overwrote_sha256=_sha(overwrote))
 
-    result = replace(base, notes=tuple(notes), problems=tuple(problems))
+    result = replace(base, notes=tuple(notes), tasks=tuple(tasks), problems=tuple(problems))
     if result.complete and summary.status != "undone" and summary.abandoned_at is None:
         record = store.get_run(run_id)
         if record is not None:
@@ -462,6 +649,21 @@ def undo_to_dict(result: UndoResult) -> dict[str, Any]:
         "complete": result.complete,
         "marked_undone": result.marked_undone,
         "refused": None if result.refused is None else asdict(result.refused),
+        "tasks": [
+            {
+                "task": task.task,
+                "applied_by": task.applied_by,
+                "sink_identity": task.sink_identity,
+                "intent": task.intent,
+                "action": task.action,
+                "status": task.status,
+                "forced": task.forced,
+                "restored": task.restored,
+                "index_restored": task.index_restored,
+                "later_runs": list(task.later_runs),
+            }
+            for task in result.tasks
+        ],
         "notes": [
             {
                 "target": note.target,
@@ -497,6 +699,16 @@ _NOT_DONE = {
 }
 
 
+_TASK_DONE = {"restore": "status restored", "already_undone": "already undone"}
+_TASK_NOT_DONE = {
+    "changed": "changed since the run (not restored; --force restores it)",
+    "newer_run": "changed by a later run too (not restored; undo it first, or --force)",
+    "sink_mismatch": "changed through another sink or vault (not restored)",
+    "unsupported": "the sink cannot undo a status change (left as it is)",
+    "failed": "failed",
+}
+
+
 def render_undo_text(result: UndoResult) -> str:
     """`result` for a terminal; untrusted text escaped (`horae.apply.render.safe`)."""
     lines = [f"Run {safe(result.run_id)} ({safe(result.pipeline)}): {result.run_status}"]
@@ -515,6 +727,18 @@ def render_undo_text(result: UndoResult) -> str:
         if note.later_runs:
             what += f"; later runs: {', '.join(safe(run) for run in note.later_runs)}"
         lines.append(f"  {safe(note.target)}: {what}")
+    for task in result.tasks:
+        if task.status == "done":
+            what = _TASK_DONE[task.action]
+            if task.restored is False:
+                what = "already as before the run"
+            if task.forced and task.action != "already_undone":
+                what += " (forced)"
+        else:
+            what = _TASK_NOT_DONE.get(task.status, "not restored")
+        if task.later_runs:
+            what += f"; later runs: {', '.join(safe(run) for run in task.later_runs)}"
+        lines.append(f"  task {safe(task.task)}: {what}")
     if result.not_undoable:
         lines.append("Not undoable (left as they are):")
         for item in result.not_undoable:

@@ -443,7 +443,7 @@ def test_undo_resumes_after_a_crash(store: Store) -> None:
     class CrashOnce(FixtureSink):
         crashed = False
 
-        async def restore(
+        async def restore(  # type: ignore[override]
             self, target: str, content: bytes | None, *, expected_sha256: str | None
         ) -> None:
             await super().restore(target, content, expected_sha256=expected_sha256)
@@ -544,7 +544,7 @@ def test_undo_problems_and_refusals(store: Store) -> None:
     assert "Problem:" in render_undo_text(result)
 
     class FailingRestore(FixtureSink):
-        async def restore(
+        async def restore(  # type: ignore[override]
             self, target: str, content: bytes | None, *, expected_sha256: str | None
         ) -> None:
             raise RuntimeError("detail")
@@ -556,7 +556,7 @@ def test_undo_problems_and_refusals(store: Store) -> None:
     assert store.run_summary(run.id).status == "ok"  # type: ignore[union-attr]
 
     class Racing(FixtureSink):
-        async def restore(
+        async def restore(  # type: ignore[override]
             self, target: str, content: bytes | None, *, expected_sha256: str | None
         ) -> None:
             raise SinkError("target_changed", "edited meanwhile")

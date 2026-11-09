@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """`horae undo <run-id>` (#22, wired to the plugin host in #26): restore every note a run
-changed (`horae.apply.undo`).
+changed, and every task status it changed (#139), through `horae.apply.undo`.
 
 Registered on the `horae` app by `horae.cli`. Notes are restored through the sink that
 applied them: the instance's plugins (`open_ports`, `McpSinks`; the core prepares their
@@ -173,7 +173,11 @@ def undo(
         ),
     ] = None,
     force: Annotated[
-        bool, typer.Option("--force", help="Restore notes that changed since the run too.")
+        bool,
+        typer.Option(
+            "--force",
+            help="Restore notes and tasks that changed since the run too (your explicit choice).",
+        ),
     ] = False,
     json_output: Annotated[bool, typer.Option("--json", help="Print the report as JSON.")] = False,
 ) -> None:
@@ -183,8 +187,10 @@ def undo(
     them, else (or with --vault) with the built-in local sink on --vault. A note the run
     created is removed. Refused when a note changed since the run, or a later run changed it
     too, unless --force (the overwritten bytes are kept in the journal); always refused when
-    the sink is another vault than the run's. Tasks, notifications and HTTP calls cannot be
-    undone: they are listed. Running it again after an interruption continues where it
+    the sink is another vault than the run's. A task status change (a tick, a snooze) is put
+    back through the sink that made it, with the task index; a task edited since is refused
+    unless --force. Created tasks, notifications and HTTP calls cannot be undone: they are
+    listed. Running it again after an interruption continues where it
     stopped.
 
     Exit codes: 0 undone, 1 configuration, store, plugin or sink problem (or another vault),
