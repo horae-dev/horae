@@ -6,15 +6,18 @@ All read the marketplace indexes of `horae.yaml` (`marketplaces`, highest priori
 refreshing each into the instance's cache (`<state_dir>/marketplaces`) unless `--offline`.
 When an index cannot be refreshed its cached copy is used, with a warning on stderr. `add`
 then installs the resolved commit into `<instance>/plugins/<name>`
-(`horae.marketplace.install`, schemas decision 62); the plugin is not enabled until it is in
-`horae.lock` with approved permissions (#46) and its dependencies are installed (#45).
+(`horae.marketplace.install`, schemas decision 62) with its own venv built from its committed
+`uv.lock` (`horae.marketplace.environment`, decision 69; uv's cache is
+`<state_dir>/uv-cache`); the plugin is not enabled until it is in `horae.lock` with approved
+permissions (#46).
 
 Exit codes (`horae.cli_output`): 0 ok; 1 configuration problem, an index that cannot be
 fetched and has no cache, or a plugin that cannot be fetched; 2 usage error (a malformed
 reference); 3 unknown plugin or version, a name listed by several marketplaces (a conflict),
-an install refused (tag and SHA disagree, invalid tree or `plugin.yaml`) or a plugin already
-installed; 70 internal error. With `--json` the report carries `warnings`; an error is
-{schema_version, error}.
+an install refused (tag and SHA disagree, invalid tree or `plugin.yaml`, no `uv.lock`, a
+lock that does not match `pyproject.toml` or lacks a hash, a build backend not allowed) or a
+plugin already installed; 70 internal error. With `--json` the report carries `warnings`; an
+error is {schema_version, error}.
 """
 
 from pathlib import Path
@@ -48,7 +51,9 @@ from horae.marketplace import (
     MarketplaceClient,
     MarketplaceError,
     NoCacheError,
+    PluginEnvironment,
     PluginInstaller,
+    Prepare,
     UnknownPlugin,
     UnknownVersion,
     resolve,
@@ -57,6 +62,8 @@ from horae.marketplace import (
 
 MARKETPLACES_DIR = "marketplaces"
 """Under the state directory: one folder per index."""
+UV_CACHE_DIR = "uv-cache"
+"""Under the state directory: uv's cache for the plugin venvs (#45)."""
 
 plugin_app = typer.Typer(
     name="plugin",
@@ -106,11 +113,15 @@ def make_installer(directory: Path) -> PluginInstaller:
     return PluginInstaller(directory)
 
 
+def make_environment(cache_dir: Path) -> Prepare | None:
+    """What builds the plugin's venv (#45). Tests replace this."""
+    return PluginEnvironment(cache_dir)
+
+
 PENDING = (
     "not enabled yet: Horae loads a plugin only once horae.lock lists it with the permissions "
-    "you approved, and its dependencies are not installed. Review the permissions in "
-    "{manifest} before enabling it (permission approval and dependency install are not "
-    "automated yet)."
+    "you approved. Review the permissions in {manifest} before enabling it (permission "
+    "approval is not automated yet)."
 )
 
 
@@ -122,6 +133,11 @@ def _failed(exc: MarketplaceError) -> CommandFailed:
 
 
 def _indexes(instance: Path, offline: bool) -> tuple[Any, Loaded]:
+    config, loaded, _state_dir = _indexes_and_state(instance, offline)
+    return config, loaded
+
+
+def _indexes_and_state(instance: Path, offline: bool) -> tuple[Any, Loaded, Path]:
     loaded_instance = load(instance)
     config = loaded_instance.config
     client = make_client(loaded_instance.state_dir / MARKETPLACES_DIR, list(config.marketplaces))
@@ -131,7 +147,7 @@ def _indexes(instance: Path, offline: bool) -> tuple[Any, Loaded]:
         raise _failed(exc) from None
     for warning in loaded.warnings:
         echo(f"warning: {warning}", err=True)
-    return config, loaded
+    return config, loaded, loaded_instance.state_dir
 
 
 def _resolve(instance: Path, ref: str, offline: bool, pre: bool, json_output: bool) -> int:
@@ -163,11 +179,15 @@ def _resolve(instance: Path, ref: str, offline: bool, pre: bool, json_output: bo
 
 
 def _add(instance: Path, ref: str, offline: bool, pre: bool, json_output: bool) -> int:
-    config, loaded = _indexes(instance, offline)
+    config, loaded, state_dir = _indexes_and_state(instance, offline)
     try:
         found = resolve(ref, loaded.indexes, pins=config.marketplace_pins, allow_prerelease=pre)
         installed = make_installer(plugins_dir(instance)).install(
-            found.name, found.version, found.repo, found.sha
+            found.name,
+            found.version,
+            found.repo,
+            found.sha,
+            prepare=make_environment(state_dir / UV_CACHE_DIR),
         )
     except MarketplaceError as exc:
         raise _failed(exc) from None
@@ -181,7 +201,7 @@ def _add(instance: Path, ref: str, offline: bool, pre: bool, json_output: bool) 
                 "index": found.index,
                 "path": where,
                 "enabled": False,
-                "pending": ["approve_permissions", "install_dependencies"],
+                "pending": ["approve_permissions"],
                 "warnings": list(loaded.warnings),
             }
         )

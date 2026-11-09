@@ -27,7 +27,7 @@ from horae.contracts.instance import PluginDefaults
 from horae.engine import execute, make_context
 from horae.plugins.host import PluginCallError, PluginHost
 from horae.plugins.host.capture import HEAD_BYTES, TAIL_BYTES
-from horae.plugins.host.env import BASE_KEYS, BASE_PATH
+from horae.plugins.host.env import BASE_PATH, PLUGIN_KEYS
 from horae.secrets import SecretResolver
 from plugin_fixtures import (
     OTHER_SECRET,
@@ -115,7 +115,7 @@ def test_the_plugin_sees_exactly_the_base_env_and_its_declared_secret(
 
     result, run_dir = _run(scenario())
     env, digests = result.data["env"], result.data["sha256"]
-    assert set(env) == BASE_KEYS | {"PROBE_TOKEN"} | _PLATFORM_ADDED
+    assert set(env) == PLUGIN_KEYS | {"PROBE_TOKEN"} | _PLATFORM_ADDED
     assert env["PATH"] == BASE_PATH
     assert env["LANG"] == "C.UTF-8"
     assert env["TZ"] == "Europe/Paris"
@@ -182,7 +182,7 @@ def test_an_optional_secret_that_resolves_is_injected_and_redacted(tmp_path: Pat
 
     result = _run(scenario())
     env, digests = result.data["env"], result.data["sha256"]
-    assert set(env) == BASE_KEYS | {"PROBE_TOKEN", "PROBE_OPTIONAL"} | _PLATFORM_ADDED
+    assert set(env) == PLUGIN_KEYS | {"PROBE_TOKEN", "PROBE_OPTIONAL"} | _PLATFORM_ADDED
     assert digests["PROBE_OPTIONAL"] == hashlib.sha256(value.encode()).hexdigest()
     assert env["PROBE_OPTIONAL"] == "[REDACTED:PROBE_OPTIONAL]"
 
@@ -195,7 +195,7 @@ def test_an_optional_secret_that_does_not_resolve_is_absent_and_the_plugin_start
             return await _call(h, "probe.env")
 
     env = _run(scenario()).data["env"]
-    assert set(env) == BASE_KEYS | {"PROBE_TOKEN"} | _PLATFORM_ADDED
+    assert set(env) == PLUGIN_KEYS | {"PROBE_TOKEN"} | _PLATFORM_ADDED
 
 
 def test_a_too_short_optional_secret_is_not_injected(tmp_path: Path) -> None:
