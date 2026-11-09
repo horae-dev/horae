@@ -71,6 +71,12 @@ Re-identification puts back the **canonical** text of the value (the classed lea
 value or vocabulary term first registered for those folded tokens), never the span as the
 input wrote it: `ZOE` in a description comes back as `Zoé`, as `ALICE` came back as `Alice`.
 
+**Hidden names.** Invisible characters (variation selectors, fillers, tags, zero-width) are
+dropped, typographic apostrophes and dashes read as the plain ones (`O\u2019Brien`), and a string
+is also read with its percent-escapes and HTML entities decoded (`Zo%C3%A9`): a name found only
+that way is replaced in the decoded text. A name part is taken from a value whatever the
+punctuation around it (`Dupont, Marie`).
+
 **Personal values** (decision 68 E). With `personal`, a value longer than `MAX_VALUE_CHARS`
 or `MAX_TERM_TOKENS` tokens, or more than `MAX_PERSONAL_VALUES` values, fails closed
 (`DeidError`: it could not be found in text); after rewriting, every string and key of what
@@ -87,6 +93,7 @@ also a common word (and folding makes `Zoe`, `Zoé` and `Zoë` one name); a valu
 """
 
 import hashlib
+import html
 import itertools
 import json
 import math
@@ -95,6 +102,7 @@ import unicodedata
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import unquote
 
 from horae.contracts.instance import ModelAlias
 from horae.contracts.skill import view_steps
@@ -172,9 +180,20 @@ def _key(text: str) -> str:
 # --- tokens -------------------------------------------------------------------------------------
 
 _FORMAT = re.compile(
-    "[\u00ad\u061c\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u206f\ufeff]"
+    "[\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f"
+    "\u202a-\u202e\u2060-\u2064\u2066-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0"
+    "\ufff9-\ufffb\U0001d173-\U0001d17a\U000e0000-\U000e0fff]"
 )
-"""Format characters dropped before matching (soft hyphen, zero-width and bidi controls)."""
+"""Invisible characters dropped before matching (the default-ignorable ones: soft hyphen,
+zero-width and bidi controls, variation selectors, Hangul and Khmer fillers, tag characters):
+a name with one inside is the same name to a reader, and to a model."""
+_PUNCTUATION = str.maketrans(
+    {
+        **dict.fromkeys("\u2018\u2019\u201b\u02b9\u02bb\u02bc\u2032\u00b4`", "'"),
+        **dict.fromkeys("\u2010\u2011\u2012\u2013\u2014\u2015\u2212", "-"),
+    }
+)
+"""Typographic apostrophes and dashes, written as the plain ones (`O\u2019Brien` is `O'Brien`)."""
 _SPACE = "\\s\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000"
 _MARKS = "\u0300-\u036f\u1ab0-\u1aff\u1dc0-\u1dff\u20d0-\u20ff\ufe20-\ufe2f"
 """The combining-mark blocks a letter run may hold after its first letter (a mark NFKC
@@ -188,8 +207,19 @@ _PHONE_SEPARATORS = frozenset(".-()+")
 
 
 def _clean(text: str) -> str:
-    """`text` as it is matched: NFKC, without format characters."""
-    return _FORMAT.sub("", unicodedata.normalize("NFKC", text))
+    """`text` as it is matched: NFKC, without invisible characters, with plain apostrophes
+    and dashes."""
+    return _FORMAT.sub("", unicodedata.normalize("NFKC", text)).translate(_PUNCTUATION)
+
+
+def _reveal(text: str) -> str:
+    """`text` with its percent-escapes (`Zo%C3%A9`) and HTML entities (`Zo&eacute;`)
+    decoded: how a name hides in a URL or in markup."""
+    if "%" in text:
+        text = unquote(text)
+    if "&" in text:
+        text = html.unescape(text)
+    return text
 
 
 def fold(text: str) -> str:
@@ -400,19 +430,24 @@ def amount_renderings(value: Any) -> set[str]:
     }
 
 
+_PART_SEPARATORS = re.compile(rf"[{_SPACE}\-,;:/|_()\[\]{{}}<>\"\u201c\u201d\u00ab\u00bb&+]+")
+
+
 def _name_parts(text: str) -> list[str]:
     """The parts of a person's name matched on their own: letter (and apostrophe) parts of
-    at least `MIN_NAME_PART_LETTERS` letters, split at white space and hyphens."""
-    parts = re.split(rf"[{_SPACE}\-\u2010-\u2015]+", _clean(text))
-    if len(parts) < 2:
+    at least `MIN_NAME_PART_LETTERS` letters, split at white space, hyphens and the
+    punctuation that sets names apart (`Dupont, Marie`, `Quillard/Lopez`), without the dots
+    and apostrophes at their ends (`Mme.`). An address or a URL is not split."""
+    cleaned = _clean(text)
+    if "@" in cleaned or "://" in cleaned:
         return []
+    parts = [part.strip(".'") for part in _PART_SEPARATORS.split(cleaned)]
     return [
         part
         for part in parts
         if sum(char.isalpha() for char in part) >= MIN_NAME_PART_LETTERS
         and all(
-            char.isalpha() or char in "'\u2019" or unicodedata.category(char) == "Mn"
-            for char in part
+            char.isalpha() or char == "'" or unicodedata.category(char) == "Mn" for char in part
         )
     ]
 
@@ -703,6 +738,9 @@ class _Pseudonymizer:
         """`text` with its known values replaced (module docstring); `text` itself when
         nothing is found."""
         cleaned = _clean(text)
+        revealed = _clean(_reveal(cleaned))
+        if revealed != cleaned and self._finds(revealed):
+            cleaned = revealed  # a known value hidden by escapes is found, and replaced
         cleaned, neutralized = _TOKEN_SHAPED.subn(r"(\1_\2)", cleaned)
         if neutralized:
             self.count("neutralized", neutralized)
@@ -721,6 +759,13 @@ class _Pseudonymizer:
             position, found = end, True
         found |= self._terms(cleaned[position:], pieces, position, secrets)
         return "".join(pieces) if found else text
+
+    def _finds(self, text: str) -> bool:
+        """Whether a known value (not a phone number or an amount) is found in `text`."""
+        if not self.trie.size:
+            return False
+        tokens = [_symbol(match.group()) for match in _TOKENS.finditer(text)]
+        return any(isinstance(value, _Known) for _, _, value in self.trie.matches(tokens))
 
     def _terms(
         self, text: str, pieces: list[str], base: int, secrets: list[tuple[int, int, str]]
@@ -814,12 +859,16 @@ def _leaked(sent: Any, personal: Sequence[str]) -> bool:
     for value in personal:
         if len(value) >= MIN_TERM_CHARS:
             trie.add(_symbols(value), value)
+            for part in _name_parts(value):
+                trie.add(_symbols(part), value)
     if not trie.size:
         return False
     for text in _strings(sent):
-        tokens = _TOKENS.findall(_clean(TOKEN.sub(" ", text)))
-        if next(trie.matches([_symbol(token) for token in tokens]), None) is not None:
-            return True
+        cleaned = _clean(TOKEN.sub(" ", text))
+        for seen in {cleaned, _clean(_reveal(cleaned))}:
+            tokens = _TOKENS.findall(seen)
+            if next(trie.matches([_symbol(token) for token in tokens]), None) is not None:
+                return True
     return False
 
 

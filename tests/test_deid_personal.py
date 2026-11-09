@@ -526,3 +526,68 @@ def test_an_eval_case_is_de_identified_like_a_run(tmp_path: Path) -> None:
     assert not ok
     assert result.error is not None
     assert result.error["kind"] == "deid_unavailable"
+
+
+# --- 5. review hardening: hidden names -------------------------------------------------------
+
+
+def _personal(text: str, *personal: str) -> Any:
+    return pseudonymize({"text": text}, {}, None, personal).data["text"]
+
+
+@pytest.mark.parametrize(
+    "invisible",
+    [0xFE0F, 0x180B, 0xE0041, 0x3164, 0x17B4, 0x034F, 0x200B, 0x2060],
+)
+def test_an_invisible_character_inside_a_name_does_not_hide_it(invisible: int) -> None:
+    assert _personal(f"Merci Zo{chr(invisible)}é !", "Zoé") == "Merci [PERSON_1] !"
+
+
+CURLY = chr(0x2019)
+
+
+@pytest.mark.parametrize("mark", [0x2019, 0x02BC, 0x2018, 0x27])
+def test_typographic_apostrophes_are_the_plain_one(mark: int) -> None:
+    text = f"O{chr(mark)}Brien"
+    assert _personal(f"Hi {text}", f"O{CURLY}Brien") == "Hi [PERSON_1]"
+    assert _personal(f"Hi {text}", "Sean O'Brien") == "Hi [PERSON_1]"
+
+
+def test_typographic_dashes_are_the_plain_hyphen() -> None:
+    assert _personal(f"Marie{chr(0x2011)}Zoé", "Marie-Zoé") == "[PERSON_1]"
+
+
+@pytest.mark.parametrize(
+    ("text", "value"),
+    [
+        ("Mr Dupont", "Dupont, Marie"),
+        ("Quillard est là", "Mme. Quillard."),
+        ("Quillard est là", "Quillard,"),
+        ("Lopez", "Quillard/Lopez"),
+        ("Zoé", '"Zoé" Martin'),
+    ],
+)
+def test_a_name_part_is_found_whatever_punctuation_surrounds_it_in_the_value(
+    text: str, value: str
+) -> None:
+    assert "[PERSON_1]" in _personal(text, value)
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["https://x.fr/?eleve=Zo%C3%A9", "Zo&eacute; et Zo&#233;", "q=zo%C3%A9&r=1"],
+)
+def test_a_name_hidden_by_percent_escapes_or_entities_is_found(text: str) -> None:
+    sent = _personal(text, "Zoé")
+    assert "[PERSON_1]" in sent
+    assert "%C3" not in sent
+    assert "&eacute;" not in sent
+    assert "&#233;" not in sent
+
+
+def test_a_hidden_name_that_survives_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    from horae.llm import deid
+
+    monkeypatch.setattr(deid._Pseudonymizer, "_finds", lambda self, text: False)
+    with pytest.raises(DeidError, match="in clear"):
+        pseudonymize({"text": "Zo%C3%A9"}, {}, None, ("Zoé",))
