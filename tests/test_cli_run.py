@@ -8,7 +8,6 @@ import asyncio
 import json
 import os
 import signal
-import threading
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -520,14 +519,23 @@ def test_a_signal_while_waiting_for_the_apply_lock_applies_nothing(
     fake.sinks = StaticSinks(default=sink)
     held = try_acquire_apply_lock(root / "state")
     assert held is not None
-    timer = threading.Timer(0.3, os.kill, (os.getpid(), signal.SIGINT))
+    real_try = runner_module.try_acquire_apply_lock
+    signalled: list[bool] = []
+
+    def try_then_signal(state_dir: Path) -> Any:
+        # Event-driven, not a timer: the run is actually waiting for the lock once a try
+        # fails, so the signal lands while it waits however loaded the machine is.
+        lock = real_try(state_dir)
+        if lock is None and not signalled:
+            signalled.append(True)
+            os.kill(os.getpid(), signal.SIGINT)
+        return lock
+
+    monkeypatch.setattr(runner_module, "try_acquire_apply_lock", try_then_signal)
     started = time.monotonic()
     with held:
-        timer.start()
-        try:
-            code, report = _json("dry-brief", "-i", str(root))
-        finally:
-            timer.cancel()
+        code, report = _json("dry-brief", "-i", str(root))
+    assert signalled
     assert time.monotonic() - started < 10  # the wait stopped, not timed out
     assert code == EXIT_SIGINT
     assert report["run"]["status"] == "failed"
