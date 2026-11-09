@@ -53,6 +53,9 @@ def test_a_plugin_is_installed_at_the_pinned_commit(tmp_path: Path) -> None:
         "version": "1.0.0",
         "repo": PLUGIN_URL,
         "commit": sha,
+        "source": "marketplace",  # decision 73 A, with the tier and index that resolved it
+        "tier": None,
+        "index": None,
     }
     assert _left(tmp_path / "plugins") == ["demo"]  # no scratch directory, no .git
 

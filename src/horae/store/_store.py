@@ -1187,6 +1187,17 @@ class Store:
             backend=call.backend,
         )
 
+    @_api
+    def plugin_activity(self) -> dict[str, datetime]:
+        """For each plugin a stored run record names (`RunRecord.plugins`), when the latest
+        such run started (`horae plugin audit`, #47). Runs still running or abandoned have
+        no record and do not count."""
+        rows = self._conn.execute(
+            "SELECT used.key, max(runs.started_at) FROM runs, json_each(runs.record, "
+            "'$.plugins') AS used WHERE runs.record IS NOT NULL GROUP BY used.key"
+        ).fetchall()
+        return {str(name): _dt(started) for name, started in rows}
+
     @staticmethod
     def _summary(row: tuple[Any, ...]) -> RunSummary:
         return RunSummary(

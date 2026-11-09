@@ -587,6 +587,7 @@ from horae.cli_eval import eval_command as _eval  # noqa: E402
 from horae.cli_init import init as _init  # noqa: E402
 from horae.cli_mcp import mcp_app as _mcp_app  # noqa: E402
 from horae.cli_plugin import plugin_app as _plugin_app  # noqa: E402
+from horae.cli_plugin_manage import audit_command as _audit_command  # noqa: E402, F401
 from horae.cli_run import run as _run  # noqa: E402
 from horae.cli_serve import serve as _serve  # noqa: E402
 from horae.cli_undo import undo as _undo  # noqa: E402

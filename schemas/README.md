@@ -4230,5 +4230,111 @@ loosened later without breaking a valid file.
 
 ### Provisional decisions (#47, pending maintainer review)
 
-73. **`horae plugin upgrade`, `remove` and `audit` (#47).** Design note on the pull request;
-    the full decision follows with the implementation.
+73. **`horae plugin upgrade` with a permission diff, `remove` and `audit` (#47).** One
+    additive schema change: `lockfile/v1.json` gains `plugins.<name>.source` (A). Commands in
+    `horae.cli_plugin_manage`; the diff and the swap in `horae.marketplace.upgrade`, what is read
+    from disk in `horae.marketplace.audit`.
+    - **A, where a plugin came from (settles decision 71 E).** `LockedPlugin.source` is `direct`
+      for a direct install from a git URL and **absent** for a marketplace install, so every
+      lock written before stays byte-identical and valid (a built-in plugin of `horae init`
+      has none either). It is approved with the rest: `lock_mismatch` compares it, so `--yes`
+      never turns one kind into the other. The install record (decision 62 F) also gets
+      `source` and, for a marketplace install, the `tier` and `index` that resolved it:
+      information for `audit` only (the host still compares name, version, repo and commit).
+      A lock entry, not "no index lists this repo", because the answer must not change when
+      an index does, and because the lock is what the user reviews and commits.
+    - **B, `horae plugin upgrade NAME[@VERSION]`** (`--pre`, `--offline`, `--yes`,
+      `--allow-host`, `--allow-local`, `--allow-downgrade`, `--json`). Only a plugin installed
+      by `horae plugin add` (a lock entry and a tree, a real directory with an install record
+      naming it) can be upgraded; a built-in or hand-copied plugin is `not_installed` (exit 3).
+      A `source: direct` entry goes through `require_installable(name, None, None)`: refused
+      before M5 (`tier_refused`), and behind the gate still refused, pointing to `remove` then
+      `add URL@SHA` (an upgrade resolves through a marketplace). The new version is resolved
+      as `add` does (`marketplace_pins`, `--pre`) and the tier rule applies again (a plugin
+      whose index no longer says `first-party` is refused). A lower version than the installed
+      one is refused (`downgrade_refused`, exit 3) unless `--allow-downgrade`; a version the
+      index now pins to another commit than the installed one is refused (`install_refused`,
+      a moved release or a tampered index); the installed version and commit with nothing new
+      asked is a no-op (exit 0, `upgraded: false`).
+    - **C, the permission diff.** Against the `horae.lock` entry (what was approved), item by
+      item, `+` added, `-` removed, `~` changed: repository, source, network, network_local,
+      secrets (required and optional together; a move between them is `~`), intents, paths read
+      and write, personal fields and pack pipelines (by digest). **Widening**, marked "new:
+      needs approval": anything added; a pipeline added or changed (new code the core runs); a
+      personal field dropped (less protection, decision 68); another repository or source.
+      Removals are shown but need nothing. When something widens, the full request (decision
+      70 A, with the pipelines' calls) follows the diff.
+    - **D, grants.** The hosts and local endpoints the lock grants beyond the installed
+      manifest (read from the installed tree) are what the user added (`--allow-host`,
+      `--allow-local`): they are kept and said so, and do not widen. New flags add to them and
+      do widen. Nothing else is carried over: a host the old manifest declared and the new one
+      drops is gone.
+    - **E, approval.** Interactive confirmation, default no. `--yes` passes only when nothing
+      widens, which includes a lock that already approves the target (a lock committed from
+      another machine: the diff is then empty). Without a terminal and without `--yes`, refused.
+      Every refusal is `approval_refused` (exit 3) with nothing changed.
+    - **F, atomic.** Under the lock guard (decision 70 D), held from reading the lock to writing
+      it: the new version goes through the same hardened install (decision 62, `install(...,
+      replace=True)`), its pack pipelines are checked, the approval runs, and its venv is built
+      (decision 69) in the scratch tree, which is then renamed to `plugins/.upgrade-new-<name>-*`
+      (swept after an hour if a kill leaves it). Then, in order: the old tree to
+      `plugins/.upgrade-old-<name>-*`, the new one to `plugins/<name>`, the old pack directory
+      aside and the new one in, the lock written. Any failure undoes the steps done, newest
+      first: the old tree, venv, pipelines and lock are as before (exit 1, `upgrade_failed`,
+      or the install's own error). The old copies are deleted only once the lock is written.
+      A kill between the two tree renames leaves no `plugins/<name>` (the host refuses to run,
+      `plugins_invalid`) and the old tree in `.upgrade-old-*`, never swept: `audit` reports it.
+      The venv is relocatable (decision 69 C), so the rename keeps it working.
+    - **G, a pack's pipelines at upgrade.** `pipelines/<plugin>/` may exist only as a real
+      directory holding nothing but the old version's own files: regular `<name>.yaml` files
+      the lock approves for the plugin, each still with its locked digest. A file edited after
+      approval, or any other entry, refuses the upgrade (it is never deleted: move it away or
+      restore it). The name clash check of decision 72 D skips the pack's own directory. A
+      plugin that was not a pack never touches `pipelines/<plugin>/`.
+    - **H, `horae plugin remove NAME`** (`--delete-secrets`, `--json`). **Refused** while the
+      plugin is listed under `plugins:` in `horae.yaml` (`plugin_enabled`, exit 3): the loader
+      then reports a missing plugin and the instance stops loading, and its scheduled pipelines
+      would stop mid-flight; disabling is an explicit step first. Refuse, not warn, so that
+      `remove` never breaks a running instance. It removes the tree (with its venv,
+      `plugins/<name>/.venv`), the lock entry and the pack's pipelines. The tree must be a real
+      directory (a symlink is refused, never followed) with an install record naming the
+      plugin; it is renamed aside (`plugins/.remove-*`) first, then the lock is written (on
+      failure the tree is renamed back, `lock_write_failed`, exit 1), then deleted. A lock entry
+      whose tree is gone is removed too (its pipelines checked against the lock).
+    - **I, what `remove` deletes in `pipelines/`.** Only files that are a pipeline the lock
+      approved for this plugin **and** that the install record lists as exactly
+      `pipelines/<plugin>/<name>.yaml` (a record naming any other path is ignored), each opened
+      with `O_NOFOLLOW` through a descriptor of `pipelines/<plugin>/` itself opened with
+      `O_NOFOLLOW` (a symlinked directory or file is never followed), a regular file whose
+      SHA-256 is still the locked one. An edited, foreign or extra file is kept and listed; the
+      directory is removed only if it is then empty.
+    - **J, what `remove` keeps.** Its secrets (each listed with the reason), the files it wrote
+      under its `paths`, and the run history in the store: listed under `kept`. No flag deletes
+      the files under its paths (they are the user's vault) or the run history (shared by
+      every pipeline). `--delete-secrets` deletes `<secrets.dir>/<file>` of each of its secrets
+      that nothing else uses (no other locked plugin, model alias, push monitor or core
+      secret, and no other secret's `{file:}` reference to the same file), only as a regular
+      file (`lstat` through a descriptor of the directory, `O_NOFOLLOW`); a secret read from an
+      environment variable, a symlink, or a file that cannot be deleted is kept and listed.
+      Values are never read or printed.
+    - **K, `horae plugin audit`** (`--json`). One row per plugin of `horae.lock` or of
+      `plugins/` (hidden entries apart): version locked and installed, source (`marketplace`,
+      `direct`, or `local` without a record), tier and index from the record (`null` when not
+      recorded), enabled, the granted permissions, personal fields and pipelines, and the last
+      activity: when the latest stored run whose record lists the plugin started
+      (`Store.plugin_activity`, the store opened read-only; `null` without a store). It reads
+      `horae.yaml` and `horae.lock` alone, not the whole instance, so it runs on an instance
+      the loader refuses because of the drift it reports.
+    - **L, drift** (exit 4, `EXIT_DIFFERENT`; the JSON document is printed as usual with
+      `drift: true`): `not_installed` (locked, no tree), `not_locked` (a tree, no lock entry),
+      `tree_invalid` (not a real directory), `record_invalid`, `record_mismatch` (record vs
+      lock), `host_refuses` (`HostRegistry.from_directory` refuses it: a manifest asking for
+      more, another version), `venv_missing` (a recorded install without `.venv`),
+      `pipeline_missing`, `pipeline_changed`, `pipeline_unapproved` (against the locked
+      digests), and `leftover` (`plugins/.upgrade-old-*`, `.upgrade-new-*`, `.remove-*`,
+      `pipelines/.upgrade-old-*`). A plugin without a record is checked by its manifest only
+      (decision 70 F).
+    - **M, exits.** `upgrade` and `remove`: 0 done, 1 configuration problem, a repository or
+      index that cannot be fetched, an invalid or unwritable lock, 2 usage (a URL given to
+      `upgrade`, a bad name or grant), 3 refused as above, 5 `lock_busy`. `audit`: 0 no drift,
+      1 configuration problem or invalid lock, 4 drift.

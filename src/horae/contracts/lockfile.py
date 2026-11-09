@@ -9,7 +9,7 @@ is sorted, so that a diff of two lockfiles shows only real changes. Reading acce
 """
 
 import re
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from pydantic import (
     AfterValidator,
@@ -81,7 +81,8 @@ class LockedPlugin(Contract):
     repo: GitRepoUrl
     """Git URL the plugin was cloned from."""
     commit: CommitSha
-    """The commit checked out; the tag for `version` must point to it."""
+    """The commit checked out. For a marketplace install the tag for `version` points to it;
+    for a direct install (`source: direct`) it is the pinned SHA, no tag is checked."""
     permissions: Permissions
     """The permissions the user approved at install or upgrade time (sorted when written).
     `network_local` (decision 66) is left out when empty, so a lock without a local grant
@@ -103,6 +104,12 @@ class LockedPlugin(Contract):
     digest, and `--yes` refuses a pack whose pipelines differ. Left out when empty (names
     sorted when written), so a lock without any is written exactly as before."""
 
+    source: Literal["direct"] | None = None
+    """Where the plugin came from (decision 73 A, settling decision 71 E): `direct` for a direct
+    install from a git URL (#48, no marketplace tier: `commit` is the pinned SHA and no tag was
+    checked); absent for a marketplace install, so a lock written before it reads the same.
+    `horae plugin upgrade` reads it to apply the direct-install gate, and `--yes` compares it."""
+
     @field_serializer("permissions", mode="wrap")
     def _canonical_permissions(
         self, value: Permissions, handler: SerializerFunctionWrapHandler
@@ -123,7 +130,7 @@ class LockedPlugin(Contract):
     def _omit_empty(self, handler: SerializerFunctionWrapHandler) -> Any:
         data = handler(self)
         if isinstance(data, dict):
-            for key in ("personal_fields", "pipelines"):
+            for key in ("personal_fields", "pipelines", "source"):
                 if not data.get(key):
                     data.pop(key, None)
         return data
