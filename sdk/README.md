@@ -195,7 +195,9 @@ user info (`user@`), `%` or brackets in the authority, no backslash, and no cont
 decision 52); `obsidian://` and every other scheme are refused. It is kept in the intent exactly as given, and the core routes it
 only to a `mode: tasks` entry whose trusted `link_prefix` it falls under (for example
 `link_prefix: https://github.com/my-org/`, with a clean path ending in `/`), as for
-`notify.push`; with no `link_prefix`, a task with a link is never routed. The host is
+`notify.push`; with no `link_prefix`, a task with a link is never routed. A `tasks` entry's
+`link_prefix` may also be a list of 1 to 32 prefixes (schemas decision 60); with overlapping
+entries the longest matching prefix wins. The host is
 compared as a DNS origin (case-insensitively, one trailing dot ignored, `:443` equal to no
 port), the path case-sensitively. A link proposed by an LLM skill must also be a URL of the
 input the model was shown (the action guard).
@@ -203,7 +205,9 @@ input the model was shown (the action guard).
 **Upgrading a source to send `link`.** Once a source sends `link`, every `mode: tasks` entry
 that receives its tasks needs a `link_prefix` covering those links, or the step fails at run
 time with `intent_unrouted` (`task link not under a trusted link_prefix`). Add the prefix to
-the pipelines before releasing the source. The entry's `link_prefix` reaches a Tasks sink in
+the pipelines before releasing the source. (Since decision 60 a task whose link is under no
+prefix is skipped instead, and recorded as an `intent_skipped` violation in the run record, so
+one off-owner item no longer fails the step.) The entry's `link_prefix` reaches a Tasks sink in
 its apply call's `params`, like `mode`: a sink must accept it and may ignore it.
 
 `tasks.task_line(title, link=...)` and `task_line_for(intent)` write it right after the
