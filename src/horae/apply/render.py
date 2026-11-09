@@ -126,7 +126,18 @@ def render_text(changes: ChangeSet, *, color: bool = False) -> str:
         lines.extend(["", _paint("Tasks:", _BOLD, color)])
         for task in changes.tasks:
             c = task.change
-            state = safe(c.after) if c.before is None else f"{safe(c.before)} -> {safe(c.after)}"
+            if c.action == "existing":
+                state = f"{safe(c.after)} (unchanged)"
+            elif c.action == "update":
+                # The sink is the authority on the vault: plugin-obsidian keeps the line it has.
+                state = (
+                    f"{safe(c.before or '')} -> {safe(c.after)} "
+                    "(changed upstream; not applied unless the sink rewrites the task)"
+                )
+            else:
+                state = (
+                    safe(c.after) if c.before is None else f"{safe(c.before)} -> {safe(c.after)}"
+                )
             lines.append(f"  {c.action} {safe(c.fingerprint)}: {state} ({safe(task.applied_by)})")
     if changes.notifications:
         lines.extend(["", _paint("Notifications:", _BOLD, color)])

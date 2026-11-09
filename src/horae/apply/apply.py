@@ -378,6 +378,15 @@ def _index_applied(
         except (StoreError, ValueError) as exc:
             _log.warning("task index: not updated (%s)", type(exc).__name__)
     if details.get("changed") is False:
+        # A `task.create` the sink adopted (it found the task in the vault, e.g. after the
+        # index was lost, #138) is indexed, status kept; a dismissed one, or anything else it
+        # left alone, is not touched: a ticked task stays ticked and is never reopened.
+        if (
+            isinstance(intent, TaskCreate)
+            and details.get("adopted")
+            and not details.get("dismissed")
+        ):
+            index_task(store, intent, tool=tool, run_id=run_id, at=at, timezone=timezone)
         return
     index_task(store, intent, tool=tool, run_id=run_id, at=at, timezone=timezone)
 
