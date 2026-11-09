@@ -381,6 +381,7 @@ def judge_intents(sue: SkillUnderEval, loaded: LoadedCase, viewed: Any, result: 
         source=sue.source,
         limits=sue.skill.intent_limits,
         links=sue.skill.links,
+        task_fingerprint=sue.skill.task_fingerprint,
     )
     result.guard = "pass" if detail is None else "violation"
     result.guard_detail = detail

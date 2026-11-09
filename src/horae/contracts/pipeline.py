@@ -9,6 +9,7 @@ from typing import Annotated, Any, Literal, Self
 
 from pydantic import Field, Strict, StringConstraints, model_validator
 
+from horae.contracts.skill import ViewPath
 from horae.contracts.types import (
     MAX_ITEMS,
     Contract,
@@ -16,9 +17,11 @@ from horae.contracts.types import (
     PipelineName,
     PluginRef,
     SkillRef,
+    StrictBool,
     StrictFloat,
     StrictInt,
     Token,
+    UniqueList,
 )
 
 CallWithParams = Annotated[
@@ -65,6 +68,8 @@ def call_parts(call: PluginCall) -> tuple[str, dict[str, Any], float | None]:
     return ref, params, None
 
 
+MAX_SKIP_PATHS = 16
+
 CallList = Annotated[list[PluginCall], Field(min_length=1, max_length=MAX_ITEMS)]
 
 _CRON_FIELD = r"[0-9A-Za-z*/,-]+"
@@ -107,6 +112,12 @@ class Budget(Contract):
     """Maximum output tokens for the step."""
 
 
+SkipWhenEmpty = (
+    StrictBool | Annotated[UniqueList[ViewPath], Field(min_length=1, max_length=MAX_SKIP_PATHS)]
+)
+"""`skip_when_empty`: `true`, or the input view paths whose values must all be empty."""
+
+
 class LlmSpec(Contract):
     """The bounded LLM step: a typed function with no tools (PLAN.md §2.1.2, §3.4)."""
 
@@ -118,6 +129,12 @@ class LlmSpec(Contract):
     on_unchanged_input: Literal["skip"] = "skip"
     """What to do when the input hash is unchanged since the last run: `skip` makes no LLM
     call (the $0 path)."""
+    skip_when_empty: SkipWhenEmpty | None = None
+    """Opt-in (decision 67): skip the step, with no model call and no cache entry, when its
+    viewed input is empty. `true`: the whole viewed input; a list of input view paths: the
+    values at every one of them. Empty means `null`, an empty string, a list or object with
+    nothing but empty members (a number or boolean is never empty). The skip is recorded as a
+    step with status `skipped`. Omitted (the default): the step always runs."""
     timeout_s: Annotated[StrictFloat, Field(gt=0)] | None = None
     """Timeout in seconds. When omitted, the core default applies."""
 
