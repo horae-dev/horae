@@ -4227,3 +4227,8 @@ loosened later without breaking a valid file.
       The prompt also prints each call's parameters (act and notify targets: `path`, `mode`,
       `url`, `link_prefix`, `topic`...; at most 160 characters each) and each `llm` step's model
       and budget.
+
+### Provisional decisions (#47, pending maintainer review)
+
+73. **`horae plugin upgrade`, `remove` and `audit` (#47).** Design note on the pull request;
+    the full decision follows with the implementation.
