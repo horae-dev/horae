@@ -3397,7 +3397,19 @@ loosened later without breaking a valid file.
       notes. A task a later run changed too is `newer_run` (undo that run first, or
       `--force`). A task edited since the run is `SinkError("target_changed")` from the sink:
       the undo is refused (`changed`, exit 4) with "use --force"; the status changes restored
-      before the refused one stay restored (undo is resumable) and no note was written. For
+      before the refused one stay restored (undo is resumable) and no note was written. #149:
+      this is deliberately not a transaction, and the report says so: a refusal names the
+      tasks restored before it, the text report ends with "Partly undone" (what is restored,
+      what is not, "run `horae undo <run>` again"), and `--json` gains `partial` (additive).
+      **Task restores run before note restores, and that stays.** The core does not know
+      which file a task line is in (the sink alone does), so it cannot order a task and a note
+      of one file by journal id; a true interleave needs a dry-run `restore_status`, which is
+      out of scope. A run that changed a note and a task line of the same file therefore
+      either is refused up front (`changed`, the file no longer matches what the note change
+      left) or, when the task restore rewrites the file after the note was read, fails the
+      note's compare-and-swap (`target_changed`, with a hint that a restored task may have
+      edited the note); `horae undo --force` restores the note in both cases and keeps the
+      overwritten bytes in the journal. For
       each restored change the task index entry is put back in the transaction that marks the
       journal entry undone: status, `snoozed_until`, `snooze_tz`, wake time and the run that
       last wrote it, exactly as journalled (`Store.restore_task_status`). A task the index
@@ -3417,7 +3429,11 @@ loosened later without breaking a valid file.
     - **E, compatibility.** horae-sdk 0.4.0: `Sink.restore(..., force=False)` and
       `Sink.restore_status(paths, details, force=False)` (default `not_supported`); the SDK
       passes `force` only when true and the sink's method takes it. `file-sink.restore`
-      accepts `force` and ignores it (no owned-block rule of its own).
+      accepts `force` and ignores it (no owned-block rule of its own; likewise the built-in
+      `LocalFileSink.restore`). A sink that overrides `restore` with the old signature must add
+      `force` to pass mypy, and `<ns>.restore_status` is a reserved operation name (a plugin
+      that provides a tool of that name is rejected at load): both are in the SDK README's
+      "Upgrading a sink to 0.4.0".
     - **Follow-up (plugin-obsidian).** Its task sink must put the replaced line in
       `Applied.details` (`before_line`; today only digests, and `restore_status` expects it
       from the core's journal, which the core cannot supply: it never sees the line), serve
@@ -3447,7 +3463,14 @@ loosened later without breaking a valid file.
       source, the positions and the fixed text `task link not under a trusted link_prefix`
       (never a link), and the core logs a warning. If every intent of a call is skipped the
       detail says `skipped all`. Every other routing failure (no entry binds the type, an
-      unknown fingerprint, ambiguity) still fails the step.
+      unknown fingerprint, ambiguity) still fails the step. **Extended by #149:** a
+      `notify.push` with a `link` that a `notify` entry would take but for that link (no
+      `link_prefix`, or none that the link falls under) is skipped the same way, with the fixed
+      text `notification link not under a trusted link_prefix`; a call that proposes both kinds
+      lists both texts in its one violation. A `notify.push` without a link, or one that no
+      `notify` entry binds at all, is unchanged. `horae doctor` reports, as a warning (never
+      an error), each pipeline whose newest 20 runs hold `intent_skipped` violations, with the
+      latest run and its detail, so a skipped link does not stay unseen.
     - **D, compatibility.** Pipelines that never had an off-prefix link are unchanged; ones
       that did now succeed with a violation instead of failing. A consumer must accept the new
       `kind`; per "Versioning" a new enum value is a compatible addition.

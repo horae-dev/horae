@@ -334,3 +334,125 @@ def test_the_index_snapshot_of_another_task_is_never_written(store: Store) -> No
     assert other is not None
     assert other.status == "todo"
     assert _status(store) == "done"
+
+
+# --- follow-ups of #149 -----------------------------------------------------------------------
+
+
+def test_refusals_count_notes_and_tasks_accurately(store: Store) -> None:
+    sink = _sink(files={INBOX: b"x\n"})
+    first, second = _run([DONE, INTENT_NOTE], "run-1"), _run([SNOOZE, INTENT_NOTE], "run-2")
+    _apply(store, first, sink)
+    _apply(store, second, sink)
+    newer = _undo(store, first.id, sink).refused
+    assert newer is not None
+    assert newer.kind == "newer_run"
+    assert newer.message.startswith("1 note and 1 task (")
+    assert "note(s)" not in newer.message
+    other = _sink(identity="elsewhere", files=dict(sink.files))
+    mismatch = _undo(store, second.id, other).refused
+    assert mismatch is not None
+    assert mismatch.kind == "sink_mismatch"
+    assert mismatch.message.startswith("1 note and 1 task (")
+
+
+def test_a_task_only_refusal_does_not_say_notes(store: Store) -> None:
+    first, second = _run([DONE], "run-1"), _run([SNOOZE], "run-2")
+    sink = _sink()
+    _apply(store, first, sink)
+    _apply(store, second, sink)
+    newer = _undo(store, first.id, sink).refused
+    assert newer is not None
+    assert newer.message.startswith("1 task (fp-old)")
+    assert "note" not in newer.message.split("were changed")[0]
+
+
+def _two_tasks(store: Store) -> tuple[RunRecord, FixtureSink]:
+    store.upsert_task(TaskEntry(fingerprint="fp-b", title="B", status="todo"), at=START)
+    second: dict[str, Any] = {"type": "task.update_status", "task": "fp-b", "status": "done"}
+    fixture = plugins([DONE, second])
+    fixture.handlers["items.today"] = lambda p, i: [{"task": "fp-old"}, {"task": "fp-b"}]
+    run = asyncio.run(run_pipeline(dry_run=False, fixture=fixture)).model_copy(
+        update={"id": "run-many"}
+    )
+    sink = _sink()
+    _apply(store, run, sink)
+    return run, sink
+
+
+def test_a_refused_task_reports_what_stays_restored_and_a_rerun_resumes(store: Store) -> None:
+    run, sink = _two_tasks(store)
+    sink.status_changed["fp-old"] = True  # restored second (latest first): refused
+    partial = _undo(store, run.id, sink)
+    assert partial.refused is not None
+    assert partial.refused.kind == "changed"
+    assert "1 task restored before it stay restored" in partial.refused.message
+    assert partial.restored == ("task fp-b",)
+    assert partial.not_restored == ("task fp-old",)
+    assert partial.partial
+    text = render_undo_text(partial)
+    assert "Partly undone (undo is not a transaction, nothing is rolled back)" in text
+    assert "Restored: task fp-b. Not restored: task fp-old." in text
+    assert "horae undo run-many` again" in text
+    assert undo_to_dict(partial)["partial"] is True
+    assert sink.task_status["fp-b"] == "todo"  # stays restored
+    assert sink.task_status["fp-old"] == "done"
+    del sink.status_changed["fp-old"]  # the rerun resumes: fp-b is not asked again
+    rerun = _undo(store, run.id, sink)
+    assert rerun.complete
+    assert not rerun.partial
+    assert [(t.task, t.action) for t in rerun.tasks] == [
+        ("fp-b", "already_undone"),
+        ("fp-old", "restore"),
+    ]
+    assert [d["task"] for d, _ in sink.status_restored].count("fp-b") == 1
+
+
+def test_a_complete_or_untouched_undo_is_not_partial(store: Store) -> None:
+    run, sink = _run([DONE], "run-whole"), _sink()
+    _apply(store, run, sink)
+    sink.status_changed["fp-old"] = True
+    refused = _undo(store, run.id, sink)
+    assert not refused.partial
+    assert "Partly undone" not in render_undo_text(refused)
+    assert "restored before it" not in (refused.refused.message if refused.refused else "")
+    done = _undo(store, run.id, sink, force=True)
+    assert done.complete
+    assert not done.partial
+    assert undo_to_dict(done)["partial"] is False
+
+
+class _SameFileSink(FixtureSink):
+    """A sink whose task line lives in the note the run also changed: restoring the task
+    writes the note, so the note's compare-and-swap, read before, no longer holds."""
+
+    async def restore_status(self, details: dict[str, Any], *, force: bool = False) -> bool:
+        wrote = await super().restore_status(details, force=force)
+        self.files[INBOX] = self.files[INBOX] + b"- [ ] task line restored\n"
+        return wrote
+
+
+def test_a_task_and_a_note_in_one_file_fail_the_note_clearly_and_force_finishes(
+    store: Store,
+) -> None:
+    # Task restores run before note restores (decision 59 C). The core cannot tell which file
+    # a task line is in (the sink alone knows), so it cannot order the two by file: the note
+    # restore fails its compare-and-swap, says why, and `--force` finishes the undo.
+    run = _run([DONE, INTENT_NOTE], "run-same-file")
+    sink = _SameFileSink(status_details=True, files={INBOX: b"x\n"})
+    _apply(store, run, sink)
+    first = _undo(store, run.id, sink)
+    assert not first.complete
+    assert [p.kind for p in first.problems] == ["target_changed"]
+    assert "a task restored in this undo may have edited this note" in first.problems[0].message
+    assert "--force" in first.problems[0].message
+    assert first.partial  # the task stays restored
+    assert [t.status for t in first.tasks] == ["done"]
+    assert "Partly undone" in render_undo_text(first)
+    again = _undo(store, run.id, sink)  # task already undone; the note is changed since the run
+    assert again.refused is not None
+    assert again.refused.kind == "changed"
+    forced = _undo(store, run.id, sink, force=True)
+    assert forced.complete
+    assert sink.files[INBOX] == b"x\n"
+    assert forced.notes[0].overwrote_sha256 is not None  # the overwritten bytes are kept

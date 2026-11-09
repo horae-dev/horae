@@ -17,7 +17,12 @@ sink compares the task's note with what it left; a task edited since is *changed
 the undo is refused (`changed`, naming the task) unless `force`, which the sink gets as
 `restore_status(force=True)`. Task changes are restored first, latest first, before any note
 (a refusal there writes no note; the task changes restored before it stay restored, and
-running undo again continues). A task a later run changed too is `newer_run`, as for a note.
+running undo again continues). Undo is not a transaction, and the report says so
+(`UndoResult.partial`: what is restored, what is not, "run it again"). The order is not by
+journal id across tasks and notes: the core cannot tell which file a task line is in, so a
+task restore that rewrites a note's file makes that note's compare-and-swap fail
+(`target_changed`, with a hint), and `--force` finishes it (#149).
+A task a later run changed too is `newer_run`, as for a note.
 A sink that cannot (`not_supported`, a plugin without `<ns>.restore_status`) leaves the change
 listed in `not_undoable`, as before.
 
@@ -154,6 +159,13 @@ class TaskUndo:
     sink_identity: str | None = None
 
 
+_WROTE = frozenset({"restore", "remove"})
+
+
+def _restored_task(task: TaskUndo) -> bool:
+    return task.status == "done" and task.action == "restore"
+
+
 @dataclass(frozen=True)
 class NotUndoable:
     """A change undo cannot revert (a task, a notification, an HTTP call)."""
@@ -199,6 +211,25 @@ class UndoResult:
             and all(note.status == "done" for note in self.notes)
             and all(task.status in {"done", "unsupported"} for task in self.tasks)
         )
+
+    @property
+    def restored(self) -> tuple[str, ...]:
+        """What this undo put back: notes (their path) and tasks (`task <fingerprint>`)."""
+        done = [n.target for n in self.notes if n.status == "done" and n.action in _WROTE]
+        return tuple(done + [f"task {t.task}" for t in self.tasks if _restored_task(t)])
+
+    @property
+    def not_restored(self) -> tuple[str, ...]:
+        """What is still to undo: notes and tasks that are neither done nor unsupported."""
+        left = [n.target for n in self.notes if n.status != "done"]
+        left += [f"task {t.task}" for t in self.tasks if t.status not in {"done", "unsupported"}]
+        return tuple(left)
+
+    @property
+    def partial(self) -> bool:
+        """Some changes were restored and others were not. Undo is not a transaction: what was
+        restored stays restored, and running undo again continues."""
+        return not self.complete and bool(self.restored)
 
 
 @dataclass(frozen=True)
@@ -324,10 +355,20 @@ async def _call[T](coro: Awaitable[T], what: str, timeout_s: float | None) -> T:
         raise _Failed("host_error", f"the sink {what} failed") from None
 
 
+def _things(notes: int, tasks: int) -> str:
+    """ "2 notes", "1 task" or "2 notes and 1 task": what a refusal counts, said accurately."""
+    parts = []
+    if notes:
+        parts.append(f"{notes} note" + ("" if notes == 1 else "s"))
+    if tasks:
+        parts.append(f"{tasks} task" + ("" if tasks == 1 else "s"))
+    return " and ".join(parts) or "0 notes"
+
+
 def _refusal(kind: UndoRefusalKind, notes: list[NoteUndo], status: str, what: str) -> UndoRefusal:
     hit = [note for note in notes if note.status == status]
     names = ", ".join(note.target for note in hit[:5])
-    return UndoRefusal(kind, f"{len(hit)} note(s) ({names}) {what}")
+    return UndoRefusal(kind, f"{_things(len(hit), 0)} ({names}) {what}")
 
 
 def _tasks(entries: list[JournalEntry], sinks: SinkRegistry) -> list[tuple[JournalEntry, _Place]]:
@@ -437,10 +478,11 @@ async def undo_run(
                 task = replace(task, status="sink_mismatch")
         tasks.append(task)
     mismatched = [n.target for n in notes if n.status == "sink_mismatch"]
-    mismatched += [t.task for t in tasks if t.status == "sink_mismatch"]
-    if mismatched:
+    mismatched_tasks = [t.task for t in tasks if t.status == "sink_mismatch"]
+    if mismatched or mismatched_tasks:
         what = "were changed through another sink or vault than the one given now"
-        message = f"{len(mismatched)} note(s) ({_names(mismatched)}) {what}"
+        count = _things(len(mismatched), len(mismatched_tasks))
+        message = f"{count} ({_names(mismatched + mismatched_tasks)}) {what}"
         refusal = UndoRefusal("sink_mismatch", message)
         return replace(base, notes=tuple(notes), tasks=tuple(tasks), refused=refusal)
 
@@ -535,9 +577,10 @@ async def undo_run(
         newer += [run for task in tasks for run in task.later_runs]
         newer = list(dict.fromkeys(newer))
         hit = [n.target for n in notes if n.status == "newer_run"]
-        hit += [t.task for t in tasks if t.status == "newer_run"]
+        hit_tasks = [t.task for t in tasks if t.status == "newer_run"]
         what = f"were changed by a later run too: undo {', '.join(newer[:5])} first, or --force"
-        refusal = UndoRefusal("newer_run", f"{len(hit)} note(s) ({_names(hit)}) {what}")
+        count = _things(len(hit), len(hit_tasks))
+        refusal = UndoRefusal("newer_run", f"{count} ({_names(hit + hit_tasks)}) {what}")
         return replace(base, **state, refused=refusal)
     if any(note.status == "changed" for note in notes):
         refusal = _refusal("changed", notes, "changed", "changed since the run; use --force")
@@ -557,6 +600,12 @@ async def undo_run(
             if error.kind == "target_changed" and not force:
                 tasks[position] = replace(task, status="changed")
                 what = f"task {entry.target} changed since the run (not restored); use --force"
+                before = sum(_restored_task(t) for t in tasks)
+                if before:
+                    what += (
+                        f"; {_things(0, before)} restored before it stay restored (undo is not a "
+                        "transaction): run undo again to continue"
+                    )
                 refused = UndoRefusal("changed", what)
                 return replace(base, notes=tuple(notes), tasks=tuple(tasks), refused=refused)
             problems.append(UndoProblem(entry.target, entry.applied_by, error.kind, error.message))
@@ -609,7 +658,15 @@ async def undo_run(
                 write = _restore(sink, group.target, content, note.found_sha256, force)
                 await _call(write, "restore", call_timeout_s)
         except _Failed as error:
-            problems.append(UndoProblem(group.target, group.applied_by, error.kind, error.message))
+            message = error.message
+            if error.kind == "target_changed" and any(_restored_task(t) for t in tasks):
+                # A task restored just before may have written this very note (its line): the
+                # status changes are restored first and the note's compare-and-swap then fails.
+                message += (
+                    "; a task restored in this undo may have edited this note: run undo again "
+                    "with --force to restore it"
+                )
+            problems.append(UndoProblem(group.target, group.applied_by, error.kind, message))
             notes[position] = replace(note, status="failed")
             break
         with store.transaction():
@@ -647,6 +704,7 @@ def undo_to_dict(result: UndoResult) -> dict[str, Any]:
         },
         "force": result.force,
         "complete": result.complete,
+        "partial": result.partial,
         "marked_undone": result.marked_undone,
         "refused": None if result.refused is None else asdict(result.refused),
         "tasks": [
@@ -709,6 +767,22 @@ _TASK_NOT_DONE = {
 }
 
 
+def _partial_line(result: UndoResult) -> str:
+    """Said when an undo stopped half-way: what stays restored, what is left, how to go on."""
+
+    def listed(items: tuple[str, ...]) -> str:
+        shown = ", ".join(safe(item) for item in items[:5])
+        return shown + (f" and {len(items) - 5} more" if len(items) > 5 else "")
+
+    left = result.not_restored
+    return (
+        "Partly undone (undo is not a transaction, nothing is rolled back). "
+        f"Restored: {listed(result.restored)}. "
+        f"Not restored: {listed(left) if left else 'see the problems above'}. "
+        f"Run `horae undo {safe(result.run_id)}` again to continue where it stopped."
+    )
+
+
 def render_undo_text(result: UndoResult) -> str:
     """`result` for a terminal; untrusted text escaped (`horae.apply.render.safe`)."""
     lines = [f"Run {safe(result.run_id)} ({safe(result.pipeline)}): {result.run_status}"]
@@ -748,6 +822,8 @@ def render_undo_text(result: UndoResult) -> str:
     for problem in result.problems:
         kind, target, message = safe(problem.kind), safe(problem.target), safe(problem.message)
         lines.append(f"Problem: {target}: {kind}: {message}")
+    if result.partial:
+        lines.append(_partial_line(result))
     if result.marked_undone:
         lines.append("The run is now marked undone.")
     elif result.complete and result.abandoned:

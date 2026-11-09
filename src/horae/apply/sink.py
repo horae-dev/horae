@@ -244,7 +244,8 @@ class RestorableSink(Sink, Protocol):
         refuse because the user edited it outside Horae's owned block (`not_owned`). It never
         lifts the compare-and-swap, the path rules or the vault boundary. The core passes it
         only when it is true, so a sink written before it (no `force` parameter) is called
-        exactly as before; for a forced undo it is retried without when it does not accept it."""
+        exactly as before; for a forced undo it is retried without when it does not accept it.
+        A sink with no such rule (`LocalFileSink`, `file-sink`) accepts `force` and ignores it."""
         ...
 
 

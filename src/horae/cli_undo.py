@@ -190,8 +190,9 @@ def undo(
     the sink is another vault than the run's. A task status change (a tick, a snooze) is put
     back through the sink that made it, with the task index; a task edited since is refused
     unless --force. Created tasks, notifications and HTTP calls cannot be undone: they are
-    listed. Running it again after an interruption continues where it
-    stopped.
+    listed. Undo is not a transaction: when it stops half-way, the report says what was
+    restored (it stays restored) and what was not, and running it again after an
+    interruption continues where it stopped.
 
     Exit codes: 0 undone, 1 configuration, store, plugin or sink problem (or another vault),
     2 usage error, 3 unknown, running or dry run (or nothing to undo), 4 refused (a note

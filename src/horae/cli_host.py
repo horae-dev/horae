@@ -21,7 +21,15 @@ from urllib.parse import urlsplit
 
 from horae.apply import SinkRegistry
 from horae.cli_output import EXIT_PROBLEMS, CommandFailed, plural
-from horae.config import CONFIG_FILE, Instance, InstanceError, Problem, ProblemsError, load_instance
+from horae.config import (
+    CONFIG_FILE,
+    PIPELINES_DIR,
+    Instance,
+    InstanceError,
+    Problem,
+    ProblemsError,
+    load_instance,
+)
 from horae.contracts.instance import ModelAlias
 from horae.contracts.pipeline import LlmStep
 from horae.contracts.plugin import StdioRuntime
@@ -35,6 +43,7 @@ from horae.plugins.host import HostRegistry, PluginCallError, RegistryError
 from horae.plugins.host.host import resolve_command
 from horae.runner import LivePorts, open_ports
 from horae.skills import SKILLS_DIR, SkillError, load_skill
+from horae.store import Store, StoreError
 
 PLUGINS_DIR = "plugins"
 LOCK_FILE = "horae.lock"
@@ -357,6 +366,49 @@ def _budget_problems(instance: Instance) -> list[Problem]:
     return problems
 
 
+SKIPPED_RUNS = 20
+"""How many of the newest runs `horae doctor` looks at for `intent_skipped` violations."""
+
+
+def _skipped_problems(instance: Instance) -> list[Problem]:
+    """A warning per pipeline for the `intent_skipped` violations of its newest runs (#149,
+    schemas decision 60): the core left out `task.create` or `notify.push` intents whose link
+    is under no trusted `link_prefix`, and the run still passed, so nothing else would tell
+    the user. Read-only: it never creates or migrates the store, and a store it cannot read
+    is not a doctor problem (the other commands report it). The violation's text holds
+    positions and a fixed reason, never a link."""
+    path = instance.store_path
+    if not path.exists():
+        return []
+    found: dict[str, list[tuple[str, str]]] = {}
+    seen: dict[str, int] = {}
+    try:
+        with Store.open(path, read_only=True) as store:
+            for summary in store.list_runs(limit=SKIPPED_RUNS, evals=False):
+                seen[summary.pipeline] = seen.get(summary.pipeline, 0) + 1
+                record = store.get_run(summary.id)
+                for violation in () if record is None else record.violations:
+                    if violation.kind == "intent_skipped":
+                        hits = found.setdefault(summary.pipeline, [])
+                        hits.append((summary.id, violation.detail))
+    except (StoreError, OSError, ValueError):  # ValueError: a record that no longer validates
+        return []
+    problems: list[Problem] = []
+    for name in sorted(found):
+        hits = found[name]
+        runs = len(dict.fromkeys(run for run, _ in hits))
+        latest_run, latest = hits[0]
+        file = instance.pipeline_files.get(name)
+        where = str(file) if file is not None else f"{PIPELINES_DIR}/{name}.yaml"
+        message = (
+            f"{runs} of its last {plural(seen[name], 'run')} skipped intents "
+            f"(latest {latest_run}): {latest}; add the link's prefix to a `link_prefix` "
+            "of the entry, or fix the source of the link"
+        )
+        problems.append(Problem(where, None, None, message, severity="warning"))
+    return problems
+
+
 def _skill_problems(instance: Instance, registry: HostRegistry) -> list[Problem]:
     """Each skill an `llm` step of a pipeline uses that does not load (`SkillError`), as the
     engine would load it (with the plugin's locked `permissions.intents`), and each loaded
@@ -459,13 +511,15 @@ def instance_problems(instance: Instance) -> list[Problem]:
     pins them (`check_plugins`), each command (its interpreter) exists and is executable,
     and every skill an `llm` step uses loads (`horae.skills.load_skill`); with an `llm` step,
     the output validator's worker runs (`horae.llm.validate.worker_problem`); the `/act`
-    key, when set, is usable (`_act_problems`)."""
+    key, when set, is usable (`_act_problems`); a warning for each pipeline whose recent runs
+    skipped intents (`_skipped_problems`, #149)."""
     problems = (
         _path_problems(instance)
         + _backend_problems(instance)
         + _budget_problems(instance)
         + _deid_problems(instance)
         + _act_problems(instance)
+        + _skipped_problems(instance)
     )
     problems.extend(_validator_problems(instance))
     if plugins_dir(instance.root).is_dir():

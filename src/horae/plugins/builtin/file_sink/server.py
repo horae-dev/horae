@@ -182,7 +182,11 @@ async def restore(
     expected_sha256: str | None = None,
     force: bool = False,
 ) -> CallToolResult:
-    """Make the note hold `content` (`null`: remove it), compare-and-swap (`horae undo`)."""
+    """Make the note hold `content` (`null`: remove it), compare-and-swap (`horae undo`).
+
+    `force` is accepted (the core sends it only for `horae undo --force`) and ignored: the
+    vault sink has no owned-block rule of its own to lift, and the compare-and-swap, the path
+    rules and the vault boundary always hold."""
     return _result(await restore_op(paths, path, content, expected_sha256, force))
 
 

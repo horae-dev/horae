@@ -93,6 +93,21 @@ still has `request.expected_before_sha256` (else `SinkError("target_changed", ..
 return `Applied.wrote(path, content)`. Other intents are applied by the sink itself; their
 text is data. See [`examples/tasks_file/tasks_file_sink.py`](examples/tasks_file/tasks_file_sink.py).
 
+### Upgrading a sink to 0.4.0 (release notes)
+
+- **Override `restore` with the `force` keyword.** `Sink.restore` now has the signature
+  `restore(self, paths, path, content, expected_sha256, force=False)`. A subclass that overrides
+  it with the old four-parameter signature still runs (the SDK calls it without `force`), but
+  **mypy rejects the override** (an incompatible override of the supertype) until you add
+  `force: bool = False`. Do the same for `restore_status(self, paths, details, force=False)`
+  if you implement it. `force` is true only for the user's `horae undo --force`; a sink with no
+  owned-block rule of its own may accept it and ignore it, as the built-in `file-sink` does.
+- **`<ns>.restore_status` is a reserved operation name.** Like `<ns>.read`, `.apply`,
+  `.restore`, `.parent_exists` and `.identity`, it is now a tool only the core calls. A plugin
+  that already provides its own tool called `<ns>.restore_status` (in `provides`) is **rejected
+  when it is loaded**: rename that tool, and implement `Sink.restore_status` instead if you want
+  `horae undo` to put a task status back.
+
 ## Manifest
 
 ```python
