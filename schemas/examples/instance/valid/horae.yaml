@@ -65,3 +65,11 @@ deidentification: { vocabulary: deid_vocabulary }
 http:
   public_url: https://horae.example.org
   trusted_proxies: [172.18.0.0/16]
+# Marketplace indexes (#43), highest priority first; any https git URL. Default: only
+# horae-dev/marketplace. A plugin that two of them list under different repositories needs a
+# pin to one of them.
+marketplaces:
+  - https://github.com/horae-dev/marketplace
+  - https://git.example.org/team/marketplace
+marketplace_pins:
+  coach: https://git.example.org/team/marketplace

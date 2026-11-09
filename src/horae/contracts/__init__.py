@@ -39,6 +39,7 @@ from horae.contracts.intents import (
     intent_adapter,
 )
 from horae.contracts.lockfile import GitRepoUrl, LockedPlugin, Lockfile
+from horae.contracts.marketplace import MarketplaceIndex, MarketplacePlugin
 from horae.contracts.pipeline import (
     ActStep,
     Budget,
@@ -141,6 +142,8 @@ __all__ = [
     "LlmStep",
     "LockedPlugin",
     "Lockfile",
+    "MarketplaceIndex",
+    "MarketplacePlugin",
     "ModelAlias",
     "NoteAppendSection",
     "NoteCreate",

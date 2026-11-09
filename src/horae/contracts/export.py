@@ -25,6 +25,7 @@ from horae.contracts.evals import EvalCase, RecordedResponse
 from horae.contracts.instance import InstanceConfig
 from horae.contracts.intents import INTENT_MODELS, Intent
 from horae.contracts.lockfile import Lockfile
+from horae.contracts.marketplace import MarketplaceIndex
 from horae.contracts.pipeline import Pipeline
 from horae.contracts.plugin import PluginManifest
 from horae.contracts.run import RunRecord
@@ -106,6 +107,7 @@ SCHEMAS: tuple[SchemaSpec, ...] = (
         for name, model in INTENT_MODELS.items()
     ),
     SchemaSpec("lockfile", 1, Lockfile, "Horae lockfile (horae.lock)"),
+    SchemaSpec("marketplace", 1, MarketplaceIndex, "Horae marketplace index (marketplace.json)"),
     SchemaSpec("run-record", 1, RunRecord, "Horae run record"),
     SchemaSpec("instance", 1, InstanceConfig, "Horae instance configuration (horae.yaml)"),
     SchemaSpec("skill", 1, SkillManifest, "Horae skill (skill.yaml)"),

@@ -1,0 +1,12 @@
+{
+  "plugins": [
+    {
+      "name": "github",
+      "repo": "https://github.com/horae-dev/plugin-github",
+      "versions": {
+        "0.1.0": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "tier": "first-party"
+    }
+  ]
+}

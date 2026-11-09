@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/horae-dev/horae/main/schemas/marketplace/v1.json",
+  "$defs": {
+    "MarketplacePlugin": {
+      "additionalProperties": false,
+      "description": "One plugin of an index.",
+      "properties": {
+        "name": {
+          "description": "The name used in `horae plugin add <name>@<version>`.",
+          "maxLength": 64,
+          "pattern": "^[a-z][a-z0-9-]*$",
+          "title": "Name",
+          "type": "string"
+        },
+        "repo": {
+          "description": "https git URL of the plugin repository.",
+          "maxLength": 512,
+          "not": {
+            "anyOf": [
+              {
+                "pattern": "/\\.\\.?(/|$)"
+              },
+              {
+                "pattern": "^https://([^/]*\\.)?localhost/"
+              }
+            ]
+          },
+          "pattern": "^https://([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)*[a-z]([a-z0-9-]{0,61}[a-z0-9])?(/[A-Za-z0-9._-]+)+$",
+          "title": "Repo",
+          "type": "string"
+        },
+        "versions": {
+          "description": "Released versions: semver -> the commit the tag `v<version>` points to.",
+          "maxProperties": 512,
+          "minProperties": 1,
+          "patternProperties": {
+            "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?(\\+[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$": {
+              "pattern": "^[0-9a-f]{40}$",
+              "type": "string"
+            }
+          },
+          "propertyNames": {
+            "maxLength": 128
+          },
+          "title": "Versions",
+          "type": "object",
+          "additionalProperties": false
+        },
+        "tier": {
+          "enum": [
+            "first-party",
+            "community"
+          ],
+          "title": "Tier",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "repo",
+        "versions",
+        "tier"
+      ],
+      "title": "MarketplacePlugin",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "A `marketplace.json` file.",
+  "properties": {
+    "plugins": {
+      "description": "One entry per plugin name (names are unique).",
+      "items": {
+        "$ref": "#/$defs/MarketplacePlugin"
+      },
+      "maxItems": 1024,
+      "title": "Plugins",
+      "type": "array"
+    }
+  },
+  "required": [
+    "plugins"
+  ],
+  "title": "Horae marketplace index (marketplace.json)",
+  "type": "object"
+}

@@ -1,0 +1,19 @@
+{
+  "plugins": [
+    {
+      "name": "github",
+      "repo": "https://github.com/horae-dev/plugin-github",
+      "versions": {
+        "0.1.0": "3f2c9e1a7b4d5c6e8f9012345678abcdef012345",
+        "0.2.0-rc.1": "c3d065f4fd79109099428e4b1f3b8d2c66918cb0"
+      },
+      "tier": "first-party"
+    },
+    {
+      "name": "coach",
+      "repo": "https://git.example.org/someone/plugin-coach",
+      "versions": { "1.0.0": "2b1bbe92d81f4720422d32f13b7fe6d812d353f8" },
+      "tier": "community"
+    }
+  ]
+}
