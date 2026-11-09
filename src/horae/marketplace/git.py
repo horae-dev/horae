@@ -5,8 +5,8 @@ An index is any git URL the user configures, and a clone is a network read of un
 only the named protocol is allowed (`https`; tests may name `file`), the user's and the
 system's git configuration are ignored, nothing may prompt, nothing inherits the environment
 (no `GIT_SSH_COMMAND`, `GIT_PROXY_COMMAND`, `GIT_EXEC_PATH`, ...), and every call has a timeout.
-Clones are full, not partial (`--filter` made a later `git show` fetch lazily over a protocol
-the other calls block).
+Clones are shallow (the tip of HEAD only) but not partial (`--filter` made a later `git show`
+fetch lazily over a protocol the other calls block).
 """
 
 import os
@@ -50,7 +50,6 @@ def run_git(cwd: Path, *args: str, allow: str = HTTPS, timeout_s: float = GIT_TI
             cwd=cwd,
             env=git_env(),
             capture_output=True,
-            text=True,
             timeout=timeout_s,
             check=False,
             stdin=subprocess.DEVNULL,
@@ -60,6 +59,11 @@ def run_git(cwd: Path, *args: str, allow: str = HTTPS, timeout_s: float = GIT_TI
     except OSError as exc:
         raise GitError(f"cannot run git: {exc.strerror or type(exc).__name__}") from exc
     if done.returncode != 0:
-        reason = " ".join(done.stderr.split())[:MAX_ERROR_CHARS]
+        stderr = done.stderr.decode("utf-8", errors="replace")
+        reason = " ".join(stderr.split())[:MAX_ERROR_CHARS]
         raise GitError(f"git {args[0]} failed: {reason}")
-    return done.stdout.strip()
+    try:
+        return done.stdout.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        # A hostile index file that is not UTF-8 is a failed fetch (the cache stays), not a crash.
+        raise GitError(f"git {args[0]} printed output that is not UTF-8") from None

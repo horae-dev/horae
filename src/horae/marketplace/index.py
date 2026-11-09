@@ -4,7 +4,7 @@
 Layout, under a cache directory (`<state_dir>/marketplaces`), one directory per index URL
 (named by the SHA-256 of the URL):
 
-    repo.git/         the full bare clone of the index repository (updated on each fetch)
+    repo.git/         the shallow bare clone of the index repository (updated on each fetch)
     marketplace.json  the last copy that passed the `MarketplaceIndex` contract
     fetched.json      {"url", "fetched_at"} of that copy
 
@@ -16,6 +16,7 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 import tempfile
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -153,22 +154,14 @@ class MarketplaceClient:
         folder.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
             if not repo.is_dir():
-                run_git(
-                    folder,
-                    "clone",
-                    "--bare",
-                    "--quiet",
-                    "--",
-                    self.remote(url),
-                    str(repo),
-                    allow=self.allow_protocol,
-                    timeout_s=self.timeout_s,
-                )
+                self._clone(url, folder, repo)
             run_git(
                 repo,
                 "fetch",
                 "--quiet",
                 "--force",
+                "--depth=1",
+                "--no-tags",
                 "--",
                 self.remote(url),
                 f"+HEAD:{HEAD_REF}",
@@ -190,6 +183,31 @@ class MarketplaceClient:
         fetched_at = self._clock()
         self._write_cache(folder, url, text, fetched_at)
         return LoadedIndex(url, index, fetched_at, from_cache=False)
+
+    def _clone(self, url: str, folder: Path, repo: Path) -> None:
+        """Clone into a scratch directory and move it into place only when complete, so a
+        clone killed by the timeout never leaves a broken `repo.git` that every later fetch
+        would trip over. Shallow (the tip only): a hostile index cannot make us download its
+        whole history."""
+        scratch = Path(tempfile.mkdtemp(dir=folder, prefix=".clone-"))
+        try:
+            run_git(
+                folder,
+                "clone",
+                "--bare",
+                "--quiet",
+                "--depth=1",
+                "--no-tags",
+                "--single-branch",
+                "--",
+                self.remote(url),
+                str(scratch),
+                allow=self.allow_protocol,
+                timeout_s=self.timeout_s,
+            )
+            scratch.replace(repo)
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
 
     # --- cache -----------------------------------------------------------------------------
 

@@ -463,3 +463,54 @@ def test_search_lists_by_priority_then_name(tmp_path: Path) -> None:
 
 def test_the_default_config_adapter_matches_the_index_url_pattern() -> None:
     TypeAdapter(InstanceConfig).validate_python({"marketplaces": [DEFAULT_MARKETPLACE]})
+
+
+# --- hostile index repositories (review of #152) -----------------------------------------------
+
+
+def test_an_index_that_is_not_utf8_is_a_failed_fetch_and_the_cache_survives(tmp_path: Path) -> None:
+    repo = publish(tmp_path / "a", [entry("one", ["1.0.0"])])
+    client = _client(tmp_path, a=repo)
+    client.load()
+    (repo / "marketplace.json").write_bytes(b'{"plugins": [], "x": "\xff\xfe"}')
+    from marketplace_fixtures import git
+
+    git(repo, "commit", "-q", "-am", "binary")
+    with pytest.raises(FetchError, match="UTF-8"):
+        client.refresh(A)
+    loaded = client.load()
+    assert loaded.indexes[0].from_cache
+    assert "UTF-8" in loaded.warnings[0]
+
+
+def test_a_killed_clone_leaves_nothing_that_breaks_the_next_fetch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = publish(tmp_path / "a", [entry("one", ["1.0.0"])])
+    client = _client(tmp_path, a=repo)
+    real = run_git
+
+    def killed(cwd: Path, *args: str, **kwargs: Any) -> str:
+        if args[0] == "clone":
+            Path(args[-1]).joinpath("HEAD").write_text("half a clone")
+            raise GitError("git clone timed out after 120s")
+        return real(cwd, *args, **kwargs)
+
+    monkeypatch.setattr(index_module, "run_git", killed)
+    with pytest.raises(NoCacheError):
+        client.load()
+    monkeypatch.setattr(index_module, "run_git", real)
+    assert [p.name for p in (client.cache_dir).glob("*/*")] == []
+    assert client.load().indexes[0].index.plugins[0].name == "one"
+
+
+def test_the_clone_is_shallow(tmp_path: Path) -> None:
+    from marketplace_fixtures import git
+
+    repo = publish(tmp_path / "a", [entry("one", ["1.0.0"])])
+    for n in range(3):
+        publish(repo, [entry("one", [f"1.0.{n + 1}"])])
+    client = _client(tmp_path, a=repo)
+    client.load()
+    bare = next(client.cache_dir.glob("*/repo.git"))
+    assert git(bare, "rev-list", "--count", "refs/horae/head") == "1"

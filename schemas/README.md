@@ -3467,7 +3467,7 @@ loosened later without breaking a valid file.
     - **B, config.** `marketplaces`: an ordered list of 1 to 16 `https://` git URLs, highest
       priority first, default `["https://github.com/horae-dev/marketplace"]`; no duplicate.
       `marketplace_pins`: plugin name -> one of the `marketplaces`.
-    - **C, fetch and cache.** `horae plugin search|resolve` clone (full clone, not
+    - **C, fetch and cache.** `horae plugin search|resolve` clone (shallow, `--depth=1`, not
       `--filter`) or update each index into `<state_dir>/marketplaces/<hash of the URL>/repo.git`,
       read `marketplace.json` from the fetched `HEAD` (at most 4 MiB), validate it, and store the
       validated copy and when it was fetched beside the clone. A copy that fails validation never
