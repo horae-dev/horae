@@ -145,6 +145,33 @@ grants no host.
 the default is `[]`, as the core sends for a plugin with no approved host, and `network=None`
 (`"network": null`) sends none, as an older core does.
 
+### Local-network services (0.6)
+
+A service on the user's network (Home Assistant at `192.168.1.10:8123`, a self-hosted ntfy at
+`ntfy.lan`, Proton Mail Bridge at `127.0.0.1:1143`) is approved in `horae.lock` under
+`permissions.network_local`, not `network` (schemas decision 66). Each entry is `host:port`
+with an explicit port; the host is a loopback, private or link-local IP literal (canonical
+form, IPv6 in brackets: `[::1]:1143`) or a `.local`, `.lan`, `.internal` or `.home.arpa` name.
+Declare them in your manifest with `Permissions(network_local=["127.0.0.1:1143"])`.
+
+- `call.host_allowed(url)` (and `request.host_allowed(url)`) also returns `True` for an `http`
+  **or** `https` URL whose host and port are exactly an approved local endpoint; a URL without
+  a port means 80 (`http`) or 443 (`https`). Plain `http` is allowed only there.
+- There is no normalisation and no DNS: `http://127.000.000.001:1143/`, another port, a name
+  that merely contains a local one (`ntfy.lan.evil.test`, `127.0.0.1.nip.io`) and user info
+  never match. A local grant cannot hold a public address, a public name, a wildcard or a cloud
+  metadata address or name (`169.254.169.254`, `metadata.google.internal`).
+- For a protocol that is not HTTP (IMAP, SMTP...), `call.address_allowed(host, port)`: `True`
+  when `host` is an approved host (any port) or `host:port` an approved local endpoint.
+- `call.local_endpoints` is the list (`()` when none, `None` when unknown). A core that sends
+  `horae/network` but not `horae/network_local` granted none; a core that sends neither is
+  unknown (`None`), as above.
+- A local name can still resolve to anything: if you resolve it yourself, keep refusing a
+  metadata or otherwise unexpected address. The M5 egress proxy checks it at connect time.
+
+`horae_sdk.testing.call(..., network_local=[...])` (a recording's `"network_local"` key) sends
+the local list; by default `[]` is sent alongside `network`.
+
 ## Manifest
 
 ```python
@@ -157,7 +184,8 @@ print(dump_manifest(data))
 ```
 
 `provides` comes from what the plugin registered, `permissions` from `Plugin(...,
-permissions=Permissions(...))`: `intents`, `network` (host names), `secrets` (injected as
+permissions=Permissions(...))`: `intents`, `network` (host names), `network_local`
+(`host:port` local-network services), `secrets` (injected as
 environment variables; the plugin does not start without them), `optional_secrets` (injected
 only when they resolve; read them with `os.environ.get` and report `secret_missing` yourself
 when a call needs one that is absent), `read` and `write` paths. Declare the least you need: undeclared

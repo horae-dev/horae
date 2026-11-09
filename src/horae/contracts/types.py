@@ -15,6 +15,7 @@ ECMA-262 and pydantic reject it. See ``schemas/README.md``.
 """
 
 import datetime
+import ipaddress
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -322,6 +323,86 @@ an optional port. No user info, fragment, backslash, whitespace or control chara
 string, never normalised; use `url_host` to read the host.
 
 Any port is accepted on a declared host (schemas README, decision 10)."""
+
+# --- local network endpoints (decision 66) ---------------------------------------------------
+
+LOCAL_SUFFIXES = ("local", "lan", "internal", "home.arpa")
+"""The name suffixes of a local endpoint: mDNS (`.local`, RFC 6762), the home network special
+use domain (`.home.arpa`, RFC 8375), the private-use `.internal` and the common `.lan`."""
+
+_OCTET = r"(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])"
+_LOCAL_NAME = rf"({_LABEL}\.)+(local|lan|internal|home\.arpa)"
+_LOCAL_V4 = (
+    rf"(127(\.{_OCTET}){{3}}|10(\.{_OCTET}){{3}}|172\.(1[6-9]|2[0-9]|3[01])(\.{_OCTET}){{2}}"
+    rf"|192\.168(\.{_OCTET}){{2}}|169\.254(\.{_OCTET}){{2}})"
+)
+_LOCAL_V6 = r"\[(::1|f[cd][0-9a-f]{2}:[0-9a-f:]{1,35}|fe[89ab][0-9a-f]:[0-9a-f:]{1,35})\]"
+LOCAL_HOST = rf"({_LOCAL_NAME}|{_LOCAL_V4}|{_LOCAL_V6})"
+"""The host of a local endpoint, as written: a name under a `LOCAL_SUFFIXES` suffix, a private,
+loopback or link-local IPv4 literal, or a bracketed loopback, ULA or link-local IPv6 literal.
+The model also requires the canonical form of an IP literal (see `_check_local`)."""
+_LOCAL_ENDPOINT = rf"^{LOCAL_HOST}:{_PORT}$"
+_METADATA = (
+    r"^(169\.254\.169\.254|169\.254\.170\.2|\[fd00:ec2::254\]"
+    r"|(metadata|instance-data)(\.[^:]*)?):"
+)
+"""Cloud instance metadata services: never a home service, and the classic SSRF target.
+Refused even as an explicit grant: the addresses (169.254.169.254, 169.254.170.2,
+fd00:ec2::254) and every name whose first label is `metadata` or `instance-data`
+(`metadata.google.internal`, `metadata.internal`, `instance-data.ec2.internal`...). A name
+can still *resolve* to a metadata address: refusing that at connect time is the M5 egress
+proxy's job (#50)."""
+
+_LOCAL_V4_NETS = tuple(
+    ipaddress.IPv4Network(net)
+    for net in ("127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16")
+)
+_LOCAL_V6_NETS = tuple(ipaddress.IPv6Network(net) for net in ("::1/128", "fc00::/7", "fe80::/10"))
+
+
+def _check_local(endpoint: str) -> str:
+    host, _, _port = endpoint.rpartition(":")
+    if re.match(_METADATA, endpoint):
+        raise ValueError("a cloud metadata address is never a local endpoint")
+    if host.startswith("["):
+        literal = host[1:-1]
+        address: ipaddress.IPv4Address | ipaddress.IPv6Address = ipaddress.IPv6Address(literal)
+        nets: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = _LOCAL_V6_NETS
+    elif re.fullmatch(_LOCAL_V4, host):
+        literal = host
+        address, nets = ipaddress.IPv4Address(literal), _LOCAL_V4_NETS
+    else:
+        if len(host) > 253:
+            raise ValueError("the host name is longer than 253 characters")
+        _check_host(host)
+        return endpoint
+    if str(address) != literal:
+        raise ValueError(f"write the address in its canonical form, {address}")
+    if not any(address in net for net in nets):
+        raise ValueError("not a loopback, private or link-local address")
+    return endpoint
+
+
+LocalEndpoint = Annotated[
+    str,
+    Strict(),
+    StringConstraints(pattern=_LOCAL_ENDPOINT, max_length=260),
+    AfterValidator(_check_local),
+    JsonSchemaExtra({"not": {"pattern": _METADATA}}),
+]
+"""A service on the local network, `host:port` with an **explicit** port, e.g.
+`127.0.0.1:1143`, `[::1]:1143`, `192.168.1.10:8123` or `homeassistant.local:8123` (decision 66).
+
+The host is one of: a lowercase name ending in `.local`, `.lan`, `.internal` or `.home.arpa`
+(with at least one label before it); an IPv4 literal in 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12,
+192.168.0.0/16 or 169.254.0.0/16; or a bracketed IPv6 literal `::1`, in fc00::/7 (ULA) or in
+fe80::/10 (link-local, no zone id). IP literals must be canonical (`str(ipaddress.ip_address)`:
+no leading zeros, compressed lowercase IPv6, no IPv4-mapped form), so one service has one
+spelling. Never a public address, a public name, `localhost`, a wildcard, a scheme or a path;
+the cloud metadata addresses (169.254.169.254, 169.254.170.2, fd00:ec2::254) and names whose
+first label is `metadata` or `instance-data` (`metadata.google.internal`,
+`instance-data.ec2.internal`) are refused. The
+range and canonical-form checks are made by the model only; the JSON Schema checks the shape."""
 
 # --- paths -----------------------------------------------------------------------------------
 

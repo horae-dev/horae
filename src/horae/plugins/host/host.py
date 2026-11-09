@@ -52,6 +52,8 @@ run's `ToolCaller`:
 - **trusted network**: and its network allow-list as approved in `horae.lock` (not the
   manifest's declared one) in `_meta["horae/network"]`, a list that is empty when the lock
   grants no host (#131), so a plugin can refuse a host the user did not approve before M5;
+  its approved local-network endpoints (`permissions.network_local`, `host:port`) travel in
+  `_meta["horae/network_local"]` the same way (decision 66, #132);
 - **runtime.command is not pinned** against the lock in v1: the lock pins the plugin's
   version, commit and permissions, and the installed manifest's command is used as it is.
   Pinning it (and the plugin's files) is M4's install and verify work (#44, #46);
@@ -149,7 +151,7 @@ class InstalledPlugin:
 def _exceeds(asked: Permissions, approved: Permissions) -> list[str]:
     extra = [
         f"{field}: {', '.join(sorted(set(getattr(asked, field)) - set(getattr(approved, field))))}"
-        for field in ("network", "secrets", "optional_secrets", "intents")
+        for field in ("network", "network_local", "secrets", "optional_secrets", "intents")
         if not set(getattr(asked, field)) <= set(getattr(approved, field))
     ]
     for access in ("read", "write"):
@@ -534,7 +536,13 @@ class PluginHost:
         paths = {"read": list(locked.read), "write": list(locked.write)}
         try:
             result = await process.call(
-                ref, params, input, timeout, paths=paths, network=permissions.network
+                ref,
+                params,
+                input,
+                timeout,
+                paths=paths,
+                network=permissions.network,
+                network_local=permissions.network_local,
             )
         except CallFailed as failed:
             await process.stop(forced=True)

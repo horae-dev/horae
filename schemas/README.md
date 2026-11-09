@@ -3661,3 +3661,91 @@ loosened later without breaking a valid file.
     - **E, exit and logging.** stdout carries the protocol only; problems go to stderr. Exit 0
       when the client closes the connection, 1 configuration problem, 2 usage error, 70
       internal error (decision 37).
+
+### Provisional decisions (#132, pending maintainer review)
+
+66. **Local-network grants in `horae.lock`, and how plugins reach the M5 egress proxy (#132).**
+    `permissions.network` holds public DNS names reached over `https` (decisions 6, 10, 63) and
+    cannot express a service on the user's network: a self-hosted ntfy at `ntfy.lan` over
+    `http`, Home Assistant at `homeassistant.local:8123` or `192.168.1.10:8123`, Proton Mail
+    Bridge at `127.0.0.1:1143`. Decision 62 is taken by open PR #155; 63 to 65 are merged.
+    - **A, a separate grant.** New `permissions.network_local` (plugin manifest and lock, both
+      schemas regenerated): a unique list of `LocalEndpoint` strings, `host:port`, e.g.
+      `["127.0.0.1:1143", "[::1]:1143", "192.168.1.10:8123", "homeassistant.local:8123"]`.
+      A string, not `{host, port, scheme}`: it sorts and diffs like the other lock lists, and
+      the scheme is not part of the grant (below). `network` is unchanged and still refuses IP
+      literals, `localhost` and ports, so nothing that was refused before becomes allowed there.
+    - **B, what a local endpoint is.** The port is **always explicit** (1 to 65535, no leading
+      zero). The host is one of: a lowercase name ending in `.local` (mDNS), `.lan`, `.internal`
+      or `.home.arpa` with at least one label before the suffix; an IPv4 literal in
+      127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 or 169.254.0.0/16; or a bracketed
+      IPv6 literal `::1`, in fc00::/7 (ULA) or fe80::/10 (no zone id). IP literals must be
+      canonical (`str(ipaddress.ip_address(...))`: no leading zeros, compressed lowercase IPv6,
+      no IPv4-mapped form), so one service has one spelling and exact matching is sound.
+      Never a public address or name, `localhost`, a single-label name, a wildcard, a scheme or a
+      path. Cloud metadata services are refused even as an explicit grant: the addresses
+      169.254.169.254, 169.254.170.2 and fd00:ec2::254, and every name whose first label is
+      `metadata` or `instance-data` (`metadata.google.internal`, `metadata.internal`,
+      `instance-data.ec2.internal`). The JSON Schema checks the shape (suffixes, private
+      prefixes, port, the metadata `not`); the model adds the ranges and the canonical form.
+      CGNAT (100.64.0.0/10, e.g. Tailscale) and single-label Docker service names are left
+      out on purpose: a Docker service gets a `.internal` alias, and widening is a later,
+      compatible change.
+    - **C, plaintext.** Plain `http` is allowed **only** on a local endpoint, never on a
+      `network` host. The grant names a host and port, not a scheme: `http` and `https` (and,
+      for `address_allowed`, any protocol) may use it, since what is approved is reaching that
+      service, and TLS on a LAN is the user's choice. `http.post` intents, `mcp-http` runtimes
+      and task links keep `HttpsUrl` and `network`: a local grant is for the plugin's own
+      connections only.
+    - **D, approval.** Manifest-declared versus lock-approved stays as decision 63: the host
+      refuses a plugin whose manifest asks for a `network_local` entry the lock does not grant
+      (`permissions not approved (network_local: ...)`), and the lock's list is the one in force.
+      The approval flow (#46) must show these entries **apart** from `network`, under "local
+      network (plain http allowed)", one line per endpoint. Until then a lock is hand-written:
+      the lockfile contract accepts the key, and a lock without local grants is written exactly
+      as before (`network_local` is left out when empty), so an older core still reads it.
+    - **E, the wire.** Every plugin call also carries `_meta["horae/network_local"]`: the locked
+      list, always present from this core (`[]` when none). horae-sdk 0.6.0:
+      `host_allowed(url)` is `True` for an `https` URL on an approved host (decision 63) **or**
+      an `http`/`https` URL whose host and port are exactly an approved local endpoint (no port
+      in the URL means 80 for `http`, 443 for `https`); `address_allowed(host, port)` does the
+      same for other protocols (IMAP); `local_endpoints` is the list. True / False / None stay:
+      no `horae/network` at all is unknown (`None`); `horae/network` without
+      `horae/network_local` (a decision-63 core, which could not grant one) means no local
+      endpoint. No normalisation and no DNS: a public name never matches a local grant
+      (`ntfy.lan.evil.test`, `127.0.0.1.nip.io`), nor do user info, another spelling of an
+      address or another port. Old plugins and SDKs ignore the new key; an older core sends
+      neither key and the SDK reports unknown.
+    - **F, the M5 egress proxy (to be followed by #49 and #50).** The proxy is exposed by an
+      **explicit** variable, not transparently: in M5 isolation only, the core sets
+      `HORAE_EGRESS_PROXY` (an `http://` URL of the allow-listing proxy) in the plugin's clean
+      environment; `*_PROXY` stays on the deny list (decision 28) and plugins keep
+      `trust_env=False`. A plugin sends its connections to **public** hosts (`network`) through
+      `HORAE_EGRESS_PROXY` (HTTP `CONNECT`), and connects to **local** endpoints directly. The
+      plugin container's network has no default route: the proxy, which resolves names itself
+      and refuses private, loopback, link-local and metadata addresses (T07), is the only way
+      out for public hosts, and each `network_local` grant becomes an explicit route or firewall
+      allow rule for exactly that address and port (a local name is resolved once by the core
+      when the container starts, and refused if it resolves outside B's ranges or to a metadata
+      address). Before M5 the variable is unset: a plugin connects directly, as today. A plugin
+      that sees the variable and cannot use a proxy must fail, not bypass it (it could not
+      anyway). Loopback in M5 means the plugin's own container; reaching a service on the
+      Docker host's loopback (Proton Mail Bridge) needs that route to the host (#49/#50 decide
+      how, e.g. a host-gateway route limited to the granted port).
+    - **G, limits before M5.** A local name can still **resolve** to a metadata or public
+      address: the grant checks what is written, not what DNS answers. Refusing that at connect
+      time is the proxy's and the route's job (#50); a plugin that resolves names itself keeps
+      refusing a resolved metadata address (plugin-ntfy already does). As in decision 63 B, the
+      `_meta` lists are advice a good plugin enforces on itself, not isolation (T05). A grant of
+      `127.0.0.1:<port>` before M5 reaches whatever listens on the core's own loopback (e.g. the
+      HTTP API, decision 51 B): the approval shows it as a local-network grant for the user to
+      judge.
+    - **H, plugin follow-ups (not changed here).** plugin-imap: declare its Bridge endpoint in
+      `network_local` (e.g. `127.0.0.1:1143`, `127.0.0.1:1025` for SMTP), require horae-sdk 0.6,
+      and check `call.address_allowed(host, port)` before connecting (`False` refuses, `None`
+      falls back to its own config); drop the 0.1.0 note that a local Bridge is always refused.
+      plugin-homeassistant: accept an IP-literal or `.local` / `.lan` base URL (`http` allowed),
+      check it with `call.host_allowed(url)`, and document `network_local` with an explicit port
+      instead of refusing IP literals. plugin-ntfy: accept an `http://` `server` on a local
+      endpoint through `request.host_allowed(url)` (port 80 or an explicit one), keep `https`
+      for public servers and its resolved-address checks, and document the `network_local` entry.

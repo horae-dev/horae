@@ -72,7 +72,7 @@
       "description": "Everything the plugin may touch. Undeclared access is a bug, blocked from M5.",
       "properties": {
         "network": {
-          "description": "Hosts the plugin may connect to.",
+          "description": "Hosts the plugin may connect to: public DNS names, `https` only, any port.",
           "items": {
             "maxLength": 253,
             "not": {
@@ -83,6 +83,21 @@
           },
           "maxItems": 256,
           "title": "Network",
+          "type": "array",
+          "uniqueItems": true
+        },
+        "network_local": {
+          "description": "Services on the local network the plugin may connect to (decision 66): loopback,\nprivate or link-local IP literals and `.local` / `.lan` / `.internal` / `.home.arpa`\nnames, each with an explicit port, matched exactly (host and port), plain `http` allowed.\nShown apart from `network` at approval (\"local network\").",
+          "items": {
+            "maxLength": 260,
+            "not": {
+              "pattern": "^(169\\.254\\.169\\.254|169\\.254\\.170\\.2|\\[fd00:ec2::254\\]|(metadata|instance-data)(\\.[^:]*)?):"
+            },
+            "pattern": "^(([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+(local|lan|internal|home\\.arpa)|(127(\\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3}|10(\\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3}|172\\.(1[6-9]|2[0-9]|3[01])(\\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){2}|192\\.168(\\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){2}|169\\.254(\\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){2})|\\[(::1|f[cd][0-9a-f]{2}:[0-9a-f:]{1,35}|fe[89ab][0-9a-f]:[0-9a-f:]{1,35})\\]):(6553[0-5]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|[1-5][0-9]{4}|[1-9][0-9]{0,3})$",
+            "type": "string"
+          },
+          "maxItems": 256,
+          "title": "Network Local",
           "type": "array",
           "uniqueItems": true
         },

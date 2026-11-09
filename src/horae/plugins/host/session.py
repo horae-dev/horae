@@ -26,7 +26,9 @@ It also carries the plugin's network allow-list **as approved in `horae.lock`** 
 `_meta["horae/network"]` (a list of host names, #131; empty when the lock grants no host,
 never "everything allowed"): before M5 isolation (no egress proxy) it lets a plugin refuse a
 host the user did not approve. The core sets it from the lock on every call; a plugin cannot
-influence it (a transform's input travels under another key).
+influence it (a transform's input travels under another key). The approved local-network
+endpoints (`permissions.network_local`, `host:port` strings, decision 66, #132) travel the same
+way in `_meta["horae/network_local"]`, also always sent (empty when none).
 """
 
 import json
@@ -53,6 +55,8 @@ PATHS_META = "dev.horae/paths"
 """Request `_meta` key of the plugin's locked path permissions."""
 NETWORK_META = "horae/network"
 """Request `_meta` key of the plugin's locked `permissions.network` (a list of host names)."""
+NETWORK_LOCAL_META = "horae/network_local"
+"""Request `_meta` key of the plugin's locked `permissions.network_local` (`host:port`)."""
 MAX_TOOLS = 1024
 """Most tools (over all `tools/list` pages) a plugin may list."""
 _MAX_PAGES = 64
@@ -180,6 +184,7 @@ class PluginProcess:
         *,
         paths: dict[str, list[str]] | None = None,
         network: Sequence[str] = (),
+        network_local: Sequence[str] = (),
     ) -> mcp_types.CallToolResult:
         """Call tool `name`; `CallFailed` (process unusable) or `PluginCallError` (it is fine)."""
         session = self.session
@@ -189,6 +194,7 @@ class PluginProcess:
         if paths is not None:
             meta[PATHS_META] = paths
         meta[NETWORK_META] = list(network)  # always sent: empty means no host, not all hosts
+        meta[NETWORK_LOCAL_META] = list(network_local)  # likewise (decision 66)
         crashed: MCPError | None = None
         result: mcp_types.CallToolResult | None = None
         with anyio.move_on_after(timeout_s) as scope:
@@ -258,6 +264,7 @@ Factory = Callable[[Spawn, StderrCapture], PluginProcess]
 __all__ = [
     "INPUT_META",
     "INTENTS_META",
+    "NETWORK_LOCAL_META",
     "NETWORK_META",
     "PATHS_META",
     "CallFailed",

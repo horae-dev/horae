@@ -7,7 +7,6 @@ from typing import Any
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
-import horae_sdk
 from horae.contracts.types import Hostname, HttpsUrl
 from horae.contracts.types import url_host as core_url_host
 from horae_sdk import Applied, ApplyRequest, Call, Network, Notifier, Paths, Permissions, Plugin
@@ -243,7 +242,3 @@ def test_a_sink_operation_gets_the_list_too() -> None:
     assert apply([])["details"] == {"allowed": False}
     assert apply(None)["details"] == {"allowed": None}
     assert sink.seen[-1].network.known is False
-
-
-def test_the_version_is_0_5_0() -> None:
-    assert horae_sdk.__version__ == "0.5.0"
