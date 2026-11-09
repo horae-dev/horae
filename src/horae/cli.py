@@ -585,6 +585,7 @@ def replay_command(
 from horae.cli_cache import cache_app as _cache_app  # noqa: E402
 from horae.cli_eval import eval_command as _eval  # noqa: E402
 from horae.cli_init import init as _init  # noqa: E402
+from horae.cli_mcp import mcp_app as _mcp_app  # noqa: E402
 from horae.cli_plugin import plugin_app as _plugin_app  # noqa: E402
 from horae.cli_run import run as _run  # noqa: E402
 from horae.cli_serve import serve as _serve  # noqa: E402
@@ -598,6 +599,7 @@ _command("undo")(_undo)
 _command("usage")(_usage)
 _command("eval")(_eval)
 app.add_typer(_cache_app, name="cache")
+app.add_typer(_mcp_app, name="mcp")
 app.add_typer(_plugin_app, name="plugin")
 
 __all__ = [

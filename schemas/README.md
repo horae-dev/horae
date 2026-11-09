@@ -3625,3 +3625,39 @@ loosened later without breaking a valid file.
       `scripts/sync_recordings.py` (`_offline_backends`, `deidentify`, `recorded_request`,
       `request_for`, `viewed_input`) to `horae.evals.request_digest`; `pack-reminders` uses no
       private replay. Pipelines can be tested with `horae run --llm-replay`.
+
+### Provisional decisions (#54, pending maintainer review)
+
+65. **The read-only MCP server (#54).** New command `horae mcp serve [-i <instance>]
+    [--brief-pipeline NAME]` (`horae.cli_mcp`, `horae.mcp_server`), over the `mcp` SDK already
+    used by the plugin host (`mcp>=2.3,<2.4`, `MCPServer`), **stdio only**. Decision 64 is taken
+    by #134.
+    - **A, tools.** Exactly three, none with a side effect: `tasks.today` (open tasks, status
+      `todo`, due today in the instance's time zone or overdue, overdue first; `limit` 1 to 100,
+      default 50), `brief.latest` (the latest run of the brief pipeline, `daily-brief` unless
+      `--brief-pipeline` says otherwise, and the `note.*` paths it journalled, never their
+      content; `run: null` when it never ran) and `runs.recent` (newest first, live skill evals
+      left out as in `/runs`; `limit` 1 to 50, default 10). The names are the ones of PLAN §3.5.
+      `pipeline.run` is #55 and is not here; the server has no resource and no prompt.
+    - **B, contracts.** Each result is a strict pydantic model (`horae.contracts.mcp`), exported
+      as `schemas/mcp/tasks-today/v1.json`, `brief-latest/v1.json` and `runs-recent/v1.json`
+      (`export --check` guards them) and published as the tool's `outputSchema`; the client
+      receives it as `structuredContent`. A run is the HTTP API's representation
+      (`horae.run_view.run_json`, decision 51 C), shared, not copied. Caps: 100 tasks, 50 runs,
+      20 targets; titles 200, targets 256, errors 500 characters.
+    - **C, untrusted text.** The client is an LLM and a note can say anything. Task `title` and
+      `target`, a target in `brief.latest` and a run `error` are marked `x-untrusted` in the
+      schema, redacted with the process registry, reduced to one printable line (control
+      characters become spaces), clipped, and declared as data in every tool description and in
+      the server's `instructions`. The server never interprets them. Marking reduces, and does
+      not remove, the risk that a hostile title steers a client; the tools cannot act on it.
+    - **D, read-only and no network.** Each call opens the store `mode=ro`
+      (`Store.open(read_only=True)`: no migration, no write, no file created; a missing store
+      is empty), takes no path, command or secret from the client, and closes it. No socket is
+      opened, so there is nothing to authenticate here; token auth for a network transport is
+      #56. A store failure is the fixed tool error `store_unreadable` (no path, no exception
+      text). The tools are annotated `readOnlyHint`, `idempotentHint`, not `destructiveHint`,
+      not `openWorldHint`.
+    - **E, exit and logging.** stdout carries the protocol only; problems go to stderr. Exit 0
+      when the client closes the connection, 1 configuration problem, 2 usage error, 70
+      internal error (decision 37).
