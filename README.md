@@ -64,6 +64,13 @@ plugin declares and asks you to approve them before pinning it in `horae.lock`.
 `--yes` re-installs, without asking, only what `horae.lock` already approves (a Docker build
 from a committed lock). Details: [schemas decision 70](schemas/README.md#decisions).
 
+A **pipeline pack** (a plugin whose `plugin.yaml` lists `provides.pipelines`) also gets its
+pipelines installed: `pipelines/<name>.yaml` of the pack is validated and copied to
+`<instance>/pipelines/<plugin>/<name>.yaml`, and the paths are recorded in
+`plugins/<plugin>/.horae-install.json`. The install is refused, and nothing is written, if any
+file is invalid, is a symlink, or would replace a file or pipeline of yours
+([schemas decision 71](schemas/README.md#provisional-decisions-133-pending-maintainer-review)).
+
 `-i` defaults to the current directory (or `HORAE_INSTANCE`). Every command takes `--json`
 for scripting (one JSON document on stdout, `schema_version: 1`, errors too) and prints no
 colour unless asked. `horae run` has no LLM backend in M1: a pipeline with an `llm` step

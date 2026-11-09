@@ -4114,3 +4114,42 @@ loosened later without breaking a valid file.
       regular file (no symlink) of at most 64 KiB holding a JSON object. A plugin **without** a
       record (the built-in ones `horae init` installs, a plugin copied by hand) is checked by
       its manifest only: an accepted gap until the files of a plugin are pinned (#47 or M5).
+
+### Provisional decisions (#133, pending maintainer review)
+
+71. **A pipeline pack's pipelines are installed by `horae plugin add` into
+    `pipelines/<plugin>/` (#133).** No schema change. (The number is provisional: #48 may take
+    one too.)
+    - **A, where.** `<instance>/pipelines/<plugin>/<pipeline>.yaml`, one directory per pack.
+      The instance loader (`horae.config.loader`) reads `pipelines/*.yaml` as before and now
+      also `pipelines/<dir>/*.yaml`, one level down; a directory whose name starts with `.` or
+      has a suffix, and a symlinked directory, are skipped. A pipeline's `name` is still its
+      file's stem and still unique in the whole instance (a second definition is the existing
+      "defined twice" problem). A directory per pack, not a prefix in the file name, because the
+      name of a pipeline is the file's stem and a prefix would change what `horae run` is
+      called by; and so that remove and upgrade (#47) delete exactly one directory.
+    - **B, what is a pack.** A plugin whose manifest lists `provides.pipelines`. The pack's
+      `pipelines/` holds exactly those names as plain `<name>.yaml` files (a missing file, an
+      undeclared one, a `.yml`, a directory or a symlink is a refusal). A plugin that lists none
+      is not a pack and installs nothing here.
+    - **C, when and how.** Inside the existing flow, as the last `prepare` step, after the
+      approval and the venv build and before the tree is moved into place: every file is read
+      once (at most 1 MiB, regular file, no symlink, resolving inside the tree), parsed with the
+      loader's safe YAML reader and validated as a `Pipeline`, and its `name` must be its file's.
+      The installer itself refuses a symlink under `pipelines/` in the git tree (a checkout with
+      `core.symlinks=false` would turn it into a file holding the link target). Any failure is
+      `install_refused` (exit 3) and nothing is written. The validated bytes are written to a
+      scratch directory `pipelines/.install-*` and renamed to `pipelines/<plugin>/` after the
+      tree is placed; if that or the `horae.lock` write fails, both are undone.
+    - **D, never overwrite.** The install is refused if `pipelines/<plugin>/` exists (the
+      plugin is not installed at that point, so it is not ours) or if another pipeline of the
+      instance already has the name of one of the pack's. #47 must delete the recorded files
+      before a reinstall, which is what makes "a file this pack installed before" replaceable.
+    - **E, the record.** The relative paths are added to the install record, key `pipelines`
+      (`plugins/<plugin>/.horae-install.json`, decision 62 F). `horae.lock` is unchanged: the
+      lock pins what was approved, and the files follow from the pinned commit. The host
+      compares only name, version, repo and commit, so the extra key is ignored there. `--json`
+      carries `pipelines` too.
+    - **F, what is not checked.** Instance-level references (a model alias, a tool nobody
+      provides, a time zone) are checked by `horae doctor` and at run time, as for a pipeline
+      written by hand: a pack cannot know the instance.

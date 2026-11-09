@@ -11,7 +11,9 @@ with its own venv built from its committed `uv.lock` (`horae.marketplace.environ
 decision 69; uv's cache is `<state_dir>/uv-cache`), shows the permissions its manifest asks
 for and, once the user approves them, writes its entry to `horae.lock`
 (`horae.marketplace.approval` and `horae.marketplace.lock`, decision 70). Approval runs
-before the venv is built, so a refused plugin's dependencies are never installed.
+before the venv is built, so a refused plugin's dependencies are never installed. A pipeline
+pack's `pipelines/*.yaml` are then validated and copied to `<instance>/pipelines/<name>/`
+(`horae.marketplace.pipelines`, decision 71); any invalid file refuses the whole install.
 
 Exit codes (`horae.cli_output`): 0 ok; 1 configuration problem, an index that cannot be
 fetched and has no cache, or a plugin that cannot be fetched; 2 usage error (a malformed
@@ -83,6 +85,7 @@ from horae.marketplace.approval import (
     with_grants,
 )
 from horae.marketplace.lock import LOCK_FILE, guard, read_lock, write_lock
+from horae.marketplace.pipelines import PackPipelines
 
 MARKETPLACES_DIR = "marketplaces"
 """Under the state directory: one folder per index."""
@@ -317,13 +320,16 @@ def _add(
         with guard(loaded_instance.state_dir):
             lock, header = read_lock(lock_path)
             approval = _Approval(lock, found, grants, yes=yes, json_output=json_output)
+            pipelines = PackPipelines(instance)
             installed = make_installer(plugins_dir(instance)).install(
                 found.name,
                 found.version,
                 found.repo,
                 found.sha,
                 prepare=_chain(
-                    approval, make_environment(loaded_instance.state_dir / UV_CACHE_DIR)
+                    approval,
+                    make_environment(loaded_instance.state_dir / UV_CACHE_DIR),
+                    pipelines,
                 ),
             )
             entry = approval.entry
@@ -333,8 +339,14 @@ def _add(
                 raise ApprovalRefused("the installed plugin is not the one approved; removed")
             plugins = {**lock.plugins, installed.name: entry}
             try:
+                pipelines.write()
+            except MarketplaceError:
+                shutil.rmtree(installed.path, ignore_errors=True)
+                raise
+            try:
                 write_lock(lock_path, Lockfile(schema_version=1, plugins=plugins), header)
             except OSError as exc:
+                pipelines.remove()
                 shutil.rmtree(installed.path, ignore_errors=True)
                 raise CommandFailed(
                     EXIT_PROBLEMS,
@@ -352,6 +364,7 @@ def _add(
                 "tier": found.tier,
                 "index": found.index,
                 "path": where,
+                "pipelines": pipelines.paths,
                 "permissions": entry.model_dump(mode="json")["permissions"],
                 "approved": True,
                 "enabled": False,
@@ -364,6 +377,8 @@ def _add(
     echo(f"  repo    {installed.repo}")
     echo(f"  commit  {installed.commit} (tag v{installed.version} points to it)")
     echo(f"  tier    {found.tier}")
+    for path in pipelines.paths:
+        echo(f"  pipeline  {path}")
     echo(PENDING)
     return EXIT_OK
 

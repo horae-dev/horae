@@ -360,6 +360,9 @@ class PluginInstaller:
             total += int(size)
             if total > MAX_TREE_BYTES:
                 raise InstallRefused(f"the tree is larger than {MAX_TREE_BYTES} bytes")
+            if mode == "120000" and path.startswith("pipelines/"):
+                # A pack's pipelines are copied into the instance (#133): never a link.
+                raise InstallRefused(f"the symlink {path!r} is in pipelines/: not allowed")
             if mode == "120000":
                 self._check_link(git_dir, path, oid, int(size))
 

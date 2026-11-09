@@ -206,8 +206,10 @@ def _timezone_exists(name: str) -> bool:
     return name in _timezones()
 
 
-def _pipeline_files(state: "_Loaded", directory: Path) -> list[Path]:
-    """The pipeline files in `directory`; unreadable or non-regular entries are problems."""
+def _pipeline_files(state: "_Loaded", directory: Path, *, nested: bool = True) -> list[Path]:
+    """The pipeline files in `directory`, and (`nested`) in each pack directory
+    `directory/<pack>/` one level down (decision 71); unreadable or non-regular entries are
+    problems."""
     try:
         info = os.stat(directory)
     except FileNotFoundError:
@@ -229,7 +231,12 @@ def _pipeline_files(state: "_Loaded", directory: Path) -> list[Path]:
         return []
     files = []
     for path in entries:
-        if path.suffix not in PIPELINE_SUFFIXES or path.name.startswith("."):
+        if path.name.startswith("."):
+            continue
+        if path.suffix not in PIPELINE_SUFFIXES:
+            # A pack directory: a real directory (never a symlink to one) named like a plugin.
+            if nested and path.suffix == "" and _is_real_directory(path):
+                files.extend(_pipeline_files(state, path, nested=False))
             continue
         try:
             regular = stat.S_ISREG(path.stat().st_mode)
@@ -243,6 +250,13 @@ def _pipeline_files(state: "_Loaded", directory: Path) -> list[Path]:
             continue
         files.append(path)
     return files
+
+
+def _is_real_directory(path: Path) -> bool:
+    try:
+        return stat.S_ISDIR(os.lstat(path).st_mode)
+    except OSError:
+        return False
 
 
 def _load(root: Path) -> _Loaded:

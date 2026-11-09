@@ -77,7 +77,7 @@ _2026-10-24. Items still unverified are marked ⚠️._
 | Concept | What it is |
 |---|---|
 | **Instance** | One `horae.yaml`, a `pipelines/` folder, a `horae.lock` file and a state directory |
-| **Plugin** | A git repo with a `plugin.yaml` manifest. It provides **sources** (read), **sinks** (apply intents), **notifiers**, **skills** (prompts and schemas for LLM steps) and **pipeline packs** (ready-made pipelines). |
+| **Plugin** | A git repo with a `plugin.yaml` manifest. It provides **sources** (read), **sinks** (apply intents), **notifiers**, **skills** (prompts and schemas for LLM steps) and **pipeline packs** (ready-made pipelines, which `horae plugin add` copies to `pipelines/<plugin>/` in the instance). |
 | **Pipeline** | YAML: a trigger, then steps. Step kinds: `collect`, `transform`, `llm`, `act`, `notify`. |
 | **Run** | One execution: inputs snapshot, step outputs, intents, applied changes, cost and status (`ok`, `noop`, `degraded`, `failed`) |
 | **Journal** | Per-run record of the changes applied, which makes undo possible |
