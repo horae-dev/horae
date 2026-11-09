@@ -6,18 +6,22 @@ All read the marketplace indexes of `horae.yaml` (`marketplaces`, highest priori
 refreshing each into the instance's cache (`<state_dir>/marketplaces`) unless `--offline`.
 When an index cannot be refreshed its cached copy is used, with a warning on stderr. `add`
 then refuses a plugin whose tier is not `first-party` (before M5), installs the resolved
-commit into `<instance>/plugins/<name>` (`horae.marketplace.install`, schemas decision 62),
-shows the permissions its manifest asks for and, once the user approves them, writes its
-entry to `horae.lock` (`horae.marketplace.approval` and `horae.marketplace.lock`, decision
-70). Its dependencies are #45.
+commit into `<instance>/plugins/<name>` (`horae.marketplace.install`, schemas decision 62)
+with its own venv built from its committed `uv.lock` (`horae.marketplace.environment`,
+decision 69; uv's cache is `<state_dir>/uv-cache`), shows the permissions its manifest asks
+for and, once the user approves them, writes its entry to `horae.lock`
+(`horae.marketplace.approval` and `horae.marketplace.lock`, decision 70). Approval runs
+before the venv is built, so a refused plugin's dependencies are never installed.
 
 Exit codes (`horae.cli_output`): 0 ok; 1 configuration problem, an index that cannot be
 fetched and has no cache, or a plugin that cannot be fetched; 2 usage error (a malformed
 reference); 3 unknown plugin or version, a name listed by several marketplaces (a conflict),
-an install refused (tag and SHA disagree, invalid tree or `plugin.yaml`, a tier that may not be
-installed, permissions not approved) or a plugin already installed; 5 another command is
-writing `horae.lock`; 70 internal error. An invalid `horae.lock` is 1 and is never rewritten.
-With `--json` the report carries `warnings`; an error is {schema_version, error}.
+an install refused (tag and SHA disagree, invalid tree or `plugin.yaml`, no `uv.lock`, a
+lock that does not match `pyproject.toml` or lacks a hash, a build backend not allowed, a
+tier that may not be installed, permissions not approved) or a plugin already installed; 5
+another command is writing `horae.lock`; 70 internal error. An invalid `horae.lock` is 1 and
+is never rewritten. With `--json` the report carries `warnings`; an error is
+{schema_version, error}.
 """
 
 import shutil
@@ -61,7 +65,9 @@ from horae.marketplace import (
     MarketplaceClient,
     MarketplaceError,
     NoCacheError,
+    PluginEnvironment,
     PluginInstaller,
+    Prepare,
     Resolved,
     TierRefused,
     UnknownPlugin,
@@ -80,6 +86,8 @@ from horae.marketplace.lock import LOCK_FILE, guard, read_lock, write_lock
 
 MARKETPLACES_DIR = "marketplaces"
 """Under the state directory: one folder per index."""
+UV_CACHE_DIR = "uv-cache"
+"""Under the state directory: uv's cache for the plugin venvs (#45)."""
 
 plugin_app = typer.Typer(
     name="plugin",
@@ -133,9 +141,14 @@ def make_installer(directory: Path) -> PluginInstaller:
     return PluginInstaller(directory)
 
 
+def make_environment(cache_dir: Path) -> Prepare | None:
+    """What builds the plugin's venv (#45). Tests replace this."""
+    return PluginEnvironment(cache_dir)
+
+
 PENDING = (
-    "approved: horae.lock pins it with the permissions above. Its dependencies are not "
-    "installed by horae yet."
+    "approved: horae.lock pins it with the permissions above, and its dependencies are "
+    "installed in its own venv."
 )
 NOT_INTERACTIVE = (
     "permissions need your approval: run `horae plugin add` in a terminal to review them, or "
@@ -198,6 +211,18 @@ def _resolve(instance: Path, ref: str, offline: bool, pre: bool, json_output: bo
     echo(f"  tier   {found.tier}")
     echo(f"  index  {found.index}")
     return EXIT_OK
+
+
+def _chain(*steps: Prepare | None) -> Prepare:
+    """Run several `prepare` hooks in order (approval first, then the venv): the first that
+    raises stops the install, and nothing is moved into place."""
+
+    def prepare(tree: Path, manifest: PluginManifest) -> None:
+        for step in steps:
+            if step is not None:
+                step(tree, manifest)
+
+    return prepare
 
 
 class _Approval:
@@ -293,7 +318,13 @@ def _add(
             lock, header = read_lock(lock_path)
             approval = _Approval(lock, found, grants, yes=yes, json_output=json_output)
             installed = make_installer(plugins_dir(instance)).install(
-                found.name, found.version, found.repo, found.sha, prepare=approval
+                found.name,
+                found.version,
+                found.repo,
+                found.sha,
+                prepare=_chain(
+                    approval, make_environment(loaded_instance.state_dir / UV_CACHE_DIR)
+                ),
             )
             entry = approval.entry
             if entry is None or installed.lock_entry(entry.permissions) != entry:
@@ -324,7 +355,7 @@ def _add(
                 "permissions": entry.model_dump(mode="json")["permissions"],
                 "approved": True,
                 "enabled": False,
-                "pending": ["install_dependencies"],
+                "pending": [],
                 "warnings": list(loaded.warnings),
             }
         )

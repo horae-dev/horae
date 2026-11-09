@@ -212,10 +212,16 @@ its own output holds it. Limits: names of fewer than 3 letters in text, nickname
 and typos are not matched.
 
 **The command.** The host starts the plugin with an empty working directory and a fixed
-`PATH` (`/usr/local/bin:/usr/bin:/bin`). Until Horae installs plugins into their own
-environments (M4), pin the command to an **absolute** interpreter that has `horae-sdk` and an
-absolute script (or `-m module`). The shipped `examples/hello/plugin.yaml` shows the shape
-with `python3`; its end-to-end test pins the interpreter the same way.
+`PATH` (`/usr/local/bin:/usr/bin:/bin`). A plugin installed with `horae plugin add` gets its
+own venv (schemas decision 69): ship a `pyproject.toml` (build backend `uv_build`,
+recommended, or `hatchling`, `setuptools`, `flit_core`, `pdm-backend`) that depends on
+`horae-sdk`, and commit its `uv.lock` (`uv lock`; the install refuses a plugin without one).
+Then write the command with a **bare** name, which the host looks up in the plugin's
+`.venv/bin` first: `command: [python, -m, <your_module>]`, or the name of a console script
+your project declares. Nothing is fetched at run time. A plugin placed by hand, without a
+venv, still needs an **absolute** interpreter that has `horae-sdk` and an absolute script (or
+`-m module`). The shipped `examples/hello/plugin.yaml` shows the shape with `python3`; its
+end-to-end test pins the interpreter the same way.
 
 ## Intents
 

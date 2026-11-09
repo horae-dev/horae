@@ -1,17 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
-"""`horae plugin search|resolve` (#43) and `horae plugin add` (#44), over local fixture
-repositories (no network)."""
+"""`horae plugin search|resolve` (#43) and `horae plugin add` (#44, with its venv: #45), over
+local fixture repositories (no network)."""
 
 import json
 import shutil
 from pathlib import Path
+from typing import Any
 
 import pytest
 from typer.testing import CliRunner
 
 from horae import cli_plugin
 from horae.cli import app
-from horae.marketplace import MarketplaceClient, PluginInstaller, approval
+from horae.contracts import PluginManifest
+from horae.marketplace import MarketplaceClient, PluginEnvironment, PluginInstaller, approval
 from marketplace_fixtures import (
     PLUGIN_URL,
     A,
@@ -178,7 +180,7 @@ def test_http_marketplaces_in_the_config_are_refused(instance_dir: Path) -> None
 
 
 @pytest.fixture
-def demo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
+def demo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     """An index listing `demo` (the good release and one whose tag was moved) and its repo."""
     repo, good = plugin_repo(tmp_path / "plugin-demo")
     _, moved = plugin_repo(repo, version="2.0.0")
@@ -197,7 +199,17 @@ def demo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
     )
     monkeypatch.setattr(cli_plugin, "interactive", lambda: True)  # approval: tests answer
     monkeypatch.setattr(approval, "FIRST_PARTY_INDEXES", frozenset({A}))
-    return {"good": good, "moved": moved}
+    prepared: dict[str, str] = {}
+
+    def make_environment(cache_dir: Path) -> Any:
+        # The demo plugin has no dependencies to install: record what `add` asked for.
+        def prepare(tree: Path, manifest: PluginManifest) -> None:
+            prepared.update(cache=str(cache_dir), tree=tree.name, plugin=manifest.name)
+
+        return prepare
+
+    monkeypatch.setattr(cli_plugin, "make_environment", make_environment)
+    return {"good": good, "moved": moved, "prepared": prepared}
 
 
 def _configure_a(instance: Path) -> None:
@@ -207,7 +219,7 @@ def _configure_a(instance: Path) -> None:
 
 
 def test_add_installs_into_the_plugin_dir_and_says_what_is_left(
-    instance_dir: Path, demo: dict[str, str]
+    instance_dir: Path, demo: dict[str, Any]
 ) -> None:
     _configure_a(instance_dir)
     code, out, _ = _run(instance_dir, "add", "demo@1.0.0", answer="y\n")
@@ -215,14 +227,14 @@ def test_add_installs_into_the_plugin_dir_and_says_what_is_left(
     assert "installed demo@1.0.0 into plugins/demo" in out
     assert demo["good"] in out
     assert "approved: horae.lock pins it" in out
-    assert "dependencies are not installed by horae yet" in out
+    assert "dependencies are installed in its own venv" in out
     assert (instance_dir / "plugins" / "demo" / "plugin.yaml").is_file()
     code, out, _ = _run(instance_dir, "add", "demo@1.0.0", "--json", answer="y\n")
     assert code == 3
     assert json.loads(out)["error"]["kind"] == "already_installed"
 
 
-def test_add_json_reports_the_install_record(instance_dir: Path, demo: dict[str, str]) -> None:
+def test_add_json_reports_the_install_record(instance_dir: Path, demo: dict[str, Any]) -> None:
     _configure_a(instance_dir)
     code, out, _ = _run(instance_dir, "add", "demo@1.0.0", "--json", answer="y\n")
     assert code == 0
@@ -231,10 +243,38 @@ def test_add_json_reports_the_install_record(instance_dir: Path, demo: dict[str,
     assert report["path"] == "plugins/demo"
     assert report["approved"] is True
     assert report["enabled"] is False
-    assert report["pending"] == ["install_dependencies"]
+    assert report["pending"] == []
+    # Its venv was built in the verified tree, with uv's cache in the state directory (#45).
+    assert demo["prepared"] == {
+        "cache": str(instance_dir / "state" / "uv-cache"),
+        "tree": "tree",
+        "plugin": "demo",
+    }
 
 
-def test_add_refuses_a_moved_tag_with_exit_3(instance_dir: Path, demo: dict[str, str]) -> None:
+def test_add_refuses_a_plugin_without_a_lock_file_and_leaves_nothing(
+    instance_dir: Path, demo: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli_plugin, "make_environment", PluginEnvironment)
+    _configure_a(instance_dir)
+    # Approved first (decision 70), then the venv step refuses the tree (decision 69).
+    code, out, err = _run(instance_dir, "add", "demo@1.0.0", "--json", answer="y\n")
+    assert code == 3, (out, err)
+    error = json.loads(out[out.index("{") :])["error"]  # the runner echoes the typed "y"
+    assert error["kind"] == "install_refused"
+    assert "no pyproject.toml" in error["message"]
+    assert not (instance_dir / "horae.lock").read_text(encoding="utf-8").count("demo:")
+    assert not list((instance_dir / "plugins").iterdir())
+
+
+def test_add_builds_a_venv_by_default(tmp_path: Path) -> None:
+    environment = cli_plugin.make_environment(tmp_path / "uv-cache")
+    assert isinstance(environment, PluginEnvironment)
+    assert environment.cache_dir == tmp_path / "uv-cache"
+    assert environment.index_url is None
+
+
+def test_add_refuses_a_moved_tag_with_exit_3(instance_dir: Path, demo: dict[str, Any]) -> None:
     _configure_a(instance_dir)
     code, out, _ = _run(instance_dir, "add", "demo", "--json")  # 2.0.0, the moved tag
     assert code == 3

@@ -79,6 +79,8 @@ def market(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
     )
     monkeypatch.setattr(cli_plugin, "interactive", lambda: True)
     monkeypatch.setattr(approval, "FIRST_PARTY_INDEXES", frozenset({A}))
+    # The fixture plugins have no dependencies: no venv to build here (#45 is tested apart).
+    monkeypatch.setattr(cli_plugin, "make_environment", lambda cache_dir: None)
     return {"first": first, "second": second}
 
 
@@ -205,7 +207,7 @@ def test_json_output_reports_the_approved_permissions(inst: Path, market: dict[s
     assert code == 0, out + err
     report = _json(out)
     assert report["approved"] is True
-    assert report["pending"] == ["install_dependencies"]
+    assert report["pending"] == []
     assert report["permissions"]["network_local"] == ["192.168.1.10:8123"]
     assert "Approve these permissions" in err
 
@@ -608,3 +610,20 @@ def test_a_plugin_without_a_record_is_checked_by_its_manifest_only(
     lock, plugins = _installed(inst)
     (plugins / "demo" / INSTALL_RECORD).unlink()
     HostRegistry.from_directory(lock, plugins)  # a built-in or hand-copied plugin
+
+
+def test_yes_refuses_an_entry_for_another_repository() -> None:
+    from horae.contracts.lockfile import LockedPlugin
+    from horae.contracts.plugin import Permissions
+    from horae.marketplace.approval import lock_mismatch
+
+    sha = "a" * 40
+    perms = Permissions()
+    existing = LockedPlugin(
+        version="1.0.0", repo="https://example.org/a/plugin", commit=sha, permissions=perms
+    )
+    wanted = existing.model_copy(update={"repo": "https://example.org/b/plugin"})
+    why = lock_mismatch(existing, wanted)
+    assert why is not None
+    assert "repository" in why
+    assert lock_mismatch(existing, existing) is None

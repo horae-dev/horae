@@ -153,9 +153,11 @@ def describe(
 
 def lock_mismatch(existing: LockedPlugin | None, wanted: LockedPlugin) -> str | None:
     """Why the lock entry `existing` does not already approve `wanted` (for `--yes`), or
-    `None` when it does: same version and commit, identical permissions."""
+    `None` when it does: same repository, version and commit, identical permissions."""
     if existing is None:
         return "horae.lock has no entry for this plugin"
+    if existing.repo != wanted.repo:
+        return f"horae.lock pins repository {existing.repo}, not {wanted.repo}"
     if existing.version != wanted.version:
         return f"horae.lock pins version {existing.version}, not {wanted.version}"
     if existing.commit != wanted.commit:

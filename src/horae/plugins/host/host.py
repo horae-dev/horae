@@ -31,9 +31,10 @@ run's `ToolCaller`:
   plugin that needs it later). The redactor is then complete from the first call, whatever
   order plugins start in (decision 35 B);
 - **startup**: the declared secrets are resolved (`secret_missing`) and checked against the
-  deny list (`env_unsafe`), `argv[0]` is resolved to an absolute path (`resolve_command`), the
-  process is spawned (`horae.plugins.host.transport`) with the environment of
-  `horae.plugins.host.env` and an empty working directory, and the MCP handshake and
+  deny list (`env_unsafe`), `argv[0]` is resolved to an absolute path (`resolve_command`; a
+  bare name in the plugin's own venv first, #45, decision 69 G), the process is spawned
+  (`horae.plugins.host.transport`) with the environment of `horae.plugins.host.env` and an
+  empty working directory, and the MCP handshake and
   `tools/list` must finish within the plugin's `startup_timeout_s` (`startup_timeout`);
 - **calls**: the tool must be in the manifest's `provides` and in `tools/list`
   (`tool_missing`); each call is bounded by its pipeline `timeout_s`, else the plugin's
@@ -122,7 +123,7 @@ from horae.engine.ports import ResolvedPlugin, ToolResult, UnknownPlugin
 from horae.marketplace.install import INSTALL_RECORD
 from horae.plugins.host import logs
 from horae.plugins.host.capture import StderrCapture
-from horae.plugins.host.env import BASE_PATH, build_env, check_names
+from horae.plugins.host.env import BASE_PATH, build_env, check_names, plugin_venv
 from horae.plugins.host.errors import HostErrorKind, PluginCallError
 from horae.plugins.host.redact import MAX_EXPANSION, Redactor, SecretInKey
 from horae.plugins.host.session import INTENTS_META, CallFailed, PluginProcess, Spawn
@@ -319,7 +320,10 @@ def resolve_command(command: list[str], root: Path | None) -> list[str]:
     - a relative path (with a `/`) is resolved against the plugin's directory with
       `Path.resolve()`, and its real path must stay inside the real plugin directory (no
       `../`, no symlink out of it);
-    - a bare name is looked up with `shutil.which` on the child's `PATH` (absolute entries).
+    - a bare name is looked up with `shutil.which` on the child's `PATH` (absolute entries):
+      for a plugin with its own venv (`<root>/.venv`, #45, decision 69) its `bin` first, so
+      `python`, `python3` or a console script of the plugin run from that venv; the path is
+      kept as found (the venv's `python` is a symlink its interpreter needs as `argv[0]`).
 
     `spawn_failed` if it is not found, not an executable file, or escapes the plugin."""
     first = command[0]
@@ -337,7 +341,9 @@ def resolve_command(command: list[str], root: Path | None) -> list[str]:
                 )
             path = str(real)
     else:
-        path = shutil.which(first, path=BASE_PATH)
+        venv = plugin_venv(root)
+        search = BASE_PATH if venv is None else f"{venv / 'bin'}:{BASE_PATH}"
+        path = shutil.which(first, path=search)
     if path is None or not os.path.isfile(path) or not os.access(path, os.X_OK):
         raise PluginCallError("spawn_failed", f"command {first!r} not found or not executable")
     return [os.path.abspath(path), *command[1:]]
@@ -674,7 +680,14 @@ class PluginHost:
         home, tmpdir, cwd = base / "home", base / "tmp", base / "cwd"
         for directory in (home, tmpdir, cwd):
             directory.mkdir(mode=0o700, parents=True)
-        env = build_env(name, home=home, tmpdir=tmpdir, timezone=self.timezone, secrets=values)
+        env = build_env(
+            name,
+            home=home,
+            tmpdir=tmpdir,
+            timezone=self.timezone,
+            secrets=values,
+            venv=plugin_venv(entry.installed.root),
+        )
         startup = self._timeouts(name).startup_timeout_s
         process = PluginProcess(
             Spawn(name, tuple(argv), env, cwd, startup), StderrCapture(CAPTURE_MARGIN)

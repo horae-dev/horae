@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """The marketplace client (#43): fetch the configured indexes, cache them, resolve plugin
-names, and install what a name resolves to (#44)."""
+names, and install what a name resolves to (#44) with its own venv (#45)."""
 
+from horae.marketplace.environment import PluginEnvironment
 from horae.marketplace.errors import (
     AlreadyInstalled,
     ApprovalRefused,
@@ -19,7 +20,7 @@ from horae.marketplace.errors import (
     UnknownVersion,
 )
 from horae.marketplace.index import Loaded, LoadedIndex, MarketplaceClient
-from horae.marketplace.install import Installed, PluginInstaller
+from horae.marketplace.install import Installed, PluginInstaller, Prepare
 from horae.marketplace.resolve import Found, Resolved, parse_ref, resolve, search
 
 __all__ = [
@@ -39,7 +40,9 @@ __all__ = [
     "MarketplaceClient",
     "MarketplaceError",
     "NoCacheError",
+    "PluginEnvironment",
     "PluginInstaller",
+    "Prepare",
     "Resolved",
     "TierRefused",
     "UnknownPlugin",

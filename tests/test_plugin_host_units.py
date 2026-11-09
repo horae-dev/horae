@@ -19,7 +19,7 @@ from horae.contracts import PluginManifest
 from horae.engine import UnknownPlugin
 from horae.plugins.host import HostRegistry, PluginCallError, RegistryError, host_for_instance
 from horae.plugins.host.capture import StderrCapture
-from horae.plugins.host.env import BASE_KEYS, BASE_PATH, build_env, unsafe_name
+from horae.plugins.host.env import BASE_KEYS, BASE_PATH, PLUGIN_KEYS, build_env, unsafe_name
 from horae.plugins.host.host import resolve_command
 from horae.plugins.host.redact import MIN_PARTIAL_BYTES, Redactor, SecretInKey, token
 from horae.plugins.host.transport import exit_status
@@ -106,9 +106,13 @@ def test_build_env_is_the_base_plus_the_secrets(tmp_path: Path) -> None:
         "TMPDIR": str(tmp_path / "t"),
         "LANG": "C.UTF-8",
         "TZ": "Europe/Paris",
+        "UV_OFFLINE": "1",
+        "UV_PYTHON_DOWNLOADS": "never",
+        "PIP_NO_INDEX": "1",
         "TOKEN": "v",
     }
-    assert set(env) - {"TOKEN"} == BASE_KEYS
+    assert set(env) - {"TOKEN"} == PLUGIN_KEYS
+    assert BASE_KEYS < PLUGIN_KEYS
     with pytest.raises(PluginCallError) as info:
         build_env(
             "p",
