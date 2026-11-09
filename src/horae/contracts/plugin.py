@@ -41,7 +41,7 @@ checked, not the license list."""
 
 CommandArg = Annotated[str, Strict(), StringConstraints(pattern=r"^[^\x00]+$", max_length=4096)]
 
-SINK_OPERATIONS = ("read", "apply", "restore", "parent_exists", "identity")
+SINK_OPERATIONS = ("read", "apply", "restore", "restore_status", "parent_exists", "identity")
 """The sink operations (`horae.plugins.host.sink`, #25): for every namespace `<ns>` of a
 plugin's `provides.sinks` and `provides.notifiers`, only the core calls `<ns>.<operation>`, a
 tool the plugin lists in `tools/list` but may not provide (so no pipeline step can call it)."""

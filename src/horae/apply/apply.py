@@ -11,16 +11,19 @@ before saving the record: `Store.journal_append` refuses a run that is no longer
    note path, a task fingerprint, an `http.post` URL, the notifier's tool for a
    notification), the sink (`applied_by`) and where it writes (`sink_identity`, when the sink
    has an `identity`) and, for a note, the bytes before and after.
-   Notes are undoable; tasks, notifications and HTTP calls are not (`undoable=False`:
-   undo restores files only, ADR 0002).
+   Notes are undoable; notifications and HTTP calls are not (`undoable=False`). A task
+   change starts as not undoable too: a `task.update_status` journals the task index entry
+   it is about to change (`TaskEntry` as JSON, its `before`), and becomes undoable at step 3
+   when the sink's answer says `changed: true` (#139, schemas decision 59).
 2. **Apply** through the sink (`Sink.apply`). For a note the core first reads the note
    (`Sink.read`, or the bytes the previous change of the run left for a chained one), checks
    that it is still what the plan saw (`before_sha256`) and recomputes the new bytes with
    `horae.apply.notes`; the sink's compare-and-swap (`expected_before_sha256`) checks again.
 3. **Mark applied** (`Store.journal_mark_applied`); for a notification in the same
-   transaction as `Store.record_notification(dedupe_key)`. When the sink reports that it
-   wrote other bytes than planned, they are journalled too (`actual_after`), so undo accepts
-   them, and the apply stops (`apply_mismatch`).
+   transaction as `Store.record_notification(dedupe_key)`; for a status change the sink's
+   `Applied.details` are journalled with it (`horae.apply.status.status_details`). When the
+   sink reports that it wrote other bytes than planned, they are journalled too
+   (`actual_after`), so undo accepts them, and the apply stops (`apply_mismatch`).
 
 **Bounded.** Each sink call (`read`, `apply`) is bounded by `call_timeout_s` (the runner
 passes `horae.yaml` `plugin_defaults.call_timeout_s`): past it the call is cancelled and the
@@ -76,6 +79,7 @@ from horae.apply.sink import (
     sink_identity,
     take_violations,
 )
+from horae.apply.status import status_details, task_snapshot
 from horae.contracts.intents import Intent, NotifyAction, NotifyPush, TaskCreate, TaskUpdateStatus
 from horae.contracts.run import AppliedChange, RunRecord, Violation
 from horae.contracts.types import MAX_ITEMS
@@ -471,6 +475,8 @@ async def _apply_all(
                 unchanged.append(index)
                 continue
             expected = item.before_sha256
+        if isinstance(intent, TaskUpdateStatus):
+            before = task_snapshot(store, intent.task)
         target = _target(item)
         identity = _identity(sink, index, tool, identities)
         entry = store.journal_append(
@@ -493,7 +499,13 @@ async def _apply_all(
         with store.transaction():
             if key is not None:
                 store.record_notification(key, at=clock(), run_id=record.id)
-            store.journal_mark_applied(entry.id, actual_after=actual)
+            store.journal_mark_applied(
+                entry.id,
+                actual_after=actual,
+                status_details=status_details(intent, result)
+                if isinstance(item, TaskItem)
+                else None,
+            )
         applied.append(AppliedChange(intent=index, target=target))
         if isinstance(item, TaskItem):
             _index_applied(store, intent, result, tool, record.id, clock(), extras.timezone)

@@ -255,7 +255,7 @@ class Slow(FixtureSink):
         await self._wait("read_target")
         return await super().read_target(target)
 
-    async def restore(
+    async def restore(  # type: ignore[override]
         self, target: str, content: bytes | None, *, expected_sha256: str | None
     ) -> None:
         await self._wait("restore")

@@ -229,6 +229,65 @@ def test_minted_buttons_reach_the_notifier_as_ntfy_http_actions() -> None:
     ]
 
 
+def test_force_is_sent_only_when_the_user_asked_for_it() -> None:
+    scripted = ScriptedHost(restore=lambda _t, a: {})
+    sink = _sink(scripted)
+    asyncio.run(sink.restore(NOTE, b"old\n", expected_sha256="a" * 64))
+    assert "force" not in scripted.calls[-1][2]  # a plugin built before it sees what it knew
+    asyncio.run(sink.restore(NOTE, b"old\n", expected_sha256="a" * 64, force=True))
+    assert scripted.calls[-1][2]["force"] is True
+
+
+def test_a_forced_restore_is_asked_again_without_force_by_a_plugin_that_refuses_it() -> None:
+    def old_plugin(_t: str, arguments: dict[str, Any]) -> Any:
+        if "force" in arguments:
+            return PluginCallError("tool_error", "notes.restore: unexpected argument force")
+        return {}
+
+    scripted = ScriptedHost(restore=old_plugin)
+    asyncio.run(_sink(scripted).restore(NOTE, None, expected_sha256="a" * 64, force=True))
+    assert ["force" in call[2] for call in scripted.calls if call[1] == "notes.restore"] == [
+        True,
+        False,
+    ]
+
+    def refusing(_t: str, _a: dict[str, Any]) -> Any:
+        return {"error": {"kind": "not_owned", "message": "outside the owned block"}}
+
+    with pytest.raises(SinkError) as caught:
+        asyncio.run(
+            _sink(ScriptedHost(restore=refusing)).restore(
+                NOTE, None, expected_sha256="a" * 64, force=True
+            )
+        )
+    assert caught.value.kind == "not_owned"  # the plugin's own refusal is not retried away
+
+
+def test_restore_status_passes_the_details_back_and_force_only_from_the_caller() -> None:
+    scripted = ScriptedHost(restore_status=lambda _t, a: {"restored": True})
+    sink = _sink(scripted)
+    details = {"changed": True, "path": NOTE, "force": True}  # data a plugin returned
+    assert asyncio.run(sink.restore_status(details)) is True
+    tool, arguments = scripted.calls[-1][1], scripted.calls[-1][2]
+    assert tool == "notes.restore_status"
+    assert arguments["details"] == details
+    assert "force" not in arguments  # inside the details it is only data
+    asyncio.run(sink.restore_status(details, force=True))
+    assert scripted.calls[-1][2]["force"] is True
+    broken = _sink(ScriptedHost(restore_status=lambda _t, a: {"restored": "yes"}))
+    with pytest.raises(SinkError) as caught:
+        asyncio.run(broken.restore_status(details))
+    assert caught.value.kind == "output_invalid"
+
+
+def test_a_plugin_without_restore_status_cannot_undo_a_status_change() -> None:
+    missing = PluginCallError("tool_missing", "notes does not list notes.restore_status")
+    sink = _sink(ScriptedHost(restore_status=lambda _t, a: missing))
+    with pytest.raises(SinkError) as caught:
+        asyncio.run(sink.restore_status({"changed": True}))
+    assert caught.value.kind == "tool_missing"  # undo lists the change as not undoable
+
+
 def test_restore_and_parent_exists() -> None:
     scripted = ScriptedHost(
         restore=lambda _t, a: {}, parent_exists=lambda _t, a: {"exists": a["path"] == NOTE}

@@ -130,6 +130,34 @@ def test_a_token_applies_once_and_is_refused_after(env: Env) -> None:
         assert entry.applied_by == TOOL
 
 
+def test_a_tick_from_a_button_can_be_undone(env: Env) -> None:
+    """The `/act` journal entry carries what `horae undo` needs when the sink says it changed
+    the task (#139): the task index entry it replaced, and the sink's details."""
+    from horae.apply import StaticSinks, undo_run
+
+    env.sink.status_details = True
+    with env.client() as client:
+        assert client.post(f"/act/{token()}").status_code == 200
+    with Store.open(env.store_path) as store:
+        before = store.get_task(TASK)
+        assert before is not None
+        assert before.status == "done"
+        ((run_id,),) = _rows(env.store_path, "SELECT run_id FROM act_consumed")
+        (entry,) = store.journal(run_id)
+        assert entry.undoable
+        assert entry.before_sha256 is not None
+        assert entry.after_sha256 is not None
+        sinks = StaticSinks(default=env.sink)
+        clock = env.clock
+        result = asyncio.run(undo_run(store, run_id, sinks, clock=clock))
+        assert result.complete
+        assert [(t.task, t.status) for t in result.tasks] == [(TASK, "done")]
+        restored = store.get_task(TASK)
+        assert restored is not None
+        assert restored.status == "todo"
+        assert env.sink.task_status[TASK] == "todo"
+
+
 def test_an_expired_token_is_refused(env: Env) -> None:
     value = token()
     env.clock.advance(seconds=TOKEN_TTL_S)

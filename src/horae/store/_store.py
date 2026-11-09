@@ -1442,18 +1442,53 @@ class Store:
         return self._entry(row)
 
     @_api
-    def journal_mark_applied(self, entry_id: int, *, actual_after: bytes | None = None) -> None:
+    def journal_mark_applied(
+        self,
+        entry_id: int,
+        *,
+        actual_after: bytes | None = None,
+        status_details: bytes | None = None,
+    ) -> None:
         """Record that a change was applied; `actual_after`: the bytes the sink really wrote,
-        when they are not the journalled `after` (kept as a blob, for undo)."""
+        when they are not the journalled `after` (kept as a blob, for undo).
+
+        `status_details` (a `task.update_status` entry only, #139, schemas decision 59): the
+        sink's `Applied.details` as JSON. They become the entry's `after` and make it
+        undoable (a task status change is undone through the sink that applied it, which gets
+        these details back); its `before` is the task index entry the caller journalled
+        (`TaskEntry` as JSON), or none for a task the index does not know."""
         self._check_size(actual_after)
+        self._check_size(status_details)
         with self.transaction():
             actual = self._put_blob(actual_after)
-            cur = self._conn.execute(
-                "UPDATE journal SET applied = 1, actual_after_sha256 = ? WHERE id = ?",
-                (actual, entry_id),
-            )
+            if status_details is None:
+                cur = self._conn.execute(
+                    "UPDATE journal SET applied = 1, actual_after_sha256 = ? WHERE id = ?",
+                    (actual, entry_id),
+                )
+            else:
+                cur = self._conn.execute(
+                    "UPDATE journal SET applied = 1, actual_after_sha256 = ?, "
+                    "after_sha256 = ?, undoable = 1 WHERE id = ? "
+                    "AND intent_type = 'task.update_status' AND after_sha256 IS NULL",
+                    (actual, self._put_blob(status_details), entry_id),
+                )
+                if cur.rowcount != 1:
+                    found = self._conn.execute(
+                        "SELECT 1 FROM journal WHERE id = ?", (entry_id,)
+                    ).fetchone()
+                    if found is not None:
+                        raise InvalidRow(f"journal entry {entry_id} cannot hold status details")
             if cur.rowcount != 1:
                 raise UnknownJournalEntry(entry_id)
+            if status_details is not None:
+                run_id, target, before_sha = self._conn.execute(
+                    "SELECT run_id, target, before_sha256 FROM journal WHERE id = ?",
+                    (entry_id,),
+                ).fetchone()
+                before = None if before_sha is None else self.blob(before_sha)
+                where = f"the details a sink gave for task {target}"
+                self._write_flags(run_id, self._new_in(status_details, before, where))
             if actual_after is not None and current_redactor().spans(actual_after):
                 run_id, target, before_sha = self._conn.execute(
                     "SELECT run_id, target, before_sha256 FROM journal WHERE id = ?",
@@ -1755,6 +1790,34 @@ class Store:
             )
             if cur.rowcount != 1:
                 raise UnknownTask(fingerprint)
+
+    @_api
+    def restore_task_status(self, task: TaskEntry, *, at: datetime) -> None:
+        """Put a task's status and snooze back as `task` has them (`horae undo` of a
+        `task.update_status`, #139): the status, `snoozed_until`, `snooze_tz`, the wake time
+        and the run that last wrote it (none when that run is gone). Title, due date,
+        time and the rest stay. Raises `UnknownTask`."""
+        until, tz, wake = _snooze(task.status, task.snoozed_until, task.snooze_tz)
+        with self.transaction():
+            known = (
+                task.run_id is not None
+                and self._conn.execute("SELECT 1 FROM runs WHERE id = ?", (task.run_id,)).fetchone()
+            )
+            cur = self._conn.execute(
+                "UPDATE tasks SET status = ?, snoozed_until = ?, snooze_tz = ?, wake_at = ?, "
+                "run_id = ?, updated_at = ? WHERE fingerprint = ?",
+                (
+                    task.status,
+                    until,
+                    tz,
+                    wake,
+                    task.run_id if known else None,
+                    _ts(at),
+                    task.fingerprint,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise UnknownTask(task.fingerprint)
 
     @_api
     def set_task_recurring(self, fingerprint: str, recurring: bool, *, at: datetime) -> None:

@@ -75,9 +75,19 @@ reported by type only. Never `print`: stdout is the protocol channel.
 
 A **sink or notifier** is never called by a pipeline step. For an `act` / `notify` entry
 `ns.tool`, the core calls the sink operations `ns.identity`, `ns.apply`, `ns.read`,
-`ns.restore` and `ns.parent_exists` (the SDK registers them; they are listed in `tools/list`
-but must not be in `provides`). Implement `identity(paths)` and `apply(request)`; a note sink
-also implements `read`, `restore` and `parent_exists`. For a `note.*` intent **the core
+`ns.restore`, `ns.restore_status` and `ns.parent_exists` (the SDK registers them; they are
+listed in `tools/list` but must not be in `provides`). Implement `identity(paths)` and
+`apply(request)`; a note sink also implements `read`, `restore` and `parent_exists`.
+`restore(paths, path, content, expected_sha256, force=False)` takes an optional `force` (SDK
+0.4): true only when the user ran `horae undo --force`, it lets the sink also restore a note
+it would refuse for being edited outside Horae's owned block; it never lifts the
+compare-and-swap, and a `restore` without the parameter is still called (without it). To make
+a `task.update_status` undoable, answer it with `Applied(..., details={"changed": True, ...})`
+holding what you need to put the task back (the line you replaced), and implement
+`restore_status(paths, details, force=False)`: the core journals those details, hands them back
+untouched to `horae undo`, and your sink returns whether it wrote, or raises
+`SinkError("target_changed")` when the task was edited since (unless `force`). Without
+`restore_status` the change is listed as not undoable, as before. For a `note.*` intent **the core
 computes the bytes** (`request.content`): write exactly those, atomically, only if the note
 still has `request.expected_before_sha256` (else `SinkError("target_changed", ...)`), and
 return `Applied.wrote(path, content)`. Other intents are applied by the sink itself; their

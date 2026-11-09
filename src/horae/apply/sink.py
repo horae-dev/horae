@@ -228,11 +228,41 @@ class RestorableSink(Sink, Protocol):
         ...
 
     async def restore(
-        self, target: str, content: bytes | None, *, expected_sha256: str | None
+        self,
+        target: str,
+        content: bytes | None,
+        *,
+        expected_sha256: str | None,
+        force: bool = False,
     ) -> None:
         """Make note `target` hold exactly `content` (`None`: remove it), a compare-and-swap:
         if its current bytes do not have SHA-256 `expected_sha256` (`None`: it must not
-        exist), nothing changes and `SinkError("target_changed")` is raised."""
+        exist), nothing changes and `SinkError("target_changed")` is raised.
+
+        `force` (#139, schemas decision 59) is the user's explicit `horae undo --force`, the
+        only way it becomes true: the sink may then also restore a note it would otherwise
+        refuse because the user edited it outside Horae's owned block (`not_owned`). It never
+        lifts the compare-and-swap, the path rules or the vault boundary. The core passes it
+        only when it is true, so a sink written before it (no `force` parameter) is called
+        exactly as before; for a forced undo it is retried without when it does not accept it."""
+        ...
+
+
+@runtime_checkable
+class TaskRestorableSink(Sink, Protocol):
+    """A sink whose `task.update_status` changes `horae undo` can revert (#139, decision 59).
+
+    The core journals the sink's `Applied.details` of a change that said `changed: true` and
+    hands them back, untouched, to the sink that applied it. The sink alone knows how to put
+    the task back (plugin-obsidian: the task's line, from `details`)."""
+
+    async def restore_status(self, details: dict[str, Any], *, force: bool = False) -> bool:
+        """Put the task back as it was before the change `details` describes. Returns whether
+        it wrote (`False`: it was already restored). `SinkError("target_changed")` when the
+        task's note changed since, unless `force` (the user's explicit `horae undo --force`:
+        the sink then restores what it recorded even though the task was edited since);
+        `not_supported` when the sink cannot; `not_restorable` when `details` do not say
+        enough. Never called for a change that did not say `changed: true`."""
         ...
 
 

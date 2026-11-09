@@ -15,7 +15,12 @@ only the core calls these, through `PluginHost.call_operation`, which accepts no
   `expected_before_sha256`, `content`, and for a `notify.push` with minted buttons
   `actions`: `[{"action": "http", "label", "url", "method": "POST"}]`, the core's signed
   `/act` links, #38): `{"target": str, "after_sha256": <hex> | null}`;
-- `<ns>.restore` (`path`, `content`: `<base64>` or `null` to remove, `expected_sha256`): `{}`;
+- `<ns>.restore` (`path`, `content`: `<base64>` or `null` to remove, `expected_sha256`, and
+  `force: true` only for `horae undo --force`, #139): `{}`;
+- `<ns>.restore_status` (`details`: the `details` the sink answered to the `task.update_status`
+  it is undoing, as journalled; `force: true` only for `horae undo --force`):
+  `{"restored": bool}` (#139, schemas decision 59). A plugin without it (`tool_missing`) or
+  one that answers `not_supported` leaves the status change listed as not undoable;
 - `<ns>.parent_exists` (`path`): `{"exists": bool}`;
 - `<ns>.identity` (no argument): `{"identity": str}`.
 
@@ -350,11 +355,42 @@ class McpSink:
         return exists
 
     async def restore(
-        self, target: str, content: bytes | None, *, expected_sha256: str | None
+        self,
+        target: str,
+        content: bytes | None,
+        *,
+        expected_sha256: str | None,
+        force: bool = False,
     ) -> None:
         payload = None if content is None else encode(content)  # note_too_large before any call
-        arguments = {"path": target, "content": payload, "expected_sha256": expected_sha256}
-        await self._op("restore", arguments)
+        arguments: dict[str, Any] = {
+            "path": target,
+            "content": payload,
+            "expected_sha256": expected_sha256,
+        }
+        if not force:  # a plugin built before `force` is called exactly as before
+            await self._op("restore", arguments)
+            return
+        try:
+            await self._op("restore", {**arguments, "force": True})
+        except SinkError as error:
+            if error.kind != "tool_error":
+                raise
+            # The tool refused its arguments: most likely a plugin that does not know `force`.
+            # Restoring is a compare-and-swap, so asking again without it is safe: the plugin
+            # then applies its own rules, and says so if they refuse the note.
+            await self._op("restore", arguments)
+
+    async def restore_status(self, details: dict[str, Any], *, force: bool = False) -> bool:
+        """Undo the `task.update_status` whose `Applied.details` are `details` (#139)."""
+        arguments: dict[str, Any] = {"details": details}
+        if force:
+            arguments["force"] = True
+        data = await self._op("restore_status", arguments)
+        restored = data.get("restored")
+        if not isinstance(restored, bool):
+            raise SinkError("output_invalid", f"{self.namespace}.restore_status: not a boolean")
+        return restored
 
 
 class McpSinks:

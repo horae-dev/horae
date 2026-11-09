@@ -46,7 +46,7 @@ from typing import Any, ClassVar, Literal
 from mcp.server.mcpserver import Context, MCPServer
 from mcp_types import CallToolResult, ContentBlock, TextContent
 
-from horae_sdk.manifest import DEFAULT_HORAE, Permissions, manifest
+from horae_sdk.manifest import DEFAULT_HORAE, SINK_OPERATIONS, Permissions, manifest
 from horae_sdk.protocol import (
     INPUT_META,
     INTENTS_META,
@@ -121,6 +121,16 @@ class Transform(Tool):
     step's data."""
 
     role: ClassVar[ToolRole] = "transforms"
+
+
+def _accepts(function: Callable[..., Any], name: str) -> bool:
+    """Whether `function` takes a parameter `name` (or any keyword): a sink written before an
+    optional parameter existed does not, and is called without it."""
+    try:
+        parameters = inspect.signature(function).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(p.name == name or p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters)
 
 
 async def _maybe_await(value: Any) -> Any:
@@ -304,12 +314,10 @@ class Plugin:
     # --- sinks and notifiers ---------------------------------------------------------------
 
     def _add_operations(self, sink: Sink) -> None:
-        """Register `<ns>.read`, `.apply`, `.restore`, `.parent_exists` and `.identity`."""
+        """Register `<ns>.read`, `.apply`, `.restore`, `.restore_status`, `.parent_exists` and
+        `.identity`."""
         ns = sink.namespace
-        taken = sorted(
-            {f"{ns}.{op}" for op in ("read", "apply", "restore", "parent_exists", "identity")}
-            & set(self.tools)
-        )
+        taken = sorted({f"{ns}.{op}" for op in SINK_OPERATIONS} & set(self.tools))
         if taken:
             raise ValueError(f"{', '.join(taken)}: a sink operation cannot be a tool")
         declared = self.permissions.intents
@@ -363,14 +371,34 @@ class Plugin:
             path: str,
             content: str | None = None,
             expected_sha256: str | None = None,
+            force: bool = False,
         ) -> CallToolResult:
             """Make the note hold content (null: remove it), compare-and-swap."""
 
             async def run() -> dict[str, Any]:
-                await _maybe_await(
-                    sink.restore(Paths.from_wire(paths), path, decode(content), expected_sha256)
-                )
+                where, data = Paths.from_wire(paths), decode(content)
+                # `force` is passed only when true and the sink's `restore` takes it: a sink
+                # written before horae-sdk 0.4 is called exactly as before.
+                if force is True and _accepts(sink.restore, "force"):
+                    await _maybe_await(sink.restore(where, path, data, expected_sha256, True))
+                else:
+                    await _maybe_await(sink.restore(where, path, data, expected_sha256))
                 return {}
+
+            return await _operation(run)
+
+        async def restore_status(
+            paths: dict[str, Any], details: dict[str, Any], force: bool = False
+        ) -> CallToolResult:
+            """Undo a task status change (`details`: what apply answered), if it can."""
+
+            async def run() -> dict[str, Any]:
+                where = Paths.from_wire(paths)
+                if force is True and _accepts(sink.restore_status, "force"):
+                    wrote = await _maybe_await(sink.restore_status(where, details, True))
+                else:
+                    wrote = await _maybe_await(sink.restore_status(where, details))
+                return {"restored": bool(wrote)}
 
             return await _operation(run)
 
@@ -391,7 +419,7 @@ class Plugin:
 
             return await _operation(run)
 
-        for function in (read, apply, restore, parent_exists, identity):
+        for function in (read, apply, restore, restore_status, parent_exists, identity):
             self.server.add_tool(function, name=f"{ns}.{function.__name__}")
 
 

@@ -3,10 +3,10 @@
 
 `manifest(...)` builds the document as a `dict` and checks the rules that are easy to get
 wrong (`ManifestError`, a `ValueError`): names and refs, the version, the sink operation names
-a plugin may not provide (`<ns>.read`, `<ns>.apply`, `<ns>.restore`, `<ns>.parent_exists`,
-`<ns>.identity` of its own sink and notifier namespaces), the permissions. The core's loader
-is the judge; the SDK's tests validate what this module writes against the generated JSON
-Schema and the pydantic model.
+a plugin may not provide (`<ns>.read`, `<ns>.apply`, `<ns>.restore`, `<ns>.restore_status`,
+`<ns>.parent_exists`, `<ns>.identity` of its own sink and notifier namespaces), the
+permissions. The core's loader is the judge; the SDK's tests validate what this module writes
+against the generated JSON Schema and the pydantic model.
 
 `Plugin.manifest()` fills `provides` from the plugin's registered tools and sinks.
 
@@ -27,7 +27,7 @@ import yaml
 
 from horae_sdk.intents import INTENT_TYPES
 
-SINK_OPERATIONS = ("read", "apply", "restore", "parent_exists", "identity")
+SINK_OPERATIONS = ("read", "apply", "restore", "restore_status", "parent_exists", "identity")
 """The operations the core calls on a sink or notifier namespace (`horae.contracts.plugin`)."""
 TOOL_KINDS = ("sources", "transforms", "sinks", "notifiers")
 DEFAULT_HORAE = ">=0"

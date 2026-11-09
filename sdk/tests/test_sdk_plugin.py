@@ -146,7 +146,7 @@ class Notes(Sink):
     def read(self, paths: Paths, path: str) -> bytes | None:
         return self.files.get(path)
 
-    def restore(
+    def restore(  # type: ignore[override]
         self, paths: Paths, path: str, content: bytes | None, expected_sha256: str | None
     ) -> None:
         if content is None:
@@ -201,6 +201,63 @@ def test_sink_operations_follow_the_host_contract() -> None:
         run(operation(plugin, "other.read", {}))
     with pytest.raises(ValueError, match="already has a sink"):
         plugin.add(Notes())
+
+
+class Tasks(Notes):
+    """A sink that records how it was asked to undo a status change."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.asked: list[tuple[dict[str, Any], bool]] = []
+        self.forced: list[bool] = []
+
+    def restore(  # the horae-sdk 0.4 signature
+        self,
+        paths: Paths,
+        path: str,
+        content: bytes | None,
+        expected_sha256: str | None,
+        force: bool = False,
+    ) -> None:
+        self.forced.append(force)
+
+    def restore_status(self, paths: Paths, details: dict[str, Any], force: bool = False) -> bool:
+        self.asked.append((details, force))
+        if details.get("edited") and not force:
+            raise SinkError("target_changed", "the task line changed")
+        return True
+
+
+def test_restore_force_and_restore_status_follow_the_contract() -> None:
+    plugin = Plugin("notes", permissions=Permissions(intents=["note.create"]))
+    sink = Tasks()
+    plugin.add(sink)
+    paths = {"read": [], "write": ["/vault"]}
+    restore = {"paths": paths, "path": "x.md", "content": None}
+    assert run(operation(plugin, "notes.restore", restore)) == {}
+    assert run(operation(plugin, "notes.restore", {**restore, "force": True})) == {}
+    assert sink.forced == [False, True]
+    status = {"paths": paths, "details": {"changed": True}}
+    assert run(operation(plugin, "notes.restore_status", status)) == {"restored": True}
+    assert sink.asked[-1] == ({"changed": True}, False)
+    edited = {"paths": paths, "details": {"edited": True}}
+    assert run(operation(plugin, "notes.restore_status", edited))["error"]["kind"] == (
+        "target_changed"
+    )
+    forced = run(operation(plugin, "notes.restore_status", {**edited, "force": True}))
+    assert forced == {"restored": True}
+    assert sink.asked[-1] == ({"edited": True}, True)
+
+
+def test_a_sink_written_before_force_is_still_called_without_it() -> None:
+    plugin = Plugin("notes", permissions=Permissions(intents=["note.create"]))
+    plugin.add(Notes())  # `restore` takes no `force`, and `restore_status` is the default
+    paths = {"read": [], "write": ["/vault"]}
+    restore = {"paths": paths, "path": "x.md", "content": None, "force": True}
+    assert run(operation(plugin, "notes.restore", restore)) == {}
+    status = {"paths": paths, "details": {"changed": True}, "force": True}
+    answer = run(operation(plugin, "notes.restore_status", status))
+    assert answer["error"]["kind"] == "not_supported"
 
 
 class Push(Notifier):
