@@ -46,10 +46,13 @@ from horae.contracts.run import Usage
 from horae.engine import TARGET_FIELDS, check_task_fingerprints, fill_target, secrets_in_viewed
 from horae.engine.guard import check_intents
 from horae.engine.ports import DeidUnavailable, LlmError, LlmRequest, LlmResponse
-from horae.evals._cases import LoadedCase
+from horae.evals._cases import EvalError, LoadedCase
+from horae.evals._match import MatchTimeout
+from horae.evals._match import search as search_pattern
 from horae.intents import IntentRejected, validate_intents
 from horae.llm.backends import FACTORIES, UNUSABLE_STOP_REASONS
 from horae.llm.base import (
+    UNVALIDATED,
     BackendFactory,
     CompletionResult,
     ModelBackends,
@@ -60,6 +63,7 @@ from horae.llm.base import (
     production_validator,
 )
 from horae.llm.deid import Deidentifier, Pseudonymized, field_classes
+from horae.llm.replay import ReplayBackend
 from horae.llm.validate import validate_output
 from horae.secrets import SecretResolver
 from horae.secrets.redact import current as current_redactor
@@ -246,14 +250,35 @@ def assertion_check(assertion: EvalAssertion, document: Any) -> Check:
             return Check(name, False, f"not a string, array or object ({type(value).__name__})")
         ok = len(value) == assertion.length
         return Check(name, ok, None if ok else f"length {len(value)}, not {assertion.length}")
-    wanted = assertion.contains
+    if assertion.check == "matches":
+        return _matches(name, assertion.matches or "", value)
+    negated = assertion.check == "not_contains"
+    wanted = assertion.not_contains if negated else assertion.contains
     if isinstance(value, str):
-        ok = isinstance(wanted, str) and wanted in value
+        if negated and not isinstance(wanted, str):
+            return Check(name, False, "not_contains on a string needs a string")
+        held = isinstance(wanted, str) and wanted in value
     elif isinstance(value, list):
-        ok = any(_same(item, wanted) for item in value)
+        held = any(_same(item, wanted) for item in value)
     else:
         return Check(name, False, f"not a string or an array ({type(value).__name__})")
-    return Check(name, ok, None if ok else "not contained")
+    if negated:
+        return Check(name, not held, "contained" if held else None)
+    return Check(name, held, None if held else "not contained")
+
+
+def _matches(name: str, pattern: str, value: Any) -> Check:
+    """The `matches` assertion: `pattern` found in the string `value` (bounded, killable
+    search: `horae.evals._match`)."""
+    if not isinstance(value, str):
+        return Check(name, False, f"not a string ({type(value).__name__})")
+    try:
+        found = search_pattern(pattern, value)
+    except MatchTimeout as error:
+        return Check(name, False, f"the pattern could not be searched: {error}")
+    except ValueError as error:
+        return Check(name, False, str(error))
+    return Check(name, found, None if found else "no match")
 
 
 def _counts(intents: Sequence[Any]) -> dict[str, int]:
@@ -475,6 +500,58 @@ def staleness(
     return stale
 
 
+def stale_message(case: str, backend: str, stale: Sequence[str]) -> str:
+    """What an offline eval says of a case whose recording no longer matches its request."""
+    changed = ", ".join(stale)
+    return (
+        f"case {case}: the recording for backend {backend} is stale ({changed} changed since "
+        "it was recorded); re-record it with `horae eval --live --record`"
+    )
+
+
+def request_digest(
+    sue: SkillUnderEval,
+    loaded: LoadedCase,
+    *,
+    backend: str = "anthropic",
+    model: str = "digest",
+    timeout_s: float = DEFAULT_TIMEOUT_S,
+    deid: Deidentifier | None = None,
+    factories: Mapping[str, BackendFactory] = FACTORIES,
+) -> RecordedRequest:
+    """The request digest of a case: the SHA-256 of the skill's prompt, of the case's viewed
+    input and of the skill's output schema, exactly what `horae eval --live --record` stores
+    as a recording's `request` and what `horae run --llm-replay` looks a recording up by.
+
+    The request is rendered as an offline eval renders it (nothing is sent, no secret is
+    read). The digests do not depend on the backend or the model; `backend` and `model` only
+    name the alias that renders (and decide whether the skill's input is de-identified, as for
+    any cloud alias: pass a local `backend` such as `ollama` for the raw input). Raises
+    `EvalError` when the case cannot be rendered (an input that does not fit the skill's view,
+    de-identification that is unavailable, a request the backend refuses)."""
+    result = CaseResult(loaded.name, backend)
+    viewed = viewed_input(sue, loaded, result)
+    if viewed is None:
+        raise EvalError(f"case {loaded.name}: {(result.error or {}).get('message', 'invalid')}")
+    alias = offline_alias(backend, model)
+    policy = Deidentifier({"eval": alias}) if deid is None else deid
+    ok, pseudo = deidentify(sue, policy, "eval", viewed, result)
+    if not ok:
+        raise EvalError(f"case {loaded.name}: {(result.error or {}).get('message', 'refused')}")
+    backends = ModelBackends(
+        models={"eval": alias},
+        secrets=SecretResolver({}, Path("/nonexistent"), {}),
+        factories=factories,
+        validate=UNVALIDATED,
+    )
+    try:
+        return recorded_request(
+            backends.render(request_for(sue, "eval", loaded, viewed, timeout_s, pseudo))
+        )
+    except LlmError as error:
+        raise EvalError(f"case {loaded.name}: {error.message}") from None
+
+
 def absorb(response: LlmResponse, result: CaseResult) -> None:
     result.schema_valid = not response.schema_errors
     result.schema_errors = list(response.schema_errors)
@@ -496,33 +573,12 @@ def finish(sue: SkillUnderEval, loaded: LoadedCase, viewed: Any, result: CaseRes
 # --- offline ----------------------------------------------------------------------------------
 
 
-class _Replay:
-    """A provider backend whose `render` is the real backend's and whose `send` returns a
-    recorded result: nothing leaves the host."""
+class _Replay(ReplayBackend):
+    """Deprecated private name of `horae.llm.replay.ReplayBackend` (#134), kept so the packs
+    that import it keep working; use the public class."""
 
     def __init__(self, inner: ProviderBackend, result: CompletionResult) -> None:
-        self._inner, self._result = inner, result
-
-    @property
-    def name(self) -> Any:
-        return self._inner.name
-
-    @property
-    def may_write_cache(self) -> bool:
-        return getattr(self._inner, "may_write_cache", False) is True
-
-    @property
-    def output_attempts(self) -> int:
-        return output_attempts(self._inner)
-
-    def render(self, completion: Any) -> dict[str, Any]:
-        return self._inner.render(completion)
-
-    async def send(self, payload: Mapping[str, Any], timeout_s: float) -> CompletionResult:
-        return self._result
-
-    async def aclose(self) -> None:
-        await self._inner.aclose()
+        super().__init__(inner, result)
 
 
 def offline_alias(backend: str, model: str) -> ModelAlias:
@@ -624,6 +680,8 @@ async def _offline_case(
         rendered = backends.render(request_for(sue, name, loaded, viewed, timeout_s, pseudo))
         result.stale = staleness(sue, rendered, recorded)
         result.stop_reason = recorded.stop_reason
+        if result.stale:
+            return result.fail("stale_recording", stale_message(loaded.name, backend, result.stale))
         absorb(await backends.send(rendered), result)
         reidentify(pseudo, result)
     except LlmError as error:
@@ -878,6 +936,7 @@ __all__ = [
     "offline_alias",
     "plan_live",
     "pretty",
+    "request_digest",
     "resolve",
     "run_offline",
     "send_live",

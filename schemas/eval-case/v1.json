@@ -47,6 +47,16 @@
         },
         {
           "required": [
+            "not_contains"
+          ]
+        },
+        {
+          "required": [
+            "matches"
+          ]
+        },
+        {
+          "required": [
             "exists"
           ]
         }
@@ -82,6 +92,26 @@
           "default": null,
           "description": "A substring of the string there, or an element of the array there.",
           "title": "Contains"
+        },
+        "not_contains": {
+          "default": null,
+          "description": "The opposite of `contains`: the string there holds no such substring, the array no such\nelement. Something must be there (a missing value fails: use `exists: false` to assert\nabsence), so a mistyped pointer cannot pass.",
+          "title": "Not Contains"
+        },
+        "matches": {
+          "anyOf": [
+            {
+              "maxLength": 256,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "A regular expression (Python `re` syntax, `re.search`: unanchored; flags inline, such as\n`(?i)`) found in the string there. At most 256 characters and it must compile. It is searched\nin a killable worker with a time limit, in a string of at most 65536 characters; a search\nthat does not finish fails the assertion (schemas decision 64).",
+          "title": "Matches"
         },
         "exists": {
           "anyOf": [

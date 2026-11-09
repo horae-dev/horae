@@ -34,7 +34,7 @@ from horae.contracts.instance import ModelAlias
 from horae.contracts.pipeline import LlmStep
 from horae.contracts.plugin import StdioRuntime
 from horae.contracts.skill import OUTPUT_SCHEMA_FILE
-from horae.engine import UnknownPlugin
+from horae.engine import LlmBackend, UnknownPlugin
 from horae.llm.backends import FACTORIES, claude_cli, schema_problems
 from horae.llm.backends._shared import lan_address
 from horae.llm.deid import vocabulary_problem
@@ -534,10 +534,13 @@ def instance_problems(instance: Instance) -> list[Problem]:
 
 
 @asynccontextmanager
-async def live_ports(instance: Instance) -> AsyncIterator[LivePorts]:
-    """`open_ports` on the instance's plugins, checked first (`check_plugins`)."""
+async def live_ports(
+    instance: Instance, *, llm: LlmBackend | None = None
+) -> AsyncIterator[LivePorts]:
+    """`open_ports` on the instance's plugins, checked first (`check_plugins`); `llm` is a
+    replacement for the instance's model backends (`horae run --llm-replay`)."""
     check_plugins(instance)
-    async with open_ports(instance, plugins_dir(instance.root)) as live:
+    async with open_ports(instance, plugins_dir(instance.root), llm=llm) as live:
         yield live
 
 

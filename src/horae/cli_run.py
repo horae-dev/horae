@@ -28,6 +28,18 @@ its declared secret resolved, on the step's first call. A backend that is not av
 fails the step with `backend_unavailable`, and a skill whose prompt is not loaded with
 `skill_unavailable` (until #27); the run is then `degraded`.
 
+**LLM replay** (#134, schemas decision 64). `--llm-replay <recordings>` answers every `llm`
+step from recorded responses instead of calling a model (`horae.llm.replay`): `<recordings>`
+is a recording file or a folder searched for `*.json` recordings (a skill's
+`evals/recorded/`, as `horae eval --live --record` writes them). The request is rendered by the
+real backend of the step's alias and looked up by its **request digest** (the skill's prompt,
+the viewed input and the output schema); the recorded output then goes through the same
+validator, intent check and action guard as a live one. A request no recording answers fails
+the step with `replay_miss` (the run is `degraded`), never a live call. Nothing is sent and no
+secret is read. The cache lookup is skipped (as `--no-cache`), and an accepted output is cached
+like any other: replay into a scratch instance, or with `--dry-run` (writes nothing), when
+the cache must keep what the model made.
+
 **Push monitor** (#39, schemas decision 49 F). When `horae.yaml` `scheduler.monitors` has
 an entry for the pipeline, its push URL (a secret) is pinged once the run has ended: `up` for
 `ok`, `noop` and `degraded`, `down` for anything else (failed, timed out, lost, crashed), and
@@ -83,7 +95,9 @@ from horae.config import Instance
 from horae.contracts import RunRecord
 from horae.contracts.types import MAX_ITEMS
 from horae.engine.template import BUILTIN_VARS
-from horae.runner import LocksUnsupported, PipelineLocked, RunLost, Runner, RunTimedOut
+from horae.evals import EvalError
+from horae.llm.replay import Recordings, replay_backends
+from horae.runner import LivePorts, LocksUnsupported, PipelineLocked, RunLost, Runner, RunTimedOut
 from horae.scheduler import PingResult, RunOutcome, ping
 from horae.store import Store, StoreError
 
@@ -198,33 +212,55 @@ async def execute_run(
     vars: dict[str, str],
     out: RunCapture,
     cache: bool = True,
+    replay: Recordings | None = None,
 ) -> RunRecord:
     """Run `name` once through the instance's plugins (`live_ports`), its records and id
-    captured in `out`. Raises what `Runner.run` raises (a cancellation included)."""
-    async with live_ports(instance) as live:
-        with Store.open(instance.store_path) as store:
-            runner = Runner(instance, store, live.ports)
-            record = await runner.run(
-                name,
-                dry_run=dry_run,
-                vars=vars,
-                on_record=out.saved.append,
-                on_begin=out.begin,
-                cache=cache,
+    captured in `out`; with `replay`, the `llm` steps are answered from those recordings.
+    Raises what `Runner.run` raises (a cancellation included)."""
+    replayed = None if replay is None else replay_backends(instance.config.models, replay)
+    try:
+        ports = live_ports(instance) if replayed is None else live_ports(instance, llm=replayed)
+        async with ports as live:
+            return await _execute(
+                instance, name, dry_run, vars, out, cache and replay is None, live
             )
-            if dry_run:
+    finally:
+        if replayed is not None:
+            await replayed.aclose()
 
-                def notified(key: str) -> bool:
-                    return store.get_notification(key) is not None
 
-                out.changes = await plan_changes(
-                    record,
-                    live.sinks,
-                    notified=notified,
-                    known_task=store.get_task,
-                    call_timeout_s=instance.config.plugin_defaults.call_timeout_s,
-                )
-            return record
+async def _execute(
+    instance: Instance,
+    name: str,
+    dry_run: bool,
+    vars: dict[str, str],
+    out: RunCapture,
+    cache: bool,
+    live: LivePorts,
+) -> RunRecord:
+    with Store.open(instance.store_path) as store:
+        runner = Runner(instance, store, live.ports)
+        record = await runner.run(
+            name,
+            dry_run=dry_run,
+            vars=vars,
+            on_record=out.saved.append,
+            on_begin=out.begin,
+            cache=cache,
+        )
+        if dry_run:
+
+            def notified(key: str) -> bool:
+                return store.get_notification(key) is not None
+
+            out.changes = await plan_changes(
+                record,
+                live.sinks,
+                notified=notified,
+                known_task=store.get_task,
+                call_timeout_s=instance.config.plugin_defaults.call_timeout_s,
+            )
+        return record
 
 
 def _run_dict(record: RunRecord) -> dict[str, Any]:
@@ -357,9 +393,16 @@ def _run(
     json_output: bool,
     runner: Callable[[Coroutine[Any, Any, Any]], Any],
     cache: bool = True,
+    llm_replay: Path | None = None,
 ) -> int:
     vars = parse_vars(var)
     instance = load(instance_dir)
+    replay = None
+    if llm_replay is not None:
+        try:
+            replay = Recordings.load(llm_replay)
+        except EvalError as error:
+            raise CommandFailed(EXIT_PROBLEMS, "replay_unavailable", error.message) from None
     if name not in instance.pipelines:
         known = ", ".join(sorted(instance.pipelines)) or "none"
         raise CommandFailed(
@@ -368,7 +411,7 @@ def _run(
     out = RunCapture()
     started = time.monotonic()
     try:
-        code = _attempt(instance, name, dry_run, vars, json_output, runner, cache, out)
+        code = _attempt(instance, name, dry_run, vars, json_output, runner, cache, out, replay)
     except CommandFailed as failed:
         if failed.kind != "pipeline_locked":
             out.outcome = failed.kind
@@ -412,12 +455,13 @@ def _attempt(
     runner: Callable[[Coroutine[Any, Any, Any]], Any],
     cache: bool,
     out: RunCapture,
+    replay: Recordings | None = None,
 ) -> int:
     """One run of `name`; sets `out.outcome` (not when the pipeline is locked, nor for a run
     interrupted before any record was saved)."""
     try:
         record: RunRecord = runner(
-            cancel_on_signals(execute_run(instance, name, dry_run, vars, out, cache))
+            cancel_on_signals(execute_run(instance, name, dry_run, vars, out, cache, replay))
         )
     except Interrupted as stop:
         out.interrupted = True
@@ -497,6 +541,14 @@ def run(
             help="Call the LLM even on unchanged input (skip the cache lookup; for debugging).",
         ),
     ] = False,
+    llm_replay: Annotated[
+        Path | None,
+        typer.Option(
+            "--llm-replay",
+            help="Answer llm steps from recorded responses (a file, or a folder of *.json "
+            "recordings) instead of calling a model.",
+        ),
+    ] = None,
     json_output: Annotated[bool, typer.Option("--json", help="Print the result as JSON.")] = False,
 ) -> None:
     """Run a pipeline once through the instance's plugins, and apply its intents.
@@ -507,7 +559,9 @@ def run(
     the apply, the apply finishes and the record is saved before the run is reported
     interrupted. An llm step calls the backend of its model alias (horae.yaml models), with
     the API key from the alias' declared secret. On unchanged input it reuses the cached
-    output instead (no call, $0); --no-cache skips that lookup.
+    output instead (no call, $0); --no-cache skips that lookup. With --llm-replay RECORDINGS the
+    llm steps are answered from recorded responses found by request digest (no model, no secret;
+    a request with no recording fails the step, replay_miss).
 
     Exit codes: 0 ok, noop or degraded (dry run: planned without problems), 1 configuration,
     plugin, store or runtime problem (the run failed or timed out; a dry run whose plan
@@ -519,7 +573,14 @@ def run(
         "run",
         json_output,
         lambda: _run(
-            instance, pipeline, dry_run, var or [], json_output, asyncio.run, not no_cache
+            instance,
+            pipeline,
+            dry_run,
+            var or [],
+            json_output,
+            asyncio.run,
+            not no_cache,
+            llm_replay,
         ),
     )
 

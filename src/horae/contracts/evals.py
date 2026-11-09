@@ -25,6 +25,7 @@ changed since it was recorded). It never holds the provider's raw payload, heade
 secret: `horae eval --live --record` writes it redacted (schemas decision 43).
 """
 
+import re
 from typing import Annotated, Any, Literal, Self
 
 from pydantic import ConfigDict, Field, Strict, StringConstraints, model_validator
@@ -60,7 +61,7 @@ JsonPointer = Annotated[
 TargetType = Literal["note.create", "note.append_section", "note.replace_owned_block", "http.post"]
 """The intent types whose target (`path`, or `url` for `http.post`) a pipeline binds."""
 
-CHECKS = ("equals", "length", "contains", "exists")
+CHECKS = ("equals", "length", "contains", "not_contains", "matches", "exists")
 """The checks of an assertion: exactly one per assertion."""
 
 
@@ -82,6 +83,15 @@ class EvalAssertion(Contract):
     """The length of the string, array or object there."""
     contains: Any = None
     """A substring of the string there, or an element of the array there."""
+    not_contains: Any = None
+    """The opposite of `contains`: the string there holds no such substring, the array no such
+    element. Something must be there (a missing value fails: use `exists: false` to assert
+    absence), so a mistyped pointer cannot pass."""
+    matches: Annotated[str, Strict(), StringConstraints(min_length=1, max_length=256)] | None = None
+    """A regular expression (Python `re` syntax, `re.search`: unanchored; flags inline, such as
+    `(?i)`) found in the string there. At most 256 characters and it must compile. It is searched
+    in a killable worker with a time limit, in a string of at most 65536 characters; a search
+    that does not finish fails the assertion (schemas decision 64)."""
     exists: StrictBool | None = None
     """Whether anything is there."""
 
@@ -90,6 +100,11 @@ class EvalAssertion(Contract):
         given = [check for check in CHECKS if check in self.model_fields_set]
         if len(given) != 1:
             raise ValueError(f"an assertion has exactly one of {', '.join(CHECKS)}")
+        if self.matches is not None:
+            try:
+                re.compile(self.matches)
+            except (re.error, RecursionError, OverflowError) as error:
+                raise ValueError(f"matches: not a valid regular expression ({error})") from None
         return self
 
     @property
