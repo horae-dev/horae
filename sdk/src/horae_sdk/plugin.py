@@ -53,7 +53,10 @@ from horae_sdk.protocol import (
     MAX_INTENTS,
     MAX_MESSAGE_BYTES,
     MESSAGE_MARGIN,
+    NETWORK_LOCAL_META,
+    NETWORK_META,
     PATHS_META,
+    Network,
     Paths,
     meta_of,
 )
@@ -80,6 +83,33 @@ class Call:
     """A transform's input, the previous step's data (untrusted; `None` for a source)."""
     paths: Paths = field(default_factory=Paths)
     """The path permissions approved in `horae.lock` (trusted)."""
+    network: Network = field(default_factory=Network)
+    """The network allow-list approved in `horae.lock` (trusted; horae-sdk 0.5), with its
+    local-network endpoints (`network.local`, horae-sdk 0.6). Unknown (`network.known` is
+    false) when the core is older and sent none."""
+
+    @property
+    def allowed_hosts(self) -> tuple[str, ...] | None:
+        """The approved host names, `()` when the lock grants none, `None` when unknown (an
+        older core): then fall back to the plugin's own configuration."""
+        return self.network.hosts
+
+    @property
+    def local_endpoints(self) -> tuple[str, ...] | None:
+        """The approved local-network endpoints (`host:port`, decision 66), `()` when none,
+        `None` when unknown (an older core)."""
+        return self.network.local if self.network.known else None
+
+    def host_allowed(self, url: str) -> bool | None:
+        """Whether `url` is approved: an `https` URL on an approved host, or an `http(s)` URL
+        on an approved local endpoint (exact host and port). `True`/`False`, or `None` when the
+        core sent no list (unknown: the plugin decides). See `Network.allows`."""
+        return self.network.allows(url)
+
+    def address_allowed(self, host: str, port: int) -> bool | None:
+        """Like `host_allowed` for a protocol that is not HTTP (IMAP, SMTP...). See
+        `Network.address_allowed`."""
+        return self.network.address_allowed(host, port)
 
 
 @dataclass(frozen=True)
@@ -94,14 +124,27 @@ class Tool:
     """A source or transform: `ref` and the function run for each call.
 
     Subclass `Source` or `Transform` with a `ref` and a `run(self, call, **params)` method,
-    or pass `ref` and `fn`."""
+    or pass `ref` and `fn`. `personal_fields` (horae-sdk 0.7, schemas decision 68) are the
+    view paths of the tool's output that hold personal data (`children[].first_name`): the
+    manifest declares them and the core de-identifies them before any cloud model."""
 
     role: ClassVar[ToolRole]
     ref: str
+    personal_fields: Sequence[str] = ()
 
-    def __init__(self, ref: str | None = None, fn: Callable[..., Any] | None = None) -> None:
+    def __init__(
+        self,
+        ref: str | None = None,
+        fn: Callable[..., Any] | None = None,
+        *,
+        personal_fields: Sequence[str] | None = None,
+    ) -> None:
         if ref is not None:
             self.ref = ref
+        if personal_fields is not None:
+            if isinstance(personal_fields, str):
+                raise TypeError(f"{self.ref}: personal_fields is a list of paths")
+            self.personal_fields = tuple(personal_fields)
         if not isinstance(getattr(self, "ref", None), str):
             raise TypeError(f"{type(self).__name__} needs a ref")
         run = fn if fn is not None else getattr(self, "run", None)
@@ -180,19 +223,25 @@ class Plugin:
         self.tools[component.ref] = component
         self.server.add_tool(self._handler(component), name=component.ref)
 
-    def source(self, ref: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-        """Decorator: register the function as source `ref`."""
-        return self._decorator(Source, ref)
+    def source(
+        self, ref: str, *, personal_fields: Sequence[str] | None = None
+    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        """Decorator: register the function as source `ref`, with the view paths of its
+        output that hold personal data (`personal_fields`, decision 68)."""
+        return self._decorator(Source, ref, personal_fields)
 
-    def transform(self, ref: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-        """Decorator: register the function as transform `ref`."""
-        return self._decorator(Transform, ref)
+    def transform(
+        self, ref: str, *, personal_fields: Sequence[str] | None = None
+    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        """Decorator: register the function as transform `ref` (`personal_fields`: as for a
+        source, relative to the transform's output)."""
+        return self._decorator(Transform, ref, personal_fields)
 
     def _decorator(
-        self, kind: type[Tool], ref: str
+        self, kind: type[Tool], ref: str, personal_fields: Sequence[str] | None
     ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
         def register(fn: Callable[..., Any]) -> Callable[..., Any]:
-            self.add(kind(ref, fn))
+            self.add(kind(ref, fn, personal_fields=personal_fields))
             return fn
 
         return register
@@ -205,6 +254,15 @@ class Plugin:
         for sink in self.sinks.values():
             listed.setdefault(sink.role, []).extend(sink.tools)
         return listed
+
+    def personal_fields(self) -> dict[str, list[str]]:
+        """`provides.personal_fields`: the declared personal fields of each source and
+        transform that has any (decision 68)."""
+        return {
+            tool.ref: list(tool.personal_fields)
+            for tool in self.tools.values()
+            if tool.personal_fields
+        }
 
     def manifest(
         self,
@@ -220,6 +278,7 @@ class Plugin:
             version=self.version,
             provides=self.provides(),
             permissions=self.permissions,
+            personal_fields=self.personal_fields(),
             command=command,
             horae=horae,
             description=self.description,
@@ -261,6 +320,7 @@ class Plugin:
                 dict(arguments),
                 meta.get(INPUT_META),
                 Paths.from_wire(meta.get(PATHS_META)),
+                Network.from_wire(meta.get(NETWORK_META), meta.get(NETWORK_LOCAL_META)),
             )
             try:
                 return self.result(tool.ref, await _maybe_await(tool.fn(call, **arguments)))
@@ -338,8 +398,12 @@ class Plugin:
             input_hash: str | None = None,
             dedupe_key: str | None = None,
             actions: list[dict[str, Any]] | None = None,
+            *,
+            ctx: Context,
         ) -> CallToolResult:
             """Apply one intent routed to this sink."""
+            meta = meta_of(ctx.request_context.meta)
+            network = Network.from_wire(meta.get(NETWORK_META), meta.get(NETWORK_LOCAL_META))
 
             async def run() -> dict[str, Any]:
                 if intent.get("type") not in declared:
@@ -358,6 +422,7 @@ class Plugin:
                     decode(content),
                     expected_before_sha256,
                     _actions(actions),
+                    network,
                 )
                 applied = await _maybe_await(sink.apply(request))
                 if not isinstance(applied, Applied):

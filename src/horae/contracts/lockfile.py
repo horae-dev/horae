@@ -18,9 +18,10 @@ from pydantic import (
     Strict,
     StringConstraints,
     field_serializer,
+    model_serializer,
 )
 
-from horae.contracts.plugin import Permissions
+from horae.contracts.plugin import Permissions, PersonalFields
 from horae.contracts.types import (
     HOST,
     MAX_ITEMS,
@@ -80,13 +81,39 @@ class LockedPlugin(Contract):
     commit: CommitSha
     """The commit checked out; the tag for `version` must point to it."""
     permissions: Permissions
-    """The permissions the user approved at install or upgrade time (sorted when written)."""
+    """The permissions the user approved at install or upgrade time (sorted when written).
+    `network_local` (decision 66) is left out when empty, so a lock without a local grant
+    is written exactly as before and an older core still reads it."""
+
+    personal_fields: PersonalFields = Field(default_factory=dict)
+    """The personal fields of the plugin's sources and transforms (`provides.personal_fields`
+    of its manifest, decision 68), recorded with the approved plugin: the core enforces the
+    union of these and the installed manifest's, so an upgrade can never drop one silently.
+    Left out when empty (paths sorted when written), so a lock without any is written exactly
+    as before and an older core still reads it."""
 
     @field_serializer("permissions", mode="wrap")
     def _canonical_permissions(
         self, value: Permissions, handler: SerializerFunctionWrapHandler
     ) -> Any:
-        return _sorted_lists(handler(value))
+        data = _sorted_lists(handler(value))
+        if isinstance(data, dict) and not data.get("network_local"):
+            data.pop("network_local", None)
+        return data
+
+    @field_serializer("personal_fields", mode="wrap")
+    def _canonical_personal_fields(
+        self, value: dict[str, list[str]], handler: SerializerFunctionWrapHandler
+    ) -> Any:
+        data = handler(value)
+        return {ref: sorted(paths) for ref, paths in sorted(data.items())}
+
+    @model_serializer(mode="wrap")
+    def _omit_empty(self, handler: SerializerFunctionWrapHandler) -> Any:
+        data = handler(self)
+        if isinstance(data, dict) and not data.get("personal_fields"):
+            data.pop("personal_fields", None)
+        return data
 
 
 class Lockfile(Contract):

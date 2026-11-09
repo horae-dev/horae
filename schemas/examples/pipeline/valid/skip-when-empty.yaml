@@ -1,0 +1,9 @@
+# Decision 67: skip the LLM step (no call, no cache entry) when the mail needing a model is empty.
+name: triage-mail
+steps:
+  - collect: [gmail.triage]
+  - llm:
+      skill: gmail/triage-mail
+      model: default
+      budget: { usd: 0.05, tokens_out: 2000 }
+      skip_when_empty: ["[].data.needs_interpretation"]

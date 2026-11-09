@@ -5,8 +5,9 @@ A Horae plugin is an MCP server over stdio that the core's plugin host starts fo
 (ADR 0003). This SDK speaks exactly the host's contract (`horae.plugins.host`):
 
 - `horae_sdk.plugin`: `Plugin`, the base classes of the host's roles (`Source`, `Transform`,
-  `Sink`, `Notifier`), `Call` (the trusted parameters, the transform input and the locked
-  paths) and `Output` (data and proposed intents);
+  `Sink`, `Notifier`), `Call` (the trusted parameters, the transform input, the locked
+  paths and the locked network hosts, `Call.host_allowed(url)`) and `Output` (data and proposed
+  intents);
 - `horae_sdk.sinks`: the sink operations the core calls (`<ns>.read`, `<ns>.apply`,
   `<ns>.restore`, `<ns>.restore_status`, `<ns>.parent_exists`, `<ns>.identity`);
 - `horae_sdk.manifest`: `plugin.yaml` helpers;
@@ -18,14 +19,16 @@ A Horae plugin is an MCP server over stdio that the core's plugin host starts fo
 from horae_sdk import intents, tasks
 from horae_sdk.manifest import Permissions, dump_manifest, manifest
 from horae_sdk.plugin import Call, Output, Paths, Plugin, PluginError, Source, Transform
+from horae_sdk.protocol import Network
 from horae_sdk.sinks import Applied, ApplyRequest, Notifier, Sink, SinkError
 
-__version__ = "0.4.0"
+__version__ = "0.7.0"
 
 __all__ = [
     "Applied",
     "ApplyRequest",
     "Call",
+    "Network",
     "Notifier",
     "Output",
     "Paths",

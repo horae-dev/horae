@@ -1,6 +1,34 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/horae-dev/horae/main/schemas/skill/v1.json",
+  "$defs": {
+    "TaskFingerprintRule": {
+      "additionalProperties": false,
+      "description": "Where the ids behind a `task.create` fingerprint live in the viewed input (decision 67).\n\nA `task.create` the skill proposes must carry the fingerprint `prefix` + an id found at\n`ids` in the viewed input; any other fingerprint is a guard violation.",
+      "properties": {
+        "ids": {
+          "description": "A path of the skill's `input_view` (or below one) whose string values are the ids, e.g.\n`[].data.needs_interpretation[].id`. A list of strings is read as its elements.",
+          "maxLength": 256,
+          "pattern": "^([A-Za-z_][A-Za-z0-9_-]*|\\[\\])(\\.[A-Za-z_][A-Za-z0-9_-]*|\\[\\])*$",
+          "title": "Ids",
+          "type": "string"
+        },
+        "prefix": {
+          "description": "What the fingerprint puts before the id, e.g. `gmail:`.",
+          "maxLength": 64,
+          "pattern": "^[A-Za-z0-9._:-]{1,64}$",
+          "title": "Prefix",
+          "type": "string"
+        }
+      },
+      "required": [
+        "ids",
+        "prefix"
+      ],
+      "title": "TaskFingerprintRule",
+      "type": "object"
+    }
+  },
   "additionalProperties": false,
   "description": "A skill's `skill.yaml`.",
   "properties": {
@@ -186,6 +214,18 @@
       ],
       "title": "Links",
       "type": "string"
+    },
+    "task_fingerprint": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TaskFingerprintRule"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Opt-in (decision 67): a `task.create` the skill proposes must carry the fingerprint\n`prefix` + an id read at `ids` in the viewed input. Omitted: a `task.create` fingerprint is\nfree text, as before. Requires `task.create` in `intents`."
     }
   },
   "required": [

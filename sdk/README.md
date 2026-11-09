@@ -93,6 +93,85 @@ still has `request.expected_before_sha256` (else `SinkError("target_changed", ..
 return `Applied.wrote(path, content)`. Other intents are applied by the sink itself; their
 text is data. See [`examples/tasks_file/tasks_file_sink.py`](examples/tasks_file/tasks_file_sink.py).
 
+### Upgrading a sink to 0.4.0 (release notes)
+
+- **Override `restore` with the `force` keyword.** `Sink.restore` now has the signature
+  `restore(self, paths, path, content, expected_sha256, force=False)`. A subclass that overrides
+  it with the old four-parameter signature still runs (the SDK calls it without `force`), but
+  **mypy rejects the override** (an incompatible override of the supertype) until you add
+  `force: bool = False`. Do the same for `restore_status(self, paths, details, force=False)`
+  if you implement it. `force` is true only for the user's `horae undo --force`; a sink with no
+  owned-block rule of its own may accept it and ignore it, as the built-in `file-sink` does.
+- **`<ns>.restore_status` is a reserved operation name.** Like `<ns>.read`, `.apply`,
+  `.restore`, `.parent_exists` and `.identity`, it is now a tool only the core calls. A plugin
+  that already provides its own tool called `<ns>.restore_status` (in `provides`) is **rejected
+  when it is loaded**: rename that tool, and implement `Sink.restore_status` instead if you want
+  `horae undo` to put a task status back.
+
+## Checking the approved hosts
+
+Since 0.5 the core sends the plugin's `permissions.network` **as approved in `horae.lock`**
+(not the manifest's declared list) with every call, so a plugin can refuse a host the user did
+not approve, even before M5 isolation (the egress proxy) exists. In a source or transform:
+
+```python
+@plugin.source("web.fetch")
+def fetch(call: Call, url: str) -> Output:
+    allowed = call.host_allowed(url)  # True, False, or None
+    if allowed is False:
+        raise PluginError("that host is not approved in horae.lock")
+    ...
+```
+
+In a sink or notifier, `request.host_allowed(url)` on the `ApplyRequest` does the same.
+`call.allowed_hosts` (`request.network.hosts`) is the list itself: a tuple, `()` when the lock
+grants no host.
+
+- `True`: `url` is an `https` URL whose host is one of the approved names. `False`: anything
+  else, including an empty list.
+- **`None` means unknown**: the core is older than this SDK and sent no list. That is not
+  "refused": the plugin decides. Fall back to what you did before, your own configuration
+  (the server or hosts the pipeline's trusted parameters name), and never treat `None` as
+  "approved by the user".
+- The matching is the lock's, nothing looser: names are lowercase and compared as written
+  (no case folding, no trailing dot, no wildcard, no implicit subdomains); a non-ASCII name
+  must be written as its `xn--` A-label; any port is accepted on an approved host; user info
+  (`user@host`), a backslash, whitespace, a fragment, an IP literal, `localhost` and any scheme
+  but `https` never match. Check the URL you are about to connect to, after any redirect.
+- A plugin cannot influence the list: it travels in the request's `_meta["horae/network"]`,
+  which the core sets, and a transform's input is under another key.
+
+`horae_sdk.testing.call(..., network=[...])` (and a recording's `"network"` key) sends a list;
+the default is `[]`, as the core sends for a plugin with no approved host, and `network=None`
+(`"network": null`) sends none, as an older core does.
+
+### Local-network services (0.6)
+
+A service on the user's network (Home Assistant at `192.168.1.10:8123`, a self-hosted ntfy at
+`ntfy.lan`, Proton Mail Bridge at `127.0.0.1:1143`) is approved in `horae.lock` under
+`permissions.network_local`, not `network` (schemas decision 66). Each entry is `host:port`
+with an explicit port; the host is a loopback, private or link-local IP literal (canonical
+form, IPv6 in brackets: `[::1]:1143`) or a `.local`, `.lan`, `.internal` or `.home.arpa` name.
+Declare them in your manifest with `Permissions(network_local=["127.0.0.1:1143"])`.
+
+- `call.host_allowed(url)` (and `request.host_allowed(url)`) also returns `True` for an `http`
+  **or** `https` URL whose host and port are exactly an approved local endpoint; a URL without
+  a port means 80 (`http`) or 443 (`https`). Plain `http` is allowed only there.
+- There is no normalisation and no DNS: `http://127.000.000.001:1143/`, another port, a name
+  that merely contains a local one (`ntfy.lan.evil.test`, `127.0.0.1.nip.io`) and user info
+  never match. A local grant cannot hold a public address, a public name, a wildcard or a cloud
+  metadata address or name (`169.254.169.254`, `metadata.google.internal`).
+- For a protocol that is not HTTP (IMAP, SMTP...), `call.address_allowed(host, port)`: `True`
+  when `host` is an approved host (any port) or `host:port` an approved local endpoint.
+- `call.local_endpoints` is the list (`()` when none, `None` when unknown). A core that sends
+  `horae/network` but not `horae/network_local` granted none; a core that sends neither is
+  unknown (`None`), as above.
+- A local name can still resolve to anything: if you resolve it yourself, keep refusing a
+  metadata or otherwise unexpected address. The M5 egress proxy checks it at connect time.
+
+`horae_sdk.testing.call(..., network_local=[...])` (a recording's `"network_local"` key) sends
+the local list; by default `[]` is sent alongside `network`.
+
 ## Manifest
 
 ```python
@@ -105,13 +184,32 @@ print(dump_manifest(data))
 ```
 
 `provides` comes from what the plugin registered, `permissions` from `Plugin(...,
-permissions=Permissions(...))`: `intents`, `network` (host names), `secrets` (injected as
+permissions=Permissions(...))`: `intents`, `network` (host names), `network_local`
+(`host:port` local-network services), `secrets` (injected as
 environment variables; the plugin does not start without them), `optional_secrets` (injected
 only when they resolve; read them with `os.environ.get` and report `secret_missing` yourself
 when a call needs one that is absent), `read` and `write` paths. Declare the least you need: undeclared
 access is a bug, and blocked from M5. The SDK checks the usual mistakes (`ManifestError`);
 the core's loader is the judge. The SDK's tests validate what it writes against
 `schemas/plugin-manifest/v1.json` and the core's model.
+
+### Personal fields (0.7)
+
+Declare which fields of a source's (or transform's) output hold personal data, as view paths
+relative to that output (the syntax of a skill's `input_view`):
+
+```python
+@plugin.source("school.homework", personal_fields=["children[].first_name", "homework[].teacher"])
+def homework(call: Call) -> Output: ...
+```
+
+The manifest then lists them under `provides.personal_fields` (left out when none), the lock
+records them, and whenever that output reaches an `llm` step on a **cloud** model alias the
+core replaces those values, and every other string that mentions one (accent- and
+case-folded, whole words), with `[PERSON_n]`, whatever the skill declares, and refuses the
+step if it cannot (schemas decision 68). A transform that moves such data must declare where
+its own output holds it. Limits: names of fewer than 3 letters in text, nicknames, initials
+and typos are not matched.
 
 **The command.** The host starts the plugin with an empty working directory and a fixed
 `PATH` (`/usr/local/bin:/usr/bin:/bin`). Until Horae installs plugins into their own

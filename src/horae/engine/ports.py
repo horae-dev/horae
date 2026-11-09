@@ -33,7 +33,7 @@ data, fails the call (`output_invalid` / `output_too_large`); any other exceptio
 """
 
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
@@ -41,7 +41,7 @@ from horae.contracts.intents import IntentType
 from horae.contracts.pipeline import Budget
 from horae.contracts.plugin import PluginManifest
 from horae.contracts.run import ErrorKind, Usage, Violation
-from horae.contracts.skill import SkillLinks
+from horae.contracts.skill import SkillLinks, TaskFingerprintRule
 
 LlmBackendName = Literal["claude-cli", "anthropic", "openai-compatible", "ollama"]
 
@@ -366,6 +366,11 @@ class LoadedSkill(Protocol):
         ...
 
     @property
+    def task_fingerprint(self) -> TaskFingerprintRule | None:
+        """The skill's opt-in `task.create` fingerprint rule (schemas decision 67)."""
+        ...
+
+    @property
     def output_bound(self) -> int:
         """The output schema's size bound, in UTF-8 bytes of compact JSON."""
         ...
@@ -427,10 +432,16 @@ class Deidentifier(Protocol):
     """The instance's de-identification policy (`horae.llm.deid.Deidentifier`, #34)."""
 
     def pseudonymize(
-        self, model_alias: str, view_options: Mapping[str, Mapping[str, Any]], data: Any
+        self,
+        model_alias: str,
+        view_options: Mapping[str, Mapping[str, Any]],
+        data: Any,
+        personal: Sequence[str] = (),
     ) -> Pseudonyms | None:
-        """`data` pseudonymized for `model_alias`, or `None` (a local alias, no field class).
-        Raises `DeidUnavailable`."""
+        """`data` pseudonymized for `model_alias`, or `None` (a local alias, neither a field
+        class nor a personal value). `personal` are the values of the personal fields declared
+        upstream (decision 68), looked for in every string; the engine passes them only when
+        there are some. Raises `DeidUnavailable`."""
         ...
 
 

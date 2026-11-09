@@ -727,6 +727,22 @@ def test_an_unroutable_item_is_skipped_and_the_rest_flow() -> None:
         assert "task link not under a trusted link_prefix" in violation.detail
 
 
+def test_an_unroutable_notification_link_is_skipped_but_a_plain_push_flows() -> None:
+    prefix = "https://notes.example.org/notes/"
+    notify = [{"sink.notify": {"link_prefix": prefix}}]
+    good = {**PUSH, "link": prefix + "1"}
+    bad = {**PUSH, "link": "https://evil.example.org/x"}
+    shown = {"mail": f"see {good['link']} and {bad['link']}"}
+    record = _route([good, PUSH, bad], notify=notify, shown=shown)
+    assert record.status == "ok", record.error
+    assert [i.intent.link for i in record.intents] == [good["link"], None]  # type: ignore[union-attr]
+    (violation,) = record.violations
+    assert violation.kind == "intent_skipped"
+    assert "1 of 3" in violation.detail
+    assert "#2" in violation.detail
+    assert "evil" not in violation.detail
+
+
 def test_every_item_unroutable_is_reported_and_the_step_still_passes() -> None:
     creates = [_link_create(GH + "stranger/a", 1), _link_create(GH + "other/b", 2)]
     record = _task_run(creates, by_source=True, entry={"mode": "tasks", "link_prefix": [ORG_A]})
@@ -893,10 +909,14 @@ def test_notification_links_need_a_trusted_prefix(
         assert record.status == "degraded"
         assert _error_kind(record, 1) == "guard_violation"
         assert record.intents == []
-    else:
-        assert record.status == "failed"
-        assert _error_kind(record, 1) == "intent_unrouted"
-        assert "evil" not in (record.steps[1].error.message or "")  # type: ignore[union-attr]
+    else:  # skipped and recorded, never fatal (decision 60)
+        assert record.status == "ok", record.error
+        assert record.intents == []
+        (violation,) = record.violations
+        assert violation.kind == "intent_skipped"
+        assert "evil" not in violation.detail
+        assert "notification link not under a trusted link_prefix" in violation.detail
+        assert "skipped all" in violation.detail
 
 
 @pytest.mark.parametrize(

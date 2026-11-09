@@ -403,3 +403,31 @@ def test_an_unusable_optional_secret_is_a_warning_and_never_shows_its_value(
     assert ": warning: optional secret GITHUB_ENTERPRISE_TOKEN" in out
     assert "too short" in out
     assert "short\n" not in out.replace("too short", "")
+
+
+def test_doctor_warns_about_recent_intent_skipped_violations(with_secrets: Path) -> None:
+    from apply_fixtures import RUN_ID, record
+    from horae.config import STORE_FILE
+    from horae.contracts import Violation
+    from horae.store import Store
+
+    code, out = _doctor("-i", str(with_secrets))
+    assert code == 0
+    assert out.strip() == "OK: 2 pipelines, 1 plugin, 2 model aliases"  # no store: nothing
+    reason = "notification link not under a trusted link_prefix"
+    detail = f"p.src: skipped all proposed intent(s) (#0): {reason}"
+    skipped = record(dry_run=False).model_copy(
+        update={"violations": [Violation(kind="intent_skipped", detail=detail)]}
+    )
+    with Store.open(with_secrets / "state" / STORE_FILE) as store:
+        store.begin_run(RUN_ID, skipped.pipeline, skipped.started_at, dry_run=False)
+        store.save_run(skipped.model_copy(update={"id": RUN_ID}))
+    code, out = _doctor("-i", str(with_secrets))
+    assert code == 0  # a warning, never a failure
+    assert "warning: 1 of its last 1 run skipped intents" in out
+    assert f"latest {RUN_ID}" in out
+    assert "notification link not under a trusted link_prefix" in out
+    report = json.loads(_doctor("-i", str(with_secrets), "--json")[1])
+    assert report["ok"] is True
+    (warning,) = [p for p in report["problems"] if "skipped intents" in p["message"]]
+    assert warning["severity"] == "warning"

@@ -1,0 +1,7 @@
+# The prefix is part of a fingerprint: no space (the `Fingerprint` alphabet).
+name: gmail/triage-mail
+version: 0.1.0
+description: Turn mail into task proposals.
+input_view: ["items[].id"]
+intents: [task.create]
+task_fingerprint: { ids: "items[].id", prefix: "gmail id " }

@@ -49,6 +49,11 @@ run's `ToolCaller`:
   as the manifest contract does), else `tool_missing`;
 - **trusted paths**: every request carries the plugin's path permissions as approved in
   `horae.lock` in `_meta["dev.horae/paths"]` (`horae.plugins.host.session`, #25);
+- **trusted network**: and its network allow-list as approved in `horae.lock` (not the
+  manifest's declared one) in `_meta["horae/network"]`, a list that is empty when the lock
+  grants no host (#131), so a plugin can refuse a host the user did not approve before M5;
+  its approved local-network endpoints (`permissions.network_local`, `host:port`) travel in
+  `_meta["horae/network_local"]` the same way (decision 66, #132);
 - **runtime.command is not pinned** against the lock in v1: the lock pins the plugin's
   version, commit and permissions, and the installed manifest's command is used as it is.
   Pinning it (and the plugin's files) is M4's install and verify work (#44, #46);
@@ -102,6 +107,7 @@ from horae.contracts.plugin import (
     Permissions,
     PluginManifest,
     StdioRuntime,
+    merge_personal_fields,
     reserved_tools,
     sink_namespaces,
 )
@@ -146,7 +152,7 @@ class InstalledPlugin:
 def _exceeds(asked: Permissions, approved: Permissions) -> list[str]:
     extra = [
         f"{field}: {', '.join(sorted(set(getattr(asked, field)) - set(getattr(approved, field))))}"
-        for field in ("network", "secrets", "optional_secrets", "intents")
+        for field in ("network", "network_local", "secrets", "optional_secrets", "intents")
         if not set(getattr(asked, field)) <= set(getattr(approved, field))
     ]
     for access in ("read", "write"):
@@ -180,7 +186,22 @@ class HostRegistry:
             extra = _exceeds(manifest.permissions, locked.permissions)
             if extra:
                 raise RegistryError(f"plugin {name}: permissions not approved ({'; '.join(extra)})")
-            effective = manifest.model_copy(update={"permissions": locked.permissions})
+            # Decision 68 B: the personal fields in force are those of the manifest and of
+            # the lock together, so neither an edited manifest nor a stale lock drops one.
+            provided = {
+                ref
+                for kind in ("sources", "transforms")
+                for ref in getattr(manifest.provides, kind)
+            }
+            personal = merge_personal_fields(
+                manifest.provides.personal_fields, locked.personal_fields, tools=provided
+            )
+            effective = manifest.model_copy(
+                update={
+                    "permissions": locked.permissions,
+                    "provides": manifest.provides.model_copy(update={"personal_fields": personal}),
+                }
+            )
             root = (roots or {}).get(name)
             self._plugins[name] = InstalledPlugin(effective, locked.commit, root)
             provides = manifest.provides
@@ -526,10 +547,19 @@ class PluginHost:
         if ref not in process.tools:
             raise PluginCallError("tool_missing", f"{name} does not list {ref} in tools/list")
         timeout = timeout_s or self._timeouts(name).call_timeout_s
-        locked = entry.installed.manifest.permissions.paths
+        permissions = entry.installed.manifest.permissions  # the locked ones (`HostRegistry`)
+        locked = permissions.paths
         paths = {"read": list(locked.read), "write": list(locked.write)}
         try:
-            result = await process.call(ref, params, input, timeout, paths=paths)
+            result = await process.call(
+                ref,
+                params,
+                input,
+                timeout,
+                paths=paths,
+                network=permissions.network,
+                network_local=permissions.network_local,
+            )
         except CallFailed as failed:
             await process.stop(forced=True)
             self._lost(entry)

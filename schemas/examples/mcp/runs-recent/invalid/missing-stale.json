@@ -1,0 +1,1 @@
+{"schema_version":1,"runs":[{"id":"20261109T060000Z-daily-brief-01","pipeline":"daily-brief","status":"ok","dry_run":false,"abandoned":false,"started_at":"2026-11-09T06:00:00Z","finished_at":"2026-11-09T06:00:30Z","duration_s":30.0,"cost":{"usd":0.01,"tokens_in":10,"tokens_out":5},"error":null}],"truncated":false}

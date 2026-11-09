@@ -107,7 +107,10 @@ entry of a later step, which is recorded in `ProposedIntent.applied_by` (the ent
    one with the longest matching prefix wins (a tie is `intent_ambiguous`). When a `tasks`
    entry would take a `task.create` but for its link, that one intent is **skipped** and the
    rest flow: the step records an `intent_skipped` violation (positions and the fixed text
-   `task link not under a trusted link_prefix`; no link is echoed), schemas decision 60;
+   `task link not under a trusted link_prefix`; no link is echoed), schemas decision 60. A
+   `notify.push` whose `link` no `notify` entry takes is skipped the same way (reason
+   `notification link not under a trusted link_prefix`; a `notify.push` without a link is
+   unaffected);
 4. a `task.update_status` is routed only if its `task` fingerprint appears, as an exact string
    value, in the data collected so far in the run (so is a `notify.push` with buttons,
    `actions`: the `task` of each, #38) (`RunRecord.inputs`, and the current
@@ -202,6 +205,15 @@ repaired; and of one cancelled by the deadline while its output was being valida
 `horae.engine.ports.attached_usage`);
 a backend's cached response costs nothing and counts towards neither the cost nor the budget.
 
+**Skipping on an empty input** (schemas decision 67). With `skip_when_empty` (`true`, or a list
+of input view paths) on the `llm` step and an empty viewed input (`horae.engine.viewpath`),
+the step makes no call, looks nothing up and caches nothing: it is recorded `skipped` with
+the output `{"skipped": "empty_input", "skill": ...}`, no `llm[]` entry, and the run goes on
+(`noop` if it proposes nothing). A listed path outside the skill's input view is
+`params_invalid` while planning. A skill's `task_fingerprint` rule is checked by the action
+guard (`horae.engine.guard`): a proposed `task.create` fingerprint must be its prefix and an id
+of the viewed input, else a `guard_violation`.
+
 **De-identification** (#34, schemas decision 47). With a `deid` policy, a skill whose input
 view declares field classes and a cloud model alias, the order is: input view, then
 pseudonymize (`deid.pseudonymize`, deterministic from the viewed input, run in a worker thread
@@ -227,6 +239,23 @@ real viewed input is checked for a resolved secret **before** it is pseudonymize
 47 J): de-identification could rewrite part of a secret so that the backend's check of the
 rendered request no longer matches it; the step is then degraded the same way, nothing is
 sent and nothing is billed.
+
+**Personal fields** (#162, schemas decision 68). A plugin may declare, per source or
+transform, the view paths of its output that hold personal data
+(`provides.personal_fields`). The plan follows them to the `llm` step: after a `collect` step
+they sit at `[].data.<path>` (every element of its list: another source's field at the same
+path is protected too); a `transform` that declares its own replaces them with its paths
+(relative to its output); one that declares none, after personal fields, loses them. Every
+tool that ran adds the values found at its declared paths (`horae.engine.personal.values`).
+At the `llm` step the located paths are added to the skill's view options as
+`{class: person}` (`merged_options`) and the values are passed to the policy, so a skill
+without classes is protected too; the request is then `classified`. For a cloud alias the
+step fails closed, before anything is sent: while planning (`deid_unavailable`, the step
+`failed`, no plugin called) when a transform lost the paths, and at the step
+(`deid_unavailable`, `degraded`) when an output contradicted the shape of a declared path, or
+when the policy finds a value it cannot match or one left in clear. A local alias is sent the
+viewed input unchanged. A path the skill's view does not select is not sent, and its values
+are still looked for in the strings that are.
 
 **Step policy** (step status, then the effect on the run; the run status is the worst of
 `failed` > `degraded` > `noop` > `ok`):
@@ -317,9 +346,12 @@ from horae.contracts.run import (
     Usage,
     Violation,
 )
+from horae.contracts.skill import view_steps
 from horae.contracts.types import MAX_ITEMS, HttpsUrl, NotePath, Sha256Hex, Token
 from horae.engine.canonical import canonical_json, canonical_pipeline, pipeline_digest, sha256_hex
 from horae.engine.guard import GUARD_ERROR, guard_for
+from horae.engine.personal import COLLECT_ROOT, merged_options, outermost, under
+from horae.engine.personal import values as values_in
 from horae.engine.ports import (
     Deidentifier,
     DeidUnavailable,
@@ -342,6 +374,7 @@ from horae.engine.ports import (
     attached_usage,
 )
 from horae.engine.template import TemplateError, render, variables
+from horae.engine.viewpath import is_empty, values_at
 from horae.intents import MAX_BODY_DEPTH, IntentRejected, safe_excerpt, validate_intents
 from horae.secrets.redact import current as current_redactor
 
@@ -608,6 +641,10 @@ class _Planned:
     llm: LlmSpec | None = None
     skill_plugin: ResolvedPlugin | None = None
     skill: LoadedSkill | None = None
+    personal: tuple[str, ...] | None = ()
+    """For the `llm` step (decision 68): the personal paths of its input, from the root of
+    the step input; `None` when a transform moved personal fields without declaring where
+    (the core cannot locate them)."""
 
 
 class _PlanError(Exception):
@@ -775,9 +812,14 @@ def _plan(
     plugins: PluginRegistry,
     has_llm: bool,
     skills: SkillSource | None = None,
+    deid: Deidentifier | None = None,
 ) -> tuple[_Planned, ...]:
     planned: list[_Planned] = []
     used: set[str] = set()
+    # Decision 68 C: where the personal fields declared upstream sit in the current value
+    # (paths from its root), `None` once a transform moved them without saying where.
+    personal: tuple[str, ...] | None = ()
+    lost_by = ""
     collect_calls = 0
     redactor = current_redactor()
     first = _kind_of(pipeline.steps[0])
@@ -817,10 +859,27 @@ def _plan(
             skill = None if skills is None else _load_skill(skills, step.llm.skill, skill_plugin)
             if isinstance(skill, StepError):
                 fail(skill.kind, skill.message)
+            if skill is not None and (why := _skip_paths_problem(step.llm, skill)):
+                fail("params_invalid", why)
             if not has_llm:
                 fail("llm_unavailable", "the pipeline has an `llm` step and no LLM backend")
+            if personal is None and deid is not None and _applies(deid, step.llm.model):
+                fail(
+                    "deid_unavailable",
+                    f"{step.llm.skill}: transform {lost_by} moves personal fields declared "
+                    "upstream without declaring its own (`provides.personal_fields`), so they "
+                    f"cannot be de-identified for cloud model alias {step.llm.model!r}: "
+                    "refused before anything is sent",
+                )
             planned.append(
-                _Planned(index, kind, llm=step.llm, skill_plugin=skill_plugin, skill=skill)
+                _Planned(
+                    index,
+                    kind,
+                    llm=step.llm,
+                    skill_plugin=skill_plugin,
+                    skill=skill,
+                    personal=personal,
+                )
             )
             continue
         calls: list[_Call] = []
@@ -857,8 +916,49 @@ def _plan(
                 entries.append(_Entry(index, position, ref, rendered, plugin, types, binds))
             else:
                 calls.append(_Call(ref, rendered, plugin, position, planned_call.timeout_s))
+        if kind == "collect":
+            personal = outermost(
+                under(COLLECT_ROOT, path) for call in calls for path in _declared(call)
+            )
+        elif kind == "transform":
+            for call in calls:
+                if _declared(call):
+                    personal = outermost(_declared(call))
+                elif personal != ():
+                    personal, lost_by = None, call.ref
         planned.append(_Planned(index, kind, calls=tuple(calls), entries=tuple(entries)))
     return tuple(planned)
+
+
+def _declared(call: _Call) -> tuple[str, ...]:
+    """The personal fields the call's plugin declares for its output (decision 68)."""
+    return tuple(call.plugin.manifest.provides.personal_fields.get(call.ref, ()))
+
+
+def _applies(deid: Deidentifier, model_alias: str) -> bool:
+    """Whether `deid` de-identifies for `model_alias` (a cloud alias); `True` when the policy
+    cannot say (fail closed)."""
+    applies = getattr(deid, "applies", None)
+    if not callable(applies):
+        return True
+    try:
+        return bool(applies(model_alias))
+    except Exception:  # a policy bug must not open a path in clear
+        return True
+
+
+def _skip_paths_problem(spec: LlmSpec, skill: LoadedSkill) -> str | None:
+    """Why the `skip_when_empty` paths do not fit the skill's input view (a path the model is
+    never shown would read as empty and skip every run), or `None`."""
+    wanted = spec.skip_when_empty
+    if not isinstance(wanted, list):
+        return None
+    shown = [view_steps(path) for path in skill.view_paths]
+    for path in wanted:
+        steps = view_steps(path)
+        if not any(steps[: len(one)] == one or one[: len(steps)] == steps for one in shown):
+            return _cap(f"{spec.skill}: skip_when_empty path {path} is not in the input view")
+    return None
 
 
 def _load_skill(skills: SkillSource, ref: str, plugin: ResolvedPlugin) -> LoadedSkill | StepError:
@@ -947,6 +1047,11 @@ class _Run:
     monotonic: Callable[[], float]
     deid: Deidentifier | None = None
     data: Any = None
+    personal_values: dict[str, None] = field(default_factory=dict)
+    """The values of the personal fields declared by every tool that ran (decision 68), in
+    order of first occurrence: looked for in the `llm` step's input."""
+    personal_problems: list[str] = field(default_factory=list)
+    """`<ref>: <path>` of each declared personal field an output contradicted the shape of."""
     inputs: list[InputSnapshot] = field(default_factory=list)
     llm_calls: list[LlmCall] = field(default_factory=list)
     intents: list[ProposedIntent] = field(default_factory=list)
@@ -957,6 +1062,15 @@ class _Run:
     partial: bool = False
     reused: bool = False
     cost: Usage = field(default_factory=lambda: _ZERO)
+
+    def note_personal(self, call: _Call, data: Any) -> None:
+        """Remember the personal values of a tool's output (decision 68 C)."""
+        declared = _declared(call)
+        if not declared:
+            return
+        found, mismatched = values_in(data, declared)
+        self.personal_values.update(dict.fromkeys(found))
+        self.personal_problems.extend(f"{call.ref}: {path}" for path in mismatched)
 
     def spend(self, usage: Usage) -> None:
         self.cost = Usage(
@@ -1055,7 +1169,7 @@ class _Run:
         seen = ([snap.data for snap in self.inputs], collected) if shown is None else shown
         unknown = set(check_task_fingerprints(typed, seen))
         routed: list[ProposedIntent] = []
-        skipped: list[int] = []
+        skipped: list[tuple[int, str]] = []
         for position, intent in enumerate(typed):
             if position in unknown:
                 unroutable.append(("intent_unrouted", position, intent.type, ""))
@@ -1069,8 +1183,8 @@ class _Run:
             if len(takers) != 1:
                 code = "intent_unrouted" if not takers else "intent_ambiguous"
                 reason = "" if takers else _unrouted_reason(intent, entries)
-                if reason == TASK_LINK_UNROUTED:
-                    skipped.append(position)  # one unroutable item never fails the step
+                if reason in {TASK_LINK_UNROUTED, NOTIFY_LINK_UNROUTED}:
+                    skipped.append((position, reason))  # one unroutable item never fails the step
                     continue
                 unroutable.append((code, position, intent.type, reason))
                 continue
@@ -1091,16 +1205,16 @@ class _Run:
             self._note_skipped(source, skipped, len(typed))
         return routed, None
 
-    def _note_skipped(self, source: str, skipped: list[int], total: int) -> None:
-        """Record, as one `intent_skipped` violation (and a log warning), the `task.create`
-        intents of one proposal left out because their link is under no trusted prefix.
-        Closed-set values only: positions and a fixed reason, never a link."""
-        positions = ", ".join(f"#{position}" for position in skipped[:20])
+    def _note_skipped(self, source: str, skipped: list[tuple[int, str]], total: int) -> None:
+        """Record, as one `intent_skipped` violation (and a log warning), the `task.create` and
+        `notify.push` intents of one proposal left out because their link is under no trusted
+        prefix. Closed-set values only: positions and fixed reasons, never a link."""
+        reasons = "; ".join(dict.fromkeys(reason for _, reason in skipped))
+        positions = ", ".join(f"#{position}" for position, _ in skipped[:20])
         more = f" and {len(skipped) - 20} more" if len(skipped) > 20 else ""
         which = "all" if len(skipped) == total else f"{len(skipped)} of {total}"
         detail = _cap(
-            f"{source}: skipped {which} proposed intent(s) ({positions}{more}): "
-            f"{TASK_LINK_UNROUTED}"
+            f"{source}: skipped {which} proposed intent(s) ({positions}{more}): {reasons}"
         )
         _log.warning("intents skipped: %s", detail)
         if len(self.violations) < MAX_ITEMS:
@@ -1198,16 +1312,18 @@ MAX_LINK_PREFIXES = 32
 TASK_LINK_UNROUTED = "task link not under a trusted link_prefix"
 """Why a `task.create` with a `link` that a `tasks` entry would otherwise take is unrouted."""
 
+NOTIFY_LINK_UNROUTED = "notification link not under a trusted link_prefix"
+"""Why a `notify.push` with a `link` that a `notify` entry would otherwise take is unrouted
+(#149, decision 60)."""
+
 
 def _unrouted_reason(intent: Intent, entries: Sequence[_Entry]) -> str:
     """A fixed reason when nothing takes `intent` only because of its `link`, else `""`."""
-    if (
-        isinstance(intent, TaskCreate)
-        and intent.link is not None
-        and any(intent.type in entry.types for entry in entries)
-    ):
-        return TASK_LINK_UNROUTED
-    return ""
+    if not isinstance(intent, (TaskCreate, NotifyPush)) or intent.link is None:
+        return ""
+    if not any(intent.type in entry.types for entry in entries):
+        return ""
+    return TASK_LINK_UNROUTED if isinstance(intent, TaskCreate) else NOTIFY_LINK_UNROUTED
 
 
 def _route_error(source: str, unroutable: list[tuple[str, int, str, str]]) -> StepError:
@@ -1306,6 +1422,7 @@ async def _collect(run: _Run, step: _Planned) -> _Outcome:
             )
             kept.extend(accepted)
         collected.append({"source": call.ref, "params": call.params, "data": result.data})
+        run.note_personal(call, result.data)
     run.inputs.extend(snapshots)
     if rejected is not None:
         # Every source that ran is recorded, with the rejected proposals, so that a replay
@@ -1357,6 +1474,7 @@ async def _transform(run: _Run, step: _Planned) -> _Outcome:
             return _Outcome("failed", rejected, calls=calls)
         kept.extend(accepted)
         run.data = result.data
+        run.note_personal(call, result.data)
     return _Outcome("ok", output=run.data, intents=kept, calls=calls)
 
 
@@ -1382,6 +1500,17 @@ async def _apply_step(run: _Run, step: _Planned) -> _Outcome:
         for entry in step.entries
     ]
     return _Outcome("ok", output=output)
+
+
+def _empty_input(spec: LlmSpec, viewed: Any) -> bool:
+    """Whether `spec.skip_when_empty` says to skip the step: the whole viewed input is empty
+    (`true`), or the values at every listed view path are (`viewed.is_empty`)."""
+    wanted = spec.skip_when_empty
+    if wanted is None or wanted is False:
+        return False
+    if wanted is True:
+        return is_empty(viewed)
+    return all(is_empty(value) for path in wanted for value in values_at(viewed, path))
 
 
 def _cache_key(
@@ -1565,7 +1694,8 @@ def _shown(step: _Planned, viewed: Any, source: str) -> dict[str, Any]:
     fingerprints must also come from the viewed input."""
     limits = None if step.skill is None else step.skill.intent_limits
     links = "input" if step.skill is None else step.skill.links
-    guard = {"guard": guard_for(viewed, source, limits, links)}
+    rule = None if step.skill is None else getattr(step.skill, "task_fingerprint", None)
+    guard = {"guard": guard_for(viewed, source, limits, links, rule)}
     return guard if step.skill is None else {**guard, "shown": (viewed,)}
 
 
@@ -1595,6 +1725,11 @@ async def _llm_step(run: _Run, step: _Planned) -> _Outcome:
         # Nothing of the input matches the view's shape: no call is made.
         message = f"{spec.skill}: the step input does not have the shape of the input view"
         return _Outcome("degraded", StepError(kind="input_invalid", message=message), stop=True)
+    if _empty_input(spec, viewed):
+        # Opt-in (schemas decision 67): no model call, no cache lookup, nothing cached. Like
+        # an unchanged-input reuse the run goes on (and is `noop` if it proposes nothing).
+        run.reused = True
+        return _Outcome("skipped", output={"skipped": "empty_input", "skill": spec.skill})
 
     def degraded(kind: str, message: str) -> _Outcome:
         return _Outcome("degraded", StepError(kind=kind, message=_cap(message)), stop=True)
@@ -1624,13 +1759,28 @@ async def _llm_step(run: _Run, step: _Planned) -> _Outcome:
     timeout = spec.timeout_s or DEFAULT_LLM_TIMEOUT_S
     deadline = run.monotonic() + timeout
     options = _view_options(skill)
-    classified = _classified(options)
+    # Decision 68: the personal fields declared upstream are classed `person` whatever the
+    # skill declares, and their values are looked for in every string.
+    if step.personal:
+        options = merged_options(options, step.personal)
+    found = tuple(run.personal_values)
+    classified = _classified(options) or step.personal is None or bool(found)
     pseudo: Pseudonyms | None = None
+    if run.deid is not None and run.personal_problems and _applies(run.deid, spec.model):
+        problem = run.personal_problems[0]
+        return degraded(
+            "deid_unavailable",
+            f"{spec.skill}: the output of {problem} does not have the shape of its declared "
+            "personal field, so it cannot be de-identified: refused before anything is sent",
+        )
     if classified and run.deid is not None:
         policy = run.deid
+        arguments: tuple[Any, ...] = (spec.model, options, viewed)
+        if found:
+            arguments = (*arguments, found)
         try:
             async with asyncio.timeout(timeout):
-                pseudo = await asyncio.to_thread(policy.pseudonymize, spec.model, options, viewed)
+                pseudo = await asyncio.to_thread(policy.pseudonymize, *arguments)
         except TimeoutError:
             return degraded("timeout", f"de-identifying took longer than {timeout} s")
         except DeidUnavailable as error:
@@ -1863,7 +2013,7 @@ async def execute(
     status: RunStatus = "ok"
     run_error: str | None = None
     try:
-        plan = _plan(pipeline, context, plugins, llm is not None, skills)
+        plan = _plan(pipeline, context, plugins, llm is not None, skills, deid)
     except _PlanError as error:
         plan = ()
         status, run_error = "failed", f"step {error.index}: {error.error.message}"

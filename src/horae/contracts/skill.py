@@ -43,6 +43,7 @@ an attacker's URL through.
 """
 
 import itertools
+from collections.abc import Iterable
 from typing import Annotated, Any, Literal, Self
 
 from pydantic import AfterValidator, Field, Strict, StringConstraints, model_validator
@@ -110,6 +111,25 @@ SkillLinks = Literal["input", "none"]
 """A skill's `links` option: `input` (URLs of the viewed input only) or `none` (no link in
 note text)."""
 
+FingerprintPrefix = Annotated[
+    str, Strict(), StringConstraints(pattern=r"^[A-Za-z0-9._:-]{1,64}$", max_length=64)
+]
+"""The fixed start of a created task's fingerprint, e.g. `gmail:` (the `Fingerprint` alphabet)."""
+
+
+class TaskFingerprintRule(Contract):
+    """Where the ids behind a `task.create` fingerprint live in the viewed input (decision 67).
+
+    A `task.create` the skill proposes must carry the fingerprint `prefix` + an id found at
+    `ids` in the viewed input; any other fingerprint is a guard violation."""
+
+    ids: ViewPath
+    """A path of the skill's `input_view` (or below one) whose string values are the ids, e.g.
+    `[].data.needs_interpretation[].id`. A list of strings is read as its elements."""
+    prefix: FingerprintPrefix
+    """What the fingerprint puts before the id, e.g. `gmail:`."""
+
+
 PROMPT_FILE = "prompt.md"
 OUTPUT_SCHEMA_FILE = "output.schema.json"
 
@@ -153,6 +173,11 @@ class SkillManifest(Contract):
     """Links in the skill's note text: `input` (only URLs of the viewed input, the default) or
     `none` (no link, autolink or bare URL at all; schemas decision 55)."""
 
+    task_fingerprint: TaskFingerprintRule | None = None
+    """Opt-in (decision 67): a `task.create` the skill proposes must carry the fingerprint
+    `prefix` + an id read at `ids` in the viewed input. Omitted: a `task.create` fingerprint is
+    free text, as before. Requires `task.create` in `intents`."""
+
     @property
     def view_paths(self) -> tuple[str, ...]:
         """The input view paths, sorted."""
@@ -176,32 +201,70 @@ class SkillManifest(Contract):
         return {} if isinstance(self.intents, list) else dict(sorted(self.intents.items()))
 
     @model_validator(mode="after")
+    def _fingerprint_rule_fits(self) -> Self:
+        # Not expressible in JSON Schema: checked by the pydantic model only.
+        rule = self.task_fingerprint
+        if rule is None:
+            return self
+        if "task.create" not in self.intents:
+            raise ValueError("task_fingerprint needs `task.create` in `intents`")
+        wanted = view_steps(rule.ids)
+        if not any(wanted[: len(view_steps(path))] == view_steps(path) for path in self.input_view):
+            raise ValueError("task_fingerprint.ids must be an input_view path (or lie below one)")
+        return self
+
+    @model_validator(mode="after")
     def _paths_are_disjoint(self) -> Self:
         # Not expressible in JSON Schema: checked by the pydantic model only.
-        steps = sorted(view_steps(path) for path in self.input_view)
-        for one, other in itertools.pairwise(steps):
-            if other[: len(one)] == one:
-                raise ValueError(
-                    f"input_view: {_join(one)} already selects {_join(other)} (overlapping paths)"
-                )
-        for one in steps:
-            for other in steps:
-                common = 0
-                while common < min(len(one), len(other)) and one[common] == other[common]:
-                    common += 1
-                if (
-                    common < len(one)
-                    and common < len(other)
-                    and (one[common] == "[]") != (other[common] == "[]")
-                ):
-                    raise ValueError(
-                        f"input_view: {_join(one)} and {_join(other)} disagree on whether "
-                        "a value is an object or an array"
-                    )
+        problem = view_paths_problem(self.input_view)
+        if problem is not None:
+            raise ValueError(f"input_view: {problem}")
         return self
 
 
-def _join(steps: tuple[str, ...]) -> str:
+def shapes_disagree(one: tuple[str, ...], other: tuple[str, ...]) -> bool:
+    """Whether two paths' steps disagree on the shape of a value they share (`a.b` and
+    `a[]`: one reads an object where the other reads an array)."""
+    common = 0
+    while common < min(len(one), len(other)) and one[common] == other[common]:
+        common += 1
+    return (
+        common < len(one)
+        and common < len(other)
+        and (one[common] == "[]") != (other[common] == "[]")
+    )
+
+
+def view_paths_problem(paths: Iterable[str]) -> str | None:
+    """Why a set of view paths is not usable together (one overlaps another, or two disagree
+    on a value's shape), or `None`. Shared by a skill's `input_view` and a plugin's
+    `personal_fields` (decision 68)."""
+    steps = sorted(view_steps(path) for path in paths)
+    for one, other in itertools.pairwise(steps):
+        if other[: len(one)] == one:
+            return f"{join_steps(one)} already selects {join_steps(other)} (overlapping paths)"
+    for one in steps:
+        for other in steps:
+            if shapes_disagree(one, other):
+                return (
+                    f"{join_steps(one)} and {join_steps(other)} disagree on whether a value is "
+                    "an object or an array"
+                )
+    return None
+
+
+def outermost(paths: Iterable[str]) -> tuple[str, ...]:
+    """The view paths, sorted, without one that lies under (or equals) another: the outer
+    path already covers it."""
+    kept: list[tuple[str, ...]] = []
+    for steps in sorted({view_steps(path) for path in paths}):
+        if not any(steps[: len(outer)] == outer for outer in kept):
+            kept.append(steps)
+    return tuple(join_steps(steps) for steps in kept)
+
+
+def join_steps(steps: tuple[str, ...]) -> str:
+    """The view path of `steps` (the inverse of `view_steps`)."""
     text = ""
     for step in steps:
         text += step if step == "[]" or not text else f".{step}"

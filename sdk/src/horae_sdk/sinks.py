@@ -20,7 +20,9 @@ them):
   `horae undo` (`content=None` removes the note). `force` is true only for the user's explicit
   `horae undo --force` (horae-sdk 0.4, optional: a `restore` without that parameter is still
   called, without it): the sink may then also restore a note it would refuse because the user
-  edited it outside Horae's owned block; it never lifts the compare-and-swap;
+  edited it outside Horae's owned block; it never lifts the compare-and-swap. A sink with no
+  such rule (the built-in `file-sink`) accepts `force` and ignores it. Override it with the
+  `force` keyword: without it mypy rejects the override;
 - `<ns>.restore_status(paths, details, force=False)` -> whether it wrote: undo a
   `task.update_status` the sink applied. `details` are the `Applied.details` it answered (the
   core journals them when they say `changed: true`, and hands them back untouched), so a sink
@@ -50,7 +52,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Literal
 
-from horae_sdk.protocol import MAX_NOTE_BYTES, Paths
+from horae_sdk.protocol import MAX_NOTE_BYTES, Network, Paths
 
 SinkRole = Literal["sinks", "notifiers"]
 _KIND = re.compile(r"[a-z_]{1,32}")
@@ -126,6 +128,20 @@ class ApplyRequest:
     an ntfy `http` action `{"action": "http", "label", "url", "method": "POST"}`. Render these,
     never the intent's own `actions`; each `url` is a single-use credential: send it to the
     push service only, never log it."""
+    network: Network = field(default_factory=Network)
+    """The network allow-list approved in `horae.lock` (trusted; horae-sdk 0.5) and its
+    local-network endpoints (horae-sdk 0.6); unknown when the core is older.
+    `host_allowed(url)` checks a URL against it."""
+
+    def host_allowed(self, url: str) -> bool | None:
+        """Whether `url` is approved (an `https` URL on an approved host, or an `http(s)` URL
+        on an approved local endpoint): `True`/`False`, or `None` when the core sent no list
+        (unknown: fall back to the sink's own configuration)."""
+        return self.network.allows(url)
+
+    def address_allowed(self, host: str, port: int) -> bool | None:
+        """Like `host_allowed` for a protocol that is not HTTP. See `Network.address_allowed`."""
+        return self.network.address_allowed(host, port)
 
 
 @dataclass(frozen=True)

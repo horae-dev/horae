@@ -1,0 +1,24 @@
+# A hand-written lock approving local-network services (decision 66): Proton Mail Bridge on
+# loopback, Home Assistant by name and by address, a self-hosted ntfy over plain http.
+schema_version: 1
+plugins:
+  imap:
+    version: 0.1.0
+    repo: https://github.com/horae-dev/plugin-imap
+    commit: 3f2c9e1a7b4d5c6e8f9012345678abcdef012345
+    permissions:
+      network_local: ["127.0.0.1:1143", "[::1]:1143"]
+      secrets: [IMAP_PASSWORD]
+  homeassistant:
+    version: 0.1.0
+    repo: https://github.com/horae-dev/plugin-homeassistant
+    commit: 3f2c9e1a7b4d5c6e8f9012345678abcdef012345
+    permissions:
+      network_local: ["192.168.1.10:8123", "homeassistant.local:8123"]
+  ntfy:
+    version: 0.1.0
+    repo: https://github.com/horae-dev/plugin-ntfy
+    commit: 3f2c9e1a7b4d5c6e8f9012345678abcdef012345
+    permissions:
+      network: [ntfy.sh]
+      network_local: ["ntfy.lan:80"]

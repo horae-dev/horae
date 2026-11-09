@@ -116,11 +116,16 @@ JSON Schema cannot express these; the models enforce them and the tests pin the 
   presence, the model also rejects an explicit `null` next to a value); `pipeline_definition`
   is a valid pipeline named `pipeline`, at most 64 KiB as compact JSON (decision 33).
 - `skill`: two `input_view` paths may not overlap (one a prefix of the other) or disagree on
-  whether a value is an object or an array (decision 39).
+  whether a value is an object or an array (decision 39). `task_fingerprint.ids` is an
+  `input_view` path (or lies below one), and `task_fingerprint` needs `task.create` in
+  `intents` (decision 67).
 - `plugin-manifest`: the host of an `mcp-http` `runtime.url` is listed in `permissions.network`;
   no tool in `provides` is a sink operation of the plugin's own sink or notifier namespaces
   (`<ns>.read`, `<ns>.apply`, `<ns>.restore`, `<ns>.parent_exists`, `<ns>.identity`,
   decision 36).
+  Each key of `provides.personal_fields` is one of `sources` or `transforms`, and a tool's
+  paths may not overlap or disagree on a value's shape (decision 68; the same rule for the
+  lock's `personal_fields`).
 - Hosts (`permissions.network`, every `https` URL): a label starting with `xn--` must be a valid
   IDNA A-label. It must round-trip through Python's `idna` codec (IDNA2003, so no runtime
   dependency) and decode to letters, marks, digits and `-` only. The second rule rejects what
@@ -2408,7 +2413,7 @@ loosened later without breaking a valid file.
       `{usd: 0.05, tokens_out: 1024}`) and `expect`: `schema_valid` (default `true`), the exact
       `output` (without its reserved `intents`), `assertions` (each a JSON pointer, RFC 6901, into
       `{"output": ..., "intents": [...]}` with exactly one of `equals`, `length`, `contains` (a
-      substring, or an array element) and `exists`), the exact raw `intents` or `intent_counts`
+      substring, or an array element), `not_contains` and `matches` (decision 64) and `exists`), the exact raw `intents` or `intent_counts`
       per type, and `guard` (`pass`, the default, or `violation` for a case that proves a hostile
       output is refused). Equality is canonical JSON equality;
     - **(C) a recording is provider-agnostic** (maintainer's preference): the parsed JSON
@@ -3398,7 +3403,19 @@ loosened later without breaking a valid file.
       notes. A task a later run changed too is `newer_run` (undo that run first, or
       `--force`). A task edited since the run is `SinkError("target_changed")` from the sink:
       the undo is refused (`changed`, exit 4) with "use --force"; the status changes restored
-      before the refused one stay restored (undo is resumable) and no note was written. For
+      before the refused one stay restored (undo is resumable) and no note was written. #149:
+      this is deliberately not a transaction, and the report says so: a refusal names the
+      tasks restored before it, the text report ends with "Partly undone" (what is restored,
+      what is not, "run `horae undo <run>` again"), and `--json` gains `partial` (additive).
+      **Task restores run before note restores, and that stays.** The core does not know
+      which file a task line is in (the sink alone does), so it cannot order a task and a note
+      of one file by journal id; a true interleave needs a dry-run `restore_status`, which is
+      out of scope. A run that changed a note and a task line of the same file therefore
+      either is refused up front (`changed`, the file no longer matches what the note change
+      left) or, when the task restore rewrites the file after the note was read, fails the
+      note's compare-and-swap (`target_changed`, with a hint that a restored task may have
+      edited the note); `horae undo --force` restores the note in both cases and keeps the
+      overwritten bytes in the journal. For
       each restored change the task index entry is put back in the transaction that marks the
       journal entry undone: status, `snoozed_until`, `snooze_tz`, wake time and the run that
       last wrote it, exactly as journalled (`Store.restore_task_status`). A task the index
@@ -3418,7 +3435,11 @@ loosened later without breaking a valid file.
     - **E, compatibility.** horae-sdk 0.4.0: `Sink.restore(..., force=False)` and
       `Sink.restore_status(paths, details, force=False)` (default `not_supported`); the SDK
       passes `force` only when true and the sink's method takes it. `file-sink.restore`
-      accepts `force` and ignores it (no owned-block rule of its own).
+      accepts `force` and ignores it (no owned-block rule of its own; likewise the built-in
+      `LocalFileSink.restore`). A sink that overrides `restore` with the old signature must add
+      `force` to pass mypy, and `<ns>.restore_status` is a reserved operation name (a plugin
+      that provides a tool of that name is rejected at load): both are in the SDK README's
+      "Upgrading a sink to 0.4.0".
     - **Follow-up (plugin-obsidian).** Its task sink must put the replaced line in
       `Applied.details` (`before_line`; today only digests, and `restore_status` expects it
       from the core's journal, which the core cannot supply: it never sees the line), serve
@@ -3448,7 +3469,14 @@ loosened later without breaking a valid file.
       source, the positions and the fixed text `task link not under a trusted link_prefix`
       (never a link), and the core logs a warning. If every intent of a call is skipped the
       detail says `skipped all`. Every other routing failure (no entry binds the type, an
-      unknown fingerprint, ambiguity) still fails the step.
+      unknown fingerprint, ambiguity) still fails the step. **Extended by #149:** a
+      `notify.push` with a `link` that a `notify` entry would take but for that link (no
+      `link_prefix`, or none that the link falls under) is skipped the same way, with the fixed
+      text `notification link not under a trusted link_prefix`; a call that proposes both kinds
+      lists both texts in its one violation. A `notify.push` without a link, or one that no
+      `notify` entry binds at all, is unchanged. `horae doctor` reports, as a warning (never
+      an error), each pipeline whose newest 20 runs hold `intent_skipped` violations, with the
+      latest run and its detail, so a skipped link does not stay unseen.
     - **D, compatibility.** Pipelines that never had an off-prefix link are unchanged; ones
       that did now succeed with a violation instead of failing. A consumer must accept the new
       `kind`; per "Versioning" a new enum value is a compatible addition.
@@ -3548,3 +3576,403 @@ loosened later without breaking a valid file.
     - **H, CLI exits.** 0 installed; 1 a repository that cannot be fetched (`install_failed`);
       3 refused (`install_refused`) or already installed (`already_installed`); the others as
       decision 61 G.
+
+### Provisional decisions (#131, pending maintainer review)
+
+63. **The locked network list travels in every plugin call's `_meta` (#131).** No schema
+    changes: it is a wire addition of the plugin host (`horae.plugins.host.session`) and the
+    SDK (horae-sdk 0.5.0). Decision 62 is taken by open PR #155.
+    - **A, the key.** Every request to a plugin (a source, a transform, a sink operation) carries
+      `_meta["horae/network"]`: the plugin's `permissions.network` **as approved in
+      `horae.lock`** (the host's effective manifest, never the manifest's declared list), a list
+      of host names in the lock's order. A plugin the lock grants no host sends `[]`: an empty
+      list is never "everything allowed", and the key is always present from a core that has
+      this decision. The key has no `dev.` prefix on purpose: it names a core capability a
+      plain MCP server never sets, and `horae/` is reserved for the core (the earlier keys,
+      `dev.horae/input`, `dev.horae/paths` and `dev.horae/intents`, are unchanged).
+    - **B, trust.** The core builds `_meta` itself; a transform's untrusted input travels under
+      `dev.horae/input` and parameters are arguments, so neither can set or shadow the key.
+      Before M5 it is **advice the plugin enforces on itself**, not isolation: a malicious
+      plugin simply ignores it (T05 stays open until the egress proxy, #50). It protects
+      against a configuration that points a good plugin at a host the user did not approve
+      (a `server` or `allowed_hosts` from trusted pipeline config, a redirect, a hostile URL).
+    - **C, matching.** `horae_sdk.Network.allows(url)` uses the lock's semantics and nothing
+      looser. A host matches only if it is written exactly as listed: names are lowercase
+      (`Hostname`) and compared without case folding, trailing dot, wildcard or implicit
+      subdomain; an internationalised name is its `xn--` A-label; any port is accepted on an
+      approved host (decision 10). The URL must satisfy the shape of `HttpsUrl`: `https` only,
+      no user info (`https://allowed@evil/` and `https://evil\@allowed/` never match), no
+      backslash, whitespace, control character, fragment or IP literal. A list entry that is not
+      a valid `Hostname` matches nothing. The core's helper `horae.contracts.url_host` stays the
+      core's reading; the SDK has no dependency on the core, so it carries its own copy, and the
+      SDK tests assert the two agree.
+    - **D, compatibility.** A core older than this decision sends no key; the SDK then reports
+      the list as **unknown** (`allowed_hosts is None`, `host_allowed(url) is None`), which is
+      not "refused": the plugin decides, and falls back to its own configuration. A present but
+      malformed value is read as an empty list (fail closed). An SDK older than 0.5 ignores the
+      key. The list is repeated on every call (a few names), not sent once.
+    - **E, scope.** Plugins are not changed here: `plugin-ntfy` (`server`) and
+      `plugin-calendar` (`allowed_hosts`) are to call `call.host_allowed(url)` /
+      `request.host_allowed(url)` in follow-ups, treating `False` as a refusal and `None` as
+      "use my own config".
+
+### Provisional decisions (#134, pending maintainer review)
+
+64. **A public replay backend, a request digest of a case, and the `not_contains` / `matches`
+    assertions (#134).** Provisional. Changes `eval-case/v1.json` (two optional checks; an
+    older case file stays valid, and `schema_version` stays 1). Decision 62 is taken by open
+    PR #155 and 63 is merged.
+    - **A, the replay backend is public.** `horae.llm.replay.ReplayBackend(inner, source)`
+      replaces the private `horae.evals._harness._Replay`: its `render` is the real backend's
+      (same payload, same digests, same cost bound) and its `send` returns a recording, so
+      nothing leaves the host and no secret is read. `source` is one `CompletionResult` (what
+      the eval harness uses) or `Recordings`, a library looked up by **request digest**.
+      `replay_backends(models, source)` builds the `ModelBackends` over it. `_Replay` stays
+      as a subclass of `ReplayBackend` (same constructor), so the packs that import it keep
+      working; it is deprecated and is removed once the packs have switched.
+    - **B, `horae run --llm-replay <recordings>`.** `<recordings>` is a recording file, or a
+      folder searched (at most 6 levels, 4096 files, dotfiles and symbolic links skipped) for
+      `*.json` recordings in the format of decision 48 C, e.g. a skill's `evals/recorded/`.
+      Every `llm` step renders its request with the real backend of its alias, and the
+      recording whose request digest (prompt, viewed input, output schema) matches answers
+      it, preferring one recorded for the alias' backend. The answer goes through the same
+      validator, intent split, redaction, routing and guard as a live one. A request no
+      recording answers fails the step with `replay_miss` (the run is `degraded`, the message
+      names the digests and whether a recording shares the prompt or the schema): **never a
+      live call**. Two recordings of one request and backend with different outputs are
+      refused when loaded. A recordings path that cannot be read is exit 1,
+      `replay_unavailable`. The cache lookup is skipped (as `--no-cache`); an accepted output
+      is cached like any other, so a replay that must leave the cache alone is a `--dry-run`
+      or a scratch instance. No new instance setting: the flag is the only switch, so a
+      replay can never be configured by mistake into a production instance.
+    - **C, the request digest of a case.** `horae.evals.request_digest(sue, loaded)` returns
+      the `RecordedRequest` (SHA-256 of the prompt, of the canonical viewed input and of the
+      canonical output schema) that `horae eval --live --record` would store and that
+      `--llm-replay` looks up, rendered offline through the real backend (the digests do not
+      depend on the backend or the model; the skill's input is de-identified as for a cloud
+      alias unless a local `backend` is given). It raises `EvalError` for a case that cannot
+      be rendered.
+    - **D, a stale recording fails `horae eval`.** Offline, a recording whose request digest
+      (or skill digest) no longer matches is the case error `stale_recording` (exit 1), with
+      the message `case <name>: the recording for backend <b> is stale (<prompt|input|schema|
+      skill> changed since it was recorded); re-record it with horae eval --live --record`.
+      Before, it was a warning and the stale answer was still judged. Live, a stale recording
+      stays a note (the new answer is what gets recorded). `stale` stays in the JSON report.
+    - **E, `not_contains`.** The opposite of `contains`: a string holds no such substring, an
+      array no such element. Something must be there: a missing value fails (`nothing there`;
+      use `exists: false` to assert absence), so a mistyped pointer cannot make the check pass
+      vacuously. A non-string needle on a string fails.
+    - **F, `matches` and ReDoS.** A regular expression (Python `re` syntax, `re.search`,
+      unanchored, flags inline such as `(?i)`) that must be found in the string at the pointer.
+      The core has no user-supplied regex elsewhere; its pattern for untrusted work that can
+      run long is the killable worker of the output validator (`horae.llm.validate`, decision
+      44), and `matches` uses it: the pattern is at most 256 characters and must compile (checked
+      when the case loads); the searched string at most 65536 characters (a longer one fails the
+      assertion); the search runs in a short-lived `python -I -B` child (empty environment,
+      `cwd` `/`, new session, CPU and memory ceilings) that is killed after 2 seconds. A search
+      that does not finish fails the assertion (`the pattern could not be searched`), never
+      passes and never hangs the eval. A non-string value fails. Nothing else changes: the
+      worker imports nothing of Horae.
+    - **G, what the packs switch to.** `pack-daily-brief`'s `tests/test_pipeline_e2e.py`
+      (`Recorded`) to `horae.llm.replay.ReplayBackend` or `replay_backends`;
+      `scripts/sync_recordings.py` (`_offline_backends`, `deidentify`, `recorded_request`,
+      `request_for`, `viewed_input`) to `horae.evals.request_digest`; `pack-reminders` uses no
+      private replay. Pipelines can be tested with `horae run --llm-replay`.
+
+### Provisional decisions (#54, pending maintainer review)
+
+65. **The read-only MCP server (#54).** New command `horae mcp serve [-i <instance>]
+    [--brief-pipeline NAME]` (`horae.cli_mcp`, `horae.mcp_server`), over the `mcp` SDK already
+    used by the plugin host (`mcp>=2.3,<2.4`, `MCPServer`), **stdio only**. Decision 64 is taken
+    by #134.
+    - **A, tools.** Exactly three, none with a side effect: `tasks.today` (open tasks, status
+      `todo`, due today in the instance's time zone or overdue, overdue first; `limit` 1 to 100,
+      default 50), `brief.latest` (the latest run of the brief pipeline, `daily-brief` unless
+      `--brief-pipeline` says otherwise, and the `note.*` paths it journalled, never their
+      content; `run: null` when it never ran) and `runs.recent` (newest first, live skill evals
+      left out as in `/runs`; `limit` 1 to 50, default 10). The names are the ones of PLAN §3.5.
+      `pipeline.run` is #55 and is not here; the server has no resource and no prompt.
+    - **B, contracts.** Each result is a strict pydantic model (`horae.contracts.mcp`), exported
+      as `schemas/mcp/tasks-today/v1.json`, `brief-latest/v1.json` and `runs-recent/v1.json`
+      (`export --check` guards them) and published as the tool's `outputSchema`; the client
+      receives it as `structuredContent`. A run is the HTTP API's representation
+      (`horae.run_view.run_json`, decision 51 C), shared, not copied. Caps: 100 tasks, 50 runs,
+      20 targets; titles 200, targets 256, errors 500 characters.
+    - **C, untrusted text.** The client is an LLM and a note can say anything. Task `title` and
+      `target`, a target in `brief.latest` and a run `error` are marked `x-untrusted` in the
+      schema, redacted with the process registry, reduced to one printable line (control
+      characters become spaces), clipped, and declared as data in every tool description and in
+      the server's `instructions`. The server never interprets them. Marking reduces, and does
+      not remove, the risk that a hostile title steers a client; the tools cannot act on it.
+    - **D, read-only and no network.** Each call opens the store `mode=ro`
+      (`Store.open(read_only=True)`: no migration, no write, no file created; a missing store
+      is empty), takes no path, command or secret from the client, and closes it. No socket is
+      opened, so there is nothing to authenticate here; token auth for a network transport is
+      #56. A store failure is the fixed tool error `store_unreadable` (no path, no exception
+      text). The tools are annotated `readOnlyHint`, `idempotentHint`, not `destructiveHint`,
+      not `openWorldHint`.
+    - **E, exit and logging.** stdout carries the protocol only; problems go to stderr. Exit 0
+      when the client closes the connection, 1 configuration problem, 2 usage error, 70
+      internal error (decision 37).
+
+### Provisional decisions (#132, pending maintainer review)
+
+66. **Local-network grants in `horae.lock`, and how plugins reach the M5 egress proxy (#132).**
+    `permissions.network` holds public DNS names reached over `https` (decisions 6, 10, 63) and
+    cannot express a service on the user's network: a self-hosted ntfy at `ntfy.lan` over
+    `http`, Home Assistant at `homeassistant.local:8123` or `192.168.1.10:8123`, Proton Mail
+    Bridge at `127.0.0.1:1143`. Decision 62 is taken by open PR #155; 63 to 65 are merged.
+    - **A, a separate grant.** New `permissions.network_local` (plugin manifest and lock, both
+      schemas regenerated): a unique list of `LocalEndpoint` strings, `host:port`, e.g.
+      `["127.0.0.1:1143", "[::1]:1143", "192.168.1.10:8123", "homeassistant.local:8123"]`.
+      A string, not `{host, port, scheme}`: it sorts and diffs like the other lock lists, and
+      the scheme is not part of the grant (below). `network` is unchanged and still refuses IP
+      literals, `localhost` and ports, so nothing that was refused before becomes allowed there.
+    - **B, what a local endpoint is.** The port is **always explicit** (1 to 65535, no leading
+      zero). The host is one of: a lowercase name ending in `.local` (mDNS), `.lan`, `.internal`
+      or `.home.arpa` with at least one label before the suffix; an IPv4 literal in
+      127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 or 169.254.0.0/16; or a bracketed
+      IPv6 literal `::1`, in fc00::/7 (ULA) or fe80::/10 (no zone id). IP literals must be
+      canonical (`str(ipaddress.ip_address(...))`: no leading zeros, compressed lowercase IPv6,
+      no IPv4-mapped form), so one service has one spelling and exact matching is sound.
+      Never a public address or name, `localhost`, a single-label name, a wildcard, a scheme or a
+      path. Cloud metadata services are refused even as an explicit grant: the addresses
+      169.254.169.254, 169.254.170.2, 169.254.170.23, fd00:ec2::254 and fd00:ec2::23, and every name whose first label is
+      `metadata` or `instance-data` (`metadata.google.internal`, `metadata.internal`,
+      `instance-data.ec2.internal`). The JSON Schema checks the shape (suffixes, private
+      prefixes, port, the metadata `not`); the model adds the ranges and the canonical form.
+      CGNAT (100.64.0.0/10, e.g. Tailscale) and single-label Docker service names are left
+      out on purpose: a Docker service gets a `.internal` alias, and widening is a later,
+      compatible change.
+    - **C, plaintext.** Plain `http` is allowed **only** on a local endpoint, never on a
+      `network` host. The grant names a host and port, not a scheme: `http` and `https` (and,
+      for `address_allowed`, any protocol) may use it, since what is approved is reaching that
+      service, and TLS on a LAN is the user's choice. `http.post` intents, `mcp-http` runtimes
+      and task links keep `HttpsUrl` and `network`: a local grant is for the plugin's own
+      connections only.
+    - **D, approval.** Manifest-declared versus lock-approved stays as decision 63: the host
+      refuses a plugin whose manifest asks for a `network_local` entry the lock does not grant
+      (`permissions not approved (network_local: ...)`), and the lock's list is the one in force.
+      The approval flow (#46) must show these entries **apart** from `network`, under "local
+      network (plain http allowed)", one line per endpoint. Until then a lock is hand-written:
+      the lockfile contract accepts the key, and a lock without local grants is written exactly
+      as before (`network_local` is left out when empty), so an older core still reads it.
+    - **E, the wire.** Every plugin call also carries `_meta["horae/network_local"]`: the locked
+      list, always present from this core (`[]` when none). horae-sdk 0.6.0:
+      `host_allowed(url)` is `True` for an `https` URL on an approved host (decision 63) **or**
+      an `http`/`https` URL whose host and port are exactly an approved local endpoint (no port
+      in the URL means 80 for `http`, 443 for `https`); `address_allowed(host, port)` does the
+      same for other protocols (IMAP); `local_endpoints` is the list. True / False / None stay:
+      no `horae/network` at all is unknown (`None`); `horae/network` without
+      `horae/network_local` (a decision-63 core, which could not grant one) means no local
+      endpoint. No normalisation and no DNS: a public name never matches a local grant
+      (`ntfy.lan.evil.test`, `127.0.0.1.nip.io`), nor do user info, another spelling of an
+      address or another port. Old plugins and SDKs ignore the new key; an older core sends
+      neither key and the SDK reports unknown.
+    - **F, the M5 egress proxy (to be followed by #49 and #50).** The proxy is exposed by an
+      **explicit** variable, not transparently: in M5 isolation only, the core sets
+      `HORAE_EGRESS_PROXY` (an `http://` URL of the allow-listing proxy) in the plugin's clean
+      environment; `*_PROXY` stays on the deny list (decision 28) and plugins keep
+      `trust_env=False`. A plugin sends its connections to **public** hosts (`network`) through
+      `HORAE_EGRESS_PROXY` (HTTP `CONNECT`), and connects to **local** endpoints directly. The
+      plugin container's network has no default route: the proxy, which resolves names itself
+      and refuses private, loopback, link-local and metadata addresses (T07), is the only way
+      out for public hosts, and each `network_local` grant becomes an explicit route or firewall
+      allow rule for exactly that address and port (a local name is resolved once by the core
+      when the container starts, and refused if it resolves outside B's ranges or to a metadata
+      address). Before M5 the variable is unset: a plugin connects directly, as today. A plugin
+      that sees the variable and cannot use a proxy must fail, not bypass it (it could not
+      anyway). Loopback in M5 means the plugin's own container; reaching a service on the
+      Docker host's loopback (Proton Mail Bridge) needs that route to the host (#49/#50 decide
+      how, e.g. a host-gateway route limited to the granted port).
+    - **G, limits before M5.** A local name can still **resolve** to a metadata or public
+      address: the grant checks what is written, not what DNS answers. Refusing that at connect
+      time is the proxy's and the route's job (#50); a plugin that resolves names itself keeps
+      refusing a resolved metadata address (plugin-ntfy already does). As in decision 63 B, the
+      `_meta` lists are advice a good plugin enforces on itself, not isolation (T05). A grant of
+      `127.0.0.1:<port>` before M5 reaches whatever listens on the core's own loopback (e.g. the
+      HTTP API, decision 51 B): the approval shows it as a local-network grant for the user to
+      judge.
+    - **H, plugin follow-ups (not changed here).** plugin-imap: declare its Bridge endpoint in
+      `network_local` (e.g. `127.0.0.1:1143`, `127.0.0.1:1025` for SMTP), require horae-sdk 0.6,
+      and check `call.address_allowed(host, port)` before connecting (`False` refuses, `None`
+      falls back to its own config); drop the 0.1.0 note that a local Bridge is always refused.
+      plugin-homeassistant: accept an IP-literal or `.local` / `.lan` base URL (`http` allowed),
+      check it with `call.host_allowed(url)`, and document `network_local` with an explicit port
+      instead of refusing IP literals. plugin-ntfy: accept an `http://` `server` on a local
+      endpoint through `request.host_allowed(url)` (port 80 or an explicit one), keep `https`
+      for public servers and its resolved-address checks, and document the `network_local` entry.
+
+### Provisional decisions (#160, pending maintainer review)
+
+67. **An `llm` step can be skipped on an empty input, and a skill can bind `task.create`
+    fingerprints to the viewed input (#160).** Provisional. Two compatible, opt-in additions:
+    an optional `llm.skip_when_empty` in `pipeline/v1.json` and an optional `task_fingerprint`
+    in `skill/v1.json`. Neither is in a pipeline or skill that does not write it, and the
+    pipeline digest is unchanged for one that omits `skip_when_empty` (`null` is left out of
+    the canonical form). Decision 66 is added by PR #159 and 62 by PR #155. Found building
+    plugin-gmail#3 (plugin-gmail PR #5). A `task.create` link built from the fingerprint
+    (item 3 of the issue) is **not** part of this decision; see F.
+    - **A, `skip_when_empty`.** On an `llm` step, `true`, or a list of 1 to 16 input view
+      paths (`ViewPath`, the syntax of a skill's `input_view`). It is evaluated on the
+      **viewed** input (after the skill's view, before de-identification, the cache lookup and
+      any model call). `true`: the whole viewed input is empty. A list: the values the paths
+      reach are all empty (a path that reaches nothing is empty), so one non-empty listed
+      field runs the step. A list path must lie on the skill's input view (be a prefix of a
+      view path or extend one), else the plan fails with `params_invalid`: a path the model is
+      never shown would be empty on every run.
+    - **B, what empty means.** `null`, `""`, `[]`, `{}`, and a list or object whose members
+      are all empty in this sense, recursively. Any other string, any number (`0` too) and any
+      boolean (`false` too) is **not** empty. A view that does not match the input at all is
+      still `input_invalid` (a degraded step), not an empty skip. A pipeline whose collect
+      source also returns a label (`source: "gmail.triage"`) is therefore not empty as a whole:
+      list the field that matters (`[].data.needs_interpretation`), or drop the label from the
+      skill's view.
+    - **C, how a skip is recorded.** No `llm[]` entry (no call was made, so there is no
+      backend, model or usage to state): the step is recorded with status `skipped`, no error,
+      and `output: {"skipped": "empty_input", "skill": "<skill>"}`. Later steps run, as after
+      an unchanged-input reuse; a `skipped` step is `ok` for the run's status, and a run that
+      proposes no intent at all ends `noop` (the same rule as a reuse). `RunRecord.input_hash`
+      stays unset and nothing is written to the LLM cache (no accepted output exists, and the
+      cache is not even looked up). Cost is zero. A replay re-evaluates the same rule on the
+      same recorded input.
+    - **D, `task_fingerprint`.** A skill may declare
+      `task_fingerprint: {ids: <ViewPath>, prefix: <text>}`. `ids` is an `input_view` path (or
+      below one) whose string values (or the strings of a list value) are the ids; `prefix` is
+      1 to 64 characters of the fingerprint alphabet (`A-Z a-z 0-9 . _ : -`), e.g. `gmail:`. A
+      `task.create` the skill proposes must carry a fingerprint **equal to** `prefix` + one of
+      those ids, as exact strings in the viewed input; anything else (an id the input never
+      held, the id without its prefix, a different prefix) refuses the whole batch. The
+      manifest is invalid if `ids` is not in the input view or if `task.create` is not in
+      `intents` (pydantic-only rules). Without the rule a `task.create` fingerprint stays free
+      text, as before; the rule's content joins the skill digest (so the cache key) only when
+      declared. Only strings are ids: a numeric id is never matched.
+    - **E, a refusal is a guard violation.** The rule is part of the action guard
+      (`horae.engine.guard.check_intents`, `task_fingerprint`), so a refusal is the existing
+      `guard` violation and a `guard_violation` step error (the step is `degraded`, nothing of
+      the batch is routed), and a cached output is re-guarded on reuse and dropped when refused
+      (decision 46). The detail is fixed text with the position and the field, never the
+      fingerprint: `skill:<skill> proposed task.create #<n> with a fingerprint not from the
+      input in `fingerprint``. Skill evals run the same check (`judge_intents`). It does not
+      reuse `check_task_fingerprints` (the `task.update_status` check, routing rule 4, which
+      lives in `horae.engine.executor` and fails as `intent_unrouted`): the executor imports
+      the guard, and the issue asks for a guard violation. Both read the viewed input as exact
+      strings; `horae.engine.viewpath` holds the path reading the new code shares.
+    - **F, not done: a link template.** Item 3 (`link_template` under `links: none`, built by
+      the core from the fingerprint) is left out. Routing picks the `tasks` entry from the
+      task's link, so an entry-owned template would have to choose the entry before the link
+      exists; that circularity is not small. A skill under `links: none` proposes tasks
+      without a link for now. A follow-up could add the template to the `act` entry
+      (`link_template` + `link_fingerprint_prefix`, id URL-encoded, result checked against the
+      entry's own `link_prefix`).
+    - **G, what plugin-gmail changes.** In `skills/gmail/triage-mail/skill.yaml`, add
+      `task_fingerprint: {ids: "[].data.needs_interpretation[].id", prefix: "gmail:"}`; in
+      `examples/triage-mail.pipeline.yaml`, replace `on_unchanged_input: skip` by (keeping it
+      is harmless) `skip_when_empty: ["[].data.needs_interpretation"]`, and say in the prompt
+      that a task's `fingerprint` is `gmail:` + the mail `id`.
+
+### Provisional decisions (#162, pending maintainer review)
+
+68. **Accent folding, and plugin-declared personal fields the core enforces (#162).**
+    Provisional. Found by plugin-school-fr#4 (plugin-school-fr PR #7). Compatible additions:
+    an optional `provides.personal_fields` in `plugin-manifest/v1.json` and an optional
+    `plugins.<name>.personal_fields` in `lockfile/v1.json` (both regenerated; `skill/v1.json`
+    is unchanged). Decision 62 is taken by open PR #155; 63 to 67 are merged. It amends
+    decision 47 C (matching) and E (when de-identification runs).
+    - **A, accent folding.** The matcher compares letters **accent-folded** on both sides,
+      the known value and the scanned text: case-folded, decomposed (NFD), nonspacing marks
+      (`Mn`) dropped (`horae.llm.deid.fold`). `Zoe`, `ZOE`, `zoé` and an NFD `Zoé` all match
+      a known `Zoé`, and a known `Zoe` matches all of them. A letter run now also holds the
+      combining marks that follow a letter (the main combining blocks), so a mark NFKC could
+      not compose (`Zo̱e`) does not cut a name in two; a token made of marks only folds to
+      itself (a symbol is never empty). Whole letter runs only, as before: `Léo` never
+      matches inside `Léonard`, unless `Léonard` is itself a known value. The **span** of the
+      text is replaced, whatever its spelling; **re-identification puts back the canonical
+      text** (the classed leaf, personal value or vocabulary term first registered for
+      those folded tokens), never the span as written: `ZOE` comes back as `Zoé`, as `ALICE`
+      already came back as `Alice` (decision 47 G). Two classed values that fold alike
+      (`Zoé`, `Zoe`) share a pseudonym. `DEID_VERSION` is 3 (part of the cloud cache key:
+      older entries are a miss once).
+    - **B, the declaration.** `provides.personal_fields: {<tool ref>: [view paths]}`, e.g.
+      `{school-fr.homework: ["children[].first_name", "homework[].teacher"]}`. A key is one
+      of the plugin's `sources` or `transforms`; the paths use the `ViewPath` syntax of a
+      skill's `input_view`, **relative to that tool's output** (not to the step input), 1 to
+      `MAX_PERSONAL_FIELDS` (64) per tool, none under another and none disagreeing with
+      another on a value's shape (pydantic-only rules). A mapping keyed by ref, not
+      `sources[]` objects: `provides.sources` stays a list of refs that every reader (host,
+      replay, marketplace, SDK) already uses. **The lock** records it with the approved
+      plugin (`LockedPlugin.personal_fields`, paths sorted, left out when empty, so a lock
+      without any is written exactly as before and an older core still reads it). The
+      installer (#46, after PR #155's `Installed.lock_entry`) copies the manifest's
+      declaration; no approval is needed, since a declaration only adds protection. **In
+      force** is the union of the installed manifest's and the lock's (each tool's paths
+      reduced to the outermost ones, `merge_personal_fields`): a manifest edited after
+      approval, or a stale lock, can never drop a field. `horae replay` reads the lock's
+      (`LockRegistry`), so a replay de-identifies as the run did.
+    - **C, which output reaches which step.** One value flows through a run (the engine's
+      "data between steps"); the plan follows the declared paths along it:
+      - after a `collect` step, each declared path `p` of a source of that step is at
+        `[].data.p` of the step's output (`[].data[].x` for `[].x`). The class applies to
+        **every** element of the list, so another source's field at the same path is
+        protected too (over-protection, never under);
+      - a later `collect` step starts a new value: its own sources' paths replace them;
+      - a `transform` that declares `personal_fields` replaces them with its own paths,
+        relative to its output: it takes responsibility for where personal data went; a
+        `transform` that declares none, when personal paths are in force, **loses** them
+        (the core cannot know where it put them); one that runs before any personal path
+        changes nothing;
+      - every tool that ran adds the **values** found at its declared paths (every string
+        leaf and object key at or below them, NFC, non-empty) to the run's personal values,
+        whichever step it ran in;
+      - at the `llm` step, the located paths are added to the skill's input view options as
+        `{class: person}`, applied to the **viewed** input (the view keeps the input's shape):
+        a skill class `person`, `email`, `phone`, `place` or `amount` at or above a path
+        already hides it and is kept; a `free_text` class at or above it (which means the same
+        as no class) and any class below it are dropped, so no classed path lies under another.
+        The personal values are known `person` values (with their name parts, decision 47 C)
+        looked for in every string and key of the viewed input. So a skill **without
+        classes** is protected, and so is a name mentioned in a description the skill views
+        while it does not view the field itself.
+      - A personal path the skill's view does **not** select is not an error: that field is
+        not sent at all, and its values are still looked for in what is sent.
+    - **D, cloud only.** As decision 47: a local alias is sent the viewed input unchanged. The
+      request is marked `classified` whenever personal paths or values reach the step, so
+      without a policy `ModelBackends` refuses it for a cloud alias (`deid_required`).
+    - **E, fail closed** (nothing is sent, nothing is billed; the messages name a tool and a
+      path, never a value), only for a cloud alias:
+      - while planning, an `llm` step after a transform that lost personal paths fails with
+        `deid_unavailable` before any plugin is called (an alias the policy cannot classify
+        counts as cloud);
+      - at the step, an output that contradicts the shape of its declared path (an object
+        where the path reads an array, a scalar where it reads either; an absent key or
+        `null` is fine) degrades it with `deid_unavailable`: the field cannot be located;
+      - the pseudonymizer refuses (`deid_unavailable`) more than `MAX_PERSONAL_VALUES` (4096)
+        values, a value longer than 1 KiB or 48 tokens (it could not be found in text), and,
+        after rewriting, any personal value still found **in clear** in a string or key of
+        what would be sent (pseudonyms put aside; a check against its own bugs).
+      The cache, a replay's reuse and the repair retry all use the same de-identified input
+      (decision 47 E: an entry is reused only with the same de-identified digest).
+    - **F, `horae eval`.** A case's input is read as a `collect` output: an element whose
+      `source` is a tool of the skill's own plugin with `personal_fields` gets the same paths
+      and values, offline and live. `horae eval` knows only that plugin's manifest: a source
+      of another plugin is not recognised (a limit).
+    - **G, limits.** Not matched: a value of fewer than 2 characters in text, a name part of
+      fewer than 3 letters (`Al` of `Al Martin`), nicknames, initials, typos and
+      transliterations (`Zoë` is `Zoe` by folding, `Zoja` is not). A number under a personal
+      path is protected where the path is located, not in text. Folding over-matches (`Zoe`
+      and `Zoé` are one name). The declaration is as good as the plugin that writes it.
+    - **H, SDK 0.7.0.** `Plugin.source(ref, personal_fields=[...])`,
+      `Plugin.transform(ref, personal_fields=[...])` (also the `personal_fields=` argument of
+      `Source` / `Transform`), and `manifest(..., personal_fields={ref: [paths]})`, written as
+      `provides.personal_fields` only when non-empty and checked like the core (a tool of the
+      plugin, a path, 1 to 64, no duplicate, overlap or shape disagreement).
+    - **I, what plugin-school-fr changes.** Require `horae-sdk>=0.7`; register each source
+      that returns `normalize(...)` data with
+      `personal_fields=list(DEIDENTIFIED_FIELDS)` (`children[].first_name`,
+      `homework[].teacher`, `grades[].teacher`) and regenerate `plugin.yaml`
+      (`python -m horae_school_fr --manifest`), which then holds
+      `provides.personal_fields: {<source ref>: [...]}`; keep `input_view()` as guidance;
+      drop `NameScrubber` (the core now folds accents) or keep it as harmless defence in
+      depth, and flip `tests/test_deid.py`'s accent test from documenting the gap to asserting
+      that `Zoe` is caught, plus a test that a skill **without** classes sends no name; update
+      the README's "Limits" (accent folding done, a skill without classes is now protected).

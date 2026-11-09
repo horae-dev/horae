@@ -123,7 +123,13 @@ def echo(ctx: Context, value: Any = None, reveal: str | None = None) -> dict[str
     environment variable `reveal` (to test output redaction)."""
     meta = ctx.request_context.meta or {}
     revealed = os.environ.get(reveal) if reveal else None
-    return {"value": value, "input": meta.get("dev.horae/input"), "revealed": revealed}
+    return {
+        "value": value,
+        "input": meta.get("dev.horae/input"),
+        "revealed": revealed,
+        "meta_network": meta.get("horae/network", "absent"),
+        "meta_network_local": meta.get("horae/network_local", "absent"),
+    }
 
 
 @server.tool(name="probe.identity")

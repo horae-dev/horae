@@ -465,7 +465,13 @@ def test_input_travels_in_meta_and_text_json_is_accepted(tmp_path: Path) -> None
             return echoed, text
 
     echoed, text = _run(scenario())
-    assert echoed.data == {"value": 7, "input": {"items": [1]}, "revealed": None}
+    assert echoed.data == {
+        "value": 7,
+        "input": {"items": [1]},
+        "revealed": None,
+        "meta_network": [],
+        "meta_network_local": [],
+    }
     assert echoed.violations == ()
     assert text.data == {"a": [1, 2]}
 

@@ -1,0 +1,12 @@
+# Decision 67: a proposed task.create must carry `gmail:` + an id found in the viewed input.
+name: gmail/triage-mail
+version: 0.1.0
+description: Turn mail into task proposals.
+input_view:
+  "[].data.needs_interpretation[].id":
+  "[].data.needs_interpretation[].subject": { class: free_text }
+intents:
+  task.create: 25
+task_fingerprint:
+  ids: "[].data.needs_interpretation[].id"
+  prefix: "gmail:"
