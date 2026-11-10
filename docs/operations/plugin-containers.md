@@ -259,20 +259,24 @@ and why). A path must:
    (it could swap a directory of yours for a link while yours starts); and a **writable**
    path must not be or hold another container plugin's writable path (two container plugins
    never write the same tree). Reading the same path, or a path holding the other's writable
-   one, is fine: that is how plugins share a vault;
-8. if writable, not be in or hold a git repository: no `.git` (in any letter case) and no
-   git directory layout under any name (a directory holding a `HEAD` with any of `objects`,
+   one, is fine: that is how plugins share a vault. Plugins on `runtime: process` are not
+   counted (they are unconfined anyway). These comparisons also use the files' identities,
+   so another letter case (macOS volumes ignore case) or a link to the same directory is
+   recognised;
+8. if writable, not be or hold a git repository: no `.git` (in any letter case) and no git
+   directory layout under any name (a directory holding a `HEAD` with any of `objects`,
    `refs`, `commondir`, `gitdir`, `config`, `hooks`, `index`, `info`, `packed-refs`,
-   `worktrees`)
-   in the path, in a directory above it up to its mount root, or anywhere below it. A plugin could
-   plant hooks that your `git` would run. If your instance is a git repository, keep a
-   writable vault outside it (`container.mount_roots`). A `.git` the plugin creates during its
-   run quarantines it, and so does any git directory layout found in a writable path. Also set
-   `git config --global safe.bareRepository explicit` for the user who runs `git` on the
-   host, so git never uses a bare repository it merely finds in a directory. Plugins
-   on `runtime: process` are not counted (they are unconfined anyway). These comparisons
-   also use the files' identities, so another letter case (macOS volumes ignore case) or a
-   link to the same directory is recognised.
+   `worktrees`) in the path or anywhere below it, and no git directory layout above it. A
+   plugin could plant hooks that your `git` would run. **A git work tree around it is fine**
+   as long as that repository's git directory stays out of the plugin's reach: the usual
+   `horae init` layout, an instance kept in git with `vault/` gitignored, mounts its vault
+   writable, because the repository's `.git` is the instance's, outside every path the plugin
+   is given. If that git directory (the `.git` above, the directory a `.git` file points to,
+   or a worktree's common directory) lies inside any path the plugin is given, read-only or
+   writable, or cannot be found, the plugin is refused. A `.git` the plugin creates during
+   its run quarantines it, and so does any git directory layout found in a writable path.
+   Also set `git config --global safe.bareRepository explicit` for the user who runs `git` on
+   the host, so git never uses a bare repository it merely finds in a directory.
 
 The paths are checked again right before `docker run`, and once more after the container has
 started and before its egress proxy lets it out: `docker inspect` must show exactly the

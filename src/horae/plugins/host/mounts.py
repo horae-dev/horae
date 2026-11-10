@@ -289,7 +289,7 @@ def plan_mounts(
     for path, writable in access.items():
         identity = check_path(plugin, path, policy)
         if writable:
-            problem = git_problem(path, policy)
+            problem = git_problem(path, policy, list(access))
             if problem is not None:
                 raise _refuse(plugin, path, problem)
         for ancestor in _ancestors(plugin, path):
@@ -346,12 +346,86 @@ def _bare_layout(names: Iterable[str]) -> bool:
     return "head" in folded and not folded.isdisjoint(GIT_DIR_COMPANIONS)
 
 
-def git_problem(path: str, policy: MountPolicy) -> str | None:
+GITDIR_FILE_MAX = 4096
+"""The longest `.git` file (`gitdir: <path>`) or `commondir` file read."""
+
+
+def _pointer(file: str, base: str, prefix: str = "") -> str:
+    """The directory a `.git` (`gitdir: <path>`) or `commondir` (`<path>`) file names, as a
+    real path; `OSError` / `ValueError` when it cannot be told."""
+    fd = os.open(file, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    with os.fdopen(fd, "rb") as handle:
+        data = handle.read(GITDIR_FILE_MAX + 1)
+    if len(data) > GITDIR_FILE_MAX:
+        raise ValueError("too long")
+    line = data.decode("utf-8").strip().splitlines()[0] if data.strip() else ""
+    if not line.startswith(prefix):
+        raise ValueError(f"no {prefix!r} line")
+    target = line.removeprefix(prefix).strip()
+    if not target:
+        raise ValueError("empty")
+    return os.path.realpath(os.path.join(base, target))
+
+
+def _git_dirs(entry: str) -> list[str]:
+    """The git directories an ancestor's `.git` entry stands for: the directory itself, or the
+    one a `.git` file points to, and that one's `commondir` (a linked worktree's main
+    repository, which holds the hooks). `OSError` / `ValueError` when it cannot be told."""
+    status = os.lstat(entry)
+    if stat.S_ISDIR(status.st_mode):
+        found = [os.path.realpath(entry)]
+    elif stat.S_ISREG(status.st_mode):
+        found = [_pointer(entry, os.path.dirname(entry), "gitdir:")]
+    elif stat.S_ISLNK(status.st_mode):
+        found = [os.path.realpath(entry)]
+    else:
+        raise ValueError("not a directory, a file or a link")
+    if not os.path.isdir(found[0]):
+        raise ValueError("its git directory does not exist")
+    common = os.path.join(found[0], "commondir")
+    if os.path.lexists(common):
+        shared = _pointer(common, found[0])
+        if not os.path.isdir(shared):
+            raise ValueError("its common git directory does not exist")
+        found.append(shared)
+    return found
+
+
+def _git_dir_problem(entry: str, declared: Sequence[str]) -> str | None:
+    """Why the ancestor `.git` `entry` makes its work tree unsafe to mount writable, or
+    `None`: its git directory (or common one) is, or lies inside, one of the plugin's
+    declared paths, compared by device and inode (decision 78 B, maintainer's choice on
+    #182). Fail closed when the git directory cannot be told."""
+    try:
+        git_dirs = _git_dirs(entry)
+    except (OSError, ValueError, UnicodeError) as error:
+        why = error.strerror if isinstance(error, OSError) else str(error)
+        return f"the git directory of {entry!r} cannot be told ({why})"
+    mounted: list[tuple[tuple[int, int], str]] = []
+    for path in declared:
+        try:
+            status = os.stat(path)
+        except OSError as error:
+            return f"{path!r} cannot be read ({error.strerror})"
+        mounted.append(((status.st_dev, status.st_ino), path))
+    for git_dir in git_dirs:
+        chain = _chain(git_dir)
+        for identity, path in mounted:
+            if identity in chain:
+                return f"the git directory of {entry!r} ({git_dir!r}) is inside {path!r}"
+    return None
+
+
+def git_problem(path: str, policy: MountPolicy, declared: Sequence[str] = ()) -> str | None:
     """Why the writable `path` may not be mounted for a git repository, or `None`: a `.git`
-    (in any letter case: volumes may ignore it) as one of its components, in any directory from
-    it up to the mount root that holds it (it would be in a work tree), or anywhere below it
-    (a bounded walk that refuses when it hits its bound). A plugin could plant hooks there that
-    the user's `git` runs."""
+    (in any letter case: volumes may ignore it) or a git directory layout as one of its
+    components or anywhere below it (a bounded walk that refuses when it hits its bound); a
+    git directory layout in a directory above it, up to the mount root that holds it; or an
+    ancestor `.git` whose git directory lies inside any of the plugin's `declared` paths (it
+    always counts `path` itself). A work tree around it is fine when its git directory stays
+    out of the plugin's reach (the maintainer's choice on #182: a vault gitignored in a
+    git-tracked instance). A plugin could otherwise plant hooks the user's `git` runs."""
+    declared = [path, *(other for other in declared if other != path)]
     if any(_is_git(part) for part in path.split("/")):
         return "a writable path may not be in a git repository"
     holding = [root for root in policy.roots if within(path, root)]
@@ -362,8 +436,11 @@ def git_problem(path: str, policy: MountPolicy) -> str | None:
             names = os.listdir(current)
         except OSError as error:
             return f"{current!r} cannot be listed to look for git ({error.strerror})"
-        if any(_is_git(name) for name in names):
-            return f"a writable path may not be in a git work tree ({current!r} has one)"
+        for name in names:
+            if _is_git(name):
+                problem = _git_dir_problem(os.path.join(current, name), declared)
+                if problem is not None:
+                    return f"a writable path may not be in this git work tree: {problem}"
         if _bare_layout(names):
             return f"a writable path may not be in a git directory ({current!r} is one)"
         if current == top:

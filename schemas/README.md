@@ -4848,16 +4848,23 @@ loosened later without breaking a valid file.
         container's own `/plugin`;
       - it is neither `/tmp` nor contains it (it may lie inside it: the bind is mounted over the
         container's tmpfs);
-      - a **writable** path is not in, nor holds, a git repository: no `.git` (in any letter
-        case, since volumes may ignore it) and no git directory layout under any name (a directory
-        holding a `HEAD` together with any of `objects`, `refs`, `commondir`, `gitdir`,
-        `config`, `hooks`, `index`, `info`, `packed-refs` or `worktrees`, any case: a bare
-        repository or a linked worktree's directory, which `GIT_DIR`, a `gitdir:` file or
-        `safe.bareRepository=all` would use; deliberately broad) as one of its components, in any directory from it
-        up to the mount root that holds it (a work tree around it), or anywhere below it (a
-        walk of at most 100 000 entries, which refuses at its bound); a plugin could plant
-        hooks the user's `git` runs. A vault inside a git-tracked instance must then be kept
-        outside the work tree (`container.mount_roots`), or be read-only;
+      - a **writable** path is not, nor holds, a git repository: no `.git` (in any letter
+        case, since volumes may ignore it) and no git directory layout under any name (a
+        directory holding a `HEAD` together with any of `objects`, `refs`, `commondir`,
+        `gitdir`, `config`, `hooks`, `index`, `info`, `packed-refs` or `worktrees`, any case:
+        a bare repository or a linked worktree's directory, which `GIT_DIR`, a `gitdir:` file
+        or `safe.bareRepository=all` would use; deliberately broad) as one of its components
+        or anywhere below it (a walk of at most 100 000 entries, which refuses at its bound),
+        and no git directory layout in a directory above it up to its mount root; a plugin
+        could plant hooks the user's `git` runs. **It may lie inside a git work tree** (the
+        maintainer's choice on #182: an instance kept in git with `vault/` gitignored, as
+        `horae init` lays it out, mounts its vault writable) as long as that repository's git
+        directory stays out of the plugin's reach: for each `.git` found in a directory above
+        it up to its mount root, its git directory (that directory, the one a `.git` file's
+        `gitdir:` names, and a linked worktree's `commondir`) must neither be nor lie inside
+        any path the plugin is given, read-only or writable, compared by device and inode;
+        a git directory that cannot be told (a `.git` file without a `gitdir:` line, too long,
+        naming nothing, a `.git` of another type) refuses the plugin (fail closed);
       - it does not lie strictly inside a writable path of **another container plugin** of the
         lock: that plugin could swap a directory of it for a link while this one starts. A
         **writable** path also must not be, nor hold, another container plugin's writable

@@ -201,10 +201,72 @@ def test_a_git_entry_in_another_case_is_refused(instance: Path, name: str) -> No
         plan_mounts("jail", [], [str(vault / "archive" / name)], policy)  # a component
 
 
-def test_a_writable_path_inside_a_git_work_tree_is_refused(instance: Path) -> None:
-    (instance / "vault" / ".Git").mkdir()  # the work tree's root, in another case
-    with pytest.raises(PluginCallError, match="git work tree"):
+def _git_dir(directory: Path) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    (directory / "objects").mkdir()
+    (directory / "refs").mkdir()
+    (directory / "hooks").mkdir()
+    return directory
+
+
+def test_the_horae_init_layout_in_git_mounts_its_vault_writable(instance: Path) -> None:
+    """The instance is a git work tree, `vault/` gitignored in it: the repository's git
+    directory is the instance's `.git`, outside the mount (the maintainer's choice on #182)."""
+    _git_dir(instance / ".git")
+    (instance / ".gitignore").write_text("state/\nplugins/\nvault/\n", encoding="utf-8")
+    vault = str(instance / "vault")
+    plan = plan_mounts("jail", [], [vault], _policy(instance))
+    assert [(m.path, m.writable) for m in plan] == [(vault, True)]
+    # Also through a `.git` file pointing to a git directory outside the mount.
+    (instance / "vault" / "archive" / ".git").write_text(
+        f"gitdir: {instance / '.git'}\n", encoding="utf-8"
+    )
+    inbox = str(instance / "vault" / "inbox")
+    with pytest.raises(PluginCallError, match="hold a git repository"):  # at or below: never
+        plan_mounts("jail", [], [vault], _policy(instance))
+    assert plan_mounts("jail", [], [inbox], _policy(instance))  # a sibling's `.git` file
+
+
+def test_a_work_tree_whose_git_directory_another_mount_reaches_is_refused(
+    instance: Path,
+) -> None:
+    vault, inbox = instance / "vault", str(instance / "vault" / "inbox")
+    _git_dir(vault / ".git")  # the work tree is the vault; its `.git` is in the vault
+    policy = _policy(instance)
+    assert plan_mounts("jail", [], [inbox], policy)  # the `.git` is not mounted: fine
+    with pytest.raises(PluginCallError, match="is inside"):
+        plan_mounts("jail", [str(vault)], [inbox], policy)  # but readable through the vault
+
+
+def test_a_git_file_pointing_inside_the_mount_is_refused(instance: Path) -> None:
+    vault, inbox = instance / "vault", instance / "vault" / "inbox"
+    gitdir = _git_dir(inbox / "deep" / "store")
+    (vault / ".git").write_text("gitdir: inbox/deep/store\n", encoding="utf-8")
+    with pytest.raises(PluginCallError, match="is inside"):
+        plan_mounts("jail", [], [str(inbox)], _policy(instance))
+    assert gitdir.is_dir()
+
+
+@pytest.mark.parametrize(
+    "content", ["gitdir: missing/store\n", "", "not a gitdir line\n", "x" * 5000]
+)
+def test_an_unresolvable_git_directory_is_refused(instance: Path, content: str) -> None:
+    (instance / "vault" / ".git").write_text(content, encoding="utf-8")
+    with pytest.raises(PluginCallError, match="cannot be told"):
         plan_mounts("jail", [], [str(instance / "vault" / "inbox")], _policy(instance))
+
+
+def test_a_worktree_whose_common_directory_is_inside_the_mount_is_refused(
+    instance: Path,
+) -> None:
+    vault, inbox = instance / "vault", instance / "vault" / "inbox"
+    common = _git_dir(inbox / "deep" / "main")
+    worktree = _git_dir(instance / "state" / "wt")  # outside the mount
+    (worktree / "commondir").write_text(f"{common}\n", encoding="utf-8")
+    (vault / ".git").write_text(f"gitdir: {worktree}\n", encoding="utf-8")
+    with pytest.raises(PluginCallError, match="is inside"):
+        plan_mounts("jail", [], [str(inbox)], _policy(instance))
 
 
 def test_a_deep_git_repository_below_a_writable_path_is_refused(instance: Path) -> None:
