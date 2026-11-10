@@ -99,6 +99,7 @@ xfail_strict = true
 markers = [
     "live: runs against a real external program (e.g. Claude Code); skipped unless enabled, never in CI",
     "container: runs plugins in real Docker containers (#49); skipped when no engine is reachable",
+    "malicious: the malicious-plugin suite (#52): every fixture's attack must fail (CI job: pytest -m malicious)",
 ]
 filterwarnings = ["error"]
 
