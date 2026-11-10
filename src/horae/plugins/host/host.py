@@ -38,9 +38,13 @@ run's `ToolCaller`:
   `tools/list` must finish within the plugin's `startup_timeout_s` (`startup_timeout`);
 - **runtime** (schemas decision 74): the plugin's effective `runtime` (`horae.yaml`) picks the
   spawn. `process` is the above; `container` starts the same MCP session in the plugin's own
-  Docker container (`horae.plugins.host.container`: read-only, no network, only its directory
-  mounted, secrets through stdin). Whatever it lacks is `runtime_unavailable` and the plugin
-  does not start: there is no fallback to `process`;
+  Docker container (`horae.plugins.host.container`: read-only, only its directory mounted,
+  secrets through stdin, and egress only through its own allow-list proxy built from the
+  locked network permissions, `horae.plugins.host.egress`, decision 76). Whatever it lacks is
+  `runtime_unavailable` and the plugin does not start: there is no fallback to `process`;
+- **blocked egress** (decision 76 F): each attempt the proxy refused (host, port, reason; never
+  a URL) becomes an `egress_blocked` violation of the call in flight, whether it succeeds or
+  fails (`ToolResult.violations`, `ToolCallError.violations`), redacted like any message;
 - **calls**: the tool must be in the manifest's `provides` and in `tools/list`
   (`tool_missing`); each call is bounded by its pipeline `timeout_s`, else the plugin's
   `call_timeout_s` (`horae.yaml`), else `plugin_defaults.call_timeout_s`;
@@ -130,6 +134,7 @@ from horae.marketplace.install import INSTALL_RECORD
 from horae.plugins.host import logs
 from horae.plugins.host.capture import StderrCapture
 from horae.plugins.host.container import ContainerRuntime
+from horae.plugins.host.egress import violations as egress_violations
 from horae.plugins.host.env import BASE_PATH, build_env, check_names, plugin_venv
 from horae.plugins.host.errors import HostErrorKind, PluginCallError
 from horae.plugins.host.redact import MAX_EXPANSION, Redactor, SecretInKey
@@ -503,7 +508,7 @@ class PluginHost:
         if len(message) > _MAX_MESSAGE:
             message = message[: _MAX_MESSAGE - 1] + "…"
         kind: HostErrorKind = error.host_kind
-        return PluginCallError(kind, message, stderr=error.stderr)
+        return PluginCallError(kind, message, stderr=error.stderr, violations=error.violations)
 
     # --- calls -----------------------------------------------------------------------------
 
@@ -583,7 +588,9 @@ class PluginHost:
                 outcome = await self._call_locked(entry, ref, params, input, timeout_s)
             except PluginCallError as error:
                 pending = self._pending(entry, error.stderr)
-                raise PluginCallError(error.host_kind, error.message, stderr=pending) from None
+                raise PluginCallError(
+                    error.host_kind, error.message, stderr=pending, violations=error.violations
+                ) from None
             pending = self._pending(entry, outcome.stderr)
             if pending is outcome.stderr:
                 return outcome
@@ -626,13 +633,41 @@ class PluginHost:
             await process.stop(forced=True)
             self._lost(entry)
             stderr = process.capture.take(self.redactor())
-            raise PluginCallError(failed.kind, f"{ref}: {failed.message}", stderr=stderr) from None
+            blocked = self._blocked(process)
+            raise PluginCallError(
+                failed.kind, f"{ref}: {failed.message}", stderr=stderr, violations=blocked
+            ) from None
         except PluginCallError as error:
             stderr = await self._stderr(process)
             kind: HostErrorKind = error.host_kind
-            raise PluginCallError(kind, f"{ref}: {error.message}", stderr=stderr) from None
+            raise PluginCallError(
+                kind, f"{ref}: {error.message}", stderr=stderr, violations=self._blocked(process)
+            ) from None
         stderr = await self._stderr(process)
-        return self._result(ref, result, stderr)
+        blocked = self._blocked(process)
+        try:
+            outcome = self._result(ref, result, stderr)
+        except PluginCallError as error:
+            raise PluginCallError(
+                error.host_kind, error.message, stderr=error.stderr, violations=blocked
+            ) from None
+        if not blocked:
+            return outcome
+        return ToolResult(
+            data=outcome.data,
+            intents=outcome.intents,
+            stderr=outcome.stderr,
+            violations=blocked + outcome.violations,
+        )
+
+    def _blocked(self, process: PluginProcess) -> tuple[Violation, ...]:
+        """The egress attempts `process`'s proxy refused since the last call, as redacted
+        `egress_blocked` violations (a refused host name may carry a secret)."""
+        proxy = process.spawn.egress
+        if proxy is None:
+            return ()
+        details = [self._redact_message(detail)[:_MAX_MESSAGE] for detail in proxy.take()]
+        return egress_violations(details)
 
     def _lost(self, entry: _Entry) -> None:
         """The process failed: it may be started once more in this run."""
@@ -700,6 +735,8 @@ class PluginHost:
                 timezone=self.timezone,
                 cwd=cwd,
                 startup_timeout_s=settings.startup_timeout_s,
+                network=permissions.network,
+                network_local=permissions.network_local,
             )
         else:
             argv = resolve_command(list(runtime.command), entry.installed.root)
@@ -716,6 +753,8 @@ class PluginHost:
             )
             spawn = Spawn(name, tuple(argv), env, cwd, settings.startup_timeout_s)
         process = PluginProcess(spawn, StderrCapture(CAPTURE_MARGIN))
+        if spawn.egress is not None:
+            self._group.start_soon(spawn.egress.watch)
         self._group.start_soon(process.serve)
         await process.ready.wait()
         if process.error is not None:

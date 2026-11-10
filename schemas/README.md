@@ -4544,3 +4544,115 @@ loosened later without breaking a valid file.
       TLS in Horae (a reverse proxy's job, as for `horae serve`). No token rotation command:
       create a new one, switch the client, revoke the old one. The plain-HTTP `horae serve`
       API keeps relying on the SSO proxy (decision 51); this decision is the MCP server's.
+
+### Provisional decisions (#50, pending maintainer review)
+
+76. **The egress allow-list proxy of plugin containers (#50).** No schema changes: the policy is
+    the lock's existing `permissions.network` and `permissions.network_local`, and blocked
+    attempts use the existing `egress_blocked` violation kind of the run record. The code is in
+    `horae.plugins.host.egress_proxy` (the proxy, standard library only) and
+    `horae.plugins.host.egress` (starting it, reading its reports). The operator guide is
+    [docs/operations/plugin-containers.md](../docs/operations/plugin-containers.md#egress-the-allow-list-proxy).
+    Only `runtime: container` (decision 74) has a proxy. The process runtime is unchanged (it
+    has no isolation, T05).
+    - **A, implementation: a small asyncio proxy in Horae, run in its own container.** It is
+      about 500 lines with no dependency. The core passes its source to the image's
+      interpreter (`python3 -I -S -c <source> <policy JSON>`), so it runs from the
+      digest-pinned image the plugin already uses (decision 74 G), with no extra image to
+      build, pin or pull. The tests import the same module. An off-the-shelf proxy (tinyproxy,
+      squid, Envoy) was rejected because none of them resolves a name once, checks *every*
+      answer against private, loopback, link-local and metadata ranges, and connects to the
+      checked address. Each would also add an image to pin and a configuration generator, so
+      the policy would live in two places.
+    - **B, one proxy per plugin start.** `ContainerRuntime.spawn` starts the proxy **before**
+      the plugin and waits for its `ready` line (30 s). The container is `docker run
+      --interactive --rm --init --pull never --log-driver none --user 65534:65534 --read-only
+      --cap-drop ALL --security-opt no-new-privileges --pids-limit 64 --memory 128m --label
+      dev.horae.egress-proxy=<plugin> --network horae-plugin-<plugin> --network horae-egress`.
+      That is decision 74 C's hardening; the proxy runs as `nobody` because it reads no file,
+      and it has no mount at all. The policy argument is built from the plugin's **locked**
+      lists only, so no plugin can use another's allow-list. It also carries the plugin
+      network's subnet: the proxy listens on port 3128 of its container and drops, without an
+      answer, any client outside that subnet (another proxy on `horae-egress`, the host). `horae-egress` is created on
+      first use: a bridge that is not `--internal`, labelled `dev.horae.network=egress`, with
+      `enable_icc=false` and no IPv6. Each run checks it like a plugin network: no
+      `ConfigOnly`/`ConfigFrom`, and every attached container must carry
+      `dev.horae.egress-proxy`. A network of that name that fails the check is refused, never
+      repaired. Docker 25 or later is needed, because `docker run` takes two `--network` flags.
+    - **C, amendment to decision 74 D.** A plugin network now has `enable_icc=true`, because the
+      plugin must reach its proxy on that bridge. It keeps `--internal` and `inhibit_ipv4`, so
+      the host still has no address there. Only the plugin's own containers
+      (`dev.horae.plugin=<name>`) and **its own** proxy (`dev.horae.egress-proxy=<name>`; the
+      value is now checked, where before any value passed) may be attached. #49's networks
+      (`enable_icc=false`) are refused with "remove it" and recreated on the next run. Two
+      concurrent runs of one plugin share its network, so one run's plugin can reach the other
+      run's proxy: same plugin, same lock, unless the lock changed between the two starts.
+    - **D, the plugin's environment.** `HTTPS_PROXY`, `HTTP_PROXY`, `https_proxy`, `http_proxy`
+      and `HORAE_EGRESS_PROXY` all hold `http://<proxy IPv4 on the plugin network>:3128`, read
+      from `docker container inspect` once the proxy is ready. They are set by the core in the
+      secret-free part of the environment (`horae.plugins.host.env.PROXY_KEYS`). `*_PROXY` and
+      `HORAE_*` stay on the secret deny list, so a plugin cannot override them, and `NO_PROXY`
+      is never set. **This replaces decision 66 F** in two ways. The standard variables are set
+      too, so clients that read the environment (`urllib`, `requests`, `httpx` by default)
+      work unchanged. And **local grants also go through the proxy** instead of per-grant
+      routes, which would need privileges (iptables in the plugin's namespace) that Horae
+      does not have. A client with `trust_env=False` ignores the variables: it has no route,
+      so it fails closed. horae-sdk 0.8 adds `egress_proxy()` to pass the proxy explicitly.
+      Other protocols (IMAP) must tunnel with `CONNECT`.
+    - **E, the policy.** Each connection carries one request:
+      - `CONNECT host:port` to a `network` host is allowed on **port 443 only**. Decision 10
+        accepted any port, but the lock has no port syntax for public hosts, so the proxy caps
+        it. A port syntax would be a later, compatible change.
+      - `CONNECT` or an absolute-form plain-HTTP request is allowed to an exact
+        `network_local` `host:port`. Plain HTTP is never allowed to a public host
+        (decision 66 C). It is forwarded in origin form with `Connection: close`, and the
+        `Proxy-*`, `Connection`, `Keep-Alive`, `TE`, `Trailer` and `Upgrade` headers are
+        dropped.
+      - An IP literal is allowed only when it is exactly a local grant (canonical form; IPv6
+        in brackets). Every other literal is refused, including the legacy numeric forms the C
+        resolver reads as addresses (`127.1`, `0x7f000001`).
+      - Names are lowercased and must be plain DNS names with no trailing dot.
+      - The proxy resolves the name itself. **Every** answer must pass: for a public name,
+        globally routable (not private, CGNAT, documentation, multicast, NAT64 or 6to4); for a
+        local name, in decision 66 B's private and link-local ranges. Metadata addresses and
+        loopback (the proxy's own container) are always refused, and an IPv4-mapped answer is
+        checked as IPv4. One bad answer refuses the whole request, so a resolver mixing
+        answers gets nothing.
+      - The connection then goes to the first IPv4 answer, an address, never the name again,
+        so **DNS rebinding cannot change what was checked**. Each new connection resolves
+        again and is checked again.
+      - No TLS interception. Bounds: an 8 KiB head read within 10 s, DNS and connect timeouts
+        of 10 s, 300 s idle per tunnel, 64 connections.
+      - Refusals answer `403` with the reason code. A name that does not resolve or an
+        unreachable upstream answers `502`, and so does an answer with no IPv4 address,
+        because `horae-egress` has no IPv6.
+    - **F, blocked attempts.** The proxy writes one JSON line to stdout per refusal (`403`
+      only): `{"event": "blocked", "host", "port", "reason"}`, where `reason` is a fixed code
+      (`host_not_allowed`, `ip_literal`, `port_not_allowed`, `plain_http_not_allowed`,
+      `private_address`, `loopback_address`, `metadata_address`, `not_local_address`). It
+      never writes a URL, path, query, header or body. It reports at most 200 and then one
+      `suppressed` line. The host reads the lines (`ProxyHandle.watch`), checks them again
+      (host shape, port range, reason shape), logs each at WARNING and keeps them (capped)
+      until the end of the next call. They then become `egress_blocked` violations,
+      `<plugin>: egress blocked to <host>:<port> (<reason>)`, redacted like any message,
+      since a refused name can carry a secret. They attach to the call's `ToolResult` or, if
+      the call fails, to its `ToolCallError.violations`, which the engine now records too.
+      They appear in the run record's `violations` (their kinds in `horae run --json`) and the
+      log. Attempts reported after a plugin's last call are only
+      logged.
+    - **G, stop.** After the plugin's container is removed, its proxy's stdin is closed (the
+      proxy exits), its CLI is killed if still there, and `docker rm --force` always runs,
+      bounded. The proxy's attachment to `horae-egress` goes with it, and the network itself is
+      kept for the next run.
+    - **H, fail closed.** If the proxy cannot start (the CLI or image fails, it has no address
+      on the plugin network, or `horae-egress` is not as in B), the proxy is removed and the
+      plugin is **not started** (`runtime_unavailable`). A proxy that dies during the run
+      leaves the plugin with no route at all.
+    - **I, limits.** A `network_local` grant on loopback (`127.0.0.1:1143`, Proton Mail Bridge on
+      the Docker host) is refused (`loopback_address`): loopback in the proxy is its own
+      container. Reaching a service on the host needs a grant of the host's address on the
+      LAN, or a host-gateway route (a follow-up). A Docker service name declared in `network`
+      resolves to a private address and is refused. A blocked attempt that never reaches the
+      proxy (a direct connection) is not recorded: it fails with "network unreachable". The
+      proxy limits where a plugin connects, not what it sends there: an approved host can still
+      receive the plugin's data (T05).

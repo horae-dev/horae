@@ -28,6 +28,7 @@ its message.
 
 from typing import Literal
 
+from horae.contracts.run import Violation
 from horae.engine.ports import ToolCallError
 
 HostErrorKind = Literal[
@@ -53,8 +54,15 @@ HostErrorKind = Literal[
 class PluginCallError(ToolCallError):
     """A failed plugin call. `message` and `stderr` are already redacted."""
 
-    def __init__(self, kind: HostErrorKind, message: str, *, stderr: str | None = None) -> None:
-        super().__init__(kind, message, stderr=stderr)
+    def __init__(
+        self,
+        kind: HostErrorKind,
+        message: str,
+        *,
+        stderr: str | None = None,
+        violations: tuple[Violation, ...] = (),
+    ) -> None:
+        super().__init__(kind, message, stderr=stderr, violations=violations)
         self.host_kind: HostErrorKind = kind
 
 

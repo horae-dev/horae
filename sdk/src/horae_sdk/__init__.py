@@ -19,10 +19,10 @@ A Horae plugin is an MCP server over stdio that the core's plugin host starts fo
 from horae_sdk import intents, tasks
 from horae_sdk.manifest import Permissions, dump_manifest, manifest
 from horae_sdk.plugin import Call, Output, Paths, Plugin, PluginError, Source, Transform
-from horae_sdk.protocol import Network
+from horae_sdk.protocol import Network, egress_proxy
 from horae_sdk.sinks import Applied, ApplyRequest, Notifier, Sink, SinkError
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 __all__ = [
     "Applied",
@@ -41,6 +41,7 @@ __all__ = [
     "Transform",
     "__version__",
     "dump_manifest",
+    "egress_proxy",
     "intents",
     "manifest",
     "tasks",

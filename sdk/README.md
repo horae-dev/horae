@@ -172,6 +172,26 @@ Declare them in your manifest with `Permissions(network_local=["127.0.0.1:1143"]
 `horae_sdk.testing.call(..., network_local=[...])` (a recording's `"network_local"` key) sends
 the local list; by default `[]` is sent alongside `network`.
 
+### In a plugin container: the egress proxy (0.8)
+
+With `runtime: container` (M5, schemas decision 76) a plugin's container has **no route out**
+but its own allow-list proxy, which the core starts with the plugin's locked `network` and
+`network_local` and names in the plugin's environment: `HTTPS_PROXY`, `HTTP_PROXY` (and their
+lowercase forms) and `HORAE_EGRESS_PROXY`, all `http://<address>:3128`. `NO_PROXY` is never
+set. The proxy allows `CONNECT` to an approved host on port 443, `CONNECT` or plain `http` to
+an exact approved local endpoint, and refuses everything else with `403` (recorded in the run
+as `egress_blocked`).
+
+- A client that reads the environment works unchanged: `urllib`, `requests`, `httpx` with its
+  default `trust_env=True`.
+- A client built with `trust_env=False` (as decision 66 F advised) ignores those variables: pass
+  the proxy explicitly, `httpx.Client(proxy=horae_sdk.egress_proxy(), trust_env=False)`.
+  `egress_proxy()` returns `None` outside a container: connect directly, as before.
+- Any other protocol (IMAP, SMTP, MQTT) must open a `CONNECT host:port` tunnel through the
+  proxy: a direct connection has no route and fails.
+- Keep `host_allowed` / `address_allowed`: they refuse early with a clear message, and the
+  process runtime has no proxy.
+
 ## Manifest
 
 ```python
