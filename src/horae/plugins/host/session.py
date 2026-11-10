@@ -120,6 +120,7 @@ class PluginProcess:
         self.ready = anyio.Event()
         self.stopped = anyio.Event()
         self._stop = anyio.Event()
+        self._host_kill = False  # Horae itself ends the process (a stalled start)
 
     def _heard(self) -> None:
         self.last_stderr = anyio.current_time()
@@ -186,6 +187,7 @@ class PluginProcess:
                 failure = ("handshake_failed", self._why(error, "the handshake failed"))
         if scope.cancelled_caught:
             failure = ("startup_timeout", f"{name} did not start within {timeout:g} s")
+            self._host_kill = self.state.returncode is None  # still running: Horae kills it
         if failure is None:
             return None
         self.state.forced = True
@@ -264,8 +266,8 @@ class PluginProcess:
 
     async def _diagnose(self) -> tuple[HostErrorKind, str] | None:
         """`Spawn.diagnose`'s answer, `None` without one or if it fails."""
-        if self.spawn.diagnose is None:
-            return None
+        if self.spawn.diagnose is None or self._host_kill or self._stop.is_set():
+            return None  # a process Horae stopped died of Horae, never of its memory limit
         try:
             return await self.spawn.diagnose()
         except Exception:  # never hide the failure being reported
