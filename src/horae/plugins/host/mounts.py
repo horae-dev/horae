@@ -219,6 +219,15 @@ def check_path(plugin: str, path: str, policy: MountPolicy) -> tuple[int, int]:
     for other in policy.sensitive:
         if within(path, other) or within(other, path):
             raise _refuse(plugin, path, f"it overlaps {other}, which no plugin may see")
+    # The same by file identity: another case on a case-insensitive volume, or an alias.
+    own = {(status.st_dev, status.st_ino), *_ancestors(plugin, path)}
+    for other in policy.sensitive:
+        try:
+            found = os.stat(other)
+        except OSError:
+            continue  # absent: nothing there to reach
+        if (found.st_dev, found.st_ino) in own or (status.st_dev, status.st_ino) in _chain(other):
+            raise _refuse(plugin, path, f"it overlaps {other}, which no plugin may see")
     for other in CONTAINER_ONLY:
         if within(other, path):
             raise _refuse(plugin, path, f"it would hide the container's own {other}")
@@ -244,16 +253,69 @@ def plan_mounts(
     if policy is None:
         first = sorted(access)[0]
         raise _refuse(plugin, first, "this host has no instance to check it against")
+    writers = _writer_identities(plugin, shared, sorted(access)[0])
     planned: list[Mount] = []
     for path, writable in access.items():
         identity = check_path(plugin, path, policy)
-        for other, written in shared:
-            if other != plugin and path != written and within(path, written):
-                raise _refuse(
-                    plugin, path, f"it lies inside {written!r}, which plugin {other} may write"
-                )
+        for ancestor in _ancestors(plugin, path):
+            for other, written, written_identity in writers:
+                if ancestor == written_identity:
+                    raise _refuse(
+                        plugin, path, f"it lies inside {written!r}, which plugin {other} may write"
+                    )
         planned.append(Mount(path, writable, identity))
     return tuple(sorted(planned, key=lambda mount: (mount.path.count("/"), mount.path)))
+
+
+def _writer_identities(
+    plugin: str, shared: Sequence[tuple[str, str]], first: str
+) -> list[tuple[str, str, tuple[int, int]]]:
+    """Each other plugin's writable path with its file identity (device and inode, after
+    `realpath`), so that an alias of it (another case on a case-insensitive volume, a link, a
+    bind mount) is recognised. One that cannot be read refuses the plugin (fail closed)."""
+    found = []
+    for other, written in shared:
+        if other == plugin:
+            continue
+        try:
+            status = os.stat(os.path.realpath(written))
+        except OSError as error:
+            why = f"{written!r}, which plugin {other} may write, cannot be read ({error.strerror})"
+            raise _refuse(plugin, first, why) from None
+        found.append((other, written, (status.st_dev, status.st_ino)))
+    return found
+
+
+def _ancestors(plugin: str, path: str) -> list[tuple[int, int]]:
+    """The file identities of `path`'s strict ancestors, up to `/`."""
+    identities = []
+    current = os.path.dirname(path)
+    while True:
+        try:
+            status = os.lstat(current)
+        except OSError as error:
+            raise _refuse(plugin, path, f"{current!r} cannot be read ({error.strerror})") from None
+        identities.append((status.st_dev, status.st_ino))
+        parent = os.path.dirname(current)
+        if parent == current:
+            return identities
+        current = parent
+
+
+def _chain(path: str) -> set[tuple[int, int]]:
+    """The file identities of `path`'s real path and its ancestors (unreadable ones left out)."""
+    identities = set()
+    current = os.path.realpath(path)
+    while True:
+        try:
+            status = os.stat(current)
+            identities.add((status.st_dev, status.st_ino))
+        except OSError:
+            pass
+        parent = os.path.dirname(current)
+        if parent == current:
+            return identities
+        current = parent
 
 
 def recheck(plugin: str, planned: Sequence[Mount], policy: MountPolicy | None) -> None:

@@ -255,7 +255,9 @@ and why). A path must:
 7. not lie strictly inside a writable path of **another plugin that runs in a container**
    (it could swap a directory of yours for a link while yours starts). The same path, or a
    path holding the other's writable one, is fine: that is how plugins share a vault. Plugins
-   on `runtime: process` are not counted (they are unconfined anyway).
+   on `runtime: process` are not counted (they are unconfined anyway). These comparisons
+   also use the files' identities, so another letter case (macOS volumes ignore case) or a
+   link to the same directory is recognised.
 
 The paths are checked again right before `docker run`, and once more after the container has
 started and before its egress proxy lets it out: `docker inspect` must show exactly the

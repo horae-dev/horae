@@ -611,3 +611,45 @@ def test_the_started_container_must_have_exactly_the_planned_mounts() -> None:
     assert "with its declared access" in str(mounts.mounts_problem(plan, writable, "/plugin"))
     volume = [*good, {"Type": "volume", "Destination": "/data"}]
     assert "not a bind mount" in str(mounts.mounts_problem(plan, volume, "/plugin"))
+
+
+def _case_insensitive(directory: Path) -> bool:
+    probe = directory / "CaseProbe"
+    probe.mkdir()
+    try:
+        return (directory / "caseprobe").exists()
+    finally:
+        probe.rmdir()
+
+
+def test_an_alias_of_another_plugins_writable_path_is_recognised(instance: Path) -> None:
+    vault, inbox = instance / "vault", str(instance / "vault" / "inbox")
+    alias = instance / "alias"
+    alias.symlink_to(vault)
+    with pytest.raises(PluginCallError, match="which plugin writer may write"):
+        plan_mounts("jail", [inbox], [], _policy(instance), [("writer", str(alias))])
+
+
+def test_a_case_variant_of_another_plugins_writable_path_is_recognised(instance: Path) -> None:
+    if not _case_insensitive(instance):
+        pytest.skip("the temporary filesystem is case-sensitive")
+    variant = str(instance / "VAULT")
+    inbox = str(instance / "vault" / "inbox")
+    with pytest.raises(PluginCallError, match="which plugin writer may write"):
+        plan_mounts("jail", [inbox], [], _policy(instance), [("writer", variant)])
+
+
+def test_another_plugins_writable_path_that_cannot_be_read_refuses(instance: Path) -> None:
+    inbox = str(instance / "vault" / "inbox")
+    missing = str(instance / "gone")
+    with pytest.raises(PluginCallError, match="cannot be read"):
+        plan_mounts("jail", [inbox], [], _policy(instance), [("writer", missing)])
+
+
+def test_a_case_variant_of_a_sensitive_path_is_refused(instance: Path) -> None:
+    if not _case_insensitive(instance):
+        pytest.skip("the temporary filesystem is case-sensitive")
+    policy = _policy(instance)
+    assert "which no plugin may see" in _refused(str(instance / "STATE"), policy)
+    assert "which no plugin may see" in _refused(str(instance / "Plugins" / "x"), policy)
+    assert check_path("jail", str(instance / "VAULT"), policy)  # not sensitive in any case

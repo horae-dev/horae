@@ -4850,6 +4850,11 @@ loosened later without breaking a valid file.
         declared path itself needs write access to its parent. Process-runtime plugins are not
         counted: they run unconfined as Horae's user anyway (T04), so excluding their paths
         would refuse common setups (`file-sink` writing the vault) and protect nothing.
+      The sensitive-path and other-plugin comparisons are made on path strings **and on file
+      identities** (device and inode of the path, its ancestors and the other path after
+      `realpath`), so another letter case on a case-insensitive volume (the macOS default) or
+      an alias (a link, a bind mount) is recognised; another plugin's writable path that
+      cannot be read refuses the plugin (fail closed).
       A host built without an instance (tests, tools) refuses every declared path. A plugin in
       **quarantine** (C) is refused first.
       The check is run three times: when the mounts are planned; again **right before** `docker
