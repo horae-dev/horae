@@ -27,6 +27,7 @@ from pydantic import TypeAdapter, ValidationError
 
 from horae.contracts.lockfile import GitRepoUrl
 from horae.contracts.marketplace import MarketplaceIndex
+from horae.marketplace.cachefs import LOCK_WAIT_S, clone_lock, make_private_dirs
 from horae.marketplace.errors import FetchError, NoCacheError
 from horae.marketplace.git import GIT_TIMEOUT_S, HTTPS, GitError, run_git
 
@@ -91,12 +92,14 @@ class MarketplaceClient:
         *,
         allow_protocol: str = HTTPS,
         timeout_s: float = GIT_TIMEOUT_S,
+        lock_wait_s: float = LOCK_WAIT_S,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self.cache_dir = cache_dir
         self.urls = tuple(urls)
         self.allow_protocol = allow_protocol
         self.timeout_s = timeout_s
+        self.lock_wait_s = lock_wait_s
         self._clock = clock
 
     # --- loading ---------------------------------------------------------------------------
@@ -151,7 +154,23 @@ class MarketplaceClient:
                 raise FetchError("not an https git URL") from None
         folder = self._folder(url)
         repo = folder / REPO_DIR
-        folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            make_private_dirs(folder)
+        except OSError as exc:
+            raise FetchError(f"cannot write {folder}: {exc.strerror}") from None
+        # One writer per clone: a second `horae plugin` waits, then fails with `LockBusy`.
+        with clone_lock(self.cache_dir, folder.name, f"marketplace {url}", wait_s=self.lock_wait_s):
+            text = self._fetch_text(url, folder, repo)
+        try:
+            index = parse_index(text)
+        except ValueError as exc:
+            raise FetchError(f"{INDEX_FILE} is invalid: {exc}") from None
+        fetched_at = self._clock()
+        self._write_cache(folder, url, text, fetched_at)
+        return LoadedIndex(url, index, fetched_at, from_cache=False)
+
+    def _fetch_text(self, url: str, folder: Path, repo: Path) -> str:
+        """Clone or update the repository and return its `marketplace.json`."""
         try:
             if not repo.is_dir():
                 self._clone(url, folder, repo)
@@ -167,6 +186,7 @@ class MarketplaceClient:
                 f"+HEAD:{HEAD_REF}",
                 allow=self.allow_protocol,
                 timeout_s=self.timeout_s,
+                network=True,
             )
             size = run_git(
                 repo, "cat-file", "-s", f"{HEAD_REF}:{INDEX_FILE}", allow=self.allow_protocol
@@ -176,13 +196,7 @@ class MarketplaceClient:
             text = run_git(repo, "show", f"{HEAD_REF}:{INDEX_FILE}", allow=self.allow_protocol)
         except GitError as exc:
             raise FetchError(str(exc)) from None
-        try:
-            index = parse_index(text)
-        except ValueError as exc:
-            raise FetchError(f"{INDEX_FILE} is invalid: {exc}") from None
-        fetched_at = self._clock()
-        self._write_cache(folder, url, text, fetched_at)
-        return LoadedIndex(url, index, fetched_at, from_cache=False)
+        return text
 
     def _clone(self, url: str, folder: Path, repo: Path) -> None:
         """Clone into a scratch directory and move it into place only when complete, so a
@@ -204,6 +218,7 @@ class MarketplaceClient:
                 str(scratch),
                 allow=self.allow_protocol,
                 timeout_s=self.timeout_s,
+                network=True,
             )
             scratch.replace(repo)
         finally:

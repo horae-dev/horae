@@ -51,7 +51,8 @@ def test_a_valid_index_is_accepted() -> None:
         {"extra": 1},
         {"versions": {"0.1.0": "3f2c9e1"}},  # short sha
         {"versions": {"0.1.0": "A" * 40}},  # uppercase
-        {"versions": {"0.1.0": "a" * 64}},  # the marketplace pins SHA-1 only
+        {"versions": {"0.1.0": "a" * 41}},  # neither 40 nor 64
+        {"versions": {"0.1.0": "a" * 63}},
         {"versions": {"v0.1.0": sha(1)}},
         {"versions": {}},
         {"repo": "http://github.com/horae-dev/plugin-github"},
@@ -188,7 +189,9 @@ def test_the_default_client_only_ever_uses_https(
 ) -> None:
     calls: list[str] = []
 
-    def fake(cwd: Path, *args: str, allow: str = "", timeout_s: float = 0) -> str:
+    def fake(
+        cwd: Path, *args: str, allow: str = "", timeout_s: float = 0, network: bool = False
+    ) -> str:
         calls.append(allow)
         raise GitError("offline")
 

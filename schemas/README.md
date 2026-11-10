@@ -3492,7 +3492,8 @@ loosened later without breaking a valid file.
       `schema/marketplace.schema.json` of `horae-dev/marketplace`, strict and `extra=forbid`:
       `{plugins: [{name, repo, versions: {<semver>: <40-hex sha>}, tier}]}`, names unique.
       Name, semver and `repo` (`GitRepoUrl`: https only) are the lockfile's types. The index pins
-      a 40-hex SHA-1 only, as the marketplace schema does (the lockfile also takes 64-hex).
+      a 40-hex SHA-1 or a 64-hex SHA-256, the lockfile's `CommitSha` (#153: the schema first took
+      40-hex only; `marketplace/v1.json` is regenerated, no version bump, as it only accepts more).
       Unique names are checked by the model, not by JSON Schema (as in the marketplace verifier).
     - **B, config.** `marketplaces`: an ordered list of 1 to 16 `https://` git URLs, highest
       priority first, default `["https://github.com/horae-dev/marketplace"]`; no duplicate.
@@ -3527,6 +3528,18 @@ loosened later without breaking a valid file.
       (`--offline`, `--pre`, `--json`, `-i`). Exit 0 ok; 1 configuration problem or no
       cache; 2 malformed reference; 3 unknown plugin or version, or conflict. They install
       nothing (#44).
+    - **C2, fetch environment, cache and concurrency (#153).** The git environment stays
+      allow-listed; a call that **reads a remote** (index clone/fetch, plugin `clone`, `fetch`,
+      `ls-remote`) also inherits exactly `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY` (and lowercase
+      forms), `SSL_CERT_FILE` and `SSL_CERT_DIR`, so a server behind a proxy or with its own CA
+      can fetch. A proxy must be an `http`, `https`, `socks5` or `socks5h` URL with a host and no
+      credentials; a CA path must be absolute and exist; otherwise the fetch fails with an error
+      that names the variable and never its value (an index then falls back to the cache, as for
+      any failed fetch). Protocol allow-list, no `ext::`, hooks off and the other variables are
+      unchanged with a proxy set. Every directory the client creates under the cache (and
+      `uv-cache`) is `0700`, ancestors included; one that already existed is not changed. Each
+      index clone is written under an exclusive `flock` on `<cache_dir>/<hash>.lock` (waiting
+      up to 150 s); past that, `LockBusy`: exit 5, kind `lock_busy`, as the `horae.lock` guard.
     - **H, trust.** An index is untrusted data ([security.md](../docs/security.md), B6): it can
       only point to a repository and a SHA. #44 re-verifies the tag and the SHA, #46 shows the
       permissions.
@@ -3544,7 +3557,9 @@ loosened later without breaking a valid file.
       <repo>`, then one `fetch -- <repo> <sha> +refs/tags/v<version>:refs/tags/v<version>`,
       so the tag is the remote's (a branch named like the tag cannot stand in for it). Only
       `https` (`GitRepoUrl`) is accepted, checked before git runs; the transport is a
-      constructor argument, never a setting (only tests pass `file`).
+      constructor argument, never a setting (only tests pass `file`). The `clone`, `fetch`
+      and `ls-remote` calls inherit the proxy and CA variables of decision 61 C2 and nothing
+      else; an install works in its own scratch directory, so it shares no clone to lock.
     - **B, verify.** `rev-parse <sha>^{commit}` must be the pinned SHA and
       `refs/tags/v<version>^{commit}` (an annotated tag dereferenced) the same commit, else the
       install is **refused**: a moved tag, a tampered index, or a SHA the repository does not

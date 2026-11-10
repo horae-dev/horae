@@ -74,6 +74,7 @@ from pathlib import Path
 from typing import Any
 
 from horae.contracts.plugin import PluginManifest
+from horae.marketplace.cachefs import make_private_dirs
 from horae.marketplace.errors import InstallError, InstallRefused
 from horae.marketplace.git import WATCH_INTERVAL_S, kill_session, tree_bytes
 from horae.plugins.host.env import BASE_PATH, VENV_DIR
@@ -286,7 +287,7 @@ class PluginEnvironment:
                 "(it is needed to install a plugin, not to run one)"
             )
         try:
-            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            make_private_dirs(self.cache_dir)
         except OSError as exc:
             raise InstallError(f"cannot write {self.cache_dir}: {exc.strerror}") from None
         baseline = tree_bytes(self.cache_dir)
