@@ -1,0 +1,3 @@
+# A plugin container's `pids` limit is 16 to 4096 (schemas decision 78 D).
+plugins:
+  github: { runtime: container, limits: { pids: 8 } }

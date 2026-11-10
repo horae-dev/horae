@@ -26,9 +26,15 @@ from typing import Any
 import pytest
 
 from horae.contracts import PluginManifest
-from horae.contracts.instance import DEFAULT_CONTAINER_IMAGE, ContainerConfig, PluginDefaults
+from horae.contracts.instance import (
+    DEFAULT_CONTAINER_IMAGE,
+    ContainerConfig,
+    ContainerLimits,
+    PluginDefaults,
+)
 from horae.plugins.host import HostRegistry, PluginCallError, PluginHost
 from horae.plugins.host.env import BASE_PATH, PLUGIN_KEYS, PROXY_KEYS
+from horae.plugins.host.mounts import MountPolicy
 from horae.secrets import SecretResolver
 from plugin_fixtures import lock_for, secrets_dir
 
@@ -36,8 +42,8 @@ pytestmark = pytest.mark.container
 
 JAIL_SERVER = Path(__file__).resolve().parent / "fixtures" / "plugins" / "jail" / "jail_server.py"
 TOKEN = "sentinel-value-for-jail-live"  # noqa: S105 (synthetic)
-TOOLS = ["env", "probe", "connect", "resolve", "tunnel", "fetch"]
-PLUGINS = ("jail", "jail-stubborn", "jail-open", "jail-egress")
+TOOLS = ["env", "probe", "connect", "resolve", "tunnel", "fetch", "fs", "plant", "fork", "hog"]
+PLUGINS = ("jail", "jail-stubborn", "jail-open", "jail-egress", "jail-mounts", "jail-limits")
 
 
 def _docker(*args: str, timeout: float = 120) -> subprocess.CompletedProcess[str]:
@@ -93,7 +99,10 @@ def plugin_dir(engine: None, tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 
 def _manifest(
-    name: str, mode: str = "normal", network: dict[str, list[str]] | None = None
+    name: str,
+    mode: str = "normal",
+    network: dict[str, list[str]] | None = None,
+    paths: dict[str, list[str]] | None = None,
 ) -> dict[str, Any]:
     command = ["python", "-m", "jail_server", mode, name]
     return {
@@ -101,7 +110,9 @@ def _manifest(
         "version": "0.1.0",
         "horae": ">=0",
         "provides": {"sources": [f"{name}.{tool}" for tool in TOOLS]},
-        "permissions": {"secrets": ["JAIL_TOKEN"]} | (network or {}),
+        "permissions": {"secrets": ["JAIL_TOKEN"]}
+        | (network or {})
+        | ({"paths": paths} if paths else {}),
         "runtime": {"protocol": "mcp-stdio", "command": command},
     }
 
@@ -113,19 +124,28 @@ def _host(
     mode: str = "normal",
     image: str | None = None,
     network: dict[str, list[str]] | None = None,
+    paths: dict[str, list[str]] | None = None,
+    mounts: MountPolicy | None = None,
+    limits: ContainerLimits | None = None,
 ) -> PluginHost:
-    manifest = _manifest(name, mode, network)
+    manifest = _manifest(name, mode, network, paths)
     registry = HostRegistry(
         lock_for(manifest), {name: PluginManifest.model_validate(manifest)}, {name: plugin_dir}
     )
     resolver = SecretResolver({}, secrets_dir(tmp_path, JAIL_TOKEN=TOKEN))
-    defaults = PluginDefaults(runtime="container", startup_timeout_s=120.0, call_timeout_s=60.0)
+    defaults = PluginDefaults(
+        runtime="container",
+        startup_timeout_s=120.0,
+        call_timeout_s=60.0,
+        limits=limits or ContainerLimits(),
+    )
     return PluginHost(
         registry,
         secrets=resolver,
         work_dir=tmp_path / "work",
         timeouts=lambda _name: defaults,
         container=ContainerConfig(image=image or DEFAULT_CONTAINER_IMAGE),
+        mounts=mounts,
     )
 
 
@@ -456,3 +476,154 @@ def test_a_sibling_run_cannot_use_another_runs_proxy(
     assert mine.data["status"] == "HTTP/1.1 200 Connection established", mine.data
     assert not stolen.data["status"], stolen.data  # dropped: no status line
     assert stolen.data["answer"] == ""
+
+
+# --- declared mounts and resource limits (#51, schemas decision 78) ------------------------------
+
+
+def _instance(tmp_path: Path) -> tuple[Path, MountPolicy]:
+    """A synthetic instance (real paths): a vault with an inbox, an undeclared directory, and
+    the instance's own controls."""
+    root = (tmp_path / "instance").resolve()
+    for directory in ("vault/inbox", "undeclared", "state", "plugins"):
+        (root / directory).mkdir(parents=True)
+    (root / "vault" / "note.md").write_text("vault note\n", encoding="utf-8")
+    (root / "undeclared" / "private.md").write_text("not for plugins\n", encoding="utf-8")
+    (root / "horae.lock").write_text("schema_version: 1\n", encoding="utf-8")
+    policy = MountPolicy.for_instance(
+        root, state_dir=root / "state", secrets_dir=tmp_path / "secrets", home=tmp_path / "home"
+    )
+    return root, policy
+
+
+def test_only_declared_paths_are_visible_and_each_behaves_as_declared(
+    tmp_path: Path, plugin_dir: Path
+) -> None:
+    root, policy = _instance(tmp_path)
+    vault, inbox = root / "vault", root / "vault" / "inbox"
+    name = "jail-mounts"
+    paths = {"read": [str(vault)], "write": [str(inbox)]}
+
+    async def go() -> dict[str, Any]:
+        async with _host(tmp_path, plugin_dir, name, paths=paths, mounts=policy) as h:
+
+            async def tool(tool: str, **params: Any) -> Any:
+                return (await h.call(f"{name}.{tool}", params, None)).data
+
+            seen = {
+                "undeclared": await tool("fs", path=str(root / "undeclared" / "private.md")),
+                "lock": await tool("fs", path=str(root / "horae.lock")),
+                "secrets": await tool("fs", path=str(tmp_path / "secrets")),
+                "vault": await tool("fs", path=str(vault)),
+                "note": await tool("fs", path=str(vault / "note.md")),
+                "inbox": await tool("fs", path=str(inbox)),
+                "planted": await tool("plant", path=str(inbox)),
+            }
+            listed = _docker("ps", "--quiet", "--filter", f"label=dev.horae.plugin={name}")
+            ids = listed.stdout.split()
+            assert len(ids) == 1, listed
+            seen["inspect"] = json.loads(_docker("inspect", ids[0]).stdout)[0]
+            seen["during"] = sorted(os.listdir(inbox))
+            return seen
+
+    seen = asyncio.run(go())
+    # Undeclared host paths do not exist in the container.
+    assert seen["undeclared"]["exists"] is False
+    assert seen["lock"]["exists"] is False
+    assert seen["secrets"]["exists"] is False
+    # Read-only: listed and read, never written.
+    assert "note.md" in seen["vault"]["listed"]
+    assert "Read-only file system" in seen["vault"]["writable"]
+    assert seen["note"]["read"] == "vault note\n"
+    assert "Read-only file system" in seen["note"]["writable"]
+    assert (vault / "note.md").read_text(encoding="utf-8") == "vault note\n"
+    # Writable, at the same path on both sides.
+    assert seen["inbox"]["writable"] is True
+    assert any(entry.startswith("jail-write-") for entry in os.listdir(inbox))
+    planted = seen["planted"]
+    assert planted["symlink"] is True
+    assert planted["fifo"] is True
+    assert "Operation not permitted" in planted["device"]  # no CAP_MKNOD
+    assert {"escape", "fifo", "inner"} <= set(seen["during"])
+    # Once the container is gone, what the host could trip over is undone.
+    assert not os.path.lexists(inbox / "escape")
+    assert not os.path.lexists(inbox / "fifo")
+    assert os.path.islink(inbox / "inner")
+    if planted["setuid"] is True:
+        assert not os.stat(inbox / "setuid").st_mode & 0o6000
+
+    data = seen["inspect"]
+    declared = [(m["Destination"], m["Source"], m["RW"]) for m in data["Mounts"]]
+    assert sorted(declared) == sorted(
+        [
+            ("/plugin", str(plugin_dir.resolve()), False),
+            (str(vault), str(vault), False),
+            (str(inbox), str(inbox), True),
+        ]
+    )
+    host = data["HostConfig"]
+    assert host["NanoCpus"] == 1_000_000_000
+    assert host["Memory"] == host["MemorySwap"] == 512 * 1024 * 1024
+    assert host["PidsLimit"] == 128
+    assert host["Ulimits"] == [{"Name": "nofile", "Hard": 1024, "Soft": 1024}]
+    assert host["AutoRemove"] is False  # inspected for OOMKilled, then removed
+    deadline = time.monotonic() + 30
+    while _docker("ps", "--all", "--quiet", "--filter", f"label=dev.horae.plugin={name}").stdout:
+        assert time.monotonic() < deadline, "the container outlived the run"
+        time.sleep(0.2)
+
+
+def test_an_unsafe_declared_path_means_the_plugin_does_not_start(
+    tmp_path: Path, plugin_dir: Path
+) -> None:
+    root, policy = _instance(tmp_path)
+    (root / "vault" / "link").symlink_to(root / "undeclared")
+    name = "jail-mounts"
+    paths = {"read": [str(root / "vault" / "link")]}
+
+    async def go() -> PluginCallError:
+        async with _host(tmp_path, plugin_dir, name, paths=paths, mounts=policy) as h:
+            with pytest.raises(PluginCallError) as info:
+                await h.call(f"{name}.env", {}, None)
+            return info.value
+
+    error = asyncio.run(go())
+    assert error.kind == "runtime_unavailable"
+    assert "symbolic link" in error.message
+    listed = _docker("ps", "--all", "--quiet", "--filter", f"label=dev.horae.plugin={name}")
+    assert not listed.stdout.strip()
+
+
+def test_the_pid_limit_holds_against_a_fork_loop(tmp_path: Path, plugin_dir: Path) -> None:
+    name = "jail-limits"
+    limits = ContainerLimits(pids=32)
+
+    async def go() -> Any:
+        async with _host(tmp_path, plugin_dir, name, limits=limits) as h:
+            forked = (await h.call(f"{name}.fork", {}, None)).data
+            alive = (await h.call(f"{name}.env", {}, None)).data  # still answers
+            return forked, alive
+
+    forked, alive = asyncio.run(go())
+    assert forked["forked"] < 32, forked
+    assert forked["error"] == "Resource temporarily unavailable"
+    assert "env" in alive
+
+
+def test_a_memory_limit_kill_is_reported_as_oom_killed(tmp_path: Path, plugin_dir: Path) -> None:
+    name = "jail-limits"
+    limits = ContainerLimits(memory_mb=64, tmp_mb=8)
+
+    async def go() -> PluginCallError:
+        async with _host(tmp_path, plugin_dir, name, limits=limits) as h:
+            with pytest.raises(PluginCallError) as info:
+                await h.call(f"{name}.hog", {"mb": 256}, None)
+            return info.value
+
+    error = asyncio.run(go())
+    assert error.kind == "oom_killed", error
+    assert "memory limit (64 MiB" in error.message
+    deadline = time.monotonic() + 30
+    while _docker("ps", "--all", "--quiet", "--filter", f"label=dev.horae.plugin={name}").stdout:
+        assert time.monotonic() < deadline, "the killed container was not removed"
+        time.sleep(0.2)

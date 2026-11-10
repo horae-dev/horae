@@ -18,6 +18,7 @@ its message.
 | `tool_missing` | the tool is not in the manifest's `provides` or not in `tools/list` |
 | `timeout` | the call took longer than its timeout; the process was killed |
 | `plugin_crashed` | the process exited (or closed stdout) while a call was in flight |
+| `oom_killed` | `runtime: container`: its memory limit killed it (during a call or its start) |
 | `plugin_unavailable` | the plugin failed earlier in the run and has used its one restart |
 | `protocol_error` | a JSON-RPC error response, or a message that is not JSON-RPC |
 | `output_too_large` | one stdout message was over `MAX_MESSAGE_BYTES`; the process was killed |
@@ -42,6 +43,7 @@ HostErrorKind = Literal[
     "tool_missing",
     "timeout",
     "plugin_crashed",
+    "oom_killed",
     "plugin_unavailable",
     "protocol_error",
     "output_too_large",

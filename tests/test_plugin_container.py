@@ -12,6 +12,7 @@ import itertools
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import time
@@ -22,7 +23,12 @@ import pytest
 from pydantic import ValidationError
 
 from horae.contracts import InstanceConfig
-from horae.contracts.instance import DEFAULT_CONTAINER_IMAGE, ContainerConfig, PluginDefaults
+from horae.contracts.instance import (
+    DEFAULT_CONTAINER_IMAGE,
+    ContainerConfig,
+    ContainerLimits,
+    PluginDefaults,
+)
 from horae.plugins.host import PluginCallError, PluginHost
 from horae.plugins.host.container import (
     ENGINE_ENV_KEYS,
@@ -39,7 +45,9 @@ from horae.plugins.host.container import (
     network_problem,
     preamble,
     run_argv,
+    tmpfs_option,
 )
+from horae.plugins.host.mounts import MountPolicy
 from horae.secrets import Secret, SecretResolver
 from plugin_fixtures import COMMIT, RAW_SERVER, lock_for, secrets_dir
 
@@ -86,8 +94,9 @@ def test_every_hardening_flag_is_present() -> None:
     image_at = argv.index(DEFAULT_CONTAINER_IMAGE)
     options, after = argv[:image_at], argv[image_at + 1 :]
     assert options[:2] == ["/usr/bin/docker", "run"]
-    for flag in ("--interactive", "--rm", "--init", "--read-only"):
+    for flag in ("--interactive", "--init", "--read-only"):
         assert flag in options
+    assert "--rm" not in options  # inspected for OOMKilled, then removed (decision 78 E)
     pairs = _pairs(options)
     for pair in [
         ("--cap-drop", "ALL"),
@@ -142,7 +151,7 @@ def test_nothing_widens_the_container() -> None:
     assert options.count("--security-opt") == 1
 
 
-def test_the_only_mount_is_the_plugin_directory_read_only() -> None:
+def test_without_declared_paths_the_only_mount_is_the_plugin_directory_read_only() -> None:
     options = _argv()[: _argv().index(DEFAULT_CONTAINER_IMAGE)]
     mounts = [value for flag, value in _pairs(options) if flag == "--mount"]
     assert mounts == ["type=bind,source=/srv/instance/plugins/jail,target=/plugin,readonly"]
@@ -503,12 +512,38 @@ if args[:2] == ["network", "create"]:
 if args[:2] == ["context", "inspect"]:
     print(fake["endpoint"])
     sys.exit(0)
+if args[:2] == ["container", "inspect"] and ".Mounts" in args[3]:
+    if fake["mounts"] is not None:
+        print(json.dumps(fake["mounts"]))
+        sys.exit(0)
+    run = json.load(open(os.path.join(config_dir, "run.json")))
+    mounts = []
+    for flag, value in zip(run, run[1:]):
+        if flag == "--mount":
+            fields = dict(part.partition("=")[::2] for part in value.split(","))
+            mounts.append(
+                {
+                    "Type": "bind",
+                    "Source": fields["source"],
+                    "Destination": fields["target"],
+                    "RW": "readonly" not in fields,
+                }
+            )
+    print(json.dumps(mounts))
+    sys.exit(0)
+if args[:2] == ["container", "inspect"] and "OOMKilled" in args[3]:
+    print("true" if fake["oom"] else "false")
+    sys.exit(0)
 if args[:2] == ["container", "inspect"] and "NetworkSettings" in args[3]:
     print(json.dumps(fake["proxy_networks"]))
     sys.exit(0)
 if args[:2] == ["container", "inspect"]:
     for container in args[4:]:
         print(json.dumps(fake["labels"][container]))
+    sys.exit(0)
+if args[:1] == ["ps"]:
+    status = next(a for a in args if a.startswith("status=")).split("=", 1)[1]
+    print("\\n".join(fake["leftovers"].get(status, [])))
     sys.exit(0)
 if args[:1] == ["rm"]:
     sys.exit(0)
@@ -536,7 +571,9 @@ if args[:1] == ["run"]:
         line += byte
     with open(os.path.join(config_dir, "preamble.json"), "wb") as handle:
         handle.write(bytes(line))
-    os.execv(sys.executable, [sys.executable, fake["server"], "normal"])
+    with open(os.path.join(config_dir, "run.json"), "w") as handle:
+        handle.write(json.dumps(args))
+    os.execv(sys.executable, [sys.executable, fake["server"], fake["mode"]])
 sys.exit(2)
 """
 
@@ -555,6 +592,10 @@ def _fake_docker(tmp_path: Path, **fake: Any) -> tuple[Path, Path]:
         "proxy": "ok",
         "admit": True,
         "blocked": [],
+        "oom": False,
+        "mounts": None,
+        "leftovers": {},
+        "mode": "normal",
         "proxy_networks": {
             f"horae-plugin-{name}": {"IPAddress": "192.168.155.2"} for name in ("raw", "jail")
         }
@@ -575,13 +616,15 @@ def _calls(state: Path) -> list[list[str]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 
-def _manifest(command: list[str] | None = None) -> dict[str, Any]:
+def _manifest(
+    command: list[str] | None = None, paths: dict[str, list[str]] | None = None
+) -> dict[str, Any]:
     return {
         "name": "raw",
         "version": "0.1.0",
         "horae": ">=0",
-        "provides": {"sources": ["raw.ok", "raw.rpc_error"]},
-        "permissions": {"secrets": ["JAIL_TOKEN"]},
+        "provides": {"sources": ["raw.ok", "raw.rpc_error", "raw.close"]},
+        "permissions": {"secrets": ["JAIL_TOKEN"]} | ({"paths": paths} if paths else {}),
         "runtime": {"protocol": "mcp-stdio", "command": command or ["python", "-m", "raw"]},
     }
 
@@ -595,11 +638,14 @@ def _host(
     uid: int | None = None,
     runtime: str = "container",
     environ: dict[str, str] | None = None,
+    paths: dict[str, list[str]] | None = None,
+    mounts: MountPolicy | None = None,
+    limits: ContainerLimits | None = None,
 ) -> PluginHost:
     from horae.contracts import PluginManifest
     from horae.plugins.host import HostRegistry
 
-    manifest = _manifest()
+    manifest = _manifest(paths=paths)
     lock = lock_for(manifest)
     registry = HostRegistry(lock, {"raw": PluginManifest.model_validate(manifest)}, {"raw": plugin})
     resolver = SecretResolver({}, secrets_dir(tmp_path, JAIL_TOKEN=TOKEN))
@@ -608,11 +654,17 @@ def _host(
         registry,
         secrets=resolver,
         work_dir=tmp_path / "work",
-        timeouts=lambda _name: PluginDefaults(runtime=runtime, startup_timeout_s=30.0),  # type: ignore[arg-type]
+        timeouts=lambda _name: PluginDefaults(
+            runtime=runtime,  # type: ignore[arg-type]
+            startup_timeout_s=30.0,
+            limits=limits or ContainerLimits(),
+        ),
         container=config,
     )
     engine = {} if state is None else {"DOCKER_CONFIG": str(state)}
-    h._containers = ContainerRuntime(config, uid=uid, environ=engine | (environ or {}))
+    h._containers = ContainerRuntime(
+        config, mounts=mounts, uid=uid, environ=engine | (environ or {})
+    )
     return h
 
 
@@ -1128,3 +1180,352 @@ def test_a_proxy_that_cannot_be_bound_to_the_plugin_means_no_plugin(tmp_path: Pa
     runs = [call for call in _calls(state) if call[0] == "run"]
     for started in runs:  # the plugin and its proxy are both removed
         assert ["rm", "--force", started[started.index("--name") + 1]] in _calls(state)
+
+
+# --- declared mounts, limits and out-of-memory kills (#51, schemas decision 78) ----------------
+
+
+def _instance(tmp_path: Path) -> tuple[Path, MountPolicy]:
+    root = (tmp_path / "instance").resolve()
+    for name in ("vault/inbox", "state", "secrets", "plugins"):
+        (root / name).mkdir(parents=True)
+    policy = MountPolicy.for_instance(
+        root, state_dir=root / "state", secrets_dir=root / "secrets", home=tmp_path / "home"
+    )
+    return root, policy
+
+
+def test_declared_paths_and_limits_reach_the_run_command(tmp_path: Path) -> None:
+    plugin = _plugin_dir(tmp_path)
+    cli, state = _fake_docker(tmp_path)
+    root, policy = _instance(tmp_path)
+    vault, inbox = str(root / "vault"), str(root / "vault" / "inbox")
+    limits = ContainerLimits(cpus=0.5, memory_mb=256, pids=64, tmp_mb=16, nofile=512)
+
+    async def go() -> Any:
+        async with _host(
+            tmp_path,
+            plugin,
+            docker=cli,
+            state=state,
+            paths={"read": [vault], "write": [inbox]},
+            mounts=policy,
+            limits=limits,
+        ) as h:
+            return await h.call("raw.ok", {}, None)
+
+    assert asyncio.run(go()).data == {"ok": True}
+    run = json.loads((state / "run.json").read_text(encoding="utf-8"))
+    mounts = [value for flag, value in _pairs(run) if flag == "--mount"]
+    assert mounts[1:] == [
+        f"type=bind,source={vault},target={vault},bind-recursive=disabled,readonly",
+        f"type=bind,source={inbox},target={inbox},bind-recursive=disabled",
+    ]
+    for flag in (
+        "--cpus=0.5",
+        "--memory=256m",
+        "--memory-swap=256m",
+        "--pids-limit=64",
+        "--ulimit=nofile=512:512",
+    ):
+        assert flag in run
+    assert ("--tmpfs", tmpfs_option(16)) in _pairs(run)
+    assert "size=16m" in tmpfs_option(16)
+
+
+def test_a_path_that_cannot_be_mounted_means_no_plugin_and_no_proxy(tmp_path: Path) -> None:
+    plugin = _plugin_dir(tmp_path)
+    cli, state = _fake_docker(tmp_path)
+    root, policy = _instance(tmp_path)
+    error = _first_error(
+        tmp_path,
+        plugin,
+        docker=cli,
+        state=state,
+        paths={"read": [str(root / "state")]},
+        mounts=policy,
+    )
+    assert error.kind == "runtime_unavailable"
+    assert "cannot be mounted" in error.message
+    assert not any(call[0] == "run" for call in _calls(state))
+
+
+def test_without_an_instance_a_declared_path_is_refused(tmp_path: Path) -> None:
+    plugin = _plugin_dir(tmp_path)
+    cli, state = _fake_docker(tmp_path)
+    root, _ = _instance(tmp_path)
+    error = _first_error(
+        tmp_path, plugin, docker=cli, state=state, paths={"read": [str(root / "vault")]}
+    )
+    assert error.kind == "runtime_unavailable"
+    assert "no instance" in error.message
+    assert not any(call[0] == "run" for call in _calls(state))
+
+
+def test_a_memory_kill_during_a_call_is_reported_as_oom_killed(tmp_path: Path) -> None:
+    plugin = _plugin_dir(tmp_path)
+    cli, state = _fake_docker(tmp_path, oom=True)
+
+    async def go() -> PluginCallError:
+        async with _host(tmp_path, plugin, docker=cli, state=state) as h:
+            with pytest.raises(PluginCallError) as info:
+                await h.call("raw.close", {}, None)
+            return info.value
+
+    error = asyncio.run(go())
+    assert error.kind == "oom_killed"
+    assert "memory limit (512 MiB" in error.message
+    calls = _calls(state)
+    inspect = next(i for i, call in enumerate(calls) if "{{json .State.OOMKilled}}" in call)
+    run = next(call for call in calls if call[0] == "run" and "dev.horae.plugin=raw" in call)
+    name = run[run.index("--name") + 1]
+    assert calls.index(["rm", "--force", name]) > inspect  # inspected before it is removed
+
+
+def test_a_crash_without_a_memory_kill_stays_a_crash(tmp_path: Path) -> None:
+    plugin = _plugin_dir(tmp_path)
+    cli, state = _fake_docker(tmp_path)
+
+    async def go() -> PluginCallError:
+        async with _host(tmp_path, plugin, docker=cli, state=state) as h:
+            with pytest.raises(PluginCallError) as info:
+                await h.call("raw.close", {}, None)
+            return info.value
+
+    assert asyncio.run(go()).kind == "plugin_crashed"
+
+
+def test_a_memory_kill_during_the_start_is_reported_as_oom_killed(tmp_path: Path) -> None:
+    plugin = _plugin_dir(tmp_path)
+    cli, state = _fake_docker(tmp_path, oom=True, mode="exit")
+    error = _first_error(tmp_path, plugin, docker=cli, state=state)
+    assert error.kind == "oom_killed"
+
+
+def test_a_container_whose_mounts_are_not_the_checked_ones_is_stopped(tmp_path: Path) -> None:
+    plugin = _plugin_dir(tmp_path)
+    root, policy = _instance(tmp_path)
+    vault = str(root / "vault")
+    swapped = [
+        {"Type": "bind", "Source": str(plugin), "Destination": "/plugin", "RW": False},
+        {"Type": "bind", "Source": str(root / "state"), "Destination": vault, "RW": False},
+    ]
+    cli, state = _fake_docker(tmp_path, mounts=swapped)
+    error = _first_error(
+        tmp_path, plugin, docker=cli, state=state, paths={"read": [vault]}, mounts=policy
+    )
+    assert error.kind == "runtime_unavailable"
+    assert "not mounted from itself" in error.message
+    assert not (state / "proxy-stdin").exists()  # never admitted: no egress at all
+
+
+def test_a_path_inside_another_container_plugins_writable_path_is_refused(
+    tmp_path: Path,
+) -> None:
+    from horae.contracts import PluginManifest
+    from horae.plugins.host import HostRegistry
+
+    plugin = _plugin_dir(tmp_path)
+    cli, state = _fake_docker(tmp_path)
+    root, policy = _instance(tmp_path)
+    raw = _manifest(paths={"read": [str(root / "vault" / "inbox")]})
+    writer = {
+        "name": "writer",
+        "version": "0.1.0",
+        "horae": ">=0",
+        "provides": {"sources": ["writer.ok"]},
+        "permissions": {"paths": {"write": [str(root / "vault")]}},
+        "runtime": {"protocol": "mcp-stdio", "command": ["python", "-m", "writer"]},
+    }
+    models = {
+        name: PluginManifest.model_validate(m) for name, m in (("raw", raw), ("writer", writer))
+    }
+    registry = HostRegistry(lock_for(raw, writer), models, {"raw": plugin, "writer": plugin})
+
+    def run(writer_runtime: str) -> Any:
+        def timeouts(name: str) -> PluginDefaults:
+            runtime = writer_runtime if name == "writer" else "container"
+            return PluginDefaults(runtime=runtime, startup_timeout_s=30.0)  # type: ignore[arg-type]
+
+        h = PluginHost(
+            registry,
+            secrets=SecretResolver({}, secrets_dir(tmp_path, JAIL_TOKEN=TOKEN)),
+            work_dir=tmp_path / "work",
+            timeouts=timeouts,
+        )
+        h._containers = ContainerRuntime(
+            ContainerConfig(docker=str(cli)), mounts=policy, environ={"DOCKER_CONFIG": str(state)}
+        )
+
+        async def go() -> Any:
+            async with h:
+                try:
+                    return await h.call("raw.ok", {}, None)
+                except PluginCallError as error:
+                    return error
+
+        return asyncio.run(go())
+
+    refused = run("container")
+    assert isinstance(refused, PluginCallError)
+    assert "which plugin writer may write" in refused.message
+    # A process-runtime writer is unconfined anyway (T04): sharing the vault is allowed.
+    assert run("process").data == {"ok": True}
+
+
+def test_a_failed_sweep_quarantines_the_plugin_until_the_operator_clears_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from horae.plugins.host import mounts as mounts_module
+
+    plugin = _plugin_dir(tmp_path)
+    cli, state = _fake_docker(tmp_path)
+    root, policy = _instance(tmp_path)
+    inbox = str(root / "vault" / "inbox")
+    monkeypatch.setattr(mounts_module, "NEW_LIMIT", 0)
+    monkeypatch.setattr(mounts_module, "CTIME_SLACK_S", 0.05)  # coarse kernel timestamps
+
+    async def go() -> Any:
+        async with _host(
+            tmp_path, plugin, docker=cli, state=state, paths={"write": [inbox]}, mounts=policy
+        ) as h:
+            first = await h.call("raw.ok", {}, None)
+            (Path(inbox) / "new.md").write_text("x", encoding="utf-8")  # as if by the plugin
+            return first
+
+    assert asyncio.run(go()).data == {"ok": True}
+    marker = root / "state" / "quarantine" / "raw"
+    assert "more than 0 new entries" in marker.read_text(encoding="utf-8")
+    assert stat.S_IMODE(marker.stat().st_mode) == 0o600
+    runs = len([c for c in _calls(state) if c[0] == "run"])
+    error = _first_error(
+        tmp_path, plugin, docker=cli, state=state, paths={"write": [inbox]}, mounts=policy
+    )
+    assert error.kind == "runtime_unavailable"
+    assert "quarantined" in error.message
+    assert len([c for c in _calls(state) if c[0] == "run"]) == runs  # nothing started
+    marker.unlink()  # the operator checked the paths
+    monkeypatch.setattr(mounts_module, "NEW_LIMIT", 100)
+
+    async def again() -> Any:
+        async with _host(
+            tmp_path, plugin, docker=cli, state=state, paths={"write": [inbox]}, mounts=policy
+        ) as h:
+            return await h.call("raw.ok", {}, None)
+
+    assert asyncio.run(again()).data == {"ok": True}
+
+
+def test_leftover_stopped_containers_of_the_plugin_are_removed_never_running_ones(
+    tmp_path: Path,
+) -> None:
+    plugin = _plugin_dir(tmp_path)
+    cli, state = _fake_docker(tmp_path, leftovers={"exited": ["0123abcd"], "dead": ["4567ef01"]})
+
+    async def go() -> Any:
+        async with _host(tmp_path, plugin, docker=cli, state=state) as h:
+            return await h.call("raw.ok", {}, None)
+
+    assert asyncio.run(go()).data == {"ok": True}
+    calls = _calls(state)
+    listed = [call for call in calls if call[:1] == ["ps"]]
+    assert {next(a for a in call if a.startswith("status=")) for call in listed} == {
+        "status=exited",
+        "status=dead",
+    }
+    assert all("label=dev.horae.plugin=raw" in call for call in listed)
+    assert ["rm", "0123abcd", "4567ef01"] in calls  # no --force: a running one would refuse
+    assert not any(call[:1] == ["ps"] and "status=running" in call for call in calls)
+
+
+def test_a_run_whose_sweep_never_ran_quarantines_the_plugin(tmp_path: Path) -> None:
+    plugin = _plugin_dir(tmp_path)
+    cli, state = _fake_docker(tmp_path)
+    root, policy = _instance(tmp_path)
+    inbox = str(root / "vault" / "inbox")
+    (root / "state" / "quarantine").mkdir()
+    (root / "state" / "quarantine" / "raw.pending").touch()  # a Horae killed mid-run
+    error = _first_error(
+        tmp_path, plugin, docker=cli, state=state, paths={"write": [inbox]}, mounts=policy
+    )
+    assert error.kind == "runtime_unavailable"
+    assert "ended before its writable paths were checked" in error.message
+    assert not any(call[0] == "run" for call in _calls(state))
+
+
+def test_a_clean_sweep_removes_the_pending_marker(tmp_path: Path) -> None:
+    plugin = _plugin_dir(tmp_path)
+    cli, state = _fake_docker(tmp_path)
+    root, policy = _instance(tmp_path)
+    inbox = str(root / "vault" / "inbox")
+    pending = root / "state" / "quarantine" / "raw.pending"
+    seen: list[bool] = []
+
+    async def go() -> Any:
+        async with _host(
+            tmp_path, plugin, docker=cli, state=state, paths={"write": [inbox]}, mounts=policy
+        ) as h:
+            result = await h.call("raw.ok", {}, None)
+            seen.append(pending.exists())  # while it runs
+            return result
+
+    assert asyncio.run(go()).data == {"ok": True}
+    assert seen == [True]
+    assert not pending.exists()
+
+
+def test_a_quarantine_that_cannot_be_written_keeps_the_pending_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from horae.plugins.host import mounts as mounts_module
+
+    plugin = _plugin_dir(tmp_path)
+    cli, state = _fake_docker(tmp_path)
+    root, policy = _instance(tmp_path)
+    inbox = str(root / "vault" / "inbox")
+    quarantine = root / "state" / "quarantine"
+    monkeypatch.setattr(mounts_module, "NEW_LIMIT", -1)  # every sweep fails
+
+    async def go() -> Any:
+        async with _host(
+            tmp_path, plugin, docker=cli, state=state, paths={"write": [inbox]}, mounts=policy
+        ) as h:
+            first = await h.call("raw.ok", {}, None)
+            quarantine.chmod(0o500)  # its quarantine file cannot be written now
+            return first
+
+    try:
+        assert asyncio.run(go()).data == {"ok": True}
+    finally:
+        quarantine.chmod(0o700)
+    assert not (quarantine / "raw").exists()
+    assert (root / "state" / "quarantine" / "raw.pending").exists()
+    error = _first_error(
+        tmp_path, plugin, docker=cli, state=state, paths={"write": [inbox]}, mounts=policy
+    )
+    assert "ended before its writable paths were checked" in error.message
+
+
+def test_a_quarantine_written_while_waiting_for_the_run_lock_is_seen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from horae.plugins.host import mounts as mounts_module
+
+    plugin = _plugin_dir(tmp_path)
+    cli, state = _fake_docker(tmp_path)
+    root, policy = _instance(tmp_path)
+    inbox = str(root / "vault" / "inbox")
+    real_lock = mounts_module.lock_plugin
+
+    def lock_after_a_concurrent_quarantine(name: str, guard: MountPolicy | None) -> int:
+        # Another run of the plugin quarantines it between the first check and the lock.
+        assert mounts_module.quarantine(name, guard, ["a concurrent run's sweep failed"])
+        return real_lock(name, guard)
+
+    monkeypatch.setattr(mounts_module, "lock_plugin", lock_after_a_concurrent_quarantine)
+    error = _first_error(
+        tmp_path, plugin, docker=cli, state=state, paths={"write": [inbox]}, mounts=policy
+    )
+    assert error.kind == "runtime_unavailable"
+    assert "quarantined" in error.message
+    assert not any(call[0] == "run" for call in _calls(state))

@@ -16,7 +16,14 @@ and run with `runtime: container`. `python -m jail_server [<mode> [<prefix>]]`; 
   established, `GET /` through the tunnel; returns the proxy's status line and the answer's
   first bytes;
 - `jail.fetch` (`url`): a plain `urllib` request, which uses `HTTP_PROXY` from the
-  environment as any standard client does; returns the HTTP status.
+  environment as any standard client does; returns the HTTP status;
+- `jail.fs` (`path`, #51): whether `path` exists, can be listed or read, and whether a new file
+  can be written in it (a directory) or appended to (a file);
+- `jail.plant` (`path`): in the directory `path`, a symbolic link to `/etc/passwd`, a FIFO, a
+  set-user-ID file and a device node, each attempted; what succeeded;
+- `jail.fork`: forks children that sleep until it has forked 1000 or `fork` fails; the count
+  and the error;
+- `jail.hog` (`mb`): allocates and touches `mb` MiB (a memory limit kills it first).
 
 Synthetic names and documentation addresses only.
 """
@@ -32,7 +39,7 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
-TOOLS = ["env", "probe", "connect", "resolve", "tunnel", "fetch"]
+TOOLS = ["env", "probe", "connect", "resolve", "tunnel", "fetch", "fs", "plant", "fork", "hog"]
 PREFIX = sys.argv[2] if len(sys.argv) > 2 else "jail"
 
 
@@ -152,6 +159,82 @@ def fetch(url: str) -> dict[str, Any]:
         return {"status": None, "error": str(error)}
 
 
+def fs(path: str) -> dict[str, Any]:
+    seen: dict[str, Any] = {"exists": os.path.lexists(path), "listed": None, "read": False}
+    try:
+        seen["listed"] = sorted(os.listdir(path)) if os.path.isdir(path) else None
+    except OSError as error:
+        seen["listed"] = str(error)
+    if os.path.isfile(path):
+        try:
+            with open(path, "rb") as handle:
+                seen["read"] = handle.read(64).decode("utf-8", errors="replace")
+        except OSError as error:
+            seen["read"] = str(error)
+    target = os.path.join(path, f"jail-write-{os.getpid()}") if os.path.isdir(path) else path
+    try:
+        with open(target, "a", encoding="ascii") as handle:
+            handle.write("x")
+        seen["writable"] = True
+    except OSError as error:
+        seen["writable"] = str(error)
+    return seen
+
+
+def plant(path: str) -> dict[str, Any]:
+    done: dict[str, Any] = {}
+
+    def attempt(name: str, action: Any) -> None:
+        try:
+            action()
+            done[name] = True
+        except OSError as error:
+            done[name] = str(error)
+
+    attempt("symlink", lambda: os.symlink("/etc/passwd", os.path.join(path, "escape")))
+    attempt("inner_symlink", lambda: os.symlink("note.md", os.path.join(path, "inner")))
+    attempt("fifo", lambda: os.mkfifo(os.path.join(path, "fifo")))
+    setuid = os.path.join(path, "setuid")
+
+    def make_setuid() -> None:
+        with open(setuid, "w", encoding="ascii") as handle:
+            handle.write("#!/bin/sh\n")
+        os.chmod(setuid, 0o4755)  # noqa: S103 (what a malicious plugin would do)
+        if not os.stat(setuid).st_mode & 0o4000:
+            raise OSError(0, "the bit did not stick")
+
+    attempt("setuid", make_setuid)
+    attempt(
+        "device", lambda: os.mknod(os.path.join(path, "null"), 0o600 | 0o020000, os.makedev(1, 3))
+    )
+    return done
+
+
+def fork() -> dict[str, Any]:
+    children: list[int] = []
+    error = None
+    try:
+        while len(children) < 1000:
+            pid = os.fork()
+            if pid == 0:
+                time.sleep(30)
+                os._exit(0)
+            children.append(pid)
+    except OSError as failure:
+        error = failure.strerror
+    for pid in children:
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+    return {"forked": len(children), "error": error}
+
+
+def hog(mb: int) -> dict[str, Any]:
+    held = [bytearray(1024 * 1024) for _ in range(mb)]
+    for block in held:
+        block[::4096] = b"x" * len(block[::4096])
+    return {"held_mb": len(held)}
+
+
 def call(request_id: Any, name: str, arguments: dict[str, Any]) -> None:
     name = name.removeprefix(PREFIX + ".")
     if name == "env":
@@ -166,6 +249,14 @@ def call(request_id: Any, name: str, arguments: dict[str, Any]) -> None:
         result(request_id, tunnel(arguments["host"], int(arguments["port"]), arguments.get("via")))
     elif name == "fetch":
         result(request_id, fetch(arguments["url"]))
+    elif name == "fs":
+        result(request_id, fs(arguments["path"]))
+    elif name == "plant":
+        result(request_id, plant(arguments["path"]))
+    elif name == "fork":
+        result(request_id, fork())
+    elif name == "hog":
+        result(request_id, hog(int(arguments["mb"])))
 
 
 def main(mode: str) -> None:

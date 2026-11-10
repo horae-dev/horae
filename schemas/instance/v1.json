@@ -87,9 +87,154 @@
           "default": null,
           "description": "The Docker CLI, as an absolute path. When omitted, `docker` on\n`/usr/local/bin:/usr/bin:/bin`.",
           "title": "Docker"
+        },
+        "mount_roots": {
+          "description": "Directories, besides the instance's own, under which a container plugin's declared\n`permissions.paths` may be mounted (schemas decision 78 B), e.g. a vault kept outside the\ninstance. A declared path elsewhere is refused (`runtime_unavailable`).",
+          "items": {
+            "maxLength": 1024,
+            "not": {
+              "pattern": "/\\.\\.?(/|$)"
+            },
+            "pattern": "^(/[^/\\\\\\x00-\\x1f\\x7f]{1,255})+$",
+            "type": "string"
+          },
+          "maxItems": 256,
+          "title": "Mount Roots",
+          "type": "array"
         }
       },
       "title": "ContainerConfig",
+      "type": "object"
+    },
+    "ContainerLimits": {
+      "additionalProperties": false,
+      "description": "The resource limits of a plugin container (schemas decision 78 D). The defaults suit a\n4-core / 16 GB home server running a handful of plugins at once.",
+      "properties": {
+        "cpus": {
+          "default": 1.0,
+          "description": "CPUs (`--cpus`): a plugin never takes more than this share of the host.",
+          "maximum": 64.0,
+          "minimum": 0.1,
+          "title": "Cpus",
+          "type": "number"
+        },
+        "memory_mb": {
+          "default": 512,
+          "description": "Memory in MiB (`--memory`, `--memory-swap` equal: no swap). Past it the kernel kills the\nplugin, reported as `oom_killed`. The `/tmp` tmpfs counts against it.",
+          "maximum": 65536,
+          "minimum": 64,
+          "title": "Memory Mb",
+          "type": "integer"
+        },
+        "pids": {
+          "default": 128,
+          "description": "Processes and threads (`--pids-limit`): a fork loop fails instead of filling the host.",
+          "maximum": 4096,
+          "minimum": 16,
+          "title": "Pids",
+          "type": "integer"
+        },
+        "tmp_mb": {
+          "default": 64,
+          "description": "Size of the `/tmp` tmpfs in MiB, the container's only scratch space. Less than\n`memory_mb`.",
+          "maximum": 1024,
+          "minimum": 1,
+          "title": "Tmp Mb",
+          "type": "integer"
+        },
+        "nofile": {
+          "default": 1024,
+          "description": "Open files per process (`--ulimit nofile`, soft and hard).",
+          "maximum": 65536,
+          "minimum": 64,
+          "title": "Nofile",
+          "type": "integer"
+        }
+      },
+      "title": "ContainerLimits",
+      "type": "object"
+    },
+    "ContainerLimitsOverride": {
+      "additionalProperties": false,
+      "description": "A plugin's own limits: each field set wins over `plugin_defaults.limits`.",
+      "properties": {
+        "cpus": {
+          "anyOf": [
+            {
+              "maximum": 64.0,
+              "minimum": 0.1,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "CPUs (`--cpus`), 0.1 to 64.",
+          "title": "Cpus"
+        },
+        "memory_mb": {
+          "anyOf": [
+            {
+              "maximum": 65536,
+              "minimum": 64,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Memory in MiB (`--memory`, no swap), 64 to 65 536.",
+          "title": "Memory Mb"
+        },
+        "pids": {
+          "anyOf": [
+            {
+              "maximum": 4096,
+              "minimum": 16,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Processes and threads (`--pids-limit`), 16 to 4096.",
+          "title": "Pids"
+        },
+        "tmp_mb": {
+          "anyOf": [
+            {
+              "maximum": 1024,
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Size of the `/tmp` tmpfs in MiB, 1 to 1024 (less than the effective `memory_mb`).",
+          "title": "Tmp Mb"
+        },
+        "nofile": {
+          "anyOf": [
+            {
+              "maximum": 65536,
+              "minimum": 64,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Open files per process (`--ulimit nofile`), 64 to 65 536.",
+          "title": "Nofile"
+        }
+      },
+      "title": "ContainerLimitsOverride",
       "type": "object"
     },
     "DailyBudget": {
@@ -593,7 +738,7 @@
     },
     "PluginDefaults": {
       "additionalProperties": false,
-      "description": "Timeouts and runtime for every plugin without its own setting (the #24 plugin host reads\nthem).",
+      "description": "Timeouts, runtime and container limits for every plugin without its own setting (the\n#24 plugin host reads them).",
       "properties": {
         "startup_timeout_s": {
           "default": 10.0,
@@ -620,6 +765,10 @@
           ],
           "title": "Runtime",
           "type": "string"
+        },
+        "limits": {
+          "$ref": "#/$defs/ContainerLimits",
+          "description": "CPU, memory, PID, `/tmp` and open-file limits of `runtime: container` (schemas decision\n78 D); the process runtime has none."
         }
       },
       "title": "PluginDefaults",
@@ -675,6 +824,18 @@
           "default": null,
           "description": "`process` or `container`. When omitted, `plugin_defaults.runtime` applies.",
           "title": "Runtime"
+        },
+        "limits": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ContainerLimitsOverride"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Container limits of this plugin; each field omitted takes `plugin_defaults.limits`'."
         }
       },
       "title": "PluginSettings",

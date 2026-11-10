@@ -6,11 +6,17 @@ operator guide. A plugin whose effective `runtime` (`horae.yaml`: `plugins.<name
 `plugin_defaults.runtime`) is `container` is started by `ContainerRuntime.spawn`, which returns
 the same `Spawn` the process runtime builds, only for the Docker CLI:
 
-- `docker run --interactive --rm --init` (`run_argv`), as Horae's own non-root uid and gid, with
+- `docker run --interactive --init` (`run_argv`), as Horae's own non-root uid and gid, with
   a read-only root filesystem, every capability dropped, `no-new-privileges`, Docker's default
   seccomp profile (never overridden), a `noexec` tmpfs on `/tmp`, no log kept by the daemon,
-  nothing pulled, and **only the plugin's directory** (its tree and its `.venv`) bind-mounted
-  read-only at `/plugin`;
+  nothing pulled, the plugin's directory (its tree and its `.venv`) bind-mounted read-only at
+  `/plugin`, and **only its declared paths** besides (`horae.plugins.host.mounts`, #51,
+  decision 78): each locked `permissions.paths` entry at the same path, read-only unless
+  declared writable, after checks that refuse the plugin when one cannot be mounted safely;
+- within its CPU, memory (no swap), PID, `/tmp` and open-file limits (`plugin_defaults.limits`,
+  `plugins.<name>.limits`); a plugin the memory limit kills fails its call with `oom_killed`
+  (`docker inspect`'s `.State.OOMKilled`), so the container is not `--rm`: it is removed once
+  inspected;
 - on the plugin's own network, `horae-plugin-<name>` (`network_name`): `--internal` and no host
   address on the bridge (`inhibit_ipv4`), so the plugin reaches nothing, the host's services
   included, but **its own egress proxy** (`horae.plugins.host.egress`, #50, decision 76), the
@@ -26,13 +32,15 @@ the same `Spawn` the process runtime builds, only for the Docker CLI:
   byte by byte before it `execve`s the plugin command with exactly that environment;
 - the command runs from the plugin's venv only (`container_command`), and the venv must be one
   the image's interpreter can run (`check_venv`);
-- once the CLI is gone, `docker rm --force` removes the container whatever the plugin did.
+- once the CLI is gone, `docker rm --force` removes the container whatever the plugin did; then
+  `mounts.sweep` undoes what it left in its writable paths that the host could trip over.
 
 **Fail closed**: whatever is missing (the CLI, the daemon, the image, the network, the venv) is a
 `runtime_unavailable` error; the host never falls back to the process runtime.
 """
 
 import json
+import logging
 import os
 import re
 import secrets
@@ -44,11 +52,12 @@ from pathlib import Path
 
 import anyio
 
-from horae.contracts.instance import ContainerConfig
-from horae.plugins.host import egress
+from horae.contracts.instance import DEFAULT_TMP_MB, ContainerConfig, ContainerLimits
+from horae.plugins.host import egress, mounts
 from horae.plugins.host.egress_proxy import LISTEN_PORT
 from horae.plugins.host.env import BASE_PATH, VENV_DIR, build_env
-from horae.plugins.host.errors import PluginCallError
+from horae.plugins.host.errors import HostErrorKind, PluginCallError
+from horae.plugins.host.mounts import UNSAFE_MOUNT, Mount, MountPolicy
 from horae.plugins.host.session import Spawn
 from horae.secrets import Secret
 
@@ -65,8 +74,16 @@ CONTAINER_TMP = "/tmp"  # noqa: S108
 CONTAINER_HOME = f"{CONTAINER_TMP}/home"
 CONTAINER_TMPDIR = f"{CONTAINER_TMP}/tmp"  # noqa: S108
 CONTAINER_WORKDIR = f"{CONTAINER_TMP}/work"
-TMPFS = f"{CONTAINER_TMP}:rw,noexec,nosuid,nodev,size=64m,mode=1777"
-"""The only writable place in a container."""
+
+
+def tmpfs_option(size_mb: int) -> str:
+    """`--tmpfs`'s value: the container's own scratch space, `size_mb` MiB."""
+    return f"{CONTAINER_TMP}:rw,noexec,nosuid,nodev,size={size_mb}m,mode=1777"
+
+
+TMPFS = tmpfs_option(DEFAULT_TMP_MB)
+"""The container's scratch space with the default size (its only writable place but the
+declared writable paths)."""
 NETWORK_PREFIX = "horae-plugin-"
 PLUGIN_LABEL = "dev.horae.plugin"
 """Label of every plugin container (value: the plugin name)."""
@@ -100,7 +117,7 @@ ENGINE_ENV_KEYS = (
 _MAX_CFG_BYTES = 64 * 1024
 _MAX_ENGINE_OUTPUT = 64 * 1024
 _SHOWN = 300
-_UNSAFE_MOUNT = re.compile(r'[,"\x00-\x1f\x7f]')
+_log = logging.getLogger("horae.plugins.host.container")
 
 
 def launcher_source(
@@ -222,7 +239,7 @@ def mount_source(plugin: str, root: Path) -> str:
     character: its value is CSV)."""
     real = root.resolve()
     text = str(real)
-    if not real.is_dir() or _UNSAFE_MOUNT.search(text):
+    if not real.is_dir() or UNSAFE_MOUNT.search(text):
         raise _unavailable(
             plugin,
             'its directory cannot be mounted (not a directory, or a path holding a "," or a quote)',
@@ -239,6 +256,18 @@ def engine_env(environ: Mapping[str, str] | None = None) -> dict[str, str]:
     return env
 
 
+def limit_options(limits: ContainerLimits) -> list[str]:
+    """The resource limits' flags (decision 78 D): `--memory-swap` equal to `--memory`, so the
+    container has no swap."""
+    return [
+        f"--cpus={limits.cpus:g}",
+        f"--memory={limits.memory_mb}m",
+        f"--memory-swap={limits.memory_mb}m",
+        f"--pids-limit={limits.pids}",
+        f"--ulimit=nofile={limits.nofile}:{limits.nofile}",
+    ]
+
+
 def run_argv(
     docker: str,
     *,
@@ -248,13 +277,17 @@ def run_argv(
     user: str,
     source: str,
     command: list[str],
+    mounts: Sequence[Mount] = (),
+    limits: ContainerLimits | None = None,
 ) -> list[str]:
-    """The `docker run` command line of decision 74 C (no secret: they go in the preamble)."""
+    """The `docker run` command line of decisions 74 C and 78 (no secret: they go in the
+    preamble). Not `--rm`: the container is inspected (`OOMKilled`) before it is removed."""
+    limits = limits or ContainerLimits()
+    declared = [arg for mount in mounts for arg in ("--mount", mount.option())]
     return [
         docker,
         "run",
         "--interactive",
-        "--rm",
         "--init",
         "--name",
         name,
@@ -271,12 +304,14 @@ def run_argv(
         "ALL",
         "--security-opt",
         "no-new-privileges",
+        *limit_options(limits),
         "--tmpfs",
-        TMPFS,
+        tmpfs_option(limits.tmp_mb),
         "--network",
         network_name(plugin),
         "--mount",
         f"type=bind,source={source},target={PLUGIN_MOUNT},readonly",
+        *declared,
         "--workdir",
         CONTAINER_TMP,
         "--entrypoint",
@@ -314,11 +349,20 @@ class ContainerRuntime:
         self,
         config: ContainerConfig | None = None,
         *,
+        mounts: MountPolicy | None = None,
         uid: int | None = None,
         gid: int | None = None,
         environ: Mapping[str, str] | None = None,
     ) -> None:
         self.config = config or ContainerConfig()
+        self.mounts = mounts
+        """Where declared paths may come from (decision 78 B); `None`: none may be mounted."""
+        self._planned: dict[str, tuple[Mount, ...]] = {}
+        """Each running container's checked mounts, by container name."""
+        self._quarantined: set[str] = set()
+        """Plugins quarantined in this run (also on disk when the policy has a directory)."""
+        self._socket: str | None = None
+        """The engine's socket path, sensitive like the policy's paths."""
         self._uid = os.getuid() if uid is None else uid
         self._gid = os.getgid() if gid is None else gid
         self._env = engine_env(environ)
@@ -340,18 +384,84 @@ class ContainerRuntime:
         startup_timeout_s: float,
         network: Sequence[str] = (),
         network_local: Sequence[str] = (),
+        paths_read: Sequence[str] = (),
+        paths_write: Sequence[str] = (),
+        limits: ContainerLimits | None = None,
+        shared: Sequence[tuple[str, str]] = (),
     ) -> Spawn:
         """The `Spawn` of `plugin`'s container, its egress proxy started with the locked
-        `network` and `network_local` as policy; `runtime_unavailable` if either cannot run
-        (`env_unsafe` for a denied secret name, as in the process runtime)."""
+        `network` and `network_local` as policy, the locked `paths_read` and `paths_write`
+        mounted (decision 78) within `limits`; `runtime_unavailable` if either cannot run or a
+        path cannot be mounted safely (`env_unsafe` for a denied secret name, as in the process
+        runtime)."""
+        limits = limits or ContainerLimits()
         if self._uid == 0:
             raise _unavailable(plugin, "Horae runs as root; plugin containers never do")
+        if plugin in self._quarantined:
+            raise _unavailable(plugin, "it is quarantined: its writable paths could not be checked")
+        mounts.check_quarantine(plugin, self.mounts)
         if root is None:
             raise _unavailable(plugin, "it has no installed directory")
         venv = check_venv(plugin, root)
         inside = container_command(plugin, command, root)
         source = mount_source(plugin, root)
         docker = await self._engine(plugin)
+        policy = self.mounts
+        if policy is not None and self._socket is not None:
+            policy = policy.with_sensitive(self._socket)
+        declared = mounts.plan_mounts(plugin, paths_read, paths_write, policy, shared)
+        writes = any(mount.writable for mount in declared)
+        lock = mounts.lock_plugin(plugin, self.mounts) if writes else None
+        try:
+            if writes:  # again, now that no other run of it can quarantine it meanwhile
+                if plugin in self._quarantined:
+                    raise _unavailable(
+                        plugin, "it is quarantined: its writable paths could not be checked"
+                    )
+                mounts.check_quarantine(plugin, self.mounts)
+                mounts.check_pending(plugin, self.mounts)
+            return await self._prepare(
+                plugin,
+                docker,
+                root,
+                venv,
+                inside,
+                source,
+                secrets,
+                timezone,
+                cwd,
+                startup_timeout_s,
+                network,
+                network_local,
+                limits,
+                policy,
+                declared,
+                lock,
+            )
+        except BaseException:
+            mounts.unlock_plugin(lock)
+            raise
+
+    async def _prepare(
+        self,
+        plugin: str,
+        docker: str,
+        root: Path,
+        venv: Path,
+        inside: list[str],
+        source: str,
+        secrets: Mapping[str, Secret],
+        timezone: str,
+        cwd: Path,
+        startup_timeout_s: float,
+        network: Sequence[str],
+        network_local: Sequence[str],
+        limits: ContainerLimits,
+        policy: MountPolicy | None,
+        declared: tuple[Mount, ...],
+        lock: int | None,
+    ) -> Spawn:
+        """The rest of `spawn`, once the mounts are planned and the run lock (if any) held."""
         await self._network(plugin, docker)
         await self._egress_network(plugin, docker)
         proxy = await self._start_proxy(plugin, docker, network, network_local)
@@ -379,15 +489,37 @@ class ContainerRuntime:
             user=f"{self._uid}:{self._gid}",
             source=source,
             command=inside,
+            mounts=declared,
+            limits=limits,
         )
 
         proxy.client_container = name
+        try:
+            await self._remove_exited(docker, plugin)
+            mounts.recheck(plugin, declared, policy)  # right before the engine mounts them
+            if lock is not None:
+                mounts.mark_pending(plugin, self.mounts)  # gone only after a clean sweep
+        except BaseException:
+            await proxy.stop()
+            raise
+        self._planned[name] = declared
+        started = mounts.now()
 
         async def remove() -> None:
             try:
-                await self._run(docker, "rm", "--force", name)
+                removed, _, _ = await self._run(docker, "rm", "--force", name)
             finally:
+                self._planned.pop(name, None)
                 await proxy.stop()
+            if lock is None:
+                return
+            try:
+                await self._sweep(plugin, declared, started, removed == 0)
+            finally:
+                mounts.unlock_plugin(lock)
+
+        async def diagnose() -> tuple[HostErrorKind, str] | None:
+            return await self._oom_killed(docker, plugin, name, limits)
 
         return Spawn(
             plugin,
@@ -398,14 +530,79 @@ class ContainerRuntime:
             preamble=line,
             cleanup=remove,
             egress=proxy,
+            diagnose=diagnose,
+        )
+
+    async def _sweep(
+        self, plugin: str, declared: tuple[Mount, ...], started: float, removed: bool
+    ) -> None:
+        """Sweep `plugin`'s writable paths, its container removed (decision 78 C). The plugin
+        is gone and its run lock keeps every other run of it away; another container plugin
+        never writes the same tree (`plan_mounts`). Writers outside containers (a process
+        plugin, the user) can still race it: the sweep works through directory descriptors
+        and fails on any change it sees. A failure quarantines the plugin; the pending marker
+        goes only after a clean sweep or a written quarantine."""
+        if not removed:
+            failures = ["its container could not be removed, so its paths were not swept"]
+        else:
+            swept = await anyio.to_thread.run_sync(mounts.sweep, plugin, declared, started)
+            failures = swept.failures
+        if not failures:
+            mounts.clear_pending(plugin, self.mounts)
+            return
+        self._quarantined.add(plugin)  # fail closed for the rest of this run in any case
+        if mounts.quarantine(plugin, self.mounts, failures):
+            mounts.clear_pending(plugin, self.mounts)
+        else:  # the pending marker stays: the next run refuses it too
+            _log.error("plugin %s: its quarantine file could not be written", plugin)
+
+    async def _remove_exited(self, docker: str, plugin: str) -> None:
+        """Remove `plugin`'s stopped containers left by an earlier, killed Horae (decision 78
+        E): exited or dead ones only, never a running one, without `--force`."""
+        found: list[str] = []
+        for status in ("exited", "dead"):
+            code, out, _ = await self._run(
+                docker,
+                "ps",
+                "--all",
+                "--quiet",
+                "--filter",
+                f"label={PLUGIN_LABEL}={plugin}",
+                "--filter",
+                f"status={status}",
+            )
+            if code == 0:
+                found += [line for line in out.decode("ascii", "replace").split() if line.isalnum()]
+        if found:
+            await self._run(docker, "rm", *found)
+
+    async def _oom_killed(
+        self, docker: str, plugin: str, name: str, limits: ContainerLimits
+    ) -> tuple[HostErrorKind, str] | None:
+        """`oom_killed` if the kernel killed something in `name` for its memory limit (decision
+        78 E), else `None` (the plugin's failure stays what it was)."""
+        code, out, _ = await self._run(
+            docker, "container", "inspect", "--format", "{{json .State.OOMKilled}}", name
+        )
+        if code != 0 or out.strip() != b"true":
+            return None
+        return (
+            "oom_killed",
+            f"plugin {plugin} (runtime container) was killed by its memory limit "
+            f"({limits.memory_mb} MiB, `plugins.{plugin}.limits.memory_mb` in horae.yaml)",
         )
 
     async def admit(self, plugin: str, proxy: egress.ProxyHandle) -> None:
         """Once the plugin's container runs, make it the only client its proxy serves
         (decision 76 C): its address on the plugin network, sent to the proxy, confirmed.
-        `runtime_unavailable` otherwise (the caller stops the plugin)."""
+        `runtime_unavailable` otherwise (the caller stops the plugin). First, its mounts must be
+        exactly the planned ones, still the files that were checked (decision 78 B): it has
+        had no egress so far."""
         docker = self._docker
         address = None
+        planned = self._planned.get(proxy.client_container)
+        if planned:
+            await self._verify_mounts(plugin, proxy.client_container, planned)
         if docker is not None:
             code, out, _ = await self._run(
                 docker,
@@ -422,6 +619,26 @@ class ContainerRuntime:
             address = egress.plugin_address(networks, network_name(plugin))
         if address is None or not await proxy.admit(address):
             raise _unavailable(plugin, "its egress proxy could not be bound to its container")
+
+    async def _verify_mounts(self, plugin: str, name: str, planned: Sequence[Mount]) -> None:
+        """`runtime_unavailable` unless the started container `name` has exactly the planned
+        mounts and each path is still the checked file (`mounts.recheck`)."""
+        problem: str | None = "the engine could not be asked"
+        if self._docker is not None:
+            code, out, _ = await self._run(
+                self._docker, "container", "inspect", "--format", "{{json .Mounts}}", name
+            )
+            try:
+                inspected = json.loads(out) if code == 0 else None
+            except ValueError:
+                inspected = None
+            problem = mounts.mounts_problem(planned, inspected, PLUGIN_MOUNT)
+        if problem is not None:
+            raise _unavailable(plugin, f"its mounts are not as checked: {problem}")
+        policy = self.mounts
+        if policy is not None and self._socket is not None:
+            policy = policy.with_sensitive(self._socket)
+        mounts.recheck(plugin, planned, policy)
 
     async def _start_proxy(
         self, plugin: str, docker: str, network: Sequence[str], network_local: Sequence[str]
@@ -572,6 +789,7 @@ class ContainerRuntime:
             raise _unavailable(
                 plugin, f"the Docker engine is not a local unix socket ({_scheme(endpoint)})"
             )
+        self._socket = endpoint.removeprefix("unix://")
 
     async def _network(self, plugin: str, docker: str) -> None:
         """Create the plugin's network if needed, and check it (decision 74 D)."""
@@ -710,9 +928,11 @@ __all__ = [
     "container_command",
     "engine_env",
     "is_local_endpoint",
+    "limit_options",
     "mount_source",
     "network_name",
     "network_problem",
     "preamble",
     "run_argv",
+    "tmpfs_option",
 ]
