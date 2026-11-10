@@ -4581,12 +4581,20 @@ loosened later without breaking a valid file.
       template variables, path or command: what runs is the pipeline as configured. A run that
       failed, a plan with problems or refused, or an empty plan get no approval (`reason`).
     - **B, the approval channel is the CLI, on a terminal.** `horae approval approve <id>` is
-      run by the user on the instance. It re-plans, shows the full change set (as `horae diff`)
-      and asks for confirmation on an interactive terminal; without a TTY on stdin it refuses
-      (`not_interactive`), and there is no `--yes`. **Why the CLI:** the MCP server must never
-      be able to approve, so the approval must travel a channel the MCP client cannot reach. A
-      token holder over HTTP has no shell on the instance; a stdio client is started by the
-      user, and an agent's own shell tool runs without a TTY. ntfy action buttons (`/act`,
+      run by the user on the instance. It re-plans, shows the **whole** change set (as `horae
+      diff`, HTTP bodies in full; when a note change is binary or larger than 1 MiB and so
+      cannot be shown, it refuses, `not_reviewable`, and the approval stays pending) and asks
+      the user to **retype a short code** printed with it (the last 6 characters of the
+      binding digest; `y` does not do). Without a TTY on stdin it refuses (`not_interactive`);
+      there is no `--yes`. **Why the CLI:** the MCP server must never be able to approve, so
+      the approval travels a channel an MCP client cannot reach *through MCP*: a token holder
+      over HTTP and an MCP-only stdio client have no way to run a command on the instance.
+      **What it does not stop:** an agent that also has a shell as the same user (Claude Code's
+      Bash tool, say) can allocate a pseudo-terminal (`pty.fork()`, `script`, `expect`), read
+      the code and type it; the review reproduced this. The TTY check and the code are
+      friction against approving by accident or by habit, **not a boundary**; such an agent can
+      already run `horae run` itself (decision 75 B). Do not give one client both this MCP
+      server and a shell as you if you rely on the approval. ntfy action buttons (`/act`,
       decision 54) were rejected for now: an `/act` link is a bearer capability that reaches the
       phone through a third-party push service, it would put a state-changing approval behind
       one tap with a small screen for the diff, and `/act` intents are fixed task actions, not
@@ -4618,13 +4626,22 @@ loosened later without breaking a valid file.
       dry run is running), `pending`, `approving` (claimed, the apply is running), and the final
       `applied`, `failed` (the apply failed), `refused` (binding mismatch), `denied`
       (`horae approval deny <id>`), `revoked` (`horae approval revoke --all`, or the requesting
-      token was revoked when the user approves), `expired` (seen past its TTL) and `void` (the
-      dry run gave nothing to approve). Only `pending` can be approved, denied or revoked.
+      token was revoked: `horae mcp token revoke` moves its pending approvals to `revoked` in
+      the same transaction, and the claim also requires the token not to be revoked),
+      `expired` (seen past its TTL) and `void` (the dry run gave nothing to approve). Only
+      `pending` can be approved, denied or revoked.
     - **E, single use.** Approving first **claims** the row with one compare-and-set
       (`UPDATE … SET status = 'approving' WHERE id = ? AND status = 'pending' AND expires_at >
-      now`): two concurrent approvals of one id apply once; the loser is told the current status.
-      A process that dies after the claim leaves `approving` (never re-applied; the run, if any,
-      is abandoned and `horae undo` reverts it).
+      now AND` the requesting token, if any, is not revoked), taken with the pipeline lock held:
+      two concurrent approvals of one id apply once; the loser is told the current status. The
+      run that applies it is recorded on the row as soon as it begins. **Interruptions:** a
+      cancellation (a signal) during the apply lets the shielded apply finish and save its run;
+      the approval then ends from that record (`applied` for `ok`, `noop`, `degraded`, else
+      `failed` or `refused`), and `failed` "interrupted" only when no record was saved. **A
+      crash** leaves `approving` (never re-applied); it is settled under the pipeline lock (on
+      the next approval of that pipeline, or by `list`, `show` and `approve` when the lock is
+      free): the dead run is recovered, then the approval ends from its record, or `failed`
+      "interrupted" when there is none (`horae undo` reverts what an abandoned run wrote).
     - **F, journal.** Every transition appends a row to `approval_events` (approval, time,
       event, run id, short reason) in the same transaction as the status change; `horae approval
       show <id>` prints them, `list` shows the latest status, the dry run and the applied run.

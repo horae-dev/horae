@@ -2087,13 +2087,32 @@ class Store:
 
     @_api
     def mcp_token_revoke(self, name: str, *, at: datetime) -> bool:
-        """Revoke the token named `name` that is not revoked yet; whether there was one."""
+        """Revoke the token named `name` that is not revoked yet, and its pending approvals
+        (#55); whether there was one."""
         with self.transaction():
-            cur = self._conn.execute(
-                "UPDATE mcp_tokens SET revoked_at = ? WHERE name = ? AND revoked_at IS NULL",
-                (_ts(at), name),
+            row = self._conn.execute(
+                "SELECT id FROM mcp_tokens WHERE name = ? AND revoked_at IS NULL", (name,)
+            ).fetchone()
+            if row is None:
+                return False
+            self._conn.execute(
+                "UPDATE mcp_tokens SET revoked_at = ? WHERE id = ?", (_ts(at), row[0])
             )
-        return cur.rowcount == 1
+            # Its pending `pipeline.run` approvals end with it (#55, decision 77 D).
+            pending = self._conn.execute(
+                "SELECT id FROM approvals WHERE token_id = ? AND status = 'pending'", (row[0],)
+            ).fetchall()
+            for (approval_id,) in pending:
+                self._approval_move(
+                    approval_id,
+                    ("pending",),
+                    "revoked",
+                    at,
+                    reason="the MCP token that asked was revoked",
+                    extra=", decided_at = ?",
+                    args=(_ts(at),),
+                )
+        return True
 
     @_api
     def mcp_token_touch(self, token_id: int, *, at: datetime) -> None:
@@ -2282,8 +2301,9 @@ class Store:
 
     @_api
     def approval_claim(self, approval_id: str, *, at: datetime) -> bool:
-        """`pending` → `approving`, only while not expired at `at`: the single use of an
-        approval (decision 77 E). Of two concurrent claims one wins."""
+        """`pending` → `approving`, only while not expired at `at` and while the token that
+        asked (if any) is not revoked: the single use of an approval (decision 77 E). Of two
+        concurrent claims one wins."""
         return self._approval_move(
             approval_id,
             ("pending",),
@@ -2291,9 +2311,49 @@ class Store:
             at,
             extra=", decided_at = ?",
             args=(_ts(at),),
-            condition=" AND expires_at > ?",
+            condition=" AND expires_at > ? AND (token_id IS NULL OR EXISTS (SELECT 1 FROM "
+            "mcp_tokens WHERE mcp_tokens.id = approvals.token_id AND revoked_at IS NULL))",
             condition_args=(_ts(at),),
         )
+
+    @_api
+    def approval_started(self, approval_id: str, run_id: str) -> None:
+        """Name the run an `approving` approval is being applied by (as soon as it begins),
+        so that a crash can be settled from that run (`approval_recover`)."""
+        with self.transaction():
+            self._conn.execute(
+                "UPDATE approvals SET applied_run_id = ? WHERE id = ? AND status = 'approving'",
+                (run_id, approval_id),
+            )
+
+    @_api
+    def approval_recover(self, pipeline: str, *, at: datetime) -> list[str]:
+        """Settle the `approving` approvals of `pipeline` left by a process that died; the
+        caller holds the pipeline's lock (so no apply of it is running) and has recovered its
+        runs. One whose run saved a record ends `applied` (`ok`, `noop`, `degraded`) or
+        `failed`; one whose run was abandoned, or never began, `failed` (interrupted)."""
+        settled: list[str] = []
+        with self.transaction():
+            rows = self._conn.execute(
+                "SELECT a.id, a.applied_run_id, r.status, r.record IS NOT NULL, r.error "
+                "FROM approvals a LEFT JOIN runs r ON r.id = a.applied_run_id "
+                "WHERE a.status = 'approving' AND a.pipeline = ? ORDER BY a.created_at, a.id",
+                (pipeline,),
+            ).fetchall()
+            for approval_id, run_id, status, recorded, error in rows:
+                if status == "running":
+                    continue  # not dead after all: left alone
+                if recorded and status in {"ok", "noop", "degraded"}:
+                    target, why = "applied", None
+                elif recorded:
+                    target, why = "failed", error or "the apply failed"
+                else:
+                    target, why = "failed", "interrupted: the apply did not finish"
+                if self._approval_move(
+                    approval_id, ("approving",), target, at, run_id=run_id, reason=why
+                ):
+                    settled.append(str(approval_id))
+        return settled
 
     @_api
     def approval_finish(

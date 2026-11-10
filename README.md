@@ -203,7 +203,8 @@ with `horae mcp token create NAME` (shown once, stored hashed), connect with
 <token>"`, and revoke it with `horae mcp token revoke NAME` (#56). `pipeline.run` (scope
 `pipeline.run`) only makes a dry run and returns an approval id; nothing is applied until you
 run `horae approval approve <id>` yourself on the instance's terminal, which shows the changes
-and asks (#55). Setup, the tool schemas and the manual check are in [docs/mcp.md](docs/mcp.md).
+and asks you to retype a short code (#55; friction, not a barrier against an agent that also
+has a shell as you). Setup, the tool schemas and the manual check are in [docs/mcp.md](docs/mcp.md).
 
 ## Deployment
 

@@ -39,6 +39,7 @@ from horae.approval import (
     request_dry_run,
 )
 from horae.cli import app
+from horae.cli_approval import confirmation_code
 from horae.cli_host import load
 from horae.config import STORE_FILE, Instance
 from horae.contracts.mcp import PipelineRun
@@ -113,6 +114,18 @@ def journal(root: Path) -> list[Any]:
         return [entry for run in runs for entry in store.journal(run.id)]
 
 
+def typed(root: Path, approval_id: str) -> str:
+    """What the user types at the prompt: the code shown with the changes."""
+    with Store.open(root / "state" / STORE_FILE) as store:
+        found = store.approval(approval_id)
+    return ("" if found is None else confirmation_code(found)) + "\n"
+
+
+def approve_cli(root: Path, approval_id: str) -> tuple[int, str]:
+    """`horae approval approve`, answering with the code it shows."""
+    return cli("approve", approval_id, "-i", str(root), input=typed(root, approval_id))
+
+
 def cli(*args: str, input: str | None = None) -> tuple[int, str]:
     result = runner.invoke(app, ["approval", *args], input=input)
     return result.exit_code, result.output
@@ -166,7 +179,9 @@ def test_a_running_pipeline_is_refused_and_recorded(fake: Ports_, root: Path) ->
 
 def test_an_approved_plan_is_applied_once_as_a_new_run(fake: Ports_, root: Path, tty: None) -> None:
     done = ask(root)
-    code, out = cli("approve", done.approval_id, "-i", str(root), input="y\n")
+    code, out = cli(
+        "approve", done.approval_id, "-i", str(root), input=typed(root, done.approval_id)
+    )
     assert code == 0, out
     assert "## B" in out  # the change set was shown before the question
     assert b"approved" in fake.sink.files[INBOX]
@@ -184,7 +199,9 @@ def test_an_approved_plan_is_applied_once_as_a_new_run(fake: Ports_, root: Path,
     assert (record.dry_run, record.status, record.cost.usd, record.llm) == (False, "ok", 0.0, [])
     assert record.intents == done.record.intents
     # Single use: a second approval of the same id applies nothing more.
-    code, out = cli("approve", done.approval_id, "-i", str(root), input="y\n")
+    code, out = cli(
+        "approve", done.approval_id, "-i", str(root), input=typed(root, done.approval_id)
+    )
     assert code == 1
     assert "is applied" in out
     assert len(fake.sink.applied) == 1
@@ -242,7 +259,9 @@ def test_an_approval_expiring_after_the_review_applies_nothing(fake: Ports_, roo
 def test_a_changed_note_refuses_the_plan(fake: Ports_, root: Path, tty: None) -> None:
     done = ask(root)
     fake.sink.files[INBOX] = b"# Inbox\nedited by hand\n"
-    code, out = cli("approve", done.approval_id, "-i", str(root), input="y\n")
+    code, out = cli(
+        "approve", done.approval_id, "-i", str(root), input=typed(root, done.approval_id)
+    )
     assert code == 4, out
     assert "changed since the dry run" in out
     assert fake.sink.applied == []
@@ -258,7 +277,9 @@ def test_a_changed_configuration_refuses_the_plan(fake: Ports_, root: Path, tty:
     config = yaml.safe_load((root / "horae.yaml").read_text("utf-8"))
     config["models"]["default"]["model"] = "opus"
     (root / "horae.yaml").write_text(yaml.safe_dump(config), "utf-8")
-    code, out = cli("approve", done.approval_id, "-i", str(root), input="y\n")
+    code, out = cli(
+        "approve", done.approval_id, "-i", str(root), input=typed(root, done.approval_id)
+    )
     assert code == 4, out
     assert fake.sink.applied == []
     assert row(root, done.approval_id).status == "refused"
@@ -299,7 +320,9 @@ def test_the_binding_covers_the_instance_digests(fake: Ports_, root: Path) -> No
 
 def test_approving_needs_an_interactive_terminal(fake: Ports_, root: Path) -> None:
     done = ask(root)
-    code, out = cli("approve", done.approval_id, "-i", str(root), input="y\n")
+    code, out = cli(
+        "approve", done.approval_id, "-i", str(root), input=typed(root, done.approval_id)
+    )
     assert code == 1
     assert "needs an interactive terminal" in out
     assert row(root, done.approval_id).status == "pending"
@@ -330,7 +353,9 @@ def test_a_denied_approval_applies_nothing(fake: Ports_, root: Path, tty: None) 
     code, out = cli("deny", done.approval_id, "-i", str(root))
     assert code == 0, out
     assert row(root, done.approval_id).status == "denied"
-    code, out = cli("approve", done.approval_id, "-i", str(root), input="y\n")
+    code, out = cli(
+        "approve", done.approval_id, "-i", str(root), input=typed(root, done.approval_id)
+    )
     assert code == 1
     assert "denied" in out
     assert fake.sink.applied == []
@@ -358,9 +383,10 @@ def test_a_revoked_token_revokes_its_pending_approvals(fake: Ports_, root: Path)
     done = ask(root, Requester(token_id, "agent"))
     with Store.open(store_path) as store:
         assert store.mcp_token_revoke("agent", at=datetime.now(UTC))
+    assert row(root, done.approval_id).status == "revoked"  # with the token, at once
     with pytest.raises(ApprovalError) as revoked:
         asyncio.run(preview(load(root), done.approval_id))
-    assert revoked.value.kind == "revoked"
+    assert revoked.value.kind == "not_pending"
     assert row(root, done.approval_id).status == "revoked"
     assert fake.sink.applied == []
 
@@ -405,7 +431,12 @@ def test_a_requester_is_rate_limited_per_hour(root: Path) -> None:
 
 def test_list_and_show_report_every_outcome(fake: Ports_, root: Path, tty: None) -> None:
     applied = ask(root)
-    assert cli("approve", applied.approval_id, "-i", str(root), input="y\n")[0] == 0
+    assert (
+        cli(
+            "approve", applied.approval_id, "-i", str(root), input=typed(root, applied.approval_id)
+        )[0]
+        == 0
+    )
     denied = ask(root)
     cli("deny", denied.approval_id, "-i", str(root))
     void = ask(root, pipeline="collect")
@@ -487,3 +518,150 @@ def test_the_mcp_surface_exposes_no_approve_path(fake: Ports_, root: Path) -> No
         assert name not in source
     for name in ("preview", "apply", "deny"):
         assert getattr(horae.mcp_server, name, None) is not getattr(approval_module, name)
+
+
+# --- review follow-ups (#181): friction, interruption, full review, revocation, recovery ------
+
+
+def test_approving_takes_the_retyped_code_not_yes(fake: Ports_, root: Path, tty: None) -> None:
+    done = ask(root)
+    code, out = cli("approve", done.approval_id, "-i", str(root), input="y\n")
+    assert code == 1
+    assert "nothing applied" in out
+    expected = confirmation_code(row(root, done.approval_id))
+    assert len(expected) == 6
+    assert f"type {expected}" in out  # shown with the changes
+    assert row(root, done.approval_id).status == "pending"
+    assert fake.sink.applied == []
+    code, out = cli("approve", done.approval_id, "-i", str(root), input=f"{expected}\n")
+    assert code == 0, out
+
+
+class SlowSink(FixtureSink):
+    """A sink whose apply takes a while, so the caller can be cancelled meanwhile."""
+
+    started: asyncio.Event | None = None
+
+    async def apply(self, call: Any, *, expected_before_sha256: str | None) -> Any:
+        assert self.started is not None
+        self.started.set()
+        await asyncio.sleep(0.2)
+        return await super().apply(call, expected_before_sha256=expected_before_sha256)
+
+
+def test_a_cancellation_during_the_apply_records_what_was_applied(fake: Ports_, root: Path) -> None:
+    done = ask(root)
+    instance = load(root)
+    seen = asyncio.run(preview(instance, done.approval_id))
+    sink = SlowSink(files=dict(fake.sink.files))
+    fake.sink = sink
+
+    async def go() -> None:
+        sink.started = asyncio.Event()
+        task = asyncio.create_task(apply(instance, seen))
+        await sink.started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(go())
+    assert b"approved" in sink.files[INBOX]  # the shielded apply finished
+    applied = row(root, done.approval_id)
+    assert applied.status == "applied"
+    with Store.open(root / "state" / STORE_FILE) as store:
+        assert applied.applied_run_id is not None
+        record = store.get_run(applied.applied_run_id)
+    assert record is not None
+    assert record.status == "ok"
+
+
+def test_http_bodies_are_shown_in_full(fake: Ports_, root: Path, tty: None) -> None:
+    from apply_fixtures import HOOK
+
+    body = {"text": "z" * 300 + "END"}
+    fake.plugins = brief_plugins([{"type": "http.post", "url": HOOK, "body": body}])
+    done = ask(root)
+    code, out = cli("approve", done.approval_id, "-i", str(root), input="no\n")
+    assert code == 1
+    assert "z" * 300 + "END" in out
+    assert "…" not in out
+
+
+def test_a_change_that_cannot_be_shown_cannot_be_approved(
+    fake: Ports_, root: Path, tty: None
+) -> None:
+    fake.sink.files[INBOX] = b"# Inbox\x00\n"  # binary: no diff to review
+    done = ask(root)
+    assert done.status == "pending"
+    code, out = cli(
+        "approve", done.approval_id, "-i", str(root), input=typed(root, done.approval_id)
+    )
+    assert code == 1
+    assert "cannot be shown in full" in out
+    assert row(root, done.approval_id).status == "pending"
+    assert fake.sink.applied == []
+
+
+def test_revoking_the_token_between_review_and_apply_applies_nothing(
+    fake: Ports_, root: Path
+) -> None:
+    store_path = root / "state" / STORE_FILE
+    with Store.open(store_path) as store:
+        token_id = store.mcp_token_add(
+            "agent", b"\x02" * 32, ("pipeline.run",), at=datetime.now(UTC), expires_at=None
+        )
+    done = ask(root, Requester(token_id, "agent"))
+    instance = load(root)
+    seen = asyncio.run(preview(instance, done.approval_id))
+    with Store.open(store_path) as store:
+        assert store.mcp_token_revoke("agent", at=datetime.now(UTC))
+    assert row(root, done.approval_id).status == "revoked"  # in the revocation's transaction
+    assert events(root, done.approval_id) == ["planning", "pending", "revoked"]
+    with pytest.raises(ApprovalError) as refused:
+        asyncio.run(apply(instance, seen))
+    assert refused.value.kind == "not_pending"
+    assert fake.sink.applied == []
+
+
+def test_the_claim_checks_the_token_too(root: Path) -> None:
+    store_path = root / "state" / STORE_FILE
+    now = datetime.now(UTC)
+    with Store.open(store_path) as store:
+        token_id = store.mcp_token_add("t", b"\x03" * 32, ("read",), at=now, expires_at=None)
+        store.approval_open(
+            "apr-claimtoken01", "p", token_id=token_id, requested_by="t", at=now,
+            max_open=3, max_per_hour=12,
+        )  # fmt: skip
+        store.begin_run("r-claim", "p", now, dry_run=True)
+        store._conn.execute(  # synthetic: a token revoked without the store method
+            "UPDATE mcp_tokens SET revoked_at = '2026-01-01T00:00:00.000000Z' WHERE id = ?",
+            (token_id,),
+        )
+        store._conn.execute(
+            "UPDATE approvals SET status = 'pending', expires_at = '2999-01-01T00:00:00.000000Z', "
+            "binding_sha256 = ? WHERE id = 'apr-claimtoken01'",
+            ("a" * 64,),
+        )
+        assert store.approval_claim("apr-claimtoken01", at=now) is False
+
+
+def test_an_approval_left_approving_by_a_crash_is_settled(fake: Ports_, root: Path) -> None:
+    store_path = root / "state" / STORE_FILE
+    first, second = ask(root), ask(root)
+    now = datetime.now(UTC)
+    with Store.open(store_path) as store:
+        # first: its process died after the claim, while its run was running.
+        assert store.approval_claim(first.approval_id, at=now)
+        store.begin_run("20261110T000000Z-dry-brief-dead01", "dry-brief", now, pid=1, host="h")
+        store.approval_started(first.approval_id, "20261110T000000Z-dry-brief-dead01")
+        # second: it died after its run was saved `ok` (here: a saved record).
+        assert store.approval_claim(second.approval_id, at=now)
+        store.approval_started(second.approval_id, second.record.id)
+    code, out = cli("list", "-i", str(root), "--json")
+    assert code == 0, out
+    dead = row(root, first.approval_id)
+    assert dead.status == "failed"
+    assert dead.reason is not None
+    assert "interrupted" in dead.reason
+    assert row(root, second.approval_id).status == "applied"
+    assert events(root, first.approval_id)[-2:] == ["approving", "failed"]

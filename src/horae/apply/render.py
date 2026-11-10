@@ -111,8 +111,9 @@ def _file_lines(item: FileDiff, color: bool) -> list[str]:
     return lines
 
 
-def render_text(changes: ChangeSet, *, color: bool = False) -> str:
-    """`changes` for a terminal, ending with a newline."""
+def render_text(changes: ChangeSet, *, color: bool = False, full: bool = False) -> str:
+    """`changes` for a terminal, ending with a newline; with `full`, HTTP bodies are shown
+    whole instead of cut at 200 characters (`horae approval approve`, #55)."""
     run = f"Run {safe(changes.run_id)} ({safe(changes.pipeline)}, {changes.run_status}"
     lines = [run + (", dry run)" if changes.dry_run else ")")]
     if changes.refused is not None:
@@ -152,7 +153,7 @@ def render_text(changes: ChangeSet, *, color: bool = False) -> str:
         for http in changes.http_calls:
             body = dumps(http.call.body, separators=(",", ":"), ensure_ascii=False)
             shown = safe(body)  # redacted before it is cut (#53): no half secret is shown
-            short = shown if len(shown) <= 200 else shown[:200] + "…"
+            short = shown if full or len(shown) <= 200 else shown[:200] + "…"
             lines.append(
                 f"  {http.call.method} {safe(http.call.url)} via {safe(http.applied_by)}"
                 f" ({len(body.encode())} bytes): {short}"

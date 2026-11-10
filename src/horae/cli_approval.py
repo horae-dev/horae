@@ -7,10 +7,18 @@ Applying it is decided here, on the instance's terminal, and nowhere else:
 
 - **`approve ID`**: re-plans the dry run against the current vault and configuration, refuses
   when it is no longer exactly what was approved for (`plan_mismatch`, recorded `refused`),
-  shows the change set (as `horae diff`) and asks for confirmation. It needs an interactive
-  terminal (a TTY on stdin) and has no `--yes`: a script or an agent's shell tool cannot
-  approve. Once confirmed, the approval is claimed (single use) and applied as a new run,
-  checked again under the apply lock; `horae undo <run>` reverts it.
+  shows the whole change set (as `horae diff`, HTTP bodies in full; a binary or too-large
+  note cannot be shown, so it refuses, `not_reviewable`) and asks the user to retype a short
+  code printed with it (the last 6 characters of the binding digest). Once confirmed, the
+  approval is claimed (single use) and applied as a new run, checked again under the apply
+  lock; `horae undo <run>` reverts it.
+
+  **What stops whom.** The approval channel is this command on the instance: an MCP client
+  that only speaks MCP (stdio or an HTTP token holder) has no way to run it. The TTY check
+  and the retyped code are **friction, not a boundary**: an agent that has a shell as the
+  same user can allocate a pseudo-terminal (`pty.fork()`, `script`, `expect`) and read the
+  code from the output. Such an agent can already do anything the user can (`horae run`);
+  give a client either MCP or a shell as you, not both, if you rely on the approval.
 - **`deny ID`**: the approval ends `denied`; nothing is applied.
 - **`revoke --all`**: every pending approval ends `revoked`.
 - **`list [--status S]`** and **`show ID`**: the approvals and, for one, its journal of
@@ -18,9 +26,10 @@ Applying it is decided here, on the instance's terminal, and nowhere else:
   first.
 
 Exit codes (`horae.cli_output`, decision 37): 0 done, 1 configuration or store problem, not
-pending (expired, denied, revoked, already used), not interactive, not confirmed, or the apply
-failed, 2 usage error, 3 unknown approval, 4 plan mismatch (nothing applied), 5 the pipeline
-is running or the apply lock is busy, 70 internal error, 130/143 interrupted.
+pending (expired, denied, revoked, already used), not interactive, not confirmed, not
+reviewable (a binary or too-large note), or the apply failed, 2 usage error, 3 unknown
+approval, 4 plan mismatch (nothing applied), 5 the pipeline is running or the apply lock is
+busy, 70 internal error, 130/143 interrupted.
 """
 
 import asyncio
@@ -32,8 +41,8 @@ from typing import Annotated, Any
 
 import typer
 
-from horae.apply import render_text
-from horae.approval import MISMATCH, ApprovalError, apply, deny, preview
+from horae.apply import MAX_DIFF_BYTES, render_text
+from horae.approval import MISMATCH, ApprovalError, apply, deny, preview, recover_stuck
 from horae.cli_host import load
 from horae.cli_output import (
     EXIT_DIFFERENT,
@@ -85,6 +94,12 @@ IdArgument = Annotated[str, typer.Argument(help="The approval id (apr-...).")]
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+def confirmation_code(row: ApprovalRow) -> str:
+    """What the user retypes to approve: the last 6 characters of the binding digest. It
+    makes approving a deliberate act; it is not a secret (it is printed with the changes)."""
+    return (row.binding_sha256 or "")[-6:]
 
 
 def _interactive() -> bool:
@@ -144,6 +159,7 @@ def _list(instance_dir: Path, status: str | None, json_output: bool) -> int:
 
         def body(store: Store) -> list[ApprovalRow]:
             store.approval_expire(at=_now())
+            recover_stuck(instance, store, at=_now())
             return store.approvals(status=status)  # type: ignore[arg-type]
 
         rows = _with_store(instance, body)
@@ -173,6 +189,7 @@ def _show(instance_dir: Path, approval_id: str, json_output: bool) -> int:
 
     def body(store: Store) -> tuple[ApprovalRow | None, list[ApprovalEvent]]:
         store.approval_expire(at=_now())
+        recover_stuck(instance, store, at=_now())
         return store.approval(approval_id), store.approval_events(approval_id)
 
     row, events = _with_store(instance, body)
@@ -204,7 +221,7 @@ def _approve(instance_dir: Path, approval_id: str) -> int:
             EXIT_PROBLEMS,
             "not_interactive",
             "approving needs an interactive terminal: run `horae approval approve` yourself "
-            "(a script or an agent cannot approve)",
+            "and review the changes",
         )
     try:
         seen = asyncio.run(preview(instance, approval_id))
@@ -215,8 +232,22 @@ def _approve(instance_dir: Path, approval_id: str) -> int:
         f"approval {row.id}: pipeline {safe(row.pipeline)}, asked by {safe(row.requested_by)} "
         f"at {_iso(row.created_at)}, expires {_iso(row.expires_at)}"
     )
-    echo(render_text(seen.plan), nl=False)
-    if not typer.confirm("Apply exactly these changes?", default=False):
+    hidden = [
+        f.path for f in seen.plan.files if f.status != "unchanged" and (f.binary or f.too_large)
+    ]
+    if hidden:
+        raise CommandFailed(
+            EXIT_PROBLEMS,
+            "not_reviewable",
+            f"nothing applied: {len(hidden)} note change(s) cannot be shown in full (binary or "
+            f"larger than {MAX_DIFF_BYTES} bytes): {', '.join(safe(p) for p in hidden)}; "
+            f"approval {row.id} stays pending (`horae approval deny {row.id}` to deny it)",
+        )
+    echo(render_text(seen.plan, full=True), nl=False)
+    code = confirmation_code(row)
+    echo(f"To apply exactly these changes, type {code} (anything else: nothing is applied).")
+    typed = typer.prompt("Code", default="", show_default=False)
+    if typed.strip() != code:
         raise CommandFailed(
             EXIT_PROBLEMS,
             "not_confirmed",
@@ -317,11 +348,13 @@ def approve(approval_id: IdArgument, instance: InstanceOption = Path()) -> None:
     """Review and apply what an MCP client asked to run, on this terminal.
 
     Re-plans the dry run, refuses if anything changed since (the plan, the pipeline, its
-    configuration, the vault), shows the changes and asks for confirmation. Needs an
-    interactive terminal; there is no --yes. Applied once, as a new run (`horae undo <run>`
-    reverts it).
+    configuration, the vault), shows every change in full and asks you to retype a short
+    code. Needs an interactive terminal; there is no --yes. This is friction against
+    approving by accident, not a barrier against an agent with a shell as you. Applied once,
+    as a new run (`horae undo <run>` reverts it).
 
-    Exit codes: 0 applied, 1 not pending, not interactive, not confirmed or the apply failed,
+    Exit codes: 0 applied, 1 not pending, not interactive, not confirmed, not reviewable or
+    the apply failed,
     3 unknown approval, 4 plan mismatch (nothing applied), 5 pipeline running or apply lock
     busy, 70 internal error, 130/143 interrupted."""
     run_command("approval approve", False, lambda: _approve(instance, approval_id))
@@ -352,4 +385,4 @@ def revoke(
     run_command("approval revoke", json_output, lambda: _revoke(instance, all_pending, json_output))
 
 
-__all__ = ["approval_app"]
+__all__ = ["approval_app", "confirmation_code"]

@@ -109,16 +109,23 @@ horae approval revoke --all -i /path/to/instance    # end every pending request
 horae approval show apr-k3j7x2m4q7ab -i /path/to/instance   # its journal of transitions
 ```
 
-- `approve` plans the dry run again, shows the full change set (as `horae diff`) and asks you
-  to confirm. It needs an interactive terminal and has no `--yes`, so a script or an agent's
-  shell tool cannot approve.
+- `approve` plans the dry run again, shows the whole change set (as `horae diff`, HTTP bodies
+  in full) and asks you to retype a 6-character code printed with it. A note change that is
+  binary or too large to show cannot be approved this way (`not_reviewable`): deny it. It
+  needs an interactive terminal and has no `--yes`.
+- **What this protects against:** a client that only has this MCP server (over stdio or with
+  a token) cannot approve. The terminal check and the code are friction against approving by
+  habit, **not a barrier** against an agent that also has a shell as you: it can open a
+  pseudo-terminal and type the code. Such an agent can already run `horae run`; if you rely
+  on the approval, do not give the same client both this server and a shell.
 - It applies **exactly** what the dry run planned. If the note it would change was edited, or
   the pipeline, its plugins, models or lockfile changed, it refuses (`refused`) and applies
   nothing; ask for a new dry run. The check is made again under the apply lock just before
-  writing.
+  writing. Interrupting it (Ctrl-C) lets the apply finish; the approval records what the run
+  did.
 - An approval works **once**. It expires after 15 minutes by default
-  (`horae mcp serve --approval-ttl MINUTES`, 1 to 60). Revoking the MCP token that asked also
-  voids its pending approvals.
+  (`horae mcp serve --approval-ttl MINUTES`, 1 to 60). Revoking the MCP token that asked
+  revokes its pending approvals at once.
 - What it applies is an ordinary run (`horae runs`), journalled; `horae undo <run>` reverts it.
 - A client may have at most 3 requests waiting and make 12 requests an hour.
 
@@ -141,9 +148,9 @@ an in-process client and with a real `horae mcp serve` child process over stdio.
 6. Confirm nothing changed: `horae runs -i demo` lists the same runs as before the questions.
 7. Ask: "Use horae pipeline.run on daily-fixture". The answer shows a dry run and an approval
    id; `horae approval list -i demo` shows it `pending`, and nothing was applied. In your own
-   terminal, `horae approval approve <id> -i demo` shows the changes and asks; answer `y`.
-   Ask Claude to approve it instead: it has no tool for that, and `horae approval approve`
-   from its shell refuses (no terminal).
+   terminal, `horae approval approve <id> -i demo` shows the changes and asks for the code it
+   prints; type it. Claude has no MCP tool to approve. Note that if Claude Code also has its
+   Bash tool, it could approve through a pseudo-terminal: the code is friction, not a barrier.
 8. Remove it when done: `claude mcp remove horae`.
 
 You can also run the server by hand: `horae mcp serve -i demo` waits for MCP messages on stdin

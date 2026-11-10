@@ -14,10 +14,13 @@ terminal). `preview` re-plans the dry run's intents against the current vault an
 binding digest, computed with the **current** instance's pipeline, configuration and lockfile
 digests: a difference refuses the approval (`refused`, nothing applied). The user confirms the
 change set; `apply` then claims the row (`pending` → `approving`, a compare-and-set that only
-one caller wins, and only before the TTL) once the pipeline lock is held, and
+one caller wins, only before the TTL and while the requesting token is not revoked) once
+the pipeline lock is held, and
 `Runner.apply_planned` copies the dry run into a new run, re-plans it under the apply lock and
 applies it only if the digest still matches. The approval ends `applied`, `failed` or
-`refused`, naming the run. Every transition is journalled (`approval_events`).
+`refused`, naming the run, also when a signal interrupts it (from the saved run's record);
+one a crash left `approving` is settled under the pipeline lock (`recover_stuck`). Every
+transition is journalled (`approval_events`).
 
 The MCP server (`horae.mcp_server`) imports `request_dry_run` only: no approve, deny or revoke
 path is reachable from it (decision 77 B).
@@ -38,8 +41,15 @@ from horae.config import Instance
 from horae.contracts import RunRecord
 from horae.engine import pipeline_digest
 from horae.engine.canonical import sha256_hex
-from horae.runner import ClaimRefused, PipelineLocked, Runner, RunTimedOut
-from horae.store import ApprovalLimited, ApprovalRow, Store
+from horae.runner import (
+    ClaimRefused,
+    PipelineLock,
+    PipelineLocked,
+    Runner,
+    RunTimedOut,
+    recover_pipeline,
+)
+from horae.store import MAX_LIST_RUNS, ApprovalLimited, ApprovalRow, Store
 
 logger = logging.getLogger("horae.approval")
 
@@ -289,6 +299,7 @@ async def preview(
     what was approved for; raises `ApprovalError` otherwise (a mismatch is recorded
     `refused`). Applies nothing."""
     with Store.open(instance.store_path) as store:
+        recover_stuck(instance, store, at=now())
         row = _pending(store, approval_id, now())
         dry = None if row.dry_run_id is None else store.get_run(row.dry_run_id)
         if dry is None:
@@ -332,12 +343,18 @@ async def apply(
         run_id: list[str] = []
 
         def claim() -> bool:
+            # The pipeline lock is held: settle what a dead process left `approving` first.
+            store.approval_recover(row.pipeline, at=now())
             return store.approval_claim(row.id, at=now())
+
+        def begun(new_run: str) -> None:
+            run_id.append(new_run)
+            store.approval_started(row.id, new_run)
 
         try:
             async with live_ports(instance) as live:
                 record = await Runner(instance, store, live.ports).apply_planned(
-                    approved.dry, verify, claim=claim, on_begin=run_id.append
+                    approved.dry, verify, claim=claim, on_begin=begun
                 )
         except ClaimRefused:
             store.approval_expire(at=now())
@@ -347,27 +364,57 @@ async def apply(
         except PipelineLocked:
             raise
         except BaseException as exc:
+            # A cancellation (a signal) after the shielded apply still saved the run: its
+            # record says what happened. Only a run with no record was interrupted.
             current = store.approval(row.id)
             if current is not None and current.status == "approving":
-                store.approval_finish(
-                    row.id,
-                    "failed",
-                    at=now(),
-                    run_id=run_id[0] if run_id else None,
-                    reason=f"the apply was interrupted ({type(exc).__name__})",
-                )
+                saved = store.get_run(run_id[0]) if run_id else None
+                if saved is not None:
+                    _finish(store, row.id, saved, now())
+                else:
+                    store.approval_finish(
+                        row.id,
+                        "failed",
+                        at=now(),
+                        run_id=run_id[0] if run_id else None,
+                        reason=f"interrupted: the apply did not finish ({type(exc).__name__})",
+                    )
             raise
-        outcome: Literal["applied", "failed", "refused"] = "applied"
-        if record.status == "failed":
-            outcome = "refused" if (record.error or "").startswith(MISMATCH) else "failed"
-        store.approval_finish(
-            row.id,
-            outcome,
-            at=now(),
-            run_id=record.id,
-            reason=None if outcome == "applied" else record.error,
-        )
+        _finish(store, row.id, record, now())
         return record
+
+
+def _finish(store: Store, approval_id: str, record: RunRecord, at: datetime) -> None:
+    """End an `approving` approval from the record of the run that applied it."""
+    outcome: Literal["applied", "failed", "refused"] = "applied"
+    if record.status == "failed":
+        outcome = "refused" if (record.error or "").startswith(MISMATCH) else "failed"
+    store.approval_finish(
+        approval_id,
+        outcome,
+        at=at,
+        run_id=record.id,
+        reason=None if outcome == "applied" else record.error,
+    )
+
+
+def recover_stuck(instance: Instance, store: Store, *, at: datetime) -> list[str]:
+    """Settle `approving` approvals a dead process left (decision 77 E): for each pipeline
+    that has one and whose lock is free now (no apply of it is running), its dead runs are
+    recovered and the approvals settled from them (`Store.approval_recover`). A pipeline
+    whose lock is busy is left for later. The ids settled."""
+    pipelines = {r.pipeline for r in store.approvals(status="approving", limit=MAX_LIST_RUNS)}
+    settled: list[str] = []
+    for name in sorted(pipelines):
+        lock = PipelineLock.try_acquire(instance.state_dir, name)
+        if lock is None:
+            continue
+        try:
+            recover_pipeline(store, name, clock=lambda: at)
+            settled.extend(store.approval_recover(name, at=at))
+        finally:
+            lock.release()
+    return settled
 
 
 def deny(
@@ -413,5 +460,6 @@ __all__ = [
     "new_approval_id",
     "plan_document",
     "preview",
+    "recover_stuck",
     "request_dry_run",
 ]
