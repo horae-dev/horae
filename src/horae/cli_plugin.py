@@ -94,7 +94,8 @@ from horae.marketplace.approval import (
     with_grants,
 )
 from horae.marketplace.direct import is_direct, parse_direct
-from horae.marketplace.lock import LOCK_FILE, guard, read_lock, write_lock
+from horae.marketplace.errors import DowngradeRefused, NotInstalled, PluginEnabled
+from horae.marketplace.lock import LOCK_FILE, guard, lock_is, read_lock, write_lock
 from horae.marketplace.pipelines import PackPipelines
 
 MARKETPLACES_DIR = "marketplaces"
@@ -129,6 +130,9 @@ JsonOption = Annotated[bool, typer.Option("--json", help="Print the result as JS
 
 _KINDS: tuple[tuple[type[MarketplaceError], int, str], ...] = (
     (AlreadyInstalled, EXIT_REFUSED, "already_installed"),
+    (DowngradeRefused, EXIT_REFUSED, "downgrade_refused"),
+    (NotInstalled, EXIT_REFUSED, "not_installed"),
+    (PluginEnabled, EXIT_REFUSED, "plugin_enabled"),
     (TierRefused, EXIT_REFUSED, "tier_refused"),
     (ApprovalRefused, EXIT_REFUSED, "approval_refused"),
     (InstallRefused, EXIT_REFUSED, "install_refused"),
@@ -255,8 +259,10 @@ class _Approval:
         yes: bool,
         json_output: bool,
         pipelines: PackPipelines | None = None,
+        source: str | None = None,
     ) -> None:
         self.pipelines = pipelines
+        self.source = source
         self.lock = lock
         self.repo = repo
         self.sha = sha
@@ -275,6 +281,7 @@ class _Approval:
             permissions=granted,
             personal_fields=manifest.provides.personal_fields,
             pipelines=self.pipelines.digests if self.pipelines is not None else {},
+            source="direct" if self.source == "direct" else None,
         )
         existing = self.lock.plugins.get(name)
         err = self.json_output
@@ -329,6 +336,7 @@ def _install_and_lock(
     *,
     yes: bool,
     json_output: bool,
+    source: str = "marketplace",
 ) -> tuple[Installed, LockedPlugin, list[str]]:
     """Under the lock guard: install with approval then the venv (`_chain`) as `prepare`,
     and write the approved entry to `horae.lock`. Raises `MarketplaceError`."""
@@ -337,7 +345,14 @@ def _install_and_lock(
         lock, header = read_lock(lock_path)
         pipelines = PackPipelines(instance)
         approval = _Approval(
-            lock, repo, sha, grants, yes=yes, json_output=json_output, pipelines=pipelines
+            lock,
+            repo,
+            sha,
+            grants,
+            yes=yes,
+            json_output=json_output,
+            pipelines=pipelines,
+            source=source,
         )
         installed = install(
             make_installer(plugins_dir(instance)),
@@ -364,9 +379,14 @@ def _install_and_lock(
         except MarketplaceError:
             shutil.rmtree(installed.path, ignore_errors=True)
             raise
+        new_lock = Lockfile(schema_version=1, plugins=plugins)
         try:
-            write_lock(lock_path, Lockfile(schema_version=1, plugins=plugins), header)
+            if durability := write_lock(lock_path, new_lock, header):
+                echo(f"warning: {durability}", err=True)
         except OSError as exc:
+            if lock_is(lock_path, new_lock):  # renamed into place: committed, not undone
+                echo(f"warning: the install is committed, but: {exc}", err=True)
+                return installed, entry, pipelines.paths
             pipelines.remove()
             shutil.rmtree(installed.path, ignore_errors=True)
             raise CommandFailed(
@@ -456,7 +476,13 @@ def _add(
             found.sha,
             grants,
             lambda installer, prepare: installer.install(
-                found.name, found.version, found.repo, found.sha, prepare=prepare
+                found.name,
+                found.version,
+                found.repo,
+                found.sha,
+                prepare=prepare,
+                tier=found.tier,
+                index=found.index,
             ),
             yes=yes,
             json_output=json_output,
@@ -492,6 +518,7 @@ def _add_direct(
             lambda installer, prepare: installer.install_commit(repo, sha, prepare=prepare),
             yes=yes,
             json_output=json_output,
+            source="direct",
         )
     except MarketplaceError as exc:
         raise _failed(exc) from None

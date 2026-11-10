@@ -10,8 +10,8 @@
   this is how a user approves their own school or Home Assistant host.
 - `describe(...)`: the approval text, grouped and labelled plainly.
 - `lock_mismatch(existing, wanted)`: why `--yes` cannot approve `wanted` from the lock entry
-  already there, or `None` when the entry is for the same version and commit with identical
-  permissions.
+  already there, or `None` when the entry is for the same source, repository, version and
+  commit with identical permissions and pipelines.
 """
 
 from collections.abc import Sequence
@@ -168,6 +168,9 @@ def lock_mismatch(existing: LockedPlugin | None, wanted: LockedPlugin) -> str | 
         return "horae.lock has no entry for this plugin"
     if existing.repo != wanted.repo:
         return f"horae.lock pins repository {existing.repo}, not {wanted.repo}"
+    if existing.source != wanted.source:
+        have_source, want_source = existing.source or "marketplace", wanted.source or "marketplace"
+        return f"horae.lock records a {have_source} install, not a {want_source} one"
     if existing.version != wanted.version:
         return f"horae.lock pins version {existing.version}, not {wanted.version}"
     if existing.commit != wanted.commit:

@@ -66,6 +66,19 @@ class ApprovalRefused(InstallRefused):
     matching `horae.lock` entry). Nothing is installed."""
 
 
+class NotInstalled(MarketplaceError):
+    """`upgrade` or `remove` names a plugin that is not installed by `horae plugin add` (no
+    `horae.lock` entry and no tree, or a tree without an install record)."""
+
+
+class DowngradeRefused(InstallRefused):
+    """`upgrade` would install a lower version than the installed one (`--allow-downgrade`)."""
+
+
+class PluginEnabled(MarketplaceError):
+    """`remove` names a plugin still listed under `plugins:` in `horae.yaml`."""
+
+
 class LockInvalid(MarketplaceError):
     """`horae.lock` exists but cannot be read or does not validate: it is never rewritten."""
 

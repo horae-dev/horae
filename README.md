@@ -55,6 +55,9 @@ uv run horae cache purge --all -i ~/horae-demo # forget cached LLM outputs (the 
 uv run horae plugin search -i ~/horae-demo     # plugins of the `marketplaces` in horae.yaml (cached; --offline works)
 uv run horae plugin resolve github@0.2.0 -i ~/horae-demo   # -> repo and pinned commit
 uv run horae plugin add github@0.2.0 -i ~/horae-demo       # clone, verify tag and SHA, show and approve permissions, pin in horae.lock (deps: #45)
+uv run horae plugin upgrade github -i ~/horae-demo         # permission diff; anything new is approved again; atomic swap
+uv run horae plugin audit -i ~/horae-demo                  # plugins, permissions, last activity; exit 4 on drift (--json)
+uv run horae plugin remove github -i ~/horae-demo          # tree, venv, pack pipelines and lock entry (disable it in horae.yaml first)
 uv run horae eval daily-brief/rank-and-word --plugin-dir tests/fixtures/plugins  # golden cases, offline
 ```
 
@@ -75,6 +78,19 @@ prompt lists each pipeline (trigger, tools, skills; a warning for tools of other
 `horae.lock` pins their digests; they run only once the plugin is listed under `plugins:` in
 `horae.yaml`
 ([schemas decision 72](schemas/README.md#provisional-decisions-133-pending-maintainer-review)).
+
+`horae plugin upgrade NAME[@VERSION]` resolves the new version like `add`, installs it next to
+the old one with its own venv, and shows what changes against `horae.lock`: a new host, local
+endpoint, secret, intent, path or pack pipeline (or a changed one, or a dropped personal field)
+must be approved again, and `--yes` passes only when nothing widens. Hosts you added are kept.
+The trees are swapped and the lock rewritten only after approval; on any failure the old
+version stays. A lower version needs `--allow-downgrade`. `horae plugin remove NAME` refuses a
+plugin still listed under `plugins:` in `horae.yaml`, then deletes its tree, venv, lock entry
+and the pack pipelines that are still its own, and lists what it kept: secrets (unless
+`--delete-secrets`), the files it wrote and the run history. `horae plugin audit` lists every
+plugin with its version, source, tier, permissions and last run, and reports drift between
+`horae.lock` and the disk (exit 4)
+([schemas decision 73](schemas/README.md#provisional-decisions-47-pending-maintainer-review)).
 
 `-i` defaults to the current directory (or `HORAE_INSTANCE`). Every command takes `--json`
 for scripting (one JSON document on stdout, `schema_version: 1`, errors too) and prints no

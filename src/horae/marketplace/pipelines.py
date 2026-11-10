@@ -23,11 +23,22 @@ The pack's tree is untrusted, so before anything is written to the instance (thi
 
 The files are written to a scratch directory in `pipelines/` and renamed into place, so the
 pack's directory is absent or complete. A failure later in the add (the lock write) removes it.
+
+**Upgrade and remove (#47, decision 73).** `PackPipelines(instance, replacing=<the locked
+digests>)` is the upgrade's hook: `pipelines/<plugin>/` may then exist, but only as a real
+directory holding nothing but the old version's own files, each a regular file named like a
+pipeline the lock approves for this plugin and still with its locked digest (an edited or
+foreign file refuses the upgrade: it is never deleted). `write()` then moves the old directory
+aside (`pipelines/.upgrade-old-*`), renames the new one in, and `remove()` puts it back;
+`commit()` deletes the old copy. `delete_own(...)` is what `remove` and `commit` delete with:
+only `<name>.yaml` regular files approved for the plugin with their locked digest, through
+`lstat` (never a symlink, never following one), then the directory only if it is empty.
 """
 
 import hashlib
 import json
 import os
+import secrets
 import shutil
 import stat
 import tempfile
@@ -46,6 +57,8 @@ PIPELINES_DIR = "pipelines"
 SUFFIX = ".yaml"
 MAX_PIPELINE_BYTES = 1024 * 1024
 SCRATCH_PREFIX = ".install-"
+OLD_PREFIX = ".upgrade-old-"
+"""An upgraded pack's previous directory, deleted once the upgrade is committed."""
 _SUFFIXES = (".yaml", ".yml")
 _name: TypeAdapter[str] = TypeAdapter(PipelineName)
 
@@ -175,12 +188,15 @@ def _stems(directory: Path) -> set[str]:
         return set()
 
 
-def _taken(pipelines: Path) -> set[str]:
-    """Names of the pipelines already in the instance (top level and pack directories)."""
+def _taken(pipelines: Path, own: str | None = None) -> set[str]:
+    """Names of the pipelines already in the instance (top level and pack directories), but
+    those of the pack directory `own` (an upgrade replaces them)."""
     names = _stems(pipelines)
     try:
         for entry in pipelines.iterdir():
             info = _lstat(entry)
+            if entry.name == own:
+                continue
             if info is not None and stat.S_ISDIR(info.st_mode) and not entry.name.startswith("."):
                 names |= _stems(entry)
     except OSError:
@@ -194,12 +210,24 @@ class PackPipelines:
     `__call__` runs on the verified tree (nothing is written to the instance); `write` runs
     once the tree is in place; `remove` undoes `write`."""
 
-    def __init__(self, instance: Path) -> None:
+    def __init__(
+        self, instance: Path, replacing: dict[str, str] | None = None, *, upgrade: bool = False
+    ) -> None:
         self.instance = instance
+        self.replacing = replacing
+        """An upgrade of a pack: the pipelines the lock approves for the installed version
+        (name -> digest); `pipelines/<plugin>/` may hold exactly those."""
+        self.upgrade = upgrade or replacing is not None
+        """An upgrade: a version that installs no pipeline leaves `pipelines/<plugin>/`
+        alone (an add keeps refusing it, decision 72 D)."""
         self.plugin: str | None = None
         self.files: dict[str, bytes] = {}
         self.parsed: dict[str, Pipeline] = {}
         self.written: Path | None = None
+        self.target: Path | None = None
+        """`pipelines/<plugin>/`, once checked."""
+        self.old: Path | None = None
+        """An upgrade: the old directory, moved aside by `write`."""
 
     @property
     def paths(self) -> list[str]:
@@ -237,12 +265,16 @@ class PackPipelines:
         parsed = {name: _validated(plugin, name, raw) for name, raw in files.items()}
         pipelines = self.instance / PIPELINES_DIR
         target = pipelines / plugin
-        if _lstat(target) is not None:
+        self.target = target
+        if self.replacing is not None:
+            check_own(plugin, target, self.replacing)
+        elif _lstat(target) is not None and (files or not self.upgrade):
             raise InstallRefused(
                 f"{plugin}: {target} already exists and is not installed by this pack; "
                 "refusing to overwrite it (move it away, or remove the pack first)"
             )
-        clash = sorted(set(files) & _taken(pipelines))
+        own = plugin if self.replacing is not None else None
+        clash = sorted(set(files) & _taken(pipelines, own))
         if clash:
             raise InstallRefused(
                 f"{plugin}: the instance already defines pipeline(s) {', '.join(clash)}; "
@@ -288,12 +320,19 @@ class PackPipelines:
         path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
 
     def write(self) -> None:
-        """Create `pipelines/<plugin>/` with the checked files, atomically."""
-        if self.plugin is None:
+        """Create `pipelines/<plugin>/` with the checked files, atomically. In an upgrade the
+        old directory, if any, is first moved aside (`OLD_PREFIX`); `remove` undoes both."""
+        target = self.target
+        if target is None or (self.plugin is None and self.replacing is None):
             return
-        pipelines = self.instance / PIPELINES_DIR
-        target = pipelines / self.plugin
+        pipelines = target.parent
         try:
+            if self.replacing is not None and os.path.lexists(target):
+                aside = pipelines / f"{OLD_PREFIX}{target.name}-{secrets.token_hex(8)}"
+                target.rename(aside)
+                self.old = aside
+            if self.plugin is None:
+                return  # the new version installs no pipeline: the old ones are only removed
             pipelines.mkdir(parents=True, exist_ok=True)
             scratch = Path(tempfile.mkdtemp(dir=pipelines, prefix=SCRATCH_PREFIX))
             try:
@@ -306,13 +345,126 @@ class PackPipelines:
                 shutil.rmtree(scratch, ignore_errors=True)
                 raise
         except OSError as exc:
+            self.remove()
             raise InstallRefused(
-                f"{self.plugin}: cannot write pipelines to {target}: {exc.strerror or exc}"
+                f"{target.name}: cannot write pipelines to {target}: {exc.strerror or exc}"
             ) from None
+        except BaseException:
+            self.remove()
+            raise
         self.written = target
 
     def remove(self) -> None:
-        """Undo `write`: delete the directory this install created."""
+        """Undo `write`: delete the directory this install created, and put an upgraded
+        pack's old directory back."""
         if self.written is not None:
             shutil.rmtree(self.written, ignore_errors=True)
             self.written = None
+        if self.old is not None and self.target is not None:
+            try:
+                self.old.rename(self.target)
+            except OSError:
+                return  # left aside: `horae plugin audit` reports it
+            self.old = None
+
+    def commit(self) -> list[str]:
+        """An upgrade is done: delete the old directory moved aside (its own files only).
+        Returns what was kept (empty when everything was deleted)."""
+        if self.old is None or self.replacing is None:
+            return []
+        kept = delete_own(self.old, self.replacing)
+        self.old = None
+        return kept
+
+
+_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+_FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+
+
+def _open_dir(directory: Path) -> int | None:
+    """A descriptor of `directory` (never through a symlink), or `None` when it is absent;
+    `OSError` when it is a symlink or not a directory."""
+    try:
+        return os.open(directory, _DIR_FLAGS)
+    except FileNotFoundError:
+        return None
+
+
+def check_own(plugin: str, directory: Path, approved: dict[str, str]) -> None:
+    """`InstallRefused` unless `directory` is absent, or a real directory whose every entry is
+    a regular `<name>.yaml` file with `name` in `approved` and the digest the lock approved."""
+    try:
+        fd = _open_dir(directory)
+    except OSError:
+        raise InstallRefused(
+            f"{plugin}: {directory} is not a directory (or is a symlink): refusing"
+        ) from None
+    if fd is None:
+        return
+    try:
+        for name in sorted(os.listdir(fd)):
+            if not _is_own(fd, name, approved):
+                raise InstallRefused(
+                    f"{plugin}: {directory / name} was not installed by this pack, or was "
+                    "changed after approval; move it away (or restore it) first: it is never "
+                    "deleted"
+                )
+    except OSError as exc:
+        raise InstallRefused(f"{plugin}: cannot read {directory}: {exc.strerror}") from None
+    finally:
+        os.close(fd)
+
+
+def _is_own(dir_fd: int, name: str, approved: dict[str, str]) -> bool:
+    """Whether entry `name` of the directory `dir_fd` is a regular file `<pipeline>.yaml` the
+    lock approves, with its digest (opened with `O_NOFOLLOW`: a symlink is never one)."""
+    pipeline = name.removesuffix(SUFFIX)
+    if not name.endswith(SUFFIX) or pipeline not in approved:
+        return False
+    try:
+        fd = os.open(name, _FILE_FLAGS, dir_fd=dir_fd)
+    except OSError:
+        return False  # a symlink (ELOOP), a vanished or unreadable entry
+    with os.fdopen(fd, "rb") as handle:
+        try:
+            info = os.fstat(handle.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_PIPELINE_BYTES:
+                return False
+            raw = handle.read(MAX_PIPELINE_BYTES + 1)
+        except OSError:
+            return False
+    return digest(raw) == approved[pipeline]
+
+
+def delete_own(directory: Path, approved: dict[str, str]) -> list[str]:
+    """Delete from `directory` the files that are a pack's own (`_is_own`: approved name,
+    locked digest, regular file), through a descriptor of the directory opened without
+    following a symlink, then `directory` itself if it is left empty. Returns what was kept:
+    every other entry, or the directory when it is not empty, not a real directory, or
+    cannot be read."""
+    try:
+        fd = _open_dir(directory)
+    except OSError:
+        return [str(directory)]
+    if fd is None:
+        return []
+    kept: list[str] = []
+    try:
+        names = sorted(os.listdir(fd))
+        for name in names:
+            if _is_own(fd, name, approved):
+                try:
+                    os.unlink(name, dir_fd=fd)
+                    continue
+                except OSError:
+                    pass
+            kept.append(str(directory / name))
+    except OSError:
+        return [str(directory)]
+    finally:
+        os.close(fd)
+    try:
+        directory.rmdir()  # never follows a symlink: a link is not a directory to rmdir
+    except OSError:
+        kept.append(str(directory))
+    return kept

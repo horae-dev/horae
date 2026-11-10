@@ -218,8 +218,11 @@ def test_behind_the_gate_a_direct_install_is_approved_and_locked(
     assert f"commit  {repo[1]} (direct install, pinned by its SHA)" in out
     assert "tier" not in out
     installed = instance_dir / "plugins" / "demo"
-    assert json.loads((installed / INSTALL_RECORD).read_text(encoding="utf-8"))["repo"] == URL
+    record = json.loads((installed / INSTALL_RECORD).read_text(encoding="utf-8"))
+    assert (record["repo"], record["source"]) == (URL, "direct")
+    assert "tier" not in record
     assert _lock(instance_dir)["plugins"]["demo"] == {
+        "source": "direct",  # decision 73 A: the lock says where it came from
         "commit": repo[1],
         "permissions": {
             "intents": [],

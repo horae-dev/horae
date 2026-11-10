@@ -42,7 +42,13 @@ tree before it is moved into place, and `horae plugin add` passes
 upgrade (#47) installs a new tree, with a fresh venv, through this same atomic path. What was
 installed is recorded in the install directory, `plugins/<name>/.horae-install.json`:
 `{schema_version, name, version, repo, commit}`, the fields of a `horae.lock` entry but the
-permissions (`Installed.lock_entry`).
+permissions (`Installed.lock_entry`), plus where it came from (decision 73 A): `source`
+(`marketplace` or `direct`) and, for a marketplace install, the `tier` and `index` that
+resolved it (information for `horae plugin audit`; the host compares only the first four).
+
+An upgrade (#47, decision 73) passes `replace=True`: the plugin must already be installed, and
+the finished tree (with its venv) is renamed to a staging directory
+`plugins/.upgrade-new-<name>-<random>` instead of `plugins/<name>`; the caller swaps it in.
 """
 
 import errno
@@ -50,6 +56,7 @@ import json
 import os
 import posixpath
 import re
+import secrets
 import shutil
 import tempfile
 import time
@@ -71,6 +78,8 @@ MANIFEST_FILE = "plugin.yaml"
 INSTALL_RECORD = ".horae-install.json"
 """In the install directory: what was installed (decision 62)."""
 SCRATCH_PREFIX = ".install-"
+STAGED_PREFIX = ".upgrade-new-"
+"""An upgrade's finished tree, waiting to be swapped in (`install(..., replace=True)`)."""
 STALE_SCRATCH_S = 3600
 """A scratch directory older than this is left by a killed install and may be removed."""
 MAX_FETCH_BYTES = 200 * 1024 * 1024
@@ -110,16 +119,26 @@ class Installed:
     commit: str
     path: Path
     manifest: PluginManifest
+    source: str = "marketplace"
+    """`marketplace` or `direct` (decision 73 A)."""
+    tier: str | None = None
+    """The marketplace tier that resolved it (information only)."""
+    index: str | None = None
+    """The marketplace index that resolved it (information only)."""
 
     def record(self) -> dict[str, Any]:
         """The content of `INSTALL_RECORD`."""
-        return {
+        record: dict[str, Any] = {
             "schema_version": 1,
             "name": self.name,
             "version": self.version,
             "repo": self.repo,
             "commit": self.commit,
+            "source": self.source,
         }
+        if self.source == "marketplace":
+            record.update(tier=self.tier, index=self.index)
+        return record
 
     def lock_entry(self, permissions: Permissions) -> LockedPlugin:
         """The `horae.lock` entry of this plugin with the permissions the user approved
@@ -132,6 +151,7 @@ class Installed:
             commit=self.commit,
             permissions=permissions,
             personal_fields=self.manifest.provides.personal_fields,
+            source="direct" if self.source == "direct" else None,
         )
 
 
@@ -184,12 +204,25 @@ class PluginInstaller:
     # --- the install ---------------------------------------------------------------------
 
     def install(
-        self, name: str, version: str, repo: str, sha: str, *, prepare: Prepare | None = None
+        self,
+        name: str,
+        version: str,
+        repo: str,
+        sha: str,
+        *,
+        prepare: Prepare | None = None,
+        tier: str | None = None,
+        index: str | None = None,
+        replace: bool = False,
     ) -> Installed:
         """Fetch `repo`, verify that `sha` and the tag `v<version>` are the same commit, and
         install its tree as `plugins/<name>`. `InstallRefused` when verification fails,
         `AlreadyInstalled` when the name is taken, `InstallError` when git fails; in every
-        case nothing is left in `plugins/`."""
+        case nothing is left in `plugins/`. `tier` and `index` are recorded as they are.
+
+        `replace=True` (an upgrade, #47): `plugins/<name>` must be installed already and is
+        left alone; the finished tree is placed in a new staging directory
+        (`STAGED_PREFIX`), returned as `Installed.path`, for the caller to swap in."""
         try:
             name = _name.validate_python(name)
             version = _version.validate_python(version)
@@ -200,9 +233,14 @@ class PluginInstaller:
             ) from None
         self._check_repo(repo)
         target = self.plugins_dir / name
-        if os.path.lexists(target):
+        if replace and not os.path.isdir(target):
+            raise InstallRefused(
+                f"plugin {name!r} is not installed in {target}: nothing to upgrade"
+            )
+        if not replace and os.path.lexists(target):
             raise AlreadyInstalled(f"plugin {name!r} is already installed in {target}")
-        return self._install(repo, sha, (name, version), prepare)
+        origin = ("marketplace", tier, index)
+        return self._install(repo, sha, (name, version), prepare, origin, replace=replace)
 
     def install_commit(self, repo: str, sha: str, *, prepare: Prepare | None = None) -> Installed:
         """A direct install from a git URL (#48): fetch the branches and tags of `repo`, require
@@ -216,7 +254,7 @@ class PluginInstaller:
         except ValidationError:
             raise InstallRefused(f"{sha!r} is not a full commit SHA") from None
         self._check_repo(repo)
-        return self._install(repo, sha, None, prepare)
+        return self._install(repo, sha, None, prepare, ("direct", None, None))
 
     def _check_repo(self, repo: str) -> None:
         if self.allow_protocol == HTTPS:
@@ -231,9 +269,13 @@ class PluginInstaller:
         sha: str,
         expected: tuple[str, str] | None,
         prepare: Prepare | None,
+        origin: tuple[str, str | None, str | None],
+        *,
+        replace: bool = False,
     ) -> Installed:
         """The install of `sha` from `repo`: at the tag of `expected = (name, version)`, or,
-        when `expected` is `None`, a direct install of the commit alone."""
+        when `expected` is `None`, a direct install of the commit alone. `origin` is
+        `(source, tier, index)`, recorded. `replace`: placed in a staging directory."""
         try:
             self.plugins_dir.mkdir(parents=True, exist_ok=True)
             self._sweep()
@@ -256,7 +298,10 @@ class PluginInstaller:
             target = self.plugins_dir / name
             if expected is None and os.path.lexists(target):
                 raise AlreadyInstalled(f"plugin {name!r} is already installed in {target}")
-            installed = Installed(name, version, repo, sha, target, manifest)
+            source, tier, index = origin
+            if replace:
+                target = self.plugins_dir / f"{STAGED_PREFIX}{name}-{secrets.token_hex(8)}"
+            installed = Installed(name, version, repo, sha, target, manifest, source, tier, index)
             (tree / INSTALL_RECORD).write_text(
                 json.dumps(installed.record(), indent=2) + "\n", encoding="utf-8"
             )
@@ -543,9 +588,15 @@ class PluginInstaller:
         return manifest
 
     def _sweep(self) -> None:
-        """Remove the scratch directories of killed installs (older than an hour)."""
+        """Remove the scratch directories of killed installs and the staged trees of killed
+        upgrades (older than an hour). An upgrade's old tree (`.upgrade-old-*`) may be the only
+        copy left by a killed upgrade: never swept (`horae plugin audit` reports it)."""
         cutoff = time.time() - STALE_SCRATCH_S
-        for entry in self.plugins_dir.glob(f"{SCRATCH_PREFIX}*"):
+        entries = [
+            *self.plugins_dir.glob(f"{SCRATCH_PREFIX}*"),
+            *self.plugins_dir.glob(f"{STAGED_PREFIX}*"),
+        ]
+        for entry in entries:
             try:
                 if not entry.is_symlink() and entry.is_dir() and entry.stat().st_mtime < cutoff:
                     shutil.rmtree(entry, ignore_errors=True)

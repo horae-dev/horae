@@ -31,7 +31,7 @@
           "type": "string"
         },
         "commit": {
-          "description": "The commit checked out; the tag for `version` must point to it.",
+          "description": "The commit checked out. For a marketplace install the tag for `version` points to it;\nfor a direct install (`source: direct`) it is the pinned SHA, no tag is checked.",
           "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$",
           "title": "Commit",
           "type": "string"
@@ -78,6 +78,20 @@
           "title": "Pipelines",
           "type": "object",
           "additionalProperties": false
+        },
+        "source": {
+          "anyOf": [
+            {
+              "const": "direct",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Where the plugin came from (decision 73 A, settling decision 71 E): `direct` for a direct\ninstall from a git URL (#48, no marketplace tier: `commit` is the pinned SHA and no tag was\nchecked); absent for a marketplace install, so a lock written before it reads the same.\n`horae plugin upgrade` reads it to apply the direct-install gate, and `--yes` compares it.",
+          "title": "Source"
         }
       },
       "required": [
