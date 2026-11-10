@@ -27,6 +27,7 @@ from horae.contracts.types import (
     _URL_REST,
     HOST,
     MAX_ITEMS,
+    AbsolutePath,
     Contract,
     IanaTimezone,
     PipelineName,
@@ -383,9 +384,66 @@ with the same uid, network and filesystem (the "declared" tier); `container`, it
 container (read-only, no network, only its own directory mounted, #49)."""
 
 
+Cpus = Annotated[StrictFloat, Field(ge=0.1, le=64.0)]
+"""CPUs a plugin container may use (`docker run --cpus`), 0.1 to 64."""
+MemoryMb = Annotated[StrictInt, Field(ge=64, le=65536)]
+"""Memory of a plugin container in MiB (`--memory`, and `--memory-swap` the same: no swap)."""
+PidsLimit = Annotated[StrictInt, Field(ge=16, le=4096)]
+"""Processes and threads a plugin container may hold at once (`--pids-limit`)."""
+TmpMb = Annotated[StrictInt, Field(ge=1, le=1024)]
+"""Size of a plugin container's `/tmp` tmpfs in MiB (it counts against its memory)."""
+Nofile = Annotated[StrictInt, Field(ge=64, le=65536)]
+"""Open files per process in a plugin container (`--ulimit nofile=N:N`)."""
+
+DEFAULT_CPUS = 1.0
+DEFAULT_MEMORY_MB = 512
+DEFAULT_PIDS = 128
+DEFAULT_TMP_MB = 64
+DEFAULT_NOFILE = 1024
+
+
+class ContainerLimits(Contract):
+    """The resource limits of a plugin container (schemas decision 78 D). The defaults suit a
+    4-core / 16 GB home server running a handful of plugins at once."""
+
+    cpus: Cpus = DEFAULT_CPUS
+    """CPUs (`--cpus`): a plugin never takes more than this share of the host."""
+    memory_mb: MemoryMb = DEFAULT_MEMORY_MB
+    """Memory in MiB (`--memory`, `--memory-swap` equal: no swap). Past it the kernel kills the
+    plugin, reported as `oom_killed`. The `/tmp` tmpfs counts against it."""
+    pids: PidsLimit = DEFAULT_PIDS
+    """Processes and threads (`--pids-limit`): a fork loop fails instead of filling the host."""
+    tmp_mb: TmpMb = DEFAULT_TMP_MB
+    """Size of the `/tmp` tmpfs in MiB, the container's only scratch space. Less than
+    `memory_mb`."""
+    nofile: Nofile = DEFAULT_NOFILE
+    """Open files per process (`--ulimit nofile`, soft and hard)."""
+
+    @model_validator(mode="after")
+    def _tmp_fits_in_memory(self) -> Self:
+        if self.tmp_mb >= self.memory_mb:
+            raise ValueError("tmp_mb must be less than memory_mb (the tmpfs is held in memory)")
+        return self
+
+
+class ContainerLimitsOverride(Contract):
+    """A plugin's own limits: each field set wins over `plugin_defaults.limits`."""
+
+    cpus: Cpus | None = None
+    """CPUs (`--cpus`), 0.1 to 64."""
+    memory_mb: MemoryMb | None = None
+    """Memory in MiB (`--memory`, no swap), 64 to 65 536."""
+    pids: PidsLimit | None = None
+    """Processes and threads (`--pids-limit`), 16 to 4096."""
+    tmp_mb: TmpMb | None = None
+    """Size of the `/tmp` tmpfs in MiB, 1 to 1024 (less than the effective `memory_mb`)."""
+    nofile: Nofile | None = None
+    """Open files per process (`--ulimit nofile`), 64 to 65 536."""
+
+
 class PluginDefaults(Contract):
-    """Timeouts and runtime for every plugin without its own setting (the #24 plugin host reads
-    them)."""
+    """Timeouts, runtime and container limits for every plugin without its own setting (the
+    #24 plugin host reads them)."""
 
     startup_timeout_s: Timeout = DEFAULT_STARTUP_TIMEOUT_S
     """Seconds a plugin may take to start and answer the MCP handshake."""
@@ -394,6 +452,9 @@ class PluginDefaults(Contract):
     runtime: PluginRuntime = "process"
     """`process` (default) or `container` (schemas decision 74). With `container` a plugin that
     cannot run in a container is refused (`runtime_unavailable`), never run as a process."""
+    limits: ContainerLimits = Field(default_factory=ContainerLimits)
+    """CPU, memory, PID, `/tmp` and open-file limits of `runtime: container` (schemas decision
+    78 D); the process runtime has none."""
 
 
 class PluginSettings(Contract):
@@ -405,6 +466,8 @@ class PluginSettings(Contract):
     """Seconds one tool call may take. When omitted, `plugin_defaults` applies."""
     runtime: PluginRuntime | None = None
     """`process` or `container`. When omitted, `plugin_defaults.runtime` applies."""
+    limits: ContainerLimitsOverride | None = None
+    """Container limits of this plugin; each field omitted takes `plugin_defaults.limits`'."""
 
 
 DEFAULT_CONTAINER_IMAGE = (
@@ -435,6 +498,12 @@ class ContainerConfig(Contract):
     docker: CommandPath | None = None
     """The Docker CLI, as an absolute path. When omitted, `docker` on
     `/usr/local/bin:/usr/bin:/bin`."""
+    mount_roots: Annotated[list[AbsolutePath], Field(max_length=MAX_ITEMS)] = Field(
+        default_factory=list
+    )
+    """Directories, besides the instance's own, under which a container plugin's declared
+    `permissions.paths` may be mounted (schemas decision 78 B), e.g. a vault kept outside the
+    instance. A declared path elsewhere is refused (`runtime_unavailable`)."""
 
 
 MIN_RUN_TIMEOUT_S = 1.0
@@ -713,6 +782,19 @@ class InstanceConfig(Contract):
     the same plugin under different repositories (schemas decision 61)."""
 
     @model_validator(mode="after")
+    def _check_plugin_limits(self) -> Self:
+        # Not expressible in JSON Schema: checked by the pydantic model only.
+        for name in self.plugins:
+            try:
+                self.plugin_limits(name)
+            except ValidationError as error:
+                reasons = "; ".join(
+                    str(item["msg"]).removeprefix("Value error, ") for item in error.errors()
+                )
+                raise ValueError(f"plugins.{name}.limits: {reasons}") from None
+        return self
+
+    @model_validator(mode="after")
     def _check_marketplaces(self) -> Self:
         if len(set(self.marketplaces)) != len(self.marketplaces):
             raise ValueError("marketplaces lists the same URL twice")
@@ -736,4 +818,15 @@ class InstanceConfig(Contract):
                 defaults.call_timeout_s if own.call_timeout_s is None else own.call_timeout_s
             ),
             runtime=defaults.runtime if own.runtime is None else own.runtime,
+            limits=self.plugin_limits(plugin),
         )
+
+    def plugin_limits(self, plugin: str) -> ContainerLimits:
+        """The effective container limits of `plugin`: each field of its own `limits` that is
+        set, else `plugin_defaults.limits`'."""
+        own = self.plugins.get(plugin, PluginSettings()).limits
+        defaults = self.plugin_defaults.limits
+        if own is None:
+            return defaults
+        changes = own.model_dump(exclude_none=True)
+        return ContainerLimits.model_validate(defaults.model_dump() | changes)

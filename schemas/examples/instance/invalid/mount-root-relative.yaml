@@ -1,0 +1,3 @@
+# `container.mount_roots` are absolute, normalised paths (schemas decision 78 B).
+container:
+  mount_roots: [vault]

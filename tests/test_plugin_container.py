@@ -22,7 +22,12 @@ import pytest
 from pydantic import ValidationError
 
 from horae.contracts import InstanceConfig
-from horae.contracts.instance import DEFAULT_CONTAINER_IMAGE, ContainerConfig, PluginDefaults
+from horae.contracts.instance import (
+    DEFAULT_CONTAINER_IMAGE,
+    ContainerConfig,
+    ContainerLimits,
+    PluginDefaults,
+)
 from horae.plugins.host import PluginCallError, PluginHost
 from horae.plugins.host.container import (
     ENGINE_ENV_KEYS,
@@ -39,7 +44,9 @@ from horae.plugins.host.container import (
     network_problem,
     preamble,
     run_argv,
+    tmpfs_option,
 )
+from horae.plugins.host.mounts import MountPolicy
 from horae.secrets import Secret, SecretResolver
 from plugin_fixtures import COMMIT, RAW_SERVER, lock_for, secrets_dir
 
@@ -86,8 +93,9 @@ def test_every_hardening_flag_is_present() -> None:
     image_at = argv.index(DEFAULT_CONTAINER_IMAGE)
     options, after = argv[:image_at], argv[image_at + 1 :]
     assert options[:2] == ["/usr/bin/docker", "run"]
-    for flag in ("--interactive", "--rm", "--init", "--read-only"):
+    for flag in ("--interactive", "--init", "--read-only"):
         assert flag in options
+    assert "--rm" not in options  # inspected for OOMKilled, then removed (decision 78 E)
     pairs = _pairs(options)
     for pair in [
         ("--cap-drop", "ALL"),
@@ -142,7 +150,7 @@ def test_nothing_widens_the_container() -> None:
     assert options.count("--security-opt") == 1
 
 
-def test_the_only_mount_is_the_plugin_directory_read_only() -> None:
+def test_without_declared_paths_the_only_mount_is_the_plugin_directory_read_only() -> None:
     options = _argv()[: _argv().index(DEFAULT_CONTAINER_IMAGE)]
     mounts = [value for flag, value in _pairs(options) if flag == "--mount"]
     assert mounts == ["type=bind,source=/srv/instance/plugins/jail,target=/plugin,readonly"]
@@ -503,6 +511,9 @@ if args[:2] == ["network", "create"]:
 if args[:2] == ["context", "inspect"]:
     print(fake["endpoint"])
     sys.exit(0)
+if args[:2] == ["container", "inspect"] and "OOMKilled" in args[3]:
+    print("true" if fake["oom"] else "false")
+    sys.exit(0)
 if args[:2] == ["container", "inspect"] and "NetworkSettings" in args[3]:
     print(json.dumps(fake["proxy_networks"]))
     sys.exit(0)
@@ -536,7 +547,9 @@ if args[:1] == ["run"]:
         line += byte
     with open(os.path.join(config_dir, "preamble.json"), "wb") as handle:
         handle.write(bytes(line))
-    os.execv(sys.executable, [sys.executable, fake["server"], "normal"])
+    with open(os.path.join(config_dir, "run.json"), "w") as handle:
+        handle.write(json.dumps(args))
+    os.execv(sys.executable, [sys.executable, fake["server"], fake["mode"]])
 sys.exit(2)
 """
 
@@ -555,6 +568,8 @@ def _fake_docker(tmp_path: Path, **fake: Any) -> tuple[Path, Path]:
         "proxy": "ok",
         "admit": True,
         "blocked": [],
+        "oom": False,
+        "mode": "normal",
         "proxy_networks": {
             f"horae-plugin-{name}": {"IPAddress": "192.168.155.2"} for name in ("raw", "jail")
         }
@@ -575,13 +590,15 @@ def _calls(state: Path) -> list[list[str]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 
-def _manifest(command: list[str] | None = None) -> dict[str, Any]:
+def _manifest(
+    command: list[str] | None = None, paths: dict[str, list[str]] | None = None
+) -> dict[str, Any]:
     return {
         "name": "raw",
         "version": "0.1.0",
         "horae": ">=0",
-        "provides": {"sources": ["raw.ok", "raw.rpc_error"]},
-        "permissions": {"secrets": ["JAIL_TOKEN"]},
+        "provides": {"sources": ["raw.ok", "raw.rpc_error", "raw.close"]},
+        "permissions": {"secrets": ["JAIL_TOKEN"]} | ({"paths": paths} if paths else {}),
         "runtime": {"protocol": "mcp-stdio", "command": command or ["python", "-m", "raw"]},
     }
 
@@ -595,11 +612,14 @@ def _host(
     uid: int | None = None,
     runtime: str = "container",
     environ: dict[str, str] | None = None,
+    paths: dict[str, list[str]] | None = None,
+    mounts: MountPolicy | None = None,
+    limits: ContainerLimits | None = None,
 ) -> PluginHost:
     from horae.contracts import PluginManifest
     from horae.plugins.host import HostRegistry
 
-    manifest = _manifest()
+    manifest = _manifest(paths=paths)
     lock = lock_for(manifest)
     registry = HostRegistry(lock, {"raw": PluginManifest.model_validate(manifest)}, {"raw": plugin})
     resolver = SecretResolver({}, secrets_dir(tmp_path, JAIL_TOKEN=TOKEN))
@@ -608,11 +628,17 @@ def _host(
         registry,
         secrets=resolver,
         work_dir=tmp_path / "work",
-        timeouts=lambda _name: PluginDefaults(runtime=runtime, startup_timeout_s=30.0),  # type: ignore[arg-type]
+        timeouts=lambda _name: PluginDefaults(
+            runtime=runtime,  # type: ignore[arg-type]
+            startup_timeout_s=30.0,
+            limits=limits or ContainerLimits(),
+        ),
         container=config,
     )
     engine = {} if state is None else {"DOCKER_CONFIG": str(state)}
-    h._containers = ContainerRuntime(config, uid=uid, environ=engine | (environ or {}))
+    h._containers = ContainerRuntime(
+        config, mounts=mounts, uid=uid, environ=engine | (environ or {})
+    )
     return h
 
 
@@ -1128,3 +1154,123 @@ def test_a_proxy_that_cannot_be_bound_to_the_plugin_means_no_plugin(tmp_path: Pa
     runs = [call for call in _calls(state) if call[0] == "run"]
     for started in runs:  # the plugin and its proxy are both removed
         assert ["rm", "--force", started[started.index("--name") + 1]] in _calls(state)
+
+
+# --- declared mounts, limits and out-of-memory kills (#51, schemas decision 78) ----------------
+
+
+def _instance(tmp_path: Path) -> tuple[Path, MountPolicy]:
+    root = (tmp_path / "instance").resolve()
+    for name in ("vault/inbox", "state", "secrets", "plugins"):
+        (root / name).mkdir(parents=True)
+    policy = MountPolicy.for_instance(
+        root, state_dir=root / "state", secrets_dir=root / "secrets", home=tmp_path / "home"
+    )
+    return root, policy
+
+
+def test_declared_paths_and_limits_reach_the_run_command(tmp_path: Path) -> None:
+    plugin = _plugin_dir(tmp_path)
+    cli, state = _fake_docker(tmp_path)
+    root, policy = _instance(tmp_path)
+    vault, inbox = str(root / "vault"), str(root / "vault" / "inbox")
+    limits = ContainerLimits(cpus=0.5, memory_mb=256, pids=64, tmp_mb=16, nofile=512)
+
+    async def go() -> Any:
+        async with _host(
+            tmp_path,
+            plugin,
+            docker=cli,
+            state=state,
+            paths={"read": [vault], "write": [inbox]},
+            mounts=policy,
+            limits=limits,
+        ) as h:
+            return await h.call("raw.ok", {}, None)
+
+    assert asyncio.run(go()).data == {"ok": True}
+    run = json.loads((state / "run.json").read_text(encoding="utf-8"))
+    mounts = [value for flag, value in _pairs(run) if flag == "--mount"]
+    assert mounts[1:] == [
+        f"type=bind,source={vault},target={vault},bind-recursive=disabled,readonly",
+        f"type=bind,source={inbox},target={inbox},bind-recursive=disabled",
+    ]
+    for flag in (
+        "--cpus=0.5",
+        "--memory=256m",
+        "--memory-swap=256m",
+        "--pids-limit=64",
+        "--ulimit=nofile=512:512",
+    ):
+        assert flag in run
+    assert ("--tmpfs", tmpfs_option(16)) in _pairs(run)
+    assert "size=16m" in tmpfs_option(16)
+
+
+def test_a_path_that_cannot_be_mounted_means_no_plugin_and_no_proxy(tmp_path: Path) -> None:
+    plugin = _plugin_dir(tmp_path)
+    cli, state = _fake_docker(tmp_path)
+    root, policy = _instance(tmp_path)
+    error = _first_error(
+        tmp_path,
+        plugin,
+        docker=cli,
+        state=state,
+        paths={"read": [str(root / "state")]},
+        mounts=policy,
+    )
+    assert error.kind == "runtime_unavailable"
+    assert "cannot be mounted" in error.message
+    assert not any(call[0] == "run" for call in _calls(state))
+
+
+def test_without_an_instance_a_declared_path_is_refused(tmp_path: Path) -> None:
+    plugin = _plugin_dir(tmp_path)
+    cli, state = _fake_docker(tmp_path)
+    root, _ = _instance(tmp_path)
+    error = _first_error(
+        tmp_path, plugin, docker=cli, state=state, paths={"read": [str(root / "vault")]}
+    )
+    assert error.kind == "runtime_unavailable"
+    assert "no instance" in error.message
+    assert not any(call[0] == "run" for call in _calls(state))
+
+
+def test_a_memory_kill_during_a_call_is_reported_as_oom_killed(tmp_path: Path) -> None:
+    plugin = _plugin_dir(tmp_path)
+    cli, state = _fake_docker(tmp_path, oom=True)
+
+    async def go() -> PluginCallError:
+        async with _host(tmp_path, plugin, docker=cli, state=state) as h:
+            with pytest.raises(PluginCallError) as info:
+                await h.call("raw.close", {}, None)
+            return info.value
+
+    error = asyncio.run(go())
+    assert error.kind == "oom_killed"
+    assert "memory limit (512 MiB" in error.message
+    calls = _calls(state)
+    inspect = next(i for i, call in enumerate(calls) if "{{json .State.OOMKilled}}" in call)
+    run = next(call for call in calls if call[0] == "run" and "dev.horae.plugin=raw" in call)
+    name = run[run.index("--name") + 1]
+    assert calls.index(["rm", "--force", name]) > inspect  # inspected before it is removed
+
+
+def test_a_crash_without_a_memory_kill_stays_a_crash(tmp_path: Path) -> None:
+    plugin = _plugin_dir(tmp_path)
+    cli, state = _fake_docker(tmp_path)
+
+    async def go() -> PluginCallError:
+        async with _host(tmp_path, plugin, docker=cli, state=state) as h:
+            with pytest.raises(PluginCallError) as info:
+                await h.call("raw.close", {}, None)
+            return info.value
+
+    assert asyncio.run(go()).kind == "plugin_crashed"
+
+
+def test_a_memory_kill_during_the_start_is_reported_as_oom_killed(tmp_path: Path) -> None:
+    plugin = _plugin_dir(tmp_path)
+    cli, state = _fake_docker(tmp_path, oom=True, mode="exit")
+    error = _first_error(tmp_path, plugin, docker=cli, state=state)
+    assert error.kind == "oom_killed"

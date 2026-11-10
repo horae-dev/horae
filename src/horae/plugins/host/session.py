@@ -65,6 +65,8 @@ MAX_TOOLS = 1024
 """Most tools (over all `tools/list` pages) a plugin may list."""
 _MAX_PAGES = 64
 _CRASH_WAIT_S = 2.0
+_DIAGNOSED = frozenset({"handshake_failed", "startup_timeout"})
+"""Start failures `Spawn.diagnose` may explain (a plugin killed while starting)."""
 _STOP_WAIT_S = 10.0
 
 
@@ -85,6 +87,11 @@ class Spawn:
     not raise and must bound its own time."""
     egress: "ProxyHandle | None" = field(default=None, repr=False)
     """The container's egress proxy (#50): the host watches its blocked attempts."""
+    diagnose: Callable[[], Awaitable[tuple[HostErrorKind, str] | None]] | None = field(
+        default=None, repr=False
+    )
+    """Asked once the process died during a call or the handshake, before `cleanup`: a more
+    precise failure than a crash (the container runtime's `oom_killed`, #51), or `None`."""
 
 
 class CallFailed(Exception):
@@ -154,6 +161,11 @@ class PluginProcess:
             self.error = PluginCallError("host_error", f"{self.spawn.plugin}: unexpected error")
         finally:
             self.session = None
+            if self.error is not None and self.error.host_kind in _DIAGNOSED:
+                with anyio.CancelScope(shield=True):
+                    diagnosed = await self._diagnose()
+                if diagnosed is not None:
+                    self.error = PluginCallError(*diagnosed)
             if self.spawn.preamble is not None:
                 self.spawn.preamble[:] = bytes(len(self.spawn.preamble))
             if self.spawn.cleanup is not None:
@@ -243,9 +255,21 @@ class PluginProcess:
                 with anyio.move_on_after(_CRASH_WAIT_S):
                     while process.returncode is None:
                         await anyio.sleep(0.01)
+            diagnosed = await self._diagnose()
+            if diagnosed is not None:
+                raise CallFailed(*diagnosed)
             status = exit_status(self.state.returncode)
             raise CallFailed("plugin_crashed", f"the process {status} during the call")
         return result
+
+    async def _diagnose(self) -> tuple[HostErrorKind, str] | None:
+        """`Spawn.diagnose`'s answer, `None` without one or if it fails."""
+        if self.spawn.diagnose is None:
+            return None
+        try:
+            return await self.spawn.diagnose()
+        except Exception:  # never hide the failure being reported
+            return None
 
     async def stop(self, *, forced: bool = False) -> None:
         """Stop the process (forced: no graceful stdin step) and wait until it is gone."""

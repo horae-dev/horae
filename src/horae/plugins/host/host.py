@@ -38,9 +38,10 @@ run's `ToolCaller`:
   `tools/list` must finish within the plugin's `startup_timeout_s` (`startup_timeout`);
 - **runtime** (schemas decision 74): the plugin's effective `runtime` (`horae.yaml`) picks the
   spawn. `process` is the above; `container` starts the same MCP session in the plugin's own
-  Docker container (`horae.plugins.host.container`: read-only, only its directory mounted,
-  secrets through stdin, and egress only through its own allow-list proxy built from the
-  locked network permissions, `horae.plugins.host.egress`, decision 76). Whatever it lacks is
+  Docker container (`horae.plugins.host.container`: read-only, only its directory and its
+  locked `permissions.paths` mounted (`horae.plugins.host.mounts`, decision 78), within its
+  `limits`, secrets through stdin, and egress only through its own allow-list proxy built from
+  the locked network permissions, `horae.plugins.host.egress`, decision 76). Whatever it lacks is
   `runtime_unavailable` and the plugin does not start: there is no fallback to `process`;
 - **blocked egress** (decision 76 F): each attempt the proxy refused (host, port, reason; never
   a URL) becomes an `egress_blocked` violation of the call in flight, whether it succeeds or
@@ -137,6 +138,7 @@ from horae.plugins.host.container import ContainerRuntime
 from horae.plugins.host.egress import violations as egress_violations
 from horae.plugins.host.env import BASE_PATH, build_env, check_names, plugin_venv
 from horae.plugins.host.errors import HostErrorKind, PluginCallError
+from horae.plugins.host.mounts import MountPolicy
 from horae.plugins.host.redact import MAX_EXPANSION, Redactor, SecretInKey
 from horae.plugins.host.session import INTENTS_META, CallFailed, PluginProcess, Spawn
 from horae.secrets import MAX_SECRET_BYTES, Secret, SecretError, SecretResolver
@@ -393,13 +395,14 @@ class PluginHost:
         timezone: str = "UTC",
         timeouts: Callable[[str], PluginDefaults] | None = None,
         container: ContainerConfig | None = None,
+        mounts: MountPolicy | None = None,
     ) -> None:
         self.registry = registry
         self.secrets = secrets
         self.timezone = timezone
         self._work_root = work_dir
         self._timeouts = timeouts or (lambda _name: PluginDefaults())
-        self._containers = ContainerRuntime(container)
+        self._containers = ContainerRuntime(container, mounts=mounts)
         """Starts the plugins whose runtime is `container` (schemas decision 74)."""
         self._entries: dict[str, _Entry] = {}
         self._group: anyio.abc.TaskGroup | None = None
@@ -737,6 +740,9 @@ class PluginHost:
                 startup_timeout_s=settings.startup_timeout_s,
                 network=permissions.network,
                 network_local=permissions.network_local,
+                paths_read=permissions.paths.read,
+                paths_write=permissions.paths.write,
+                limits=settings.limits,
             )
         else:
             argv = resolve_command(list(runtime.command), entry.installed.root)
@@ -819,8 +825,8 @@ def host_for_instance(
     instance: Instance, registry: HostRegistry, *, secrets: SecretResolver | None = None
 ) -> PluginHost:
     """A `PluginHost` for `instance` (`horae.config.Instance`): its time zone, plugin timeouts
-    and runtimes, container settings, secret resolver and `<state_dir>/plugin-runs` as the work
-    directory."""
+    and runtimes, container settings and mount policy (decision 78 B), secret resolver and
+    `<state_dir>/plugin-runs` as the work directory."""
     return PluginHost(
         registry,
         secrets=secrets or instance.secret_resolver(),
@@ -828,6 +834,12 @@ def host_for_instance(
         timezone=instance.config.timezone,
         timeouts=instance.plugin_timeouts,
         container=instance.config.container,
+        mounts=MountPolicy.for_instance(
+            instance.root,
+            state_dir=instance.state_dir,
+            secrets_dir=instance.secrets_dir,
+            mount_roots=instance.config.container.mount_roots,
+        ),
     )
 
 

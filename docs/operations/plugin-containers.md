@@ -4,14 +4,16 @@
 [decision 74](../../schemas/README.md#provisional-decisions-49-pending-maintainer-review)
 (provisional), and its egress proxy, [#50](https://github.com/horae-dev/horae/issues/50),
 [decision 76](../../schemas/README.md#provisional-decisions-50-pending-maintainer-review)
-(provisional). Part of M5 hard isolation: declared mounts and resource limits (#51) and the
-malicious-plugin suite (#52) build on it.
+(provisional), its declared mounts and resource limits,
+[#51](https://github.com/horae-dev/horae/issues/51),
+[decision 78](../../schemas/README.md#provisional-decisions-51-pending-maintainer-review)
+(provisional). Part of M5 hard isolation: the malicious-plugin suite (#52) builds on it.
 
 By default (`runtime: process`) a plugin is a child process of Horae: same user, same network,
 same filesystem (the "declared" tier, `docs/security.md` T04 and T05). With `runtime: container`
-each plugin runs in its own Docker container, and sees only its own directory, read-only. Its
-only way out is its own allow-list proxy, which lets through only the hosts `horae.lock`
-approves for it. The MCP session, timeouts, restarts, results and redaction are the same in
+each plugin runs in its own Docker container, within CPU, memory and process limits, and sees
+only its own directory, read-only, and the paths `horae.lock` approves for it. Its only way out
+is its own allow-list proxy, which lets through only the hosts `horae.lock` approves for it. The MCP session, timeouts, restarts, results and redaction are the same in
 both runtimes: only how the plugin is started changes.
 
 ## Enabling it
@@ -31,7 +33,11 @@ plugins:
 container:                    # optional
   image: python:3.12-slim-bookworm@sha256:<digest>   # default: the Horae image's base
   docker: /usr/bin/docker     # default: `docker` on /usr/local/bin:/usr/bin:/bin
+  mount_roots: [/srv/vault]   # default: none (only the instance directory), see below
 ```
+
+Resource limits and declared paths are set in the same file:
+[Declared paths](#declared-paths) and [Resource limits](#resource-limits).
 
 The operator chooses, never the plugin: the runtime is not in `plugin.yaml` nor in
 `horae.lock`, so a plugin cannot ask to run outside a container.
@@ -62,24 +68,29 @@ the plugin** with `runtime_unavailable` (it is not started, and never run as a p
 
 ## What a plugin container is
 
-`docker run --interactive --rm --init` with:
+`docker run --interactive --init` with:
 
 | Setting | Why |
 |---|---|
 | `--user <horae uid>:<gid>`, never 0 | non-root; reads only what Horae's user can |
 | `--read-only` | the image cannot be changed |
-| `--tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777` | the only writable place (`HOME=/tmp/home`, `TMPDIR=/tmp/tmp`, working directory `/tmp/work`), nothing executable there |
+| `--tmpfs /tmp:rw,noexec,nosuid,nodev,size=<tmp_mb>m,mode=1777` | its scratch space (`HOME=/tmp/home`, `TMPDIR=/tmp/tmp`, working directory `/tmp/work`), nothing executable there |
 | `--cap-drop ALL`, `--security-opt no-new-privileges` | no capability, no setuid escalation |
 | Docker's default seccomp profile | never overridden (no `seccomp=unconfined`, no `--privileged`, `--cap-add`, `--device`, host namespace) |
-| `--mount type=bind,source=<plugins/name>,target=/plugin,readonly` | the **only** mount: the plugin's tree and its venv |
+| `--mount type=bind,source=<plugins/name>,target=/plugin,readonly` | the plugin's tree and its venv |
+| `--mount type=bind,source=<path>,target=<path>,bind-recursive=disabled[,readonly]` | each **declared path** approved in `horae.lock`, at the same path; read-only unless declared writable ([below](#declared-paths)) |
+| `--cpus`, `--memory` = `--memory-swap`, `--pids-limit`, `--ulimit nofile` | its [resource limits](#resource-limits); no swap |
 | `--network horae-plugin-<name>` | its own network, see below |
 | `--init` | Docker's init is PID 1: children are reaped and signalled with the plugin |
 | `--log-driver none` | the daemon keeps no copy of the plugin's output (stderr may echo a secret) |
 | `--pull never` | nothing is downloaded at run time |
 | `--label dev.horae.plugin=<name>`, `--name horae-<name>-<random>` | to find and remove it |
 
-The plugin sees neither `horae.yaml`, the lock, the store, the vault, `/run/secrets`, other
-plugins nor Horae's processes and environment. `tests/test_plugin_container_live.py` checks all
+Not `--rm`: when a plugin dies, Horae asks the engine whether its memory limit killed it
+before removing the container itself (`docker rm --force`, always).
+
+The plugin sees neither `horae.yaml`, the lock, the store, `/run/secrets`, other plugins,
+Horae's processes and environment, nor any path of the vault it did not declare. `tests/test_plugin_container_live.py` checks all
 of this from inside a container (uid, capabilities, `NoNewPrivs`, seccomp mode, read-only
 filesystem and mount, `noexec` tmpfs, visible processes) and from `docker inspect`.
 
@@ -194,10 +205,115 @@ engine that does not take it fails the start with `startup_timeout`.
 
 As for a process: stdin is closed, then the CLI is sent `SIGTERM` (it forwards it to the
 container) and `SIGKILL`; then Horae always runs `docker rm --force <name>`, so a plugin that
-ignores end-of-file and signals, or started background processes, is removed with them. If
-Horae itself is killed with `SIGKILL`, a container may be left running until its plugin exits
-on end-of-file; list such leftovers with `docker ps --filter label=dev.horae.plugin` (Horae does
-not sweep them: it could remove the container of a concurrent run).
+ignores end-of-file and signals, or started background processes, is removed with them, and
+then sweeps its writable paths ([below](#declared-paths)). If Horae itself is killed with
+`SIGKILL`, a container may be left running until its plugin exits on end-of-file, or left
+stopped (containers are no longer `--rm`); list such leftovers with `docker ps --all --filter
+label=dev.horae.plugin` and remove them with `docker rm` (Horae does not sweep them: it could
+remove the container of a concurrent run).
+
+## Declared paths
+
+A plugin that declares `permissions.paths` (a vault to write notes to, files to read) gets
+exactly the paths **approved in `horae.lock`** (what you accepted at `horae plugin add`, never
+the manifest's own list), each **mounted at the same path** in its container:
+
+- a `read` path is mounted read-only; a `write` path read-write (a path in both is writable);
+- nested paths behave as declared: a writable `vault/inbox` under a read-only `vault` is
+  writable and the rest of the vault is not; a read-only `vault/archive` under a writable
+  `vault` stays read-only;
+- a filesystem mounted below a declared path on the host (a USB disk, another bind mount) is
+  not carried in (`bind-recursive=disabled`);
+- **nothing else** of the host is there: an undeclared path does not exist in the container.
+
+**How the plugin finds them.** Through the configuration it already receives: every request
+carries the approved paths in `_meta["dev.horae/paths"]` (`{"read": [...], "write": [...]}`).
+Since they are the same paths inside the container, that list, a file path a pipeline passes as
+a parameter, and a path the plugin returns all mean the same file on both sides. Nothing is
+added to the plugin's environment, and a plugin written for the process runtime works
+unchanged.
+
+**What is refused.** Before anything starts (its egress proxy included), every declared path
+is checked; if one fails, **the plugin is not started** (`runtime_unavailable`, naming the path
+and why). A path must:
+
+1. be what `--mount` can carry (no `,`, `"` or control character);
+2. be **its own real path**: no symbolic link anywhere in it (declare the real path: `realpath
+   <path>` prints it);
+3. exist, and be a directory or a regular file (never a socket, device or FIFO);
+4. lie in the instance directory, or in a directory you list in `container.mount_roots` (a vault
+   kept elsewhere, e.g. `/srv/vault`);
+5. neither be, contain nor lie inside a **sensitive path**: the instance's `horae.yaml`,
+   `horae.lock`, `plugins/`, `pipelines/`, `skills/`, `.git/`, state directory and secrets
+   directory (`secrets.dir`, `/run/secrets` by default); the Docker socket (the one the CLI uses,
+   `/var/run/docker.sock`, `/run/docker.sock`, `/run/containerd`); in Horae's home `.ssh`,
+   `.gnupg`, `.docker`, `.aws`, `.azure`, `.kube`, `.config`, `.netrc`, `.git-credentials`,
+   `.pypirc`; and the system directories (`/etc`, `/usr`, `/proc`, `/sys`, `/dev`, `/run`,
+   `/root`, `/boot`, `/bin`, `/sbin`, `/lib*`, `/var/lib/docker`, ...). So the instance
+   directory or your home directory as a whole are refused: declare the vault itself;
+6. not be `/tmp` itself (the container's own scratch space).
+
+`horae doctor` does not check these yet: the first run with the plugin reports a refusal.
+
+**What a bind mount cannot do.** Docker's bind mounts take no `nosuid`, `nodev` or `noexec`
+option: a declared path keeps the host filesystem's own flags. Inside the container nothing is
+gained from that (no capability: no device node can be made; `no-new-privileges`: a set-user-ID
+file grants nothing; a hard link cannot cross mounts). But in a **writable** path a plugin can
+leave things for the host to trip over: a symbolic link to `~/.ssh/authorized_keys` that Horae
+or Obsidian would follow, a FIFO that blocks a reader, a set-user-ID program that runs as your
+user. So when the container is gone, Horae **sweeps** each writable path: for what was created
+or changed during the plugin's run (never your older files), it removes a symbolic link to a
+place the plugin could not write itself, removes a FIFO, socket or device, and clears a
+set-user-ID bit, logging each at WARNING. It also warns when a declared path was replaced
+(renamed away by a writable parent). The sweep looks at 200 000 entries at most and says so
+past that. While the plugin runs, what it wrote is on the host as it wrote it.
+
+**Example.** A plugin declaring `paths: {read: [/srv/vault], write: [/srv/vault/Inbox]}`,
+approved in the lock, with the vault outside the instance:
+
+```yaml
+container:
+  mount_roots: [/srv/vault]
+plugins:
+  notes-digest:
+    runtime: container
+```
+
+## Resource limits
+
+Each plugin container runs within limits you set in `horae.yaml`, for all plugins
+(`plugin_defaults.limits`) or one (`plugins.<name>.limits`, each field set there wins). The
+plugin cannot change them: they are not in its manifest or the lock.
+
+```yaml
+plugin_defaults:
+  runtime: container
+  limits:              # the defaults, written out
+    cpus: 1.0          # --cpus: at most one core's worth of CPU time
+    memory_mb: 512     # --memory and --memory-swap: 512 MiB, no swap
+    pids: 128          # --pids-limit: processes and threads
+    tmp_mb: 64         # the /tmp tmpfs, counted in memory_mb
+    nofile: 1024       # --ulimit nofile: open files per process
+plugins:
+  big-parser:
+    limits:
+      memory_mb: 2048  # the other fields keep plugin_defaults.limits
+```
+
+| Field | Default | Bounds | What happens at the limit |
+|---|---|---|---|
+| `cpus` | 1.0 | 0.1 to 64 (and at most the host's CPU count: the engine refuses more) | the plugin is slowed, never stopped; a call may then hit its `call_timeout_s` |
+| `memory_mb` | 512 | 64 to 65 536 | the kernel kills it: the call fails with **`oom_killed`** (`plugin <name> (runtime container) was killed by its memory limit (512 MiB, ...)`), not a generic crash; it may restart once in the run like any failed plugin |
+| `pids` | 128 | 16 to 4096 | `fork` and new threads fail (`EAGAIN`); a fork loop stops there |
+| `tmp_mb` | 64 | 1 to 1024, less than `memory_mb` | writes to `/tmp` fail (`ENOSPC`) |
+| `nofile` | 1024 | 64 to 65 536 | `open` fails (`EMFILE`) |
+
+The defaults suit a **4-core / 16 GB home server**: one plugin never takes more than a core,
+and ten plugin containers at their memory limit (five plugins, each started at most twice in a
+run) still leave over 10 GB; each egress proxy adds at most 128 MiB (decision 76). A Python
+plugin with a thread pool and a few children fits in 128 PIDs. Raise `memory_mb` for a plugin
+that parses large files, and lower the defaults on a smaller machine (a Raspberry Pi 4 with
+4 GB: `memory_mb: 256`, `cpus: 0.5`).
 
 ## The image
 
@@ -252,7 +368,12 @@ start, not their footprint. Not measured on such a server itself; re-run the ben
 
 ## Limits and follow-ups
 
-- **No resource limits yet** (CPU, memory, PIDs): #51, which also adds declared mounts.
+- **Declared paths** (decision 78 C): a writable path is the host's own filesystem while the
+  plugin runs; the sweep runs only once it stops. Between Horae's check and the engine's
+  mount, a process able to write a parent directory could swap a component for a symbolic
+  link (the next start's check, and the sweep, report it). Nesting a read-only path under a
+  writable one lets the plugin rename the directories in between (the read-only contents move
+  along, unchanged; the sweep warns). `horae doctor` does not check paths yet.
 - **Podman** is not supported; **the Horae image** cannot start containers (above).
 - **Egress limits** (decision 76 I): public hosts on port 443 only; IPv4 only out of
   `horae-egress`; loopback grants are not reachable from a container; a direct connection a

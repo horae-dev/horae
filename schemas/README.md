@@ -4859,9 +4859,11 @@ loosened later without breaking a valid file.
       container is removed, `mounts.sweep` walks every writable mount (not following links,
       not leaving its filesystem, at most 200 000 entries, then it says so) and, for each entry
       whose `st_ctime` is at or after the container's start (less 2 s; a plugin cannot set
-      `ctime` back, so a user's own older files are never touched): removes a symbolic link
-      whose target, resolved lexically from where it is, lies outside the plugin's writable
-      paths; removes a device, FIFO or socket; clears a set-user-ID bit (and set-group-ID on a
+      `ctime` back, so a user's own older files are never touched) and that the plugin could
+      write (not in a read-only child): removes a symbolic link whose target, resolved
+      lexically from where it is, is a place the plugin could not write itself (outside its
+      writable paths, or in a read-only child of one: a host process following the link would
+      act there for it); removes a device, FIFO or socket; clears a set-user-ID bit (and set-group-ID on a
       file). It also checks every declared path is still the same file (device and inode) as
       when it was checked. Each finding is logged at WARNING (at most 50 lines a sweep, then a
       count); like egress attempts after a plugin's last call (decision 76 F), they are not run
