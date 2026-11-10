@@ -36,7 +36,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import anyio
 import mcp_types
@@ -47,6 +47,9 @@ from mcp_types import CONNECTION_CLOSED
 from horae.plugins.host.capture import StderrCapture
 from horae.plugins.host.errors import HostErrorKind, PluginCallError
 from horae.plugins.host.transport import ProcessState, exit_status, open_stdio
+
+if TYPE_CHECKING:
+    from horae.plugins.host.egress import ProxyHandle
 
 INPUT_META = "dev.horae/input"
 """Request `_meta` key of a transform's input data."""
@@ -80,6 +83,8 @@ class Spawn:
     cleanup: Callable[[], Awaitable[None]] | None = field(default=None, repr=False)
     """Awaited once the process is gone (the container runtime removes its container); it must
     not raise and must bound its own time."""
+    egress: "ProxyHandle | None" = field(default=None, repr=False)
+    """The container's egress proxy (#50): the host watches its blocked attempts."""
 
 
 class CallFailed(Exception):

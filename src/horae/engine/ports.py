@@ -57,7 +57,21 @@ class EngineCallError(Exception):
 
 
 class ToolCallError(EngineCallError):
-    """A tool call failed (timeout, crash, tool error…). Kinds are the host's (#24)."""
+    """A tool call failed (timeout, crash, tool error…). Kinds are the host's (#24).
+
+    `violations` are what the host flagged during the failed call (e.g. `egress_blocked`,
+    #50): recorded in the run like a successful call's."""
+
+    def __init__(
+        self,
+        kind: ErrorKind,
+        message: str,
+        *,
+        stderr: str | None = None,
+        violations: tuple[Violation, ...] = (),
+    ) -> None:
+        super().__init__(kind, message, stderr=stderr)
+        self.violations = violations
 
 
 class LlmError(EngineCallError):

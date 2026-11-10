@@ -1088,7 +1088,8 @@ class _Run:
             )
         except EngineCallError as error:
             message = _describe(call.ref, error.kind, error.message)
-            return _Failure(_kind(error.kind), message, getattr(error, "stderr", None))
+            flagged = _violations(getattr(error, "violations", ()))
+            return _Failure(_kind(error.kind), message, getattr(error, "stderr", None), flagged)
         except Exception as error:  # a host bug must not crash the run
             return _Failure("host_error", f"{call.ref}: unexpected {type(error).__name__}")
         if not isinstance(result, ToolResult):

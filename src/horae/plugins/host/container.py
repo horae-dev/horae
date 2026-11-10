@@ -11,10 +11,15 @@ the same `Spawn` the process runtime builds, only for the Docker CLI:
   seccomp profile (never overridden), a `noexec` tmpfs on `/tmp`, no log kept by the daemon,
   nothing pulled, and **only the plugin's directory** (its tree and its `.venv`) bind-mounted
   read-only at `/plugin`;
-- on the plugin's own network, `horae-plugin-<name>` (`network_name`): `--internal`, no
-  inter-container traffic, and no host address on the bridge (`inhibit_ipv4`), so the plugin
-  reaches nothing, the host's services included; checked on each run's first start of the plugin,
-  and refused (never repaired) when it is not exactly that. #50 attaches its egress proxy there;
+- on the plugin's own network, `horae-plugin-<name>` (`network_name`): `--internal` and no host
+  address on the bridge (`inhibit_ipv4`), so the plugin reaches nothing, the host's services
+  included, but **its own egress proxy** (`horae.plugins.host.egress`, #50, decision 76), the
+  only other container allowed there; checked on each run's first start of the plugin, and
+  refused (never repaired) when it is not exactly that;
+- egress only through that proxy: one per plugin start, with the plugin's locked network
+  permissions as its policy, on the plugin's network and `horae-egress`; the plugin gets its
+  address in `HTTPS_PROXY` / `HTTP_PROXY` / `HORAE_EGRESS_PROXY`. A proxy that does not start
+  means the plugin does not either;
 - **secrets** never on a command line nor in the container's configuration: the plugin's
   environment (`horae.plugins.host.env.build_env`, with the container's paths) is the first line
   of the container's stdin (`preamble`), which `LAUNCHER`, run by the image's interpreter, reads
@@ -34,12 +39,14 @@ import secrets
 import shutil
 import stat
 import subprocess
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import anyio
 
 from horae.contracts.instance import ContainerConfig
+from horae.plugins.host import egress
+from horae.plugins.host.egress_proxy import LISTEN_PORT
 from horae.plugins.host.env import BASE_PATH, VENV_DIR, build_env
 from horae.plugins.host.errors import PluginCallError
 from horae.plugins.host.session import Spawn
@@ -66,12 +73,14 @@ PLUGIN_LABEL = "dev.horae.plugin"
 NETWORK_LABEL = "dev.horae.network"
 """Label of every plugin network (value `plugin`); a network without it is refused."""
 EGRESS_LABEL = "dev.horae.egress-proxy"
-"""Reserved for #50: a container with this label may join a plugin network (its proxy)."""
+"""Label of an egress proxy (value: the plugin name): it may join that plugin's network only."""
 NETWORK_OPTIONS = {
-    "com.docker.network.bridge.enable_icc": "false",
+    "com.docker.network.bridge.enable_icc": "true",
     "com.docker.network.bridge.inhibit_ipv4": "true",
 }
-"""Driver options a plugin network must have (decision 74 D)."""
+"""Driver options a plugin network must have (decision 74 D, as amended by decision 76 C:
+inter-container traffic is on, so the plugin reaches its proxy; only its own containers and its
+own proxy may be attached)."""
 ENGINE_TIMEOUT_S = 10.0
 """Each Docker CLI call but `run` (inspect, create, rm) may take this long."""
 MAX_PREAMBLE = 1024 * 1024
@@ -315,7 +324,9 @@ class ContainerRuntime:
         self._env = engine_env(environ)
         self._lock = anyio.Lock()
         self._docker: str | None = None
-        self._networks: set[str] = set()
+        self._networks: dict[str, str] = {}
+        """Each checked plugin network's IPv4 subnet."""
+        self._egress_checked = False
 
     async def spawn(
         self,
@@ -327,8 +338,11 @@ class ContainerRuntime:
         timezone: str,
         cwd: Path,
         startup_timeout_s: float,
+        network: Sequence[str] = (),
+        network_local: Sequence[str] = (),
     ) -> Spawn:
-        """The `Spawn` of `plugin`'s container; `runtime_unavailable` if it cannot run in one
+        """The `Spawn` of `plugin`'s container, its egress proxy started with the locked
+        `network` and `network_local` as policy; `runtime_unavailable` if either cannot run
         (`env_unsafe` for a denied secret name, as in the process runtime)."""
         if self._uid == 0:
             raise _unavailable(plugin, "Horae runs as root; plugin containers never do")
@@ -339,16 +353,23 @@ class ContainerRuntime:
         source = mount_source(plugin, root)
         docker = await self._engine(plugin)
         await self._network(plugin, docker)
-        env = build_env(
-            plugin,
-            home=Path(CONTAINER_HOME),
-            tmpdir=Path(CONTAINER_TMPDIR),
-            timezone=timezone,
-            secrets=secrets,
-            venv=Path(PLUGIN_MOUNT) / venv.name,
-        )
-        line = preamble(env)
-        env.clear()
+        await self._egress_network(plugin, docker)
+        proxy = await self._start_proxy(plugin, docker, network, network_local)
+        try:
+            env = build_env(
+                plugin,
+                home=Path(CONTAINER_HOME),
+                tmpdir=Path(CONTAINER_TMPDIR),
+                timezone=timezone,
+                secrets=secrets,
+                venv=Path(PLUGIN_MOUNT) / venv.name,
+                proxy=proxy.url,
+            )
+            line = preamble(env)
+            env.clear()
+        except BaseException:
+            await proxy.stop()
+            raise
         name = f"horae-{plugin}-{secrets_token()}"
         argv = run_argv(
             docker,
@@ -360,8 +381,13 @@ class ContainerRuntime:
             command=inside,
         )
 
+        proxy.client_container = name
+
         async def remove() -> None:
-            await self._run(docker, "rm", "--force", name)
+            try:
+                await self._run(docker, "rm", "--force", name)
+            finally:
+                await proxy.stop()
 
         return Spawn(
             plugin,
@@ -371,7 +397,120 @@ class ContainerRuntime:
             startup_timeout_s,
             preamble=line,
             cleanup=remove,
+            egress=proxy,
         )
+
+    async def admit(self, plugin: str, proxy: egress.ProxyHandle) -> None:
+        """Once the plugin's container runs, make it the only client its proxy serves
+        (decision 76 C): its address on the plugin network, sent to the proxy, confirmed.
+        `runtime_unavailable` otherwise (the caller stops the plugin)."""
+        docker = self._docker
+        address = None
+        if docker is not None:
+            code, out, _ = await self._run(
+                docker,
+                "container",
+                "inspect",
+                "--format",
+                "{{json .NetworkSettings.Networks}}",
+                proxy.client_container,
+            )
+            try:
+                networks = json.loads(out) if code == 0 else None
+            except ValueError:
+                networks = None
+            address = egress.plugin_address(networks, network_name(plugin))
+        if address is None or not await proxy.admit(address):
+            raise _unavailable(plugin, "its egress proxy could not be bound to its container")
+
+    async def _start_proxy(
+        self, plugin: str, docker: str, network: Sequence[str], network_local: Sequence[str]
+    ) -> egress.ProxyHandle:
+        """Start `plugin`'s egress proxy and wait until it listens (decision 76 B, H); else
+        remove it and raise `runtime_unavailable`."""
+        name = f"horae-egress-{plugin}-{secrets_token()}"
+        argv = egress.proxy_argv(
+            docker,
+            plugin=plugin,
+            name=name,
+            image=self.config.image,
+            plugin_network=network_name(plugin),
+            policy=egress.proxy_policy(
+                network, network_local, self._networks[network_name(plugin)]
+            ),
+            python=IMAGE_PYTHON,
+            labels={EGRESS_LABEL: plugin},
+        )
+
+        async def remove() -> None:
+            await self._run(docker, "rm", "--force", name)
+
+        try:
+            process = await egress.open_proxy(argv, self._env)
+        except OSError as error:
+            raise _unavailable(
+                plugin, f"the egress proxy cannot be started: {error.strerror}"
+            ) from None
+        proxy = egress.ProxyHandle(plugin, name, process, remove)
+        try:
+            if not await proxy.ready():
+                why = await proxy.error()
+                raise _unavailable(plugin, f"the egress proxy did not start: {why}")
+            code, out, _ = await self._run(
+                docker,
+                "container",
+                "inspect",
+                "--format",
+                "{{json .NetworkSettings.Networks}}",
+                name,
+            )
+            try:
+                networks = json.loads(out) if code == 0 else None
+            except ValueError:
+                networks = None
+            address = egress.plugin_address(networks, network_name(plugin))
+            if address is None:
+                raise _unavailable(
+                    plugin, f"the egress proxy has no address on {network_name(plugin)}"
+                )
+        except BaseException:
+            await proxy.stop()
+            raise
+        proxy.url = f"http://{address}:{LISTEN_PORT}"
+        return proxy
+
+    async def _egress_network(self, plugin: str, docker: str) -> None:
+        """Create `horae-egress` if needed, and check it (decision 76 B): a bridge that is not
+        internal, without IPv6, labelled, with only egress proxies attached."""
+        async with self._lock:
+            if self._egress_checked:
+                return
+            name = egress.EGRESS_NETWORK
+            found = await self._inspect_network(docker, name)
+            if found is None:
+                options = [
+                    f"--opt={key}={value}" for key, value in egress.EGRESS_NETWORK_OPTIONS.items()
+                ]
+                await self._run(
+                    docker,
+                    "network",
+                    "create",
+                    "--driver=bridge",
+                    *options,
+                    f"--label={NETWORK_LABEL}={egress.EGRESS_NETWORK_LABEL}",
+                    name,
+                )
+                found = await self._inspect_network(docker, name)
+            if found is None:
+                raise _unavailable(plugin, f"network {name} cannot be created")
+            problem = egress.egress_network_problem(found) or await self._intruders(
+                docker, None, found
+            )
+            if problem is not None:
+                raise _unavailable(
+                    plugin, f"network {name} exists but {problem}: remove it (`docker network rm`)"
+                )
+            self._egress_checked = True
 
     async def _run(self, *args: str) -> tuple[int, bytes, bytes]:
         """Run a Docker CLI command, bounded by `ENGINE_TIMEOUT_S`; (-1, b"", message) when it
@@ -456,18 +595,22 @@ class ContainerRuntime:
         if found is None:
             raise _unavailable(plugin, f"network {name} cannot be created")
         problem = network_problem(found) or await self._intruders(docker, plugin, found)
-        if problem is not None:
+        subnet = egress.network_subnet(found)
+        if problem is None and subnet is None:
+            problem = "has no IPv4 subnet"
+        if problem is not None or subnet is None:
             raise _unavailable(
                 plugin, f"network {name} exists but {problem}: remove it (`docker network rm`)"
             )
-        self._networks.add(name)
+        self._networks[name] = subnet
 
     async def _intruders(
-        self, docker: str, plugin: str, network: Mapping[str, object]
+        self, docker: str, plugin: str | None, network: Mapping[str, object]
     ) -> str | None:
         """Why a container attached to the plugin's network does not belong there, or `None`:
         each must carry `dev.horae.plugin=<plugin>` (another container of this plugin, a
-        concurrent run) or `EGRESS_LABEL` (#50's proxy)."""
+        concurrent run) or `EGRESS_LABEL=<plugin>` (its proxy). For the egress network
+        (`plugin` is `None`), each must be an egress proxy."""
         attached = network.get("Containers")
         if not attached:
             return None
@@ -487,7 +630,11 @@ class ContainerRuntime:
                 labels = json.loads(line)
             except ValueError:
                 return "has containers that cannot be inspected"
-            if not isinstance(labels, dict) or not container_belongs(labels, plugin):
+            if not isinstance(labels, dict):
+                labels = {}  # a container without any label
+            if plugin is None and not isinstance(labels.get(EGRESS_LABEL), str):
+                return "has a container attached that is not an egress proxy"
+            if plugin is not None and not container_belongs(labels, plugin):
                 return "has a container attached that is not this plugin's"
         return None
 
@@ -529,8 +676,8 @@ def network_problem(network: Mapping[str, object]) -> str | None:
 
 def container_belongs(labels: Mapping[str, object], plugin: str) -> bool:
     """Whether a container with `labels` may be on `plugin`'s network: one of its own
-    containers, or #50's egress proxy (`EGRESS_LABEL`)."""
-    return labels.get(PLUGIN_LABEL) == plugin or EGRESS_LABEL in labels
+    containers, or its own egress proxy (`EGRESS_LABEL=<plugin>`, never another plugin's)."""
+    return labels.get(PLUGIN_LABEL) == plugin or labels.get(EGRESS_LABEL) == plugin
 
 
 def is_local_endpoint(endpoint: str) -> bool:

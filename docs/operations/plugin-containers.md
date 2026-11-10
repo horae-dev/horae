@@ -2,13 +2,16 @@
 
 [#49](https://github.com/horae-dev/horae/issues/49), schemas
 [decision 74](../../schemas/README.md#provisional-decisions-49-pending-maintainer-review)
-(provisional). Part of M5 hard isolation: the egress proxy (#50), declared mounts and resource
-limits (#51) and the malicious-plugin suite (#52) build on it.
+(provisional), and its egress proxy, [#50](https://github.com/horae-dev/horae/issues/50),
+[decision 76](../../schemas/README.md#provisional-decisions-50-pending-maintainer-review)
+(provisional). Part of M5 hard isolation: declared mounts and resource limits (#51) and the
+malicious-plugin suite (#52) build on it.
 
 By default (`runtime: process`) a plugin is a child process of Horae: same user, same network,
 same filesystem (the "declared" tier, `docs/security.md` T04 and T05). With `runtime: container`
-each plugin runs in its own Docker container, and sees only its own directory, read-only, with
-no network at all. The MCP session, timeouts, restarts, results and redaction are the same in
+each plugin runs in its own Docker container, and sees only its own directory, read-only. Its
+only way out is its own allow-list proxy, which lets through only the hosts `horae.lock`
+approves for it. The MCP session, timeouts, restarts, results and redaction are the same in
 both runtimes: only how the plugin is started changes.
 
 ## Enabling it
@@ -43,16 +46,18 @@ the plugin** with `runtime_unavailable` (it is not started, and never run as a p
    and mount paths of its own host.
 2. The image, pulled once: `docker pull <image>` (runs use `--pull never`, nothing is fetched at
    run time).
-3. Horae running as a non-root user: the container runs as Horae's own uid and gid (so it can
+3. **Docker Engine 25 or later**: the egress proxy is started on two networks in one
+   `docker run`.
+4. Horae running as a non-root user: the container runs as Horae's own uid and gid (so it can
    read the plugin tree Horae installed), and Horae refuses to start one as root.
-4. The plugin installed by `horae plugin add` with its own venv (`plugins/<name>/.venv`,
+5. The plugin installed by `horae plugin add` with its own venv (`plugins/<name>/.venv`,
    decision 69) **built by `/usr/local/bin/python3.12`**, which is what the Horae image does.
    A venv is linked to the interpreter that built it, and the plugin image has that interpreter
    at that path; a venv built elsewhere (a developer's machine, a distribution's
    `/usr/bin/python3.12`) is refused with a message naming its interpreter. The built-in plugins
    (`file-sink`, `fixture-source`) run from Horae's own interpreter and have no venv: keep them
    on `runtime: process`.
-5. The plugin's command must run from its venv: `[python, -m, <module>]`, a console script of
+6. The plugin's command must run from its venv: `[python, -m, <module>]`, a console script of
    the venv, or a path inside the plugin directory. An absolute command (a host path) is refused.
 
 ## What a plugin container is
@@ -84,7 +89,10 @@ Each plugin gets its own bridge network, `horae-plugin-<name>`, which Horae crea
 and checks on each run:
 
 - `--internal`: no route out of the host;
-- `com.docker.network.bridge.enable_icc=false`: no traffic between containers on it;
+- `com.docker.network.bridge.enable_icc=true`: the plugin can reach its egress proxy (below),
+  the only other container allowed there. #49 created these networks with `enable_icc=false`;
+  such a network is now refused with "remove it": `docker network rm horae-plugin-<name>`
+  and the next run recreates it;
 - `com.docker.network.bridge.inhibit_ipv4=true`: **the host has no address on it.** On a plain
   internal network the host's bridge address is the containers' gateway, and every service the
   host exposes on `0.0.0.0` (Horae's own API on a bare-metal install, sshd, a database, a
@@ -94,13 +102,76 @@ and checks on each run:
 It must also carry the label `dev.horae.network=plugin`, must not be a configuration-only
 network or take its configuration from another one, and every container already attached to it
 must be labelled `dev.horae.plugin=<name>` (the same plugin in a concurrent run) or
-`dev.horae.egress-proxy` (reserved for the #50 proxy). A network of that name that does not
-pass all of this (IPv6 on, another driver, made by hand, a foreign container attached) is
-refused, never changed or deleted: `docker network rm horae-plugin-<name>` and the
-next run recreates it. Until #50 adds the egress proxy a container has **no network access at
-all**: no DNS, no Internet, no LAN. A plugin that needs `permissions.network` or
-`network_local` fails its calls under this runtime until then (the grants still travel in
-`_meta["horae/network"]`).
+`dev.horae.egress-proxy=<name>` (its own proxy; another plugin's proxy is refused). A network
+of that name that does not pass all of this (IPv6 on, another driver, made by hand, a foreign
+container attached) is refused, never changed or deleted: `docker network rm
+horae-plugin-<name>` and the next run recreates it. Apart from its proxy, a container has **no
+network access at all**: no DNS, no Internet, no LAN, not the host.
+
+### Egress: the allow-list proxy
+
+Each time a plugin container starts, Horae first starts **that plugin's own proxy**, in a
+container of its own, and starts the plugin only once the proxy listens. The proxy's only
+policy is the plugin's lock entry: `permissions.network` (public names) and
+`permissions.network_local` (`host:port` on your network), including the grants you added
+with `--allow-host` / `--allow-local`. It is the plugin's only way out:
+
+| The plugin asks for | Allowed when |
+|---|---|
+| `CONNECT name:443` (HTTPS) | `name` is in `network`, and every address it resolves to is public |
+| `CONNECT name:port` on another port | never for a `network` host (the lock has no port for them: 443 only) |
+| `CONNECT host:port` or plain `http://host:port/…` | `host:port` is exactly a `network_local` entry, and a name resolves only to private addresses (link-local 169.254.x.y only through a literal grant of that address) |
+| an IP address | only when it is exactly a `network_local` entry |
+| anything else | refused (`403`), and recorded |
+
+The proxy resolves names itself and connects to the address it checked, never to the name
+again (no DNS rebinding). It refuses cloud metadata addresses (`169.254.169.254`…) and loopback
+whatever the grant, and never decrypts TLS. The plugin finds it in `HTTPS_PROXY`, `HTTP_PROXY`
+(and lowercase) and `HORAE_EGRESS_PROXY`, `http://<address>:3128`. Standard clients use these
+on their own; a plugin whose HTTP client ignores the environment must pass the proxy itself
+(horae-sdk 0.8: `egress_proxy()`), or its connections fail.
+
+**What a refusal looks like.** The plugin gets `403 Forbidden` with a reason code. The run
+records an `egress_blocked` violation per attempt, for example `github: egress blocked to
+evil.example.net:443 (host_not_allowed)`, and Horae logs it at WARNING. Only the host, the port
+and the reason are recorded, never the URL, its query or headers. Reasons are
+`host_not_allowed` (not in the lock: add it with `horae plugin add --allow-host` if you trust
+it), `port_not_allowed`, `plain_http_not_allowed`, `ip_literal`, `private_address`,
+`embedded_address` (an IPv6 answer carrying an IPv4 address), `link_local_address`,
+`metadata_address`, `loopback_address`, `not_local_address` (a local name resolved
+elsewhere), `malformed_target` (a target it cannot parse, such as `127.1` or user info:
+recorded without the host), and `dns_failed` / `no_ipv4_address` (`502`). A server that does
+not answer is `502` and not recorded. At most 200 attempts are listed per minute; beyond that
+the run records `N more blocked egress attempts`.
+
+**The proxy container.** `docker run --interactive --rm --init` from the same pinned image,
+running `python3 -I -S -c <the proxy's source> <policy>`, as `65534:65534` (nobody), with
+`--read-only`, `--cap-drop ALL`, `no-new-privileges`, Docker's seccomp profile, `--pids-limit
+64`, `--memory 128m`, `--log-driver none`, `--pull never`, no mount, no environment, named
+`horae-egress-<plugin>-<random>` and labelled `dev.horae.egress-proxy=<plugin>`. It is attached
+to the plugin's network and to **`horae-egress`**, a plain bridge Horae creates on first use
+(labelled `dev.horae.network=egress`, `enable_icc=false` so proxies do not reach each other,
+no IPv6) and checks on each run like the plugin networks. It also runs with
+`--sysctl net.ipv4.ip_forward=0`. The proxy listens only on its address on the plugin's
+network, and serves **only its plugin's container**: once the plugin has started, Horae tells
+the proxy that container's address, and every other client (a concurrent run of the same
+plugin on the same network included) is dropped without an answer. `enable_icc=false` is not
+enforced by every engine (OrbStack ignores it), so this client check, not the bridge option,
+is what keeps containers off each other's proxies. Its `docker inspect` shows the policy (host
+names, not secrets).
+
+**Fail closed.** A proxy that cannot start, has no address on the plugin's network, or cannot
+be bound to the plugin's container means the plugin is not started (`runtime_unavailable`). When the plugin stops, its proxy is
+stopped and removed with it (`docker rm --force`). If Horae is killed, a leftover proxy exits
+when its standard input closes; list them with `docker ps --filter label=dev.horae.egress-proxy`.
+
+**Local services.** The proxy reaches your LAN through the Docker host (`horae-egress` is NATed
+like any bridge), so `192.168.1.10:8123` or `homeassistant.local:8123` work when granted. A
+grant on **loopback** (`127.0.0.1:1143`, e.g. Proton Mail Bridge on the Docker host) is
+refused: loopback is the proxy's own container. Grant the host's LAN address and port instead,
+with the service listening there, or keep that plugin on `runtime: process`. A service on the
+Docker host itself is reachable at the `horae-egress` gateway address if you grant that
+`address:port` (it is private, so it is never reachable without such a grant).
 
 ### Secrets
 
@@ -168,21 +239,24 @@ cores, 16 GB) with OrbStack (Docker Engine 29.8, a Linux VM with 10 CPUs and 8 G
 | Start and first call (median) | 83 ms | 314 ms (first ever, with network creation: 701 ms) |
 | One call (median / p95) | 51.8 / 52.6 ms | 52.3 / 53.5 ms |
 | Stop (median) | 12 ms | 187 ms (`docker rm --force` included) |
+| With the egress proxy (#50), median of 7 | | start and first call 770 ms, stop 344 ms: the proxy adds about 0.45 s per start (its container, one `docker inspect`, before the plugin's) and 0.15 s per stop, same machine |
 | Memory of an idle container | | about 9 MiB (`docker stats`), plus the plugin's own |
 
 A call costs the same in both runtimes (about 50 ms of each is the host's stderr quiet window,
-`STDERR_QUIET_S`); a container adds about 0.25 s per plugin start and 0.2 s per stop. A plugin
-starts at most twice per run (one restart) and is stopped after its last planned call, so a
-pipeline using five plugins pays about 2 s more per run and holds at most five small containers
-at a time. That fits a 4-core / 16 GB home server with a wide margin: the cost is the containers'
+`STDERR_QUIET_S`); a container with its egress proxy adds about 0.7 s per plugin start and
+0.35 s per stop. A plugin starts at most twice per run (one restart) and is stopped after its
+last planned call, so a pipeline using five plugins pays about 5 s more per run and holds at
+most ten small containers at a time (each plugin and its proxy). That fits a 4-core / 16 GB home server with a wide margin: the cost is the containers'
 start, not their footprint. Not measured on such a server itself; re-run the benchmark there
 (the live tests are a quick check: `uv run pytest tests/test_plugin_container_live.py`).
 
 ## Limits and follow-ups
 
 - **No resource limits yet** (CPU, memory, PIDs): #51, which also adds declared mounts.
-- **No egress**: #50 attaches its proxy to the plugin networks.
 - **Podman** is not supported; **the Horae image** cannot start containers (above).
+- **Egress limits** (decision 76 I): public hosts on port 443 only; IPv4 only out of
+  `horae-egress`; loopback grants are not reachable from a container; a direct connection a
+  plugin tries without the proxy fails but is not recorded (only refusals by the proxy are).
 - **The tier gate stays**: `horae plugin add` still refuses non-first-party and direct installs
   before M5 (`horae.marketplace.approval`, `DIRECT_INSTALLS`). Lifting it needs #50, #51 and #52,
   and should require `runtime: container` for such plugins.

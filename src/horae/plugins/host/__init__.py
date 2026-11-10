@@ -27,8 +27,9 @@ explicitly), so secrets read from files (`/run/secrets/<NAME>`, the default, sch
 plugin can read the environment, hence the declared secrets, of another plugin running at the
 same time (accepted for first-party plugins; each plugin is stopped after its last planned
 call to narrow it, schemas decision 35 A). The proper fix
-(one container per plugin, M5 #50/#51) is tracked there. `undeclared_secret`,
-`undeclared_path` and `egress_blocked` (network) are not detected in v1.
+(one container per plugin, `runtime: container`, #49) is opt-in. `undeclared_secret` and
+`undeclared_path` are not detected in v1; `egress_blocked` is recorded for container plugins,
+whose egress proxy reports each refused connection (#50, `horae.plugins.host.egress`).
 
 - `horae.plugins.host.sink`: the MCP-backed `Sink` / `RestorableSink` (`McpSink`) and its
   `SinkRegistry` (`McpSinks`): a sink's operations are tools named by convention, called by
