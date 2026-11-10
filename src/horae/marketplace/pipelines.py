@@ -38,6 +38,7 @@ only `<name>.yaml` regular files approved for the plugin with their locked diges
 `lstat` (never a symlink, never following one), then the directory only if it is empty.
 """
 
+import contextlib
 import ctypes
 import ctypes.util
 import errno
@@ -426,7 +427,8 @@ def rename_noreplace(src: Path, dst: Path) -> None:
     On Linux this is `renameat2(RENAME_NOREPLACE)`, atomic. Elsewhere (macOS, or a file
     system without it) `dst` is created with an exclusive `mkdir` and the entries of `src` are
     moved into it through descriptors of both directories, then `src` is removed: on a
-    failure `dst` is deleted again and `src` is left to the caller."""
+    failure the entries already moved are moved back and `dst` is removed again if it is
+    still the empty directory created here (never recursively)."""
     fn = _renameat2()
     if fn is not None:
         if fn(_AT_FDCWD, os.fsencode(src), _AT_FDCWD, os.fsencode(dst), _RENAME_NOREPLACE) == 0:
@@ -437,21 +439,41 @@ def rename_noreplace(src: Path, dst: Path) -> None:
         if err not in (errno.ENOSYS, errno.EINVAL, errno.ENOTSUP):
             raise OSError(err, os.strerror(err), str(dst))
     os.mkdir(dst)  # exclusive: EEXIST for a directory, a file or a symlink
+    dst_fd = os.open(dst, _DIR_FLAGS)
     try:
+        made = os.fstat(dst_fd)  # the directory this call created
         src_fd = os.open(src, _DIR_FLAGS)
+        moved: list[str] = []
         try:
-            dst_fd = os.open(dst, _DIR_FLAGS)
             try:
                 for name in os.listdir(src_fd):
                     os.rename(name, name, src_dir_fd=src_fd, dst_dir_fd=dst_fd)
-            finally:
-                os.close(dst_fd)
+                    moved.append(name)
+                os.rmdir(src)
+            except BaseException:
+                for name in moved:  # put back exactly what was moved, nothing else
+                    with contextlib.suppress(OSError):
+                        os.rename(name, name, src_dir_fd=dst_fd, dst_dir_fd=src_fd)
+                _rmdir_if_ours(dst, made)
+                raise
         finally:
             os.close(src_fd)
-        os.rmdir(src)
     except BaseException:
-        shutil.rmtree(dst, ignore_errors=True)
+        _rmdir_if_ours(dst, os.fstat(dst_fd))  # no-op unless still the made directory
         raise
+    finally:
+        os.close(dst_fd)
+
+
+def _rmdir_if_ours(path: Path, made: os.stat_result) -> None:
+    """`rmdir` `path` if it is still the directory with the device and inode of `made`; it
+    only succeeds when empty, and nothing is ever deleted recursively."""
+    try:
+        now = os.lstat(path)
+        if (now.st_dev, now.st_ino) == (made.st_dev, made.st_ino):
+            os.rmdir(path)
+    except OSError:
+        pass
 
 
 def check_own(plugin: str, directory: Path, approved: dict[str, str]) -> None:

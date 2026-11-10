@@ -554,3 +554,33 @@ def test_rename_noreplace_moves_a_directory_to_a_free_name(
     mod.rename_noreplace(tmp_path / "a", tmp_path / "b")
     assert not (tmp_path / "a").exists()
     assert (tmp_path / "b" / "x.yaml").read_text(encoding="utf-8") == "x"
+
+
+def test_a_fallback_move_that_fails_partway_puts_every_file_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from horae.marketplace import pipelines as mod
+
+    monkeypatch.setattr(mod, "_renameat2", lambda: None)
+    src = tmp_path / "scratch"
+    src.mkdir()
+    for name in ("a.yaml", "b.yaml", "c.yaml"):
+        (src / name).write_text(name, encoding="utf-8")
+    bystander = tmp_path / "keep.txt"
+    bystander.write_text("mine", encoding="utf-8")
+    real = os.rename
+    calls: list[str] = []
+
+    def flaky(a: Any, b: Any, *, src_dir_fd: int, dst_dir_fd: int) -> None:
+        calls.append(a)
+        if len(calls) == 3:  # the third move fails; the later ones (put back) go through
+            raise OSError(5, "I/O error")
+        real(a, b, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+    monkeypatch.setattr(os, "rename", flaky)
+    with pytest.raises(OSError, match="I/O error"):
+        mod.rename_noreplace(src, tmp_path / "target")
+    assert sorted(p.name for p in src.iterdir()) == ["a.yaml", "b.yaml", "c.yaml"]
+    assert (src / "a.yaml").read_text(encoding="utf-8") == "a.yaml"
+    assert not (tmp_path / "target").exists()
+    assert bystander.read_text(encoding="utf-8") == "mine"
