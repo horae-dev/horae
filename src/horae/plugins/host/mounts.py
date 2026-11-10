@@ -318,14 +318,32 @@ def _is_git(name: str) -> bool:
     return name.casefold() == ".git"
 
 
-_BARE = frozenset({"head", "objects", "refs"})
+GIT_DIR_COMPANIONS = frozenset(
+    {
+        "commondir",
+        "config",
+        "gitdir",
+        "hooks",
+        "index",
+        "info",
+        "objects",
+        "packed-refs",
+        "refs",
+        "worktrees",
+    }
+)
+"""Entries that, next to a `HEAD`, make a directory look like a git directory: a bare
+repository (`objects`, `refs`), a linked worktree's (`commondir`, `gitdir`), or any other
+(`config`, `hooks`…). Deliberately broad: a vault directory holding `HEAD` and one of these is
+refused rather than guessed about (decision 78 B)."""
 
 
 def _bare_layout(names: Iterable[str]) -> bool:
-    """Whether a directory's entries make it a git directory under any name (a bare
-    repository: `HEAD`, `objects`, `refs`, in any letter case), which `GIT_DIR` or
-    `safe.bareRepository=all` would use."""
-    return {name.casefold() for name in names} >= _BARE
+    """Whether a directory's entries make it a git directory under any name, in any letter
+    case: a `HEAD` together with any of `GIT_DIR_COMPANIONS` (what `GIT_DIR`, a `gitdir:` file
+    or `safe.bareRepository=all` would use)."""
+    folded = {name.casefold() for name in names}
+    return "head" in folded and not folded.isdisjoint(GIT_DIR_COMPANIONS)
 
 
 def git_problem(path: str, policy: MountPolicy) -> str | None:
@@ -700,9 +718,8 @@ class _Walk:
             self.fail(f"could not list {_shown(path)} ({error.strerror})")
             return
         if _bare_layout(entry.name for entry in entries) and writable_at(path, self.mounts):
-            with suppress(OSError):
-                if os.fstat(fd).st_ctime >= self.cutoff:
-                    self.fail(f"{_shown(path)} is a new git directory (HEAD, objects, refs)")
+            # Whatever its age: `git_problem` refuses to mount it, so it is the plugin's.
+            self.fail(f"{_shown(path)} has a git directory layout (HEAD and git entries)")
         children: list[tuple[str, str, os.stat_result]] = []
         for entry in entries:
             if self.stopped:

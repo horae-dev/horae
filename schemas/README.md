@@ -4849,9 +4849,11 @@ loosened later without breaking a valid file.
       - it is neither `/tmp` nor contains it (it may lie inside it: the bind is mounted over the
         container's tmpfs);
       - a **writable** path is not in, nor holds, a git repository: no `.git` (in any letter
-        case, since volumes may ignore it) and no bare-repository layout (a directory holding
-        `HEAD`, `objects` and `refs`, any name, any case: `GIT_DIR` or
-        `safe.bareRepository=all` would use it) as one of its components, in any directory from it
+        case, since volumes may ignore it) and no git directory layout under any name (a directory
+        holding a `HEAD` together with any of `objects`, `refs`, `commondir`, `gitdir`,
+        `config`, `hooks`, `index`, `info`, `packed-refs` or `worktrees`, any case: a bare
+        repository or a linked worktree's directory, which `GIT_DIR`, a `gitdir:` file or
+        `safe.bareRepository=all` would use; deliberately broad) as one of its components, in any directory from it
         up to the mount root that holds it (a work tree around it), or anywhere below it (a
         walk of at most 100 000 entries, which refuses at its bound); a plugin could plant
         hooks the user's `git` runs. A vault inside a git-tracked instance must then be kept
@@ -4920,8 +4922,10 @@ loosened later without breaking a valid file.
       quarantines the plugin. A quarantine file that cannot be written leaves the marker, and
       the plugin is refused for the rest of the run. The quarantine and the marker are checked
       again once the run lock is held, so a concurrent run that quarantined the plugin in
-      between is seen. **The sweep fails closed**: a new `.git` entry (any case) or a new
-      bare-repository layout anywhere in a writable path (the operator guide recommends
+      between is seen. **The sweep fails closed**, and none of its
+      checks swallows an error (each becomes a failure): a new `.git` entry (any case), or a git
+      directory layout anywhere in a writable path whatever its age (B refuses to mount one,
+      so it is the plugin's) (the operator guide recommends
       `safe.bareRepository=explicit`), a declared path replaced or removed, a
       directory it cannot list, an entry it cannot `lstat` or undo, an entry on another device
       that is not a host mount point (`/proc/self/mountinfo`; a plugin cannot mount anything,

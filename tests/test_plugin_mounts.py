@@ -960,4 +960,47 @@ def test_a_new_bare_repository_layout_fails_the_sweep(
     since = mounts.now()
     _bare(inbox / "deep" / "anything", "mixed")
     swept = sweep("jail", [_mount(inbox)], since)
-    assert any("new git directory" in failure for failure in swept.failures)
+    assert any("git directory layout" in failure for failure in swept.failures)
+
+
+@pytest.mark.parametrize(
+    "companion",
+    [*sorted(mounts.GIT_DIR_COMPANIONS), "COMMONDIR", "Config"],
+)
+def test_head_with_any_git_companion_is_a_git_directory(instance: Path, companion: str) -> None:
+    gitdir = instance / "vault" / "archive" / "wt"
+    gitdir.mkdir()
+    (gitdir / "Head").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    (gitdir / companion).write_text("../../.x\n", encoding="utf-8")
+    with pytest.raises(PluginCallError, match="git directory"):
+        plan_mounts("jail", [], [str(instance / "vault")], _policy(instance))
+
+
+def test_a_worktree_style_commondir_layout_fails_the_sweep_whatever_its_age(
+    instance: Path,
+) -> None:
+    gitdir = instance / "vault" / "inbox" / "deep"
+    (gitdir / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    (gitdir / "commondir").write_text("../..\n", encoding="utf-8")
+    swept = sweep("jail", [_mount(instance / "vault" / "inbox")], mounts.now() + 60)  # old
+    assert any("git directory layout" in failure for failure in swept.failures)
+
+
+def test_head_alone_is_not_a_git_directory(instance: Path) -> None:
+    (instance / "vault" / "HEAD.md").write_text("x", encoding="utf-8")
+    (instance / "vault" / "head").write_text("a note called head\n", encoding="utf-8")
+    assert plan_mounts("jail", [], [str(instance / "vault" / "inbox")], _policy(instance))
+
+
+def test_an_fstat_error_in_the_sweep_fails_it(
+    instance: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inbox = instance / "vault" / "inbox"
+    plan = [_mount(inbox)]
+
+    def broken_fstat(fd: int) -> Any:
+        raise OSError(5, "Input/output error")
+
+    monkeypatch.setattr(os, "fstat", broken_fstat)
+    swept = sweep("jail", plan, mounts.now())
+    assert swept.failures, "an fstat error must fail the sweep"
