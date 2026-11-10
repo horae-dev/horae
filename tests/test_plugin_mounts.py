@@ -948,8 +948,9 @@ def test_a_bare_repository_layout_is_refused_under_any_name(instance: Path, case
     with pytest.raises(PluginCallError, match="git directory"):
         plan_mounts("jail", [], [str(vault / "archive" / "notes-backup")], policy)  # itself
     _bare(vault / "inbox" / "deep", case)
+    refs = "refs" if case == "upper" else "REFS"  # as created (volumes may keep case)
     with pytest.raises(PluginCallError, match="git directory"):  # above it
-        plan_mounts("jail", [], [str(vault / "inbox" / "deep" / "refs")], policy)
+        plan_mounts("jail", [], [str(vault / "inbox" / "deep" / refs)], policy)
 
 
 def test_a_new_bare_repository_layout_fails_the_sweep(
