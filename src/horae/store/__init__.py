@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The SQLite store: runs, step records, journal, LLM cache, task index, notification state.
+"""The SQLite store: runs, step records, journal, LLM cache, task index, notification state,
+MCP token digests.
 
 See ADR 0006. The schema is created and upgraded by numbered SQL migrations shipped in
 `horae/store/migrations/`; `PRAGMA user_version` is the schema version. Every failure is a
@@ -10,6 +11,7 @@ from horae.store._errors import (
     ActTokenUsed,
     InvalidRow,
     JournalTooLarge,
+    McpTokenExists,
     MigrationError,
     PipelineBusy,
     RunExists,
@@ -39,6 +41,7 @@ from horae.store._store import (
     CacheEntry,
     DaySpend,
     JournalEntry,
+    McpTokenRow,
     NotificationState,
     Overrun,
     RunSummary,
@@ -66,6 +69,8 @@ __all__ = [
     "InvalidRow",
     "JournalEntry",
     "JournalTooLarge",
+    "McpTokenExists",
+    "McpTokenRow",
     "Migration",
     "MigrationError",
     "NotificationState",

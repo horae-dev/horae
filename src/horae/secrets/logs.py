@@ -24,11 +24,15 @@ every logger, the root included:
   `thread_excepthook`): an uncaught exception's report (type, message and traceback, as the
   default hooks format it) is redacted before it is written to `stderr` (only the text; the
   exception object itself is not changed);
+- it replaces anything shaped like an MCP bearer token (`hmcp_` and 16 or more base64url
+  characters, `MCP_TOKEN_SHAPE`, #56) with `[REDACTED:mcp_token]`: a token the server was
+  sent is not a secret this process resolved, so the registry cannot know its value;
 - it pins the `HTTP_LOGGERS` (and their children already created) to at least `WARNING`, so
   request headers are never even formatted.
 """
 
 import logging
+import re
 import sys
 import threading
 import traceback
@@ -42,6 +46,10 @@ from horae.secrets.redact import Redactor, current
 HTTP_LOGGERS = ("httpx", "httpx2", "httpcore", "httpcore2")
 """Pinned to `WARNING` by `install()`: at `DEBUG` they log request headers."""
 
+MCP_TOKEN_SHAPE = re.compile(r"hmcp_[A-Za-z0-9_-]{16,}")
+"""An MCP bearer token (`horae.mcp_auth`, 43 characters after the prefix), or most of one."""
+MCP_TOKEN_REDACTED = "[REDACTED:mcp_token]"  # noqa: S105 - a marker, not a secret
+
 _sources: "weakref.WeakSet[Any]" = weakref.WeakSet()
 """Open plugin hosts (each has a `redactor()` method returning a `Redactor`)."""
 _lock = threading.Lock()
@@ -54,12 +62,13 @@ def covered(name: str) -> bool:
 
 
 def redact_all(text: str) -> str:
-    """`text` redacted with the process registry and every registered source."""
+    """`text` redacted with the process registry, every registered source and the MCP
+    token shape."""
     text, _ = current().redact_text(text)
     for source in list(_sources):
         redactor: Redactor = source.redactor()
         text, _ = redactor.redact_text(text)
-    return text
+    return MCP_TOKEN_SHAPE.sub(MCP_TOKEN_REDACTED, text)
 
 
 def scrub(record: logging.LogRecord) -> None:
@@ -154,6 +163,8 @@ def unregister(source: Any) -> None:
 
 __all__ = [
     "HTTP_LOGGERS",
+    "MCP_TOKEN_REDACTED",
+    "MCP_TOKEN_SHAPE",
     "covered",
     "excepthook",
     "install",
