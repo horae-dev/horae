@@ -496,7 +496,13 @@ def test_evil_paths_sees_only_its_grants_and_its_traps_are_undone(
     # A hard link across mounts is refused by the kernel; a write through `..` lands outside
     # every mount (the read-only root filesystem); a device needs CAP_MKNOD.
     assert planted["hardlink"] == "Invalid cross-device link"
-    assert planted["dotdot_write"] in ("Read-only file system", "No such file or directory")
+    # (the parents of a mount point exist on the read-only root filesystem, created by the
+    # engine as root: which error comes first depends on the engine)
+    assert planted["dotdot_write"] in (
+        "Read-only file system",
+        "No such file or directory",
+        "Permission denied",
+    )
     assert not (root / "evil-dotdot.md").exists()
     assert planted["device"] == "Operation not permitted"
     # What the kernel allowed inside the writable path, the link resolves to nothing there...
