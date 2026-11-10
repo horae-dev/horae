@@ -622,7 +622,7 @@ def _spawn(tmp_path: Path, plugin: Path, *, secrets: dict[str, Secret] | None = 
     )
 
     async def go() -> Any:
-        return await runtime.spawn(
+        spawn = await runtime.spawn(
             "jail",
             root=plugin,
             command=["python", "-m", "jail_server"],
@@ -631,6 +631,9 @@ def _spawn(tmp_path: Path, plugin: Path, *, secrets: dict[str, Secret] | None = 
             cwd=tmp_path,
             startup_timeout_s=10.0,
         )
+        assert spawn.egress is not None
+        await spawn.egress.stop()  # the plugin is never run here: stop its (fake) proxy
+        return spawn
 
     return asyncio.run(go())
 

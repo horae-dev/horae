@@ -319,6 +319,10 @@ class ProxyHandle:
                     process.kill()
                 with anyio.move_on_after(STOP_WAIT_S):
                     await process.wait()
+            for stream in (process.stdout, process.stderr):
+                with suppress(Exception):
+                    if stream is not None:
+                        await stream.aclose()  # the watch task's reads end here too
             with suppress(Exception):
                 await self._remove()
 
