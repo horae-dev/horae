@@ -48,7 +48,7 @@ from horae.config import CONFIG_FILE, STORE_FILE, Instance, ProblemsError
 from horae.config.documents import read_yaml, validate
 from horae.contracts.instance import CORE_SECRET_NAMES, EnvSecretRef, InstanceConfig
 from horae.contracts.lockfile import LockedPlugin, Lockfile
-from horae.contracts.plugin import Permissions, PluginManifest
+from horae.contracts.plugin import PluginManifest
 from horae.contracts.types import PluginName
 from horae.marketplace import (
     ApprovalRefused,
@@ -62,6 +62,7 @@ from horae.marketplace.approval import (
     describe,
     lock_mismatch,
     parse_grants,
+    recorded_grants,
     require_installable,
     with_grants,
 )
@@ -146,14 +147,6 @@ def _recorded(name: str, root: Path) -> dict[str, Any]:
     return record
 
 
-def _manifest_permissions(root: Path) -> Permissions | None:
-    """The permissions the installed manifest declares, or `None` when it cannot be read."""
-    try:
-        return validate(read_yaml(root / MANIFEST_FILE), PluginManifest).permissions
-    except (ProblemsError, OSError, ValueError):
-        return None
-
-
 # --- upgrade ---------------------------------------------------------------------------------
 
 
@@ -192,6 +185,7 @@ class _UpgradeApproval:
             permissions=granted,
             personal_fields=manifest.provides.personal_fields,
             pipelines=self.pipelines.digests,
+            user_grants=recorded_grants(self.hosts, self.local),
         )
         changes = permission_diff(self.old, wanted)
         err = self.json_output
@@ -201,6 +195,19 @@ class _UpgradeApproval:
         )
         for line in describe_diff(changes):
             echo(safe(line), err=err)
+        if self.old.user_grants is None:
+            dropped = sorted(
+                {*self.old.permissions.network, *self.old.permissions.network_local}
+                - {*granted.network, *granted.network_local}
+            )
+            if dropped:
+                echo(
+                    "note: horae.lock records no host you added with --allow-host / "
+                    "--allow-local for this plugin (installed before it did, or none added), "
+                    f"so none is carried over; dropped: {', '.join(map(safe, dropped))}. If you "
+                    "added one of them, run the upgrade again with --allow-host / --allow-local",
+                    err=err,
+                )
         if widens(changes):
             # The full request, so what is new is read in context (pipelines with their calls).
             for line in describe(
@@ -323,7 +330,7 @@ def _upgrade_locked(
         and not record_mismatch(record, name, old.version, old.repo, old.commit)
     ):
         return _report_current(name, old, json_output, list(loaded.warnings))
-    kept_hosts, kept_local = user_grants(old.permissions, _manifest_permissions(root))
+    kept_hosts, kept_local = user_grants(old)
     all_grants = (sorted({*kept_hosts, *grants[0]}), sorted({*kept_local, *grants[1]}))
     for host in kept_hosts:
         echo(f"keeping the host you added: {host}", err=json_output)
@@ -360,7 +367,9 @@ def _upgrade_locked(
     staged = installed.path
     entry = approval.entry
     if entry is None or (
-        installed.lock_entry(entry.permissions).model_copy(update={"pipelines": entry.pipelines})
+        installed.lock_entry(entry.permissions).model_copy(
+            update={"pipelines": entry.pipelines, "user_grants": entry.user_grants}
+        )
         != entry
     ):
         delete_tree(staged)

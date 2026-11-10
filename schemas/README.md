@@ -4272,11 +4272,30 @@ loosened later without breaking a valid file.
       personal field dropped (less protection, decision 68); another repository or source.
       Removals are shown but need nothing. When something widens, the full request (decision
       70 A, with the pipelines' calls) follows the diff.
-    - **D, grants.** The hosts and local endpoints the lock grants beyond the installed
-      manifest (read from the installed tree) are what the user added (`--allow-host`,
-      `--allow-local`): they are kept and said so, and do not widen. New flags add to them and
-      do widen. Nothing else is carried over: a host the old manifest declared and the new one
+    - **D, grants.** The hosts and local endpoints the user added (`--allow-host`,
+      `--allow-local`) are kept and said so, and do not widen. New flags add to them and do
+      widen. Nothing else is carried over: a host the old manifest declared and the new one
       drops is gone.
+      *Amendment (#175).* The first version worked the user's grants out as the lock's hosts
+      minus the hosts of the installed `plugins/<name>/plugin.yaml`. That file is not verified
+      (a plugin running as the user can rewrite it, and a killed upgrade can leave the new
+      tree in place under the old lock), so a host the old version declared could be
+      relabelled "added by you" and stay granted. `add` and `upgrade` now record the user's
+      grants in the lock entry, `plugins.<name>.user_grants` (`network`, `network_local`),
+      and an upgrade carries over **only** those. A lock entry, not the install record:
+      the lock is what the user reviews, commits and approves, it is written atomically with
+      the approval, and `user_grants` must be a subset of `permissions` (a lock that lists a
+      grant it does not give is invalid); the record lives in the plugin's own tree, the
+      very place the bug came from, and a killed upgrade leaves the new version's record
+      there. The field is optional and omitted when empty, so a lock written before it, or
+      for an install with no `--allow-*`, is byte-identical; `lockfile/v1.json` gains the
+      optional property (additive). `lock_mismatch` does not compare it (the permissions it
+      grants are what `--yes` approves). **Legacy entries** have no record: the manifest at
+      the pinned commit would need a fetch of the old commit (no clone is kept, and
+      `--offline` must work), so nothing is carried over, failing toward fewer grants. The
+      upgrade prints a note naming the old hosts and endpoints the new version drops and
+      asks to pass `--allow-host` / `--allow-local` again if the user added them; the next
+      upgrade records them.
     - **E, approval.** Interactive confirmation, default no. `--yes` passes only when nothing
       widens, which includes a lock that already approves the target (a lock committed from
       another machine: the diff is then empty). Without a terminal and without `--yes`, refused.

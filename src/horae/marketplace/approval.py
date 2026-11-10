@@ -20,7 +20,7 @@ from pydantic import TypeAdapter, ValidationError
 
 from horae.contracts.instance import DEFAULT_MARKETPLACE
 from horae.contracts.intents import IntentType
-from horae.contracts.lockfile import LockedPlugin
+from horae.contracts.lockfile import LockedPlugin, UserGrants
 from horae.contracts.marketplace import Tier
 from horae.contracts.plugin import Permissions
 from horae.contracts.types import Hostname, LocalEndpoint
@@ -106,6 +106,13 @@ def with_grants(asked: Permissions, hosts: Sequence[str], local: Sequence[str]) 
             "network_local": sorted({*asked.network_local, *local}),
         }
     )
+
+
+def recorded_grants(hosts: Sequence[str], local: Sequence[str]) -> UserGrants | None:
+    """The `--allow-host` / `--allow-local` values as the lock entry records them (`None` when
+    there are none, so the field is left out of the lock)."""
+    grants = UserGrants(network=sorted(set(hosts)), network_local=sorted(set(local)))
+    return grants or None
 
 
 def _group(lines: list[str], label: str, values: Sequence[str], added: set[str]) -> None:
@@ -201,6 +208,7 @@ __all__ = [
     "describe",
     "lock_mismatch",
     "parse_grants",
+    "recorded_grants",
     "require_installable",
     "with_grants",
 ]

@@ -90,6 +90,7 @@ from horae.marketplace.approval import (
     describe,
     lock_mismatch,
     parse_grants,
+    recorded_grants,
     require_installable,
     with_grants,
 )
@@ -281,6 +282,7 @@ class _Approval:
             permissions=granted,
             personal_fields=manifest.provides.personal_fields,
             pipelines=self.pipelines.digests if self.pipelines is not None else {},
+            user_grants=recorded_grants(self.hosts, self.local),
             source="direct" if self.source == "direct" else None,
         )
         existing = self.lock.plugins.get(name)
@@ -366,7 +368,7 @@ def _install_and_lock(
         if (
             entry is None
             or installed.lock_entry(entry.permissions).model_copy(
-                update={"pipelines": entry.pipelines}
+                update={"pipelines": entry.pipelines, "user_grants": entry.user_grants}
             )
             != entry
         ):
