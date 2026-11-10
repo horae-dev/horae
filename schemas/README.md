@@ -4227,6 +4227,14 @@ loosened later without breaking a valid file.
       The prompt also prints each call's parameters (act and notify targets: `path`, `mode`,
       `url`, `link_prefix`, `topic`...; at most 160 characters each) and each `llm` step's model
       and budget.
+    - **K, amendment (#173): exclusive placement.** D's "never overwrite" was a `lexists` check
+      followed by `rename`, which on POSIX silently replaces an empty directory created in
+      between. The scratch directory is now placed with `rename_noreplace`:
+      `renameat2(RENAME_NOREPLACE)` on Linux, an exclusive `mkdir` of the target plus a move of
+      the files through directory descriptors elsewhere. A target that exists, empty or not, is
+      refused (`install_refused`, nothing left behind, the lock not written). The same primitive
+      moves an upgraded pack's old directory aside and puts it back on rollback (decision 73);
+      `remove` only deletes. No schema change.
 
 ### Provisional decisions (#47, pending maintainer review)
 

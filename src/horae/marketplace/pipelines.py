@@ -21,8 +21,11 @@ The pack's tree is untrusted, so before anything is written to the instance (thi
   a user's file is never replaced. (The plugin is not installed at this point, so whatever is
   there is not ours; `remove` (#47) deletes the recorded files before a reinstall.)
 
-The files are written to a scratch directory in `pipelines/` and renamed into place, so the
-pack's directory is absent or complete. A failure later in the add (the lock write) removes it.
+The files are written to a scratch directory in `pipelines/` and renamed into place without
+replacing anything (`rename_noreplace`: `renameat2(RENAME_NOREPLACE)`, or an exclusive `mkdir`
+elsewhere; a directory that appears at the target meanwhile, even an empty one, is refused, #173),
+so the pack's directory is absent or complete. A failure later in the add (the lock write)
+removes it.
 
 **Upgrade and remove (#47, decision 73).** `PackPipelines(instance, replacing=<the locked
 digests>)` is the upgrade's hook: `pipelines/<plugin>/` may then exist, but only as a real
@@ -35,14 +38,20 @@ only `<name>.yaml` regular files approved for the plugin with their locked diges
 `lstat` (never a symlink, never following one), then the directory only if it is empty.
 """
 
+import contextlib
+import ctypes
+import ctypes.util
+import errno
 import hashlib
 import json
 import os
 import secrets
 import shutil
 import stat
+import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
 from pydantic import TypeAdapter
 
@@ -329,7 +338,7 @@ class PackPipelines:
         try:
             if self.replacing is not None and os.path.lexists(target):
                 aside = pipelines / f"{OLD_PREFIX}{target.name}-{secrets.token_hex(8)}"
-                target.rename(aside)
+                rename_noreplace(target, aside)
                 self.old = aside
             if self.plugin is None:
                 return  # the new version installs no pipeline: the old ones are only removed
@@ -338,9 +347,12 @@ class PackPipelines:
             try:
                 for name, raw in self.files.items():
                     (scratch / f"{name}{SUFFIX}").write_bytes(raw)
-                if os.path.lexists(target):
-                    raise InstallRefused(f"{self.plugin}: {target} appeared; not overwriting it")
-                scratch.rename(target)
+                try:
+                    rename_noreplace(scratch, target)
+                except FileExistsError:
+                    raise InstallRefused(
+                        f"{self.plugin}: {target} appeared; not overwriting it"
+                    ) from None
             except BaseException:
                 shutil.rmtree(scratch, ignore_errors=True)
                 raise
@@ -362,7 +374,7 @@ class PackPipelines:
             self.written = None
         if self.old is not None and self.target is not None:
             try:
-                self.old.rename(self.target)
+                rename_noreplace(self.old, self.target)
             except OSError:
                 return  # left aside: `horae plugin audit` reports it
             self.old = None
@@ -388,6 +400,80 @@ def _open_dir(directory: Path) -> int | None:
         return os.open(directory, _DIR_FLAGS)
     except FileNotFoundError:
         return None
+
+
+_LINUX = sys.platform.startswith("linux")
+_RENAME_NOREPLACE = 1
+_AT_FDCWD = -100
+
+
+def _renameat2() -> Any:
+    """`renameat2(2)` from libc (Linux only), or `None`."""
+    if not _LINUX:
+        return None
+    try:
+        fn = ctypes.CDLL(ctypes.util.find_library("c") or None, use_errno=True).renameat2
+    except (OSError, AttributeError):
+        return None
+    fn.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    fn.restype = ctypes.c_int
+    return fn
+
+
+def rename_noreplace(src: Path, dst: Path) -> None:
+    """Rename the directory `src` to `dst`, which must not exist: `FileExistsError` if it does,
+    even when it is an empty directory created a moment ago (a plain `rename` replaces that).
+
+    On Linux this is `renameat2(RENAME_NOREPLACE)`, atomic. Elsewhere (macOS, or a file
+    system without it) `dst` is created with an exclusive `mkdir` and the entries of `src` are
+    moved into it through descriptors of both directories, then `src` is removed: on a
+    failure the entries already moved are moved back and `dst` is removed again if it is
+    still the empty directory created here (never recursively)."""
+    fn = _renameat2()
+    if fn is not None:
+        if fn(_AT_FDCWD, os.fsencode(src), _AT_FDCWD, os.fsencode(dst), _RENAME_NOREPLACE) == 0:
+            return
+        err = ctypes.get_errno()
+        if err == errno.EEXIST:
+            raise FileExistsError(err, os.strerror(err), str(dst))
+        if err not in (errno.ENOSYS, errno.EINVAL, errno.ENOTSUP):
+            raise OSError(err, os.strerror(err), str(dst))
+    os.mkdir(dst)  # exclusive: EEXIST for a directory, a file or a symlink
+    dst_fd = os.open(dst, _DIR_FLAGS)
+    try:
+        made = os.fstat(dst_fd)  # the directory this call created
+        src_fd = os.open(src, _DIR_FLAGS)
+        moved: list[str] = []
+        try:
+            try:
+                for name in os.listdir(src_fd):
+                    os.rename(name, name, src_dir_fd=src_fd, dst_dir_fd=dst_fd)
+                    moved.append(name)
+                os.rmdir(src)
+            except BaseException:
+                for name in moved:  # put back exactly what was moved, nothing else
+                    with contextlib.suppress(OSError):
+                        os.rename(name, name, src_dir_fd=dst_fd, dst_dir_fd=src_fd)
+                _rmdir_if_ours(dst, made)
+                raise
+        finally:
+            os.close(src_fd)
+    except BaseException:
+        _rmdir_if_ours(dst, os.fstat(dst_fd))  # no-op unless still the made directory
+        raise
+    finally:
+        os.close(dst_fd)
+
+
+def _rmdir_if_ours(path: Path, made: os.stat_result) -> None:
+    """`rmdir` `path` if it is still the directory with the device and inode of `made`; it
+    only succeeds when empty, and nothing is ever deleted recursively."""
+    try:
+        now = os.lstat(path)
+        if (now.st_dev, now.st_ino) == (made.st_dev, made.st_ino):
+            os.rmdir(path)
+    except OSError:
+        pass
 
 
 def check_own(plugin: str, directory: Path, approved: dict[str, str]) -> None:

@@ -5,6 +5,7 @@ fixture repositories (no network)."""
 import hashlib
 import json
 import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -509,3 +510,77 @@ def test_a_directory_whose_lock_entry_approves_no_pipeline_is_ignored(
         loaded = load_instance(inst)  # `github` is enabled and locked, with no pipelines
     assert "stray" not in loaded.pipelines
     assert any("approves no pipeline" in r.message for r in caplog.records)
+
+
+@pytest.mark.parametrize("native", [True, False], ids=["renameat2", "mkdir-fallback"])
+def test_a_directory_appearing_before_the_placement_is_refused_not_replaced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, native: bool
+) -> None:
+    from horae.marketplace import pipelines as mod
+
+    if not native:
+        monkeypatch.setattr(mod, "_renameat2", lambda: None)
+    pipelines = tmp_path / "pipelines"
+    pipelines.mkdir()
+    hook = PackPipelines(tmp_path)
+    hook.plugin, hook.files = "demo-pack", {"weekly-review": b"name: weekly-review\n"}
+    hook.target = pipelines / "demo-pack"
+    real = tempfile.mkdtemp
+
+    def racing(*args: Any, **kwargs: Any) -> str:
+        scratch: str = real(*args, **kwargs)
+        (pipelines / "demo-pack").mkdir()  # appears after the check, before the placement
+        return scratch
+
+    monkeypatch.setattr(tempfile, "mkdtemp", racing)
+    with pytest.raises(InstallRefused, match="appeared"):
+        hook.write()
+    assert (pipelines / "demo-pack").is_dir()
+    assert list((pipelines / "demo-pack").iterdir()) == []  # the intruder is untouched
+    assert [p.name for p in pipelines.iterdir()] == ["demo-pack"]  # no scratch left
+    assert hook.written is None
+
+
+@pytest.mark.parametrize("native", [True, False], ids=["renameat2", "mkdir-fallback"])
+def test_rename_noreplace_moves_a_directory_to_a_free_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, native: bool
+) -> None:
+    from horae.marketplace import pipelines as mod
+
+    if not native:
+        monkeypatch.setattr(mod, "_renameat2", lambda: None)
+    (tmp_path / "a").mkdir()
+    (tmp_path / "a" / "x.yaml").write_text("x", encoding="utf-8")
+    mod.rename_noreplace(tmp_path / "a", tmp_path / "b")
+    assert not (tmp_path / "a").exists()
+    assert (tmp_path / "b" / "x.yaml").read_text(encoding="utf-8") == "x"
+
+
+def test_a_fallback_move_that_fails_partway_puts_every_file_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from horae.marketplace import pipelines as mod
+
+    monkeypatch.setattr(mod, "_renameat2", lambda: None)
+    src = tmp_path / "scratch"
+    src.mkdir()
+    for name in ("a.yaml", "b.yaml", "c.yaml"):
+        (src / name).write_text(name, encoding="utf-8")
+    bystander = tmp_path / "keep.txt"
+    bystander.write_text("mine", encoding="utf-8")
+    real = os.rename
+    calls: list[str] = []
+
+    def flaky(a: Any, b: Any, *, src_dir_fd: int, dst_dir_fd: int) -> None:
+        calls.append(a)
+        if len(calls) == 3:  # the third move fails; the later ones (put back) go through
+            raise OSError(5, "I/O error")
+        real(a, b, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+    monkeypatch.setattr(os, "rename", flaky)
+    with pytest.raises(OSError, match="I/O error"):
+        mod.rename_noreplace(src, tmp_path / "target")
+    assert sorted(p.name for p in src.iterdir()) == ["a.yaml", "b.yaml", "c.yaml"]
+    assert (src / "a.yaml").read_text(encoding="utf-8") == "a.yaml"
+    assert not (tmp_path / "target").exists()
+    assert bystander.read_text(encoding="utf-8") == "mine"
