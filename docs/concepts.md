@@ -101,6 +101,16 @@ plugin name and version to a repository and a full commit SHA, with a tier (`fir
 `horae.yaml`, and `horae plugin resolve <name>@<version>` prints the repository and pinned
 commit ([ADR 0004](adr/0004-git-marketplace-with-sha-pinning.md)).
 
+!!! note "Proxy and custom CA"
+    Git reads indexes and plugin repositories with a minimal environment. Only for those
+    fetches it passes on `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY` (and the lowercase forms),
+    `SSL_CERT_FILE` and `SSL_CERT_DIR`. A proxy must be a URL with no credentials (put them
+    in a trusted network path, not the variable) and a CA path must be absolute and exist;
+    otherwise the fetch fails naming the variable, never its value. Everything else in the
+    environment, and the protocol and hook restrictions, stay as they are. The cache under
+    `<state_dir>/marketplaces` is private (`0700`), and two `horae plugin` runs take turns
+    on the same index (a run that waits too long exits with code 5, `lock_busy`).
+
 !!! note "Status"
     Search and resolve are on `main`. Installing, upgrading, removing and auditing plugins
     (`horae plugin add | upgrade | remove | audit`, with the permission prompt and the lock

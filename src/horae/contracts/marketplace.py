@@ -4,8 +4,8 @@
 The index is the published format of `horae-dev/marketplace` (its
 `schema/marketplace.schema.json`): a list of plugins, each with its git repository, the released
 versions pinned to a full commit SHA, and a tier. The name, version, repository and commit
-patterns are the lockfile's (`horae.contracts.lockfile`), except that the index pins a 40-hex
-SHA-1 only, as the marketplace schema does.
+patterns are the lockfile's (`horae.contracts.lockfile`), the commit included: a 40-hex SHA-1
+or a 64-hex SHA-256 (#153).
 
 An index is untrusted data: the core validates every index it fetches with this contract
 (strict, unknown keys rejected) before using any of it.
@@ -13,16 +13,16 @@ An index is untrusted data: the core validates every index it fetches with this 
 
 from typing import Annotated, Literal, Self
 
-from pydantic import Field, Strict, StringConstraints, model_validator
+from pydantic import Field, model_validator
 
 from horae.contracts.lockfile import GitRepoUrl
-from horae.contracts.types import Contract, PluginName, SemVer
+from horae.contracts.types import CommitSha, Contract, PluginName, SemVer
 
 MAX_INDEX_PLUGINS = 1024
 MAX_PLUGIN_VERSIONS = 512
 
-IndexCommit = Annotated[str, Strict(), StringConstraints(pattern=r"^[0-9a-f]{40}$")]
-"""The full 40-hex commit id a released version is pinned to."""
+IndexCommit = CommitSha
+"""The full commit id a released version is pinned to: 40 hex (SHA-1) or 64 hex (SHA-256)."""
 
 Tier = Literal["first-party", "community"]
 """`first-party`: maintained in the horae-dev organization. `community`: anyone else."""

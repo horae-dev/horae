@@ -102,6 +102,8 @@ _CHECKOUT_OPTIONS = ("core.symlinks=false", "core.protectHFS=true", "core.protec
 _name: TypeAdapter[str] = TypeAdapter(PluginName)
 _version: TypeAdapter[str] = TypeAdapter(SemVer)
 _sha: TypeAdapter[str] = TypeAdapter(CommitSha)
+_REMOTE_COMMANDS = frozenset({"clone", "fetch", "ls-remote"})
+"""The git subcommands of an install that read the remote (the rest runs on the scratch clone)."""
 _repo: TypeAdapter[str] = TypeAdapter(GitRepoUrl)
 
 Prepare = Callable[[Path, PluginManifest], None]
@@ -335,9 +337,16 @@ class PluginInstaller:
     def _git(
         self, cwd: Path, *args: str, options: tuple[str, ...] = (), watch: Path | None = None
     ) -> str:
+        # Only the calls that read the remote inherit the proxy and CA variables (#153).
+        network = args[0] in _REMOTE_COMMANDS
         if watch is None:
             return run_git(
-                cwd, *args, allow=self.allow_protocol, timeout_s=self.timeout_s, options=options
+                cwd,
+                *args,
+                allow=self.allow_protocol,
+                timeout_s=self.timeout_s,
+                options=options,
+                network=network,
             )
         # A download is killed once the scratch directory holds more than the budget.
         return run_git(
@@ -348,6 +357,7 @@ class PluginInstaller:
             options=options,
             watch=watch,
             max_bytes=MAX_FETCH_BYTES,
+            network=network,
         )
 
     def _fetch(self, scratch: Path, git_dir: Path, repo: str, version: str, sha: str) -> None:
