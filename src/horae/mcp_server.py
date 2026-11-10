@@ -194,9 +194,10 @@ def _task(task: TaskEntry, today: date) -> McpTask:
     )
 
 
-def build_server(reader: Reader, *, stdio: bool = True) -> MCPServer:
+def build_server(reader: Reader, *, stdio: bool) -> MCPServer:
     """The MCP server with its three read-only tools, each needing the scope `read`: granted
-    over stdio (`stdio=True`), else only to an HTTP request whose token has it."""
+    over stdio (`stdio=True`), else only to an HTTP request whose token has it. `stdio` has
+    no default: every caller says which transport it serves (stdio grants every scope)."""
     server = MCPServer("horae", instructions=INSTRUCTIONS)
 
     def need(ctx: Context, scope: str) -> None:
@@ -254,6 +255,14 @@ def build_http_app(
     alone, so a revoked token is refused on its next request). The SDK's DNS-rebinding check
     is always on: `Host` must be a loopback name or one of `allowed_hosts` (any port), and an
     `Origin`, when sent, the same over `http` or `https`."""
+    return http_app(build_server(reader, stdio=False), verifier, allowed_hosts)
+
+
+def http_app(
+    server: MCPServer, verifier: TokenVerifier, allowed_hosts: tuple[str, ...] = ()
+) -> ASGIApp:
+    """`server` (built with `stdio=False`) over streamable HTTP, as `build_http_app` serves
+    it: stateless, JSON, the DNS-rebinding check on, every request behind `TokenAuth`."""
     names = (*_LOOPBACK, *allowed_hosts)
     security = TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
@@ -262,7 +271,7 @@ def build_http_app(
             o for n in names for s in ("http", "https") for o in (f"{s}://{n}", f"{s}://{n}:*")
         ],
     )
-    app = build_server(reader, stdio=False).streamable_http_app(
+    app = server.streamable_http_app(
         streamable_http_path=MCP_PATH,
         json_response=True,
         stateless_http=True,
@@ -279,4 +288,5 @@ __all__ = [
     "build_http_app",
     "build_server",
     "clean",
+    "http_app",
 ]

@@ -4374,7 +4374,8 @@ loosened later without breaking a valid file.
       CLI; for #55, the approval of a `pipeline.run` stays required over stdio too (the
       approval, not the transport, protects against a client steered by note text). The
       transport decides this, not the absence of an HTTP request: a tool served over HTTP
-      without an authenticated user gets no scope (fail closed).
+      without an authenticated user gets no scope (fail closed), and `build_server` takes
+      `stdio` as a required keyword (no default that would grant every scope).
     - **C, scopes.** `read` (the three read-only tools; each tool checks it, else the tool
       error `insufficient_scope`) and `pipeline.run` (reserved for #55: lets a client *ask* for
       a pipeline's dry run and an approval; it never approves anything, the approval stays
@@ -4407,8 +4408,9 @@ loosened later without breaking a valid file.
       As a last resort the record factory replaces anything matching `hmcp_[A-Za-z0-9_-]{16,}`
       with `[REDACTED:mcp_token]` (`horae.secrets.logs.MCP_TOKEN_SHAPE`): a token a client
       sent is not a secret this process resolved, so value-based redaction cannot know it.
-      `list` shows name, scopes, times and status, never a token or a digest. A refusal is
-      logged at INFO without detail.
+      `list` shows name, scopes, times and status, never a token or a digest. Refusals are
+      logged without detail as a count, at most one INFO line a minute (`RefusalLog`), so a
+      client sending bad tokens cannot flood the log.
     - **G, the listener.** `horae mcp serve --http [--host 127.0.0.1] [--port 8765]
       [--allowed-host NAME]...`: stateless streamable HTTP with JSON responses at `/mcp` (no
       MCP session, no server-sent stream: each request stands alone). It binds to loopback by

@@ -3,6 +3,7 @@
 transport behind `TokenAuth`, `horae mcp token create|list|revoke`. Synthetic values only."""
 
 import asyncio
+import contextlib
 import hmac
 import json
 import logging
@@ -23,6 +24,7 @@ import pytest
 import uvicorn
 from mcp import Client
 from mcp.client.streamable_http import streamable_http_client
+from mcp.server.mcpserver import Context
 from typer.testing import CliRunner
 
 import horae.secrets.logs
@@ -36,14 +38,16 @@ from horae.mcp_auth import (
     SCOPE_READ,
     STDIO_SCOPES,
     TOKEN_CHARS,
+    RefusalLog,
     TokenVerifier,
     granted_scopes,
     match,
     new_token,
+    require_scope,
     token_digest,
     well_formed,
 )
-from horae.mcp_server import MCP_PATH, Reader, build_http_app
+from horae.mcp_server import MCP_PATH, Reader, build_http_app, build_server, http_app
 from horae.secrets.logs import MCP_TOKEN_REDACTED, redact_all
 from horae.store import McpTokenExists, Store
 from runner_fixtures import write_instance
@@ -253,12 +257,9 @@ class Served:
         self.url = url
 
 
-@pytest.fixture
-def served(root: Path, store_path: Path) -> Iterator[Served]:
-    """The real HTTP app (`build_http_app`) on a loopback port, in a thread."""
-    state = root / "state"
-    reader = Reader(state, store_path, "Europe/Paris", "daily-brief", lambda: NOW)
-    app = build_http_app(reader, TokenVerifier(store_path))
+@contextlib.contextmanager
+def serving(app: Any) -> Iterator[Served]:
+    """`app` on a loopback port, in a thread."""
     sock = socket.create_server(("127.0.0.1", 0))
     config = uvicorn.Config(app, log_config=None, access_log=False, lifespan="on")
     server = ApiServer(config, sock)  # leaves the process's signal handlers alone
@@ -275,6 +276,17 @@ def served(root: Path, store_path: Path) -> Iterator[Served]:
     finally:
         server.request_stop()
         thread.join(10)
+
+
+def http_reader(root: Path, store_path: Path) -> Reader:
+    return Reader(root / "state", store_path, "Europe/Paris", "daily-brief", lambda: NOW)
+
+
+@pytest.fixture
+def served(root: Path, store_path: Path) -> Iterator[Served]:
+    """The real HTTP app (`build_http_app`) on a loopback port."""
+    with serving(build_http_app(http_reader(root, store_path), TokenVerifier(store_path))) as s:
+        yield s
 
 
 INIT = {
@@ -540,3 +552,72 @@ def test_the_real_command_serves_http_on_loopback_with_a_token(
     assert proc.returncode == 0
     assert token not in err
     assert "hmcp_" not in err
+
+
+# --- review follow-ups: explicit transport, pipeline.run over HTTP, refusal logging -------------
+
+
+def test_build_server_needs_its_transport_said(root: Path, store_path: Path) -> None:
+    with pytest.raises(TypeError):
+        build_server(http_reader(root, store_path))  # type: ignore[call-arg]
+
+
+def call_probe(url: str, token: str) -> Any:
+    async def go() -> Any:
+        headers = {"authorization": f"Bearer {token}"}
+        async with (
+            httpx2.AsyncClient(headers=headers, timeout=10) as http,
+            Client(streamable_http_client(url, http_client=http)) as client,
+        ):
+            return await client.call_tool("probe.pipeline_run", {})
+
+    return asyncio.run(asyncio.wait_for(go(), 30))
+
+
+def test_a_read_only_token_is_refused_what_needs_pipeline_run(root: Path, store_path: Path) -> None:
+    """No tool needs `pipeline.run` yet (#55): a probe tool on the HTTP-built server checks
+    it with `require_scope`, behind the same `http_app` wrapping as `build_http_app`."""
+    server = build_server(http_reader(root, store_path), stdio=False)
+
+    @server.tool(name="probe.pipeline_run")
+    def probe(ctx: Context) -> str:
+        require_scope(ctx.request_context.request, SCOPE_PIPELINE_RUN, stdio=False)
+        return "allowed"
+
+    reader_token = add(store_path, "reader")
+    runner_token = add(store_path, "runner", (SCOPE_READ, SCOPE_PIPELINE_RUN))
+    with serving(http_app(server, TokenVerifier(store_path))) as s:
+        refused = call_probe(s.url, reader_token)
+        allowed = call_probe(s.url, runner_token)
+    assert refused.is_error
+    assert "insufficient_scope" in json.dumps([c.model_dump() for c in refused.content])
+    assert not allowed.is_error
+
+
+def test_refusals_are_logged_as_one_summary_per_interval(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG, logger="horae.mcp")
+    clock = [1000.0]
+    log = RefusalLog(interval=60, clock=lambda: clock[0])
+    for _ in range(500):
+        log.refused()
+    clock[0] += 59
+    log.refused()
+    assert len(caplog.records) == 1  # the first refusal only
+    clock[0] += 1
+    log.refused()
+    lines = [r.getMessage() for r in caplog.records]
+    assert len(lines) == 2
+    assert lines[1].startswith("501 MCP request(s)")
+
+
+def test_a_flood_of_bad_tokens_logs_one_line(
+    store_path: Path, served: Served, caplog: pytest.LogCaptureFixture
+) -> None:
+    add(store_path, "laptop")
+    caplog.set_level(logging.DEBUG, logger="horae.mcp")
+    for _ in range(25):
+        assert post(served.url, {"authorization": f"Bearer {new_token()}"}).status_code == 401
+    refusals = [r for r in caplog.records if "refused" in r.getMessage()]
+    assert len(refusals) == 1

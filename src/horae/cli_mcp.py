@@ -78,7 +78,7 @@ def _reader(instance: Path, brief_pipeline: str) -> Reader:
 
 
 def _serve(instance: Path, brief_pipeline: str) -> int:
-    build_server(_reader(instance, brief_pipeline)).run("stdio")
+    build_server(_reader(instance, brief_pipeline), stdio=True).run("stdio")
     return EXIT_OK
 
 

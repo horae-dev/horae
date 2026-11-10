@@ -42,7 +42,7 @@ def reader(root: Path, pipeline: str = "daily-brief") -> Reader:
 
 def call(r: Reader, name: str, **args: Any) -> dict[str, Any]:
     async def go() -> dict[str, Any]:
-        async with Client(build_server(r)) as client:
+        async with Client(build_server(r, stdio=True)) as client:
             result = await client.call_tool(name, args)
             assert not result.is_error
             assert result.structured_content is not None
@@ -109,7 +109,7 @@ def snapshot(root: Path) -> tuple[Any, ...]:
 
 def test_the_client_lists_exactly_the_three_read_only_tools(root: Path) -> None:
     async def go() -> list[Any]:
-        async with Client(build_server(reader(root))) as client:
+        async with Client(build_server(reader(root), stdio=True)) as client:
             return (await client.list_tools()).tools
 
     tools = asyncio.run(go())
@@ -124,7 +124,7 @@ def test_the_client_lists_exactly_the_three_read_only_tools(root: Path) -> None:
 
 def test_the_output_schemas_are_the_exported_contracts(root: Path) -> None:
     async def go() -> dict[str, Any]:
-        async with Client(build_server(reader(root))) as client:
+        async with Client(build_server(reader(root), stdio=True)) as client:
             return {t.name: t.output_schema for t in (await client.list_tools()).tools}
 
     schemas = asyncio.run(go())
@@ -274,7 +274,7 @@ def test_an_unreadable_store_is_a_fixed_error_without_path(root: Path, store_pat
     store_path.write_bytes(b"not a database" * 100)
 
     async def go() -> Any:
-        async with Client(build_server(reader(root))) as client:
+        async with Client(build_server(reader(root), stdio=True)) as client:
             return await client.call_tool("runs.recent", {})
 
     result = asyncio.run(go())
@@ -286,7 +286,7 @@ def test_an_unreadable_store_is_a_fixed_error_without_path(root: Path, store_pat
 
 def test_no_other_tool_resource_or_prompt_exists(root: Path) -> None:
     async def go() -> tuple[int, int]:
-        async with Client(build_server(reader(root))) as client:
+        async with Client(build_server(reader(root), stdio=True)) as client:
             return (
                 len((await client.list_resources()).resources),
                 len((await client.list_prompts()).prompts),

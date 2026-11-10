@@ -19,7 +19,8 @@ included), computes the digest of what it was given (of a fixed dummy when that 
 well-formed token, so the work is the same) and compares it with **every** row's digest with
 `hmac.compare_digest`, without stopping at a match. Only then are the result's revocation and
 expiry looked at. A missing, malformed, unknown, wrong, revoked or expired token therefore
-costs the same work and gets the **same answer**: `401`, `{"error": "invalid_token"}`, the
+costs the same work and gets the **same answer** (refusals are logged as a count, at most
+one line a minute: `RefusalLog`): `401`, `{"error": "invalid_token"}`, the
 same `WWW-Authenticate` header (`TokenAuth`). Revocation takes effect on the next request:
 nothing is cached.
 
@@ -44,6 +45,7 @@ import hmac
 import logging
 import re
 import secrets
+import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -220,6 +222,36 @@ async def _reply(send: Send, status_code: int, body: bytes, headers: list[Any]) 
     await send({"type": "http.response.body", "body": body})
 
 
+REFUSAL_LOG_INTERVAL_S = 60.0
+"""Refused requests are logged as one summary line at most this often."""
+
+
+class RefusalLog:
+    """Logs refused requests as a count, at most one INFO line per `interval` seconds, so a
+    client flooding bad tokens cannot flood the log (one line for the first refusal, then
+    one per interval with how many were refused since the last line). Called on the event
+    loop only."""
+
+    def __init__(
+        self,
+        interval: float = REFUSAL_LOG_INTERVAL_S,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.interval, self.clock = interval, clock
+        self.pending = 0
+        self.last: float | None = None
+
+    def refused(self) -> None:
+        self.pending += 1
+        now = self.clock()
+        if self.last is None or now - self.last >= self.interval:
+            logger.info(
+                "%d MCP request(s) without a valid token refused since the last report",
+                self.pending,
+            )
+            self.pending, self.last = 0, now
+
+
 class TokenAuth:
     """ASGI middleware: every HTTP request needs a valid token, else `401 invalid_token`
     (one answer for every reason) before the app sees it; a store that cannot be read is
@@ -227,8 +259,11 @@ class TokenAuth:
     `AuthenticatedUser`, which binds an MCP session to its token) and `scope["auth"]` (its
     scopes). Lifespan events pass; a WebSocket is closed."""
 
-    def __init__(self, app: ASGIApp, verifier: TokenVerifier) -> None:
+    def __init__(
+        self, app: ASGIApp, verifier: TokenVerifier, refusals: RefusalLog | None = None
+    ) -> None:
         self.app, self.verifier = app, verifier
+        self.refusals = refusals or RefusalLog()
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "lifespan":
@@ -247,7 +282,7 @@ class TokenAuth:
             return
         del presented
         if principal is None:
-            logger.info("an MCP request without a valid token was refused")
+            self.refusals.refused()
             await _reply(send, 401, INVALID_TOKEN_BODY, _401_HEADERS)
             return
         inner = dict(scope)
@@ -279,6 +314,7 @@ __all__ = [
     "DIGEST_LABEL",
     "MAX_EXPIRES_DAYS",
     "NAME",
+    "REFUSAL_LOG_INTERVAL_S",
     "SCOPES",
     "SCOPE_PIPELINE_RUN",
     "SCOPE_READ",
@@ -287,6 +323,7 @@ __all__ = [
     "TOKEN_CHARS",
     "TOKEN_PREFIX",
     "Principal",
+    "RefusalLog",
     "TokenAuth",
     "TokenVerifier",
     "granted_scopes",
