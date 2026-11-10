@@ -96,6 +96,7 @@ from horae.store._errors import (
     ActTokenUsed,
     InvalidRow,
     JournalTooLarge,
+    McpTokenExists,
     PipelineBusy,
     RunExists,
     RunNotRunning,
@@ -441,6 +442,21 @@ class TaskEntry(Contract):
     def wake_at(self) -> datetime | None:
         """When a snoozed task comes back, in UTC."""
         return _opt_dt(_snooze(self.status, self.snoozed_until, self.snooze_tz)[2])
+
+
+@dataclass(frozen=True)
+class McpTokenRow:
+    """A bearer token of the MCP server's HTTP transport (#56, schemas decision 75): its
+    digest, never the token."""
+
+    id: int
+    name: str
+    token_sha256: bytes
+    scopes: tuple[str, ...]
+    created_at: datetime
+    expires_at: datetime | None
+    last_used_at: datetime | None
+    revoked_at: datetime | None
 
 
 @dataclass(frozen=True)
@@ -1963,6 +1979,77 @@ class Store:
                 (expired_before, limit),
             )
         return cur.rowcount
+
+    # --- MCP tokens (#56, schemas decision 75) -----------------------------------------------
+
+    @_api
+    def mcp_token_add(
+        self,
+        name: str,
+        token_sha256: bytes,
+        scopes: tuple[str, ...],
+        *,
+        at: datetime,
+        expires_at: datetime | None,
+    ) -> int:
+        """Store a new MCP token's digest; its id. Raises `McpTokenExists` when a token that is
+        not revoked already has `name` (nothing is written)."""
+        if type(token_sha256) is not bytes or len(token_sha256) != 32:
+            raise ValueError("an MCP token digest is 32 bytes")
+        if not scopes or any(not s or " " in s for s in scopes):
+            raise ValueError("an MCP token has at least one scope, without spaces")
+        with self.transaction():
+            taken = self._conn.execute(
+                "SELECT 1 FROM mcp_tokens WHERE name = ? AND revoked_at IS NULL", (name,)
+            ).fetchone()
+            if taken is not None:
+                raise McpTokenExists(name)
+            cur = self._conn.execute(
+                "INSERT INTO mcp_tokens (name, token_sha256, scopes, created_at, expires_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (name, token_sha256, " ".join(sorted(scopes)), _ts(at), _opt_ts(expires_at)),
+            )
+        return int(cur.lastrowid or 0)
+
+    @_api
+    def mcp_tokens(self) -> list[McpTokenRow]:
+        """Every MCP token, revoked ones included, oldest first."""
+        rows = self._conn.execute(
+            "SELECT id, name, token_sha256, scopes, created_at, expires_at, last_used_at, "
+            "revoked_at FROM mcp_tokens ORDER BY id"
+        ).fetchall()
+        return [
+            McpTokenRow(
+                id=int(r[0]),
+                name=str(r[1]),
+                token_sha256=bytes(r[2]),
+                scopes=tuple(str(r[3]).split()),
+                created_at=_dt(r[4]),
+                expires_at=_opt_dt(r[5]),
+                last_used_at=_opt_dt(r[6]),
+                revoked_at=_opt_dt(r[7]),
+            )
+            for r in rows
+        ]
+
+    @_api
+    def mcp_token_revoke(self, name: str, *, at: datetime) -> bool:
+        """Revoke the token named `name` that is not revoked yet; whether there was one."""
+        with self.transaction():
+            cur = self._conn.execute(
+                "UPDATE mcp_tokens SET revoked_at = ? WHERE name = ? AND revoked_at IS NULL",
+                (_ts(at), name),
+            )
+        return cur.rowcount == 1
+
+    @_api
+    def mcp_token_touch(self, token_id: int, *, at: datetime) -> None:
+        """Record that token `token_id` was used at `at` (a revoked token is left alone)."""
+        with self.transaction():
+            self._conn.execute(
+                "UPDATE mcp_tokens SET last_used_at = ? WHERE id = ? AND revoked_at IS NULL",
+                (_ts(at), token_id),
+            )
 
     # --- notification state ----------------------------------------------------------------
 

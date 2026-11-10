@@ -90,6 +90,13 @@ class UnknownTask(StoreError):
         self.fingerprint = fingerprint
 
 
+class McpTokenExists(StoreError):
+    """A token that is not revoked already has this name (#56)."""
+
+    def __init__(self, name: str) -> None:
+        super().__init__(f"an MCP token named {name!r} already exists")
+
+
 class ActTokenUsed(StoreError):
     """An `/act` token's nonce is already consumed (#38): the token was used."""
 

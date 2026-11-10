@@ -4460,3 +4460,79 @@ loosened later without breaking a valid file.
       0.25 s and a stop about 0.2 s per plugin; a call costs the same as in the process runtime;
       an idle container holds about 9 MiB. Threat rows T26, T27 and T42 to T45 of
       `docs/security.md`.
+
+### Provisional decisions (#56, pending maintainer review)
+
+75. **MCP server authentication (#56).** `horae mcp serve` gains a network transport, streamable HTTP (`--http`), and every
+    request on it needs a bearer token. New module `horae.mcp_auth`, commands
+    `horae mcp token create|list|revoke` (`horae.cli_mcp_token`), store migration 9
+    (`mcp_tokens`). The tools and their contracts (decision 65) are unchanged.
+    - **A, tokens.** `hmcp_` and 32 bytes from `secrets.token_bytes` as unpadded base64url (256
+      bits, 48 characters). The prefix makes a leaked token recognisable by secret scanners and
+      by Horae's log scrubber (F). A token is printed once by `create` (stdout; `--json` puts it
+      in `token`) and never again: the store keeps `SHA-256("horae-mcp-token/v1\0" || token)`
+      only. **Why SHA-256 and not a password hash:** a slow KDF (argon2, scrypt, bcrypt)
+      protects low-entropy secrets from guessing once the digest leaks; a 256-bit random token
+      cannot be guessed whatever the hash speed, so a slow hash would only add a per-request
+      CPU cost that any client could use to load the server. The label keeps this digest
+      distinct from any other SHA-256 of the same bytes. No pepper: it would need a second
+      secret and adds nothing against a 2^256 search.
+    - **B, stdio needs no token.** A stdio server is a child process of the user's own MCP
+      client, reading the instance with the user's rights: whoever can start it can already
+      read the store and run `horae run`. The operating system has authenticated the caller,
+      and a token in the client's config would sit next to the instance path and add nothing.
+      A stdio session is granted every scope (`STDIO_SCOPES`), the same as its user at the
+      CLI; for #55, the approval of a `pipeline.run` stays required over stdio too (the
+      approval, not the transport, protects against a client steered by note text). The
+      transport decides this, not the absence of an HTTP request: a tool served over HTTP
+      without an authenticated user gets no scope (fail closed), and `build_server` takes
+      `stdio` as a required keyword (no default that would grant every scope).
+    - **C, scopes.** `read` (the three read-only tools; each tool checks it, else the tool
+      error `insufficient_scope`) and `pipeline.run` (reserved for #55: lets a client *ask* for
+      a pipeline's dry run and an approval; it never approves anything, the approval stays
+      the user's, out of band). `create` grants `read` unless `--scope` says otherwise
+      (repeatable). No wildcard, no admin scope, no token management over MCP.
+    - **D, store.** Table `mcp_tokens` in the instance store (`<state_dir>/horae.db`, 0600,
+      state directory 0700, as every store): `id`, `name` (1 to 64 of `[A-Za-z0-9._-]`, first
+      a letter or digit; unique among the tokens not revoked), `token_sha256` (32 bytes,
+      unique), `scopes` (space-separated), `created_at`, optional `expires_at`
+      (`--expires-in DAYS`, 1 to 3650), `last_used_at` (written at most once a minute per
+      token, best effort with a 100 ms busy timeout) and `revoked_at`. Revoked rows are kept
+      (list shows them); a revoked name can be reused. The store, not a JSON file, so a
+      revocation and a last-use update never overwrite each other.
+    - **E, verification.** Every request opens the store read-only (a WAL reader, so a
+      revocation committed a moment ago is seen: revocation applies to the next request; no
+      cache), reads every row, digests the presented token (a fixed dummy when it is not
+      token-shaped) and compares the digest with every row's using `hmac.compare_digest`,
+      without stopping at a match; revocation and expiry are checked only after. A missing,
+      malformed, unknown, wrong, revoked or expired token costs the same work and gets the
+      same answer: `401`, body `{"error":"invalid_token","error_description":"a valid bearer
+      token is required"}`, `WWW-Authenticate: Bearer realm="horae", error="invalid_token"`,
+      `Cache-Control: no-store`. Only `Authorization: Bearer <token>` is read (scheme case
+      insensitive, exactly one header); never a query parameter or a cookie. Every path and
+      method is behind the check (no unauthenticated route, no OAuth metadata). A store that
+      cannot be read is `503` (fail closed). An authenticated request carries the SDK's
+      `AuthenticatedUser` (its `client_id` is the token's row id, never the token), which is
+      what the tools check scopes against.
+    - **F, never logged.** No Horae code logs the header or the token; uvicorn's access log is
+      off and its log configuration not applied (Horae's redacting record factory stays).
+      As a last resort the record factory replaces anything matching `hmcp_[A-Za-z0-9_-]{16,}`
+      with `[REDACTED:mcp_token]` (`horae.secrets.logs.MCP_TOKEN_SHAPE`): a token a client
+      sent is not a secret this process resolved, so value-based redaction cannot know it.
+      `list` shows name, scopes, times and status, never a token or a digest. Refusals are
+      logged without detail as a count, at most one INFO line a minute (`RefusalLog`), so a
+      client sending bad tokens cannot flood the log.
+    - **G, the listener.** `horae mcp serve --http [--host 127.0.0.1] [--port 8765]
+      [--allowed-host NAME]...`: stateless streamable HTTP with JSON responses at `/mcp` (no
+      MCP session, no server-sent stream: each request stands alone). It binds to loopback by
+      default and **refuses to start** (exit 1, `no_token`) while no token is usable (none,
+      all revoked or expired). A non-loopback `--host` prints a warning: the token travels in
+      clear text unless a TLS reverse proxy terminates in front. The SDK's DNS-rebinding check
+      is always on: `Host` must be a loopback name or an `--allowed-host` (any port), and an
+      `Origin`, when sent, one of them. `--host`, `--port` and `--allowed-host` without
+      `--http` are a usage error. SIGINT / SIGTERM stop it (exit 0; a second signal forces).
+    - **H, not done here.** No rate limit: a 256-bit token cannot be guessed, and a client
+      flooding refusals costs one store read each (loopback by default; a proxy can limit). No
+      TLS in Horae (a reverse proxy's job, as for `horae serve`). No token rotation command:
+      create a new one, switch the client, revoke the old one. The plain-HTTP `horae serve`
+      API keeps relying on the SSO proxy (decision 51); this decision is the MCP server's.

@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """The read-only MCP server (#54, schemas decision 65): `horae mcp serve`.
 
-Three tools, over stdio only, that let an MCP client (Claude Code, another agent) look at an
-instance without becoming its brain:
+Three tools, over stdio or, with a bearer token, streamable HTTP (#56), that let an MCP client
+(Claude Code, another agent) look at an instance without becoming its brain:
 
 - **`tasks.today`**: open tasks due today (in the instance's time zone) or overdue;
 - **`brief.latest`**: the latest run of the brief pipeline and the notes it changed;
@@ -11,10 +11,12 @@ instance without becoming its brain:
 **Read-only by construction.** Every call opens the store with `Store.open(read_only=True)`
 (plain `mode=ro`: no migration, no write, no new file; a missing store reads as empty) and
 closes it. No tool takes a path, a command, a secret or a note's content; no tool runs a
-pipeline (`pipeline.run` is #55) or touches the vault. There is no authentication because
-there is no listener: the client starts this process and talks to it over its stdin and
-stdout (B2-like trust: whoever can start it can already read the store). Authentication of a
-network transport is #56.
+pipeline (`pipeline.run` is #55) or touches the vault.
+
+**Authentication** (#56, decision 75, `horae.mcp_auth`). Over stdio there is no listener: the
+client starts this process and talks to it over its stdin and stdout, so whoever can start it
+can already read the store; no token is asked. Over HTTP (`build_http_app`) every request needs
+a bearer token (`TokenAuth`), and every tool checks its scope (`read`) with `require_scope`.
 
 **What leaves.** Run documents are `horae.run_view.run_json` (the API's representation: no
 step output, LLM text, journal bytes, `pid`, `host`), checked against the strict contracts of
@@ -31,9 +33,11 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+from mcp.server.transport_security import TransportSecuritySettings
 from mcp_types import ToolAnnotations
+from starlette.types import ASGIApp
 
 from horae.contracts.mcp import (
     MAX_BRIEF_TARGETS,
@@ -49,6 +53,7 @@ from horae.contracts.mcp import (
     RunsRecent,
     TasksToday,
 )
+from horae.mcp_auth import SCOPE_READ, TokenAuth, TokenVerifier, require_scope
 from horae.run_view import run_json, stale_flags
 from horae.secrets.redact import current as current_redactor
 from horae.store import RunSummary, Store, StoreError, TaskEntry
@@ -189,9 +194,14 @@ def _task(task: TaskEntry, today: date) -> McpTask:
     )
 
 
-def build_server(reader: Reader) -> MCPServer:
-    """The MCP server with its three read-only tools (stdio; no other transport is used)."""
+def build_server(reader: Reader, *, stdio: bool) -> MCPServer:
+    """The MCP server with its three read-only tools, each needing the scope `read`: granted
+    over stdio (`stdio=True`), else only to an HTTP request whose token has it. `stdio` has
+    no default: every caller says which transport it serves (stdio grants every scope)."""
     server = MCPServer("horae", instructions=INSTRUCTIONS)
+
+    def need(ctx: Context, scope: str) -> None:
+        require_scope(ctx.request_context.request, scope, stdio=stdio)
 
     @server.tool(
         name="tasks.today",
@@ -201,7 +211,8 @@ def build_server(reader: Reader) -> MCPServer:
         ),
         annotations=_READ_ONLY,
     )
-    def tasks_today(limit: int = DEFAULT_LIMIT_TASKS) -> TasksToday:
+    def tasks_today(ctx: Context, limit: int = DEFAULT_LIMIT_TASKS) -> TasksToday:
+        need(ctx, SCOPE_READ)
         return reader.tasks_today(max(1, min(limit, MAX_TASKS)))
 
     @server.tool(
@@ -212,7 +223,8 @@ def build_server(reader: Reader) -> MCPServer:
         ),
         annotations=_READ_ONLY,
     )
-    def brief_latest() -> BriefLatest:
+    def brief_latest(ctx: Context) -> BriefLatest:
+        need(ctx, SCOPE_READ)
         return reader.latest_brief()
 
     @server.tool(
@@ -223,10 +235,58 @@ def build_server(reader: Reader) -> MCPServer:
         ),
         annotations=_READ_ONLY,
     )
-    def runs_recent(limit: int = DEFAULT_LIMIT_RUNS) -> RunsRecent:
+    def runs_recent(ctx: Context, limit: int = DEFAULT_LIMIT_RUNS) -> RunsRecent:
+        need(ctx, SCOPE_READ)
         return reader.recent_runs(max(1, min(limit, MAX_RUNS)))
 
     return server
 
 
-__all__ = ["DEFAULT_BRIEF_PIPELINE", "INSTRUCTIONS", "Reader", "build_server", "clean"]
+MCP_PATH = "/mcp"
+_LOOPBACK = ("127.0.0.1", "localhost", "[::1]")
+
+
+def build_http_app(
+    reader: Reader, verifier: TokenVerifier, allowed_hosts: tuple[str, ...] = ()
+) -> ASGIApp:
+    """The tools over streamable HTTP at `MCP_PATH`, every request behind `TokenAuth`.
+
+    Stateless and JSON-only (no MCP session, no server-sent stream: each request stands
+    alone, so a revoked token is refused on its next request). The SDK's DNS-rebinding check
+    is always on: `Host` must be a loopback name or one of `allowed_hosts` (any port), and an
+    `Origin`, when sent, the same over `http` or `https`."""
+    return http_app(build_server(reader, stdio=False), verifier, allowed_hosts)
+
+
+def http_app(
+    server: MCPServer, verifier: TokenVerifier, allowed_hosts: tuple[str, ...] = ()
+) -> ASGIApp:
+    """`server` (built with `stdio=False`) over streamable HTTP, as `build_http_app` serves
+    it: stateless, JSON, the DNS-rebinding check on, every request behind `TokenAuth`."""
+    names = (*_LOOPBACK, *allowed_hosts)
+    security = TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=[h for n in names for h in (n, f"{n}:*")],
+        allowed_origins=[
+            o for n in names for s in ("http", "https") for o in (f"{s}://{n}", f"{s}://{n}:*")
+        ],
+    )
+    app = server.streamable_http_app(
+        streamable_http_path=MCP_PATH,
+        json_response=True,
+        stateless_http=True,
+        transport_security=security,
+    )
+    return TokenAuth(app, verifier)
+
+
+__all__ = [
+    "DEFAULT_BRIEF_PIPELINE",
+    "INSTRUCTIONS",
+    "MCP_PATH",
+    "Reader",
+    "build_http_app",
+    "build_server",
+    "clean",
+    "http_app",
+]

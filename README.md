@@ -196,8 +196,12 @@ the lock, or run `horae init` in the new place.
 
 `horae mcp serve -i <instance>` serves `tasks.today`, `brief.latest` and `runs.recent` to an MCP
 client over stdio, read-only (#54). Add it to Claude Code with
-`claude mcp add horae -- horae mcp serve -i <instance>`; setup, the tool schemas and the
-manual check are in [docs/mcp.md](docs/mcp.md).
+`claude mcp add horae -- horae mcp serve -i <instance>`. Over the network, `horae mcp serve
+--http` (loopback, port 8765 by default) requires a bearer token on every request: create one
+with `horae mcp token create NAME` (shown once, stored hashed), connect with
+`claude mcp add --transport http horae http://127.0.0.1:8765/mcp --header "Authorization: Bearer
+<token>"`, and revoke it with `horae mcp token revoke NAME` (#56). Setup, the tool schemas and
+the manual check are in [docs/mcp.md](docs/mcp.md).
 
 ## Deployment
 
