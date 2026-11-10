@@ -926,3 +926,38 @@ def test_the_pending_marker_is_exclusive_and_refuses_a_start(instance: Path) -> 
         mounts.mark_pending("jail", policy)  # O_EXCL
     mounts.clear_pending("jail", policy)
     mounts.check_pending("jail", policy)
+
+
+def _bare(directory: Path, case: str = "upper") -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    head, objects, refs = (
+        ("HEAD", "objects", "refs") if case == "upper" else ("head", "Objects", "REFS")
+    )
+    (directory / head).write_text("ref: refs/heads/main\n", encoding="utf-8")
+    (directory / objects).mkdir()
+    (directory / refs).mkdir()
+
+
+@pytest.mark.parametrize("case", ["upper", "mixed"])
+def test_a_bare_repository_layout_is_refused_under_any_name(instance: Path, case: str) -> None:
+    vault = instance / "vault"
+    _bare(vault / "archive" / "notes-backup", case)
+    policy = _policy(instance)
+    with pytest.raises(PluginCallError, match="git directory"):
+        plan_mounts("jail", [], [str(vault)], policy)  # below it
+    with pytest.raises(PluginCallError, match="git directory"):
+        plan_mounts("jail", [], [str(vault / "archive" / "notes-backup")], policy)  # itself
+    _bare(vault / "inbox" / "deep", case)
+    with pytest.raises(PluginCallError, match="git directory"):  # above it
+        plan_mounts("jail", [], [str(vault / "inbox" / "deep" / "refs")], policy)
+
+
+def test_a_new_bare_repository_layout_fails_the_sweep(
+    instance: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(mounts, "CTIME_SLACK_S", 0.05)  # coarse kernel timestamps
+    inbox = instance / "vault" / "inbox"
+    since = mounts.now()
+    _bare(inbox / "deep" / "anything", "mixed")
+    swept = sweep("jail", [_mount(inbox)], since)
+    assert any("new git directory" in failure for failure in swept.failures)

@@ -260,11 +260,14 @@ and why). A path must:
    path must not be or hold another container plugin's writable path (two container plugins
    never write the same tree). Reading the same path, or a path holding the other's writable
    one, is fine: that is how plugins share a vault;
-8. if writable, not be in or hold a git repository: no `.git` (in any letter case) in the
-   path, in a directory above it up to its mount root, or anywhere below it. A plugin could
+8. if writable, not be in or hold a git repository: no `.git` (in any letter case) and no
+   bare-repository layout (a directory holding `HEAD`, `objects` and `refs`, under any name)
+   in the path, in a directory above it up to its mount root, or anywhere below it. A plugin could
    plant hooks that your `git` would run. If your instance is a git repository, keep a
    writable vault outside it (`container.mount_roots`). A `.git` the plugin creates during its
-   run quarantines it. Plugins
+   run quarantines it, and so does a new bare-repository layout. Also set
+   `git config --global safe.bareRepository explicit` for the user who runs `git` on the
+   host, so git never uses a bare repository it merely finds in a directory. Plugins
    on `runtime: process` are not counted (they are unconfined anyway). These comparisons
    also use the files' identities, so another letter case (macOS volumes ignore case) or a
    link to the same directory is recognised.

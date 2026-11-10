@@ -318,6 +318,16 @@ def _is_git(name: str) -> bool:
     return name.casefold() == ".git"
 
 
+_BARE = frozenset({"head", "objects", "refs"})
+
+
+def _bare_layout(names: Iterable[str]) -> bool:
+    """Whether a directory's entries make it a git directory under any name (a bare
+    repository: `HEAD`, `objects`, `refs`, in any letter case), which `GIT_DIR` or
+    `safe.bareRepository=all` would use."""
+    return {name.casefold() for name in names} >= _BARE
+
+
 def git_problem(path: str, policy: MountPolicy) -> str | None:
     """Why the writable `path` may not be mounted for a git repository, or `None`: a `.git`
     (in any letter case: volumes may ignore it) as one of its components, in any directory from
@@ -336,6 +346,8 @@ def git_problem(path: str, policy: MountPolicy) -> str | None:
             return f"{current!r} cannot be listed to look for git ({error.strerror})"
         if any(_is_git(name) for name in names):
             return f"a writable path may not be in a git work tree ({current!r} has one)"
+        if _bare_layout(names):
+            return f"a writable path may not be in a git directory ({current!r} is one)"
         if current == top:
             break
         current = os.path.dirname(current)
@@ -346,6 +358,8 @@ def git_problem(path: str, policy: MountPolicy) -> str | None:
             entries = list(os.scandir(directory))
         except OSError as error:
             return f"{directory!r} cannot be listed to look for git ({error.strerror})"
+        if _bare_layout(entry.name for entry in entries):
+            return f"a writable path may not hold a git directory ({directory!r} is one)"
         for entry in entries:
             seen += 1
             if seen > GIT_SCAN_LIMIT:
@@ -685,6 +699,10 @@ class _Walk:
         except OSError as error:
             self.fail(f"could not list {_shown(path)} ({error.strerror})")
             return
+        if _bare_layout(entry.name for entry in entries) and writable_at(path, self.mounts):
+            with suppress(OSError):
+                if os.fstat(fd).st_ctime >= self.cutoff:
+                    self.fail(f"{_shown(path)} is a new git directory (HEAD, objects, refs)")
         children: list[tuple[str, str, os.stat_result]] = []
         for entry in entries:
             if self.stopped:
