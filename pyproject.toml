@@ -53,6 +53,12 @@ dev = [
     "hypothesis>=6.100",
     "horae-sdk",
 ]
+# The docs site (`mkdocs.yml`), built by CI and published by `.github/workflows/pages.yml`.
+# Exact pins: the site is built from the lock (`uv sync --no-dev --group docs`).
+docs = [
+    "mkdocs==1.6.1",
+    "mkdocs-material==9.8.0",
+]
 
 # The plugin SDK (`sdk/`, published as `horae-sdk`) is a workspace member: one lock, and the
 # core's lint, types and tests cover it. Coverage is gated per package (below).

@@ -1,0 +1,76 @@
+site_name: Horae
+site_description: "A predictable, self-hosted personal agent: pipelines, intents and pinned plugins."
+site_url: https://horae-dev.github.io/horae/
+repo_url: https://github.com/horae-dev/horae
+repo_name: horae-dev/horae
+docs_dir: docs
+strict: true
+
+validation:
+  omitted_files: warn
+  absolute_links: warn
+  unrecognized_links: warn
+  anchors: warn
+
+theme:
+  name: material
+  font: false # no request to Google Fonts: the site loads nothing from a third party
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - search.highlight
+
+hooks:
+  - tools/docs/hooks.py
+
+markdown_extensions:
+  - admonition
+  - tables
+  - toc:
+      permalink: true
+      # GitHub-style heading ids, so the anchors the existing docs link to keep working
+      slugify: !!python/object/apply:pymdownx.slugs.slugify {kwds: {case: lower}}
+  - pymdownx.superfences
+  - pymdownx.tasklist:
+      custom_checkbox: true
+
+nav:
+  - Home: index.md
+  - Concepts: concepts.md
+  - Quick start: quickstart.md
+  - Writing a plugin: writing-a-plugin.md
+  - Security model:
+      - Security and threat model: security.md
+      - Threat model note (T14): design/0014-threat-model-note.md
+  - CLI reference: reference/cli.md
+  - Operations:
+      - Docker Compose: operations/compose.md
+      - Coolify: operations/coolify.md
+      - Container image: operations/container-image.md
+      - Retention and backups: operations/retention-and-backups.md
+      - Plugin containers: operations/plugin-containers.md
+      - Releasing: operations/releasing.md
+      - MCP server: mcp.md
+  - Reference:
+      - Runtime (README): reference/runtime.md
+      - Schemas and decisions: reference/schemas.md
+      - Plugin SDK: reference/sdk.md
+      - Plugin template: plugins/template.md
+  - Design:
+      - Retention workflow: design/0014a-retention-workflow.md
+      - Action links: design/0038-act-links.md
+      - claude-cli backend: design/0029-claude-cli-backend.md
+  - Architecture decisions:
+      - adr/README.md
+      - adr/0001-pipelines-not-agent-loops.md
+      - adr/0002-intents-applied-by-the-core.md
+      - adr/0003-mcp-as-the-plugin-protocol.md
+      - adr/0004-git-marketplace-with-sha-pinning.md
+      - adr/0005-claude-cli-backend-and-its-terms.md
+      - adr/0006-sqlite-as-the-store.md
+      - adr/0000-template.md
+  - Project:
+      - Plan: PLAN.md
+      - Roadmap: ROADMAP.md
+      - Estimation: ESTIMATION.md

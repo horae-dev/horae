@@ -283,10 +283,28 @@ jobs:
             grep -q "required variable ${name} is missing a value" "${RUNNER_TEMP}/err.txt"
           done
 
+  # The docs site (mkdocs.yml). --strict fails on a broken link or anchor, and the CLI reference
+  # is generated from the Typer app, so a command whose help cannot be rendered fails here too.
+  # Publishing is pages.yml, on main only.
+  docs:
+    name: Docs (mkdocs build --strict)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: ${{ env.UV_VERSION }}
+          cache-python: true
+      - run: uv sync --no-dev --group docs
+      - run: uv run mkdocs build --strict
+
   ci-ok:
     name: CI OK
     if: ${{ always() }}
-    needs: [lock, lint, types, test, malicious, sdk, gitleaks, codeql, image, deploy]
+    needs: [lock, lint, types, test, malicious, sdk, gitleaks, codeql, image, deploy, docs]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions: {}

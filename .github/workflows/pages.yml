@@ -1,0 +1,60 @@
+name: Docs (GitHub Pages)
+
+# Publishes the MkDocs site (mkdocs.yml) from main. Pull requests only build it, in ci.yml.
+# Needs the repository setting Pages > Build and deployment > Source = "GitHub Actions"; until
+# it is set, the deploy job fails and the site is not published.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  UV_LOCKED: "1"
+  UV_PYTHON_PREFERENCE: only-managed
+  # renovate: datasource=github-releases depName=astral-sh/uv
+  UV_VERSION: 0.13.6
+
+jobs:
+  build:
+    name: Build the site
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read # checkout
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: ${{ env.UV_VERSION }}
+          cache-python: true
+      - run: uv sync --no-dev --group docs
+      - run: uv run mkdocs build --strict
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: site
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: [build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pages: write # publish the artifact
+      id-token: write # the deployment is verified with the job's OIDC token
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
