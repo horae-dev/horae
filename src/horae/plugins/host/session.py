@@ -32,7 +32,8 @@ way in `_meta["horae/network_local"]`, also always sent (empty when none).
 """
 
 import json
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -73,6 +74,12 @@ class Spawn:
     env: dict[str, str] = field(repr=False)
     cwd: Path
     startup_timeout_s: float
+    preamble: bytearray | None = field(default=None, repr=False)
+    """Written to stdin before the MCP stream (the container runtime's environment, schemas
+    decision 74 E); zeroed once written."""
+    cleanup: Callable[[], Awaitable[None]] | None = field(default=None, repr=False)
+    """Awaited once the process is gone (the container runtime removes its container); it must
+    not raise and must bound its own time."""
 
 
 class CallFailed(Exception):
@@ -125,6 +132,7 @@ class PluginProcess:
                 cwd=self.spawn.cwd,
                 capture=self.capture,
                 state=self.state,
+                preamble=self.spawn.preamble,
             ) as (read, write):
                 self.spawn.env.clear()  # the child has its copy; keep no secret around
                 async with ClientSession(read, write, logging_callback=self._log) as session:
@@ -140,6 +148,11 @@ class PluginProcess:
             self.error = PluginCallError("host_error", f"{self.spawn.plugin}: unexpected error")
         finally:
             self.session = None
+            if self.spawn.preamble is not None:
+                self.spawn.preamble[:] = bytes(len(self.spawn.preamble))
+            if self.spawn.cleanup is not None:
+                with anyio.CancelScope(shield=True), suppress(Exception):
+                    await self.spawn.cleanup()
             self.ready.set()
             self.stopped.set()
 

@@ -15,9 +15,24 @@
         "# renovate: datasource=(?<datasource>[a-z-]+) depName=(?<depName>[^\\s]+)\\n\\s*[A-Z_]+_VERSION: (?<currentValue>[\\w.-]+)"
       ],
       "extractVersionTemplate": "^v?(?<version>.+)$"
+    },
+    {
+      "customType": "regex",
+      "description": "The plugin container image (#49, schemas decision 74 G): the same python base image as the Dockerfile's PYTHON_IMAGE, which a test keeps equal; grouped with it below.",
+      "managerFilePatterns": ["/^src/horae/contracts/instance\\.py$/"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>docker) depName=(?<depName>[^\\s]+)\\n\\s*\"[^:\"]+:(?<currentValue>[^@\"]+)@(?<currentDigest>sha256:[0-9a-f]{64})\""
+      ]
     }
   ],
   "packageRules": [
+    {
+      "description": "The Horae image's base (Dockerfile) and the plugin container image (#49) move together",
+      "groupName": "python base image",
+      "matchManagers": ["dockerfile", "custom.regex"],
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["python"]
+    },
     {
       "groupName": "ruff",
       "minimumReleaseAge": "7 days",

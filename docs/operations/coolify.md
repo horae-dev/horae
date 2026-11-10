@@ -183,6 +183,11 @@ pick either one). These network settings fail **open** for neighbours (everythin
 working, and the neighbours reach port 8080 without SSO): check them after every change
 ([Verify on the server](#verify-on-the-server)).
 
+**Plugin containers** (`runtime: container`, #49) are not available in this template: it mounts
+no Docker socket into Horae, on purpose (a socket mount makes a Horae compromise root on the
+server, `docs/security.md` T26). The options and their risks:
+[plugin-containers.md](plugin-containers.md#horae-inside-docker-coolify-compose).
+
 ### Routing: only `/act/` is exempt from SSO
 
 - `<name>` (`HORAE_TRAEFIK_NAME`, default `horae`): `Host(<public host>)`, the whole host

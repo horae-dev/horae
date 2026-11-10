@@ -4444,3 +4444,7 @@ loosened later without breaking a valid file.
     - **K, left to the sibling stories.** CPU, memory and PID limits and declared mounts are
       #51; the egress proxy is #50; the malicious-plugin suite is #52. The argument builder
       (`run_argv`) is the one place they add flags.
+    - **L, cost.** Measured (operator guide, "Latency and sizing"): a container start adds about
+      0.25 s and a stop about 0.2 s per plugin; a call costs the same as in the process runtime;
+      an idle container holds about 9 MiB. Threat rows T26, T27 and T42 to T45 of
+      `docs/security.md`.

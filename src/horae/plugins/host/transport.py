@@ -15,6 +15,10 @@ file object. Here the process is spawned with:
   `MAX_MESSAGE_BYTES` (8 MiB) each (`output_too_large` otherwise), stderr is drained into a
   `StderrCapture` as it arrives.
 
+A `preamble` (the container runtime's environment line, schemas decision 74 E) is written to
+stdin before anything else, and the buffer is zeroed once written; a process that will not take
+it is a `spawn_failed`.
+
 A line that is not a JSON-RPC message is a `protocol_error`. Either failure is recorded in
 `ProcessState.failure` and ends the read stream, so the session's pending requests fail at
 once (the caller then kills the process).
@@ -40,6 +44,7 @@ from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
 import anyio
 import mcp_types
@@ -127,10 +132,12 @@ async def open_stdio(
     capture: StderrCapture,
     state: ProcessState,
     max_message: int = MAX_MESSAGE_BYTES,
+    preamble: bytearray | None = None,
 ) -> AsyncIterator[TransportStreams]:
     """Spawn the plugin and yield the session's (read, write) streams; stop it on exit.
 
-    Raises `PluginCallError("spawn_failed")` when the process cannot be started."""
+    Raises `PluginCallError("spawn_failed")` when the process cannot be started or does not
+    take its `preamble`."""
     try:
         process = await anyio.open_process(
             list(argv),
@@ -146,6 +153,8 @@ async def open_stdio(
         reason = error.strerror if isinstance(error, OSError) and error.strerror else "invalid"
         raise PluginCallError("spawn_failed", f"cannot start {argv[0]}: {reason}") from None
     state.process = process
+    if preamble is not None:
+        await _send_preamble(process, preamble, argv[0])
     read_send, read_stream = anyio.create_memory_object_stream[SessionMessage | Exception](0)
     write_stream, write_receive = anyio.create_memory_object_stream[SessionMessage](0)
     stderr_done = anyio.Event()
@@ -229,6 +238,23 @@ async def open_stdio(
                             await pipe.aclose()
                 _close_transport(process)
             group.cancel_scope.cancel()
+
+
+async def _send_preamble(process: Process, preamble: bytearray, command: str) -> None:
+    """Write `preamble` to the process's stdin, then zero it; on failure stop the process and
+    raise `spawn_failed`."""
+    assert process.stdin is not None  # noqa: S101 (spawned with pipes)
+    try:
+        # A bytearray (zeroed below; a `bytes` copy could not be): the pipe writer copies what
+        # it cannot write at once, so zeroing after the send never changes what was sent.
+        await process.stdin.send(cast(bytes, preamble))
+    except (anyio.ClosedResourceError, anyio.BrokenResourceError, OSError):
+        with anyio.CancelScope(shield=True):
+            await terminate(process, graceful=False)
+            _close_transport(process)
+        raise PluginCallError("spawn_failed", f"{command} did not take its environment") from None
+    finally:
+        preamble[:] = bytes(len(preamble))
 
 
 def _close_transport(process: Process) -> None:

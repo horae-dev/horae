@@ -9,6 +9,7 @@ its message.
 | Kind | Meaning |
 |---|---|
 | `runtime_unsupported` | no runtime, or `mcp-http` (not supported in v1) |
+| `runtime_unavailable` | `runtime: container` cannot run it (engine, image, network, venv) |
 | `secret_missing` | a declared secret could not be resolved (nothing started) |
 | `env_unsafe` | a declared secret name is on the deny list (`horae.plugins.host.env`) |
 | `spawn_failed` | the command could not be found or started |
@@ -31,6 +32,7 @@ from horae.engine.ports import ToolCallError
 
 HostErrorKind = Literal[
     "runtime_unsupported",
+    "runtime_unavailable",
     "secret_missing",
     "env_unsafe",
     "spawn_failed",
