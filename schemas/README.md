@@ -4704,3 +4704,93 @@ loosened later without breaking a valid file.
       proxy (a direct connection) is not recorded: it fails with "network unreachable". The
       proxy limits where a plugin connects, not what it sends there: an approved host can still
       receive the plugin's data (T05).
+
+### Provisional decisions (#55, pending maintainer review)
+
+77. **Approval-gated `pipeline.run` (#55).** One new MCP tool, `pipeline.run`, a store migration
+    (10: `approvals`, `approval_events`), a new result contract (`schemas/mcp/pipeline-run/v1.json`)
+    and a new command group, `horae approval list|show|approve|deny|revoke` (`horae.approval`,
+    `horae.cli_approval`). Decision 76 is taken by #50, in parallel.
+    - **A, the tool only asks.** `pipeline.run {pipeline}` needs the scope `pipeline.run`
+      (decision 75 C; granted over stdio, decision 75 B). It runs the pipeline as a **dry run**
+      (`Runner.run(dry_run=True)`: the engine applies nothing either way, and no sink is asked
+      to apply; collect steps and the LLM run as in `horae run --dry-run`, charged to the daily
+      budgets), plans it (`plan_changes`, which only calls `Sink.read`) and returns a summary of
+      what would be applied (counts and one line per change: kind, action, a clipped
+      `x-untrusted` target; never a note body, a diff, a notification text or an HTTP body) and,
+      when there is something applicable, an **approval id** with its expiry. It takes no
+      template variables, path or command: what runs is the pipeline as configured. A run that
+      failed, a plan with problems or refused, or an empty plan get no approval (`reason`).
+    - **B, the approval channel is the CLI, on a terminal.** `horae approval approve <id>` is
+      run by the user on the instance. It re-plans, shows the **whole** change set (as `horae
+      diff`, HTTP bodies in full; when a note change is binary or larger than 1 MiB and so
+      cannot be shown, it refuses, `not_reviewable`, and the approval stays pending) and asks
+      the user to **retype a short code** printed with it (the last 6 characters of the
+      binding digest; `y` does not do). Without a TTY on stdin it refuses (`not_interactive`);
+      there is no `--yes`. **Why the CLI:** the MCP server must never be able to approve, so
+      the approval travels a channel an MCP client cannot reach *through MCP*: a token holder
+      over HTTP and an MCP-only stdio client have no way to run a command on the instance.
+      **What it does not stop:** an agent that also has a shell as the same user (Claude Code's
+      Bash tool, say) can allocate a pseudo-terminal (`pty.fork()`, `script`, `expect`), read
+      the code and type it; the review reproduced this. The TTY check and the code are
+      friction against approving by accident or by habit, **not a boundary**; such an agent can
+      already run `horae run` itself (decision 75 B). Do not give one client both this MCP
+      server and a shell as you if you rely on the approval. ntfy action buttons (`/act`,
+      decision 54) were rejected for now: an `/act` link is a bearer capability that reaches the
+      phone through a third-party push service, it would put a state-changing approval behind
+      one tap with a small screen for the diff, and `/act` intents are fixed task actions, not
+      an arbitrary run's plan. The API behind the SSO proxy was rejected because `horae serve`
+      is optional and has no write route today. Both remain possible later, on top of the same
+      store transitions. The MCP server registers no approve, deny or revoke tool; it imports
+      only `request_dry_run`, and the approving transitions (`approval_claim`,
+      `approval_decide`, `approval_finish`, `Runner.apply_planned`) are not referenced from
+      `horae.mcp_server`.
+    - **C, what an approval is bound to.** The approval row keeps a **binding digest**,
+      SHA-256 of the canonical JSON of: the pipeline name; the pipeline's digest, the instance's
+      `config_digest` and `lock_digest`; the run context (date, time zone, variables) and the
+      run's `input_hash`; every proposed intent with its route; and the planned change set
+      (`horae.apply.to_dict` without the run id, the dry-run flag and the notification dedupe
+      keys, which depend on the run id): note paths with before and after SHA-256 and the diff,
+      task changes, notifications (with whether each was already sent), HTTP calls. At request
+      time the digests are the dry run's own; at approval time they are the **current**
+      instance's. Applying does not run the pipeline again: the dry run's record is copied into
+      a new run (new id, not a dry run, no LLM calls or cost of its own) whose intents are
+      re-planned against the vault **under the apply lock**, and the change set is applied only
+      if the recomputed digest equals the approved one (`hmac.compare_digest`); otherwise the run
+      is saved `failed` (`approval_mismatch`, nothing applied) and the approval is `refused`. A
+      changed note, pipeline, plugin set, model configuration or lockfile, a notification sent
+      meanwhile, or a task that changed in the index therefore all refuse. The apply itself is
+      the normal one (journal first, compare-and-swap on note bytes), so `horae undo <run>`
+      reverts it like any run.
+    - **D, lifetime.** An approval is `pending` for a TTL set by the server,
+      `horae mcp serve --approval-ttl MINUTES` (1 to 60, default 15). Statuses: `planning` (the
+      dry run is running), `pending`, `approving` (claimed, the apply is running), and the final
+      `applied`, `failed` (the apply failed), `refused` (binding mismatch), `denied`
+      (`horae approval deny <id>`), `revoked` (`horae approval revoke --all`, or the requesting
+      token was revoked: `horae mcp token revoke` moves its pending approvals to `revoked` in
+      the same transaction, and the claim also requires the token not to be revoked),
+      `expired` (seen past its TTL) and `void` (the dry run gave nothing to approve). Only
+      `pending` can be approved, denied or revoked.
+    - **E, single use.** Approving first **claims** the row with one compare-and-set
+      (`UPDATE … SET status = 'approving' WHERE id = ? AND status = 'pending' AND expires_at >
+      now AND` the requesting token, if any, is not revoked), taken with the pipeline lock held:
+      two concurrent approvals of one id apply once; the loser is told the current status. The
+      run that applies it is recorded on the row as soon as it begins. **Interruptions:** a
+      cancellation (a signal) during the apply lets the shielded apply finish and save its run;
+      the approval then ends from that record (`applied` for `ok`, `noop`, `degraded`, else
+      `failed` or `refused`), and `failed` "interrupted" only when no record was saved. **A
+      crash** leaves `approving` (never re-applied); it is settled under the pipeline lock (on
+      the next approval of that pipeline, or by `list`, `show` and `approve` when the lock is
+      free): the dead run is recovered, then the approval ends from its record, or `failed`
+      "interrupted" when there is none (`horae undo` reverts what an abandoned run wrote).
+    - **F, journal.** Every transition appends a row to `approval_events` (approval, time,
+      event, run id, short reason) in the same transaction as the status change; `horae approval
+      show <id>` prints them, `list` shows the latest status, the dry run and the applied run.
+      The applied run is an ordinary run in `horae runs` and the apply journal.
+    - **G, flood limits.** Per requester (a token's id, or `stdio`), at most 3 approvals
+      `planning` or `pending` at once and at most 12 requests per rolling hour; above that the
+      tool error is `too_many_pending` / `rate_limited` and no dry run starts. The check and the
+      insert of the `planning` row are one transaction.
+    - **H, not done here.** No approval over ntfy or the HTTP API (B); no template variables
+      from the client; approvals are not shown in `runs.recent` or `/runs` (the run view keeps
+      its contract; the approval log is `horae approval list`).

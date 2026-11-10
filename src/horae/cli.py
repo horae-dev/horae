@@ -582,6 +582,7 @@ def replay_command(
 
 # `horae init`, `run`, `serve`, `undo`, `usage`, `eval`, `cache` and `plugin` live in their own
 # modules; registered here so `horae.cli.app` has every command.
+from horae.cli_approval import approval_app as _approval_app  # noqa: E402
 from horae.cli_cache import cache_app as _cache_app  # noqa: E402
 from horae.cli_eval import eval_command as _eval  # noqa: E402
 from horae.cli_init import init as _init  # noqa: E402
@@ -599,6 +600,7 @@ _command("serve")(_serve)
 _command("undo")(_undo)
 _command("usage")(_usage)
 _command("eval")(_eval)
+app.add_typer(_approval_app, name="approval")
 app.add_typer(_cache_app, name="cache")
 app.add_typer(_mcp_app, name="mcp")
 app.add_typer(_plugin_app, name="plugin")

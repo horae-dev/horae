@@ -25,8 +25,9 @@ same `WWW-Authenticate` header (`TokenAuth`). Revocation takes effect on the nex
 nothing is cached.
 
 **Scopes** (`SCOPES`). `read`: the read-only tools (`tasks.today`, `brief.latest`,
-`runs.recent`). `pipeline.run`: reserved for #55, which may let a client *ask* for a pipeline's
-dry run; it never approves anything (the approval is the user's, out of band). A token gets
+`runs.recent`). `pipeline.run`: the tool `pipeline.run` (#55, decision 77), which lets a client
+*ask* for a pipeline's dry run and an approval; it never approves anything (the approval is
+the user's, at the instance's terminal: `horae approval approve`). A token gets
 `read` unless told otherwise. A tool checks its scope with `require_scope`.
 
 **stdio needs no token.** `horae mcp serve` over stdio is a child process of the user's own
@@ -303,6 +304,23 @@ def granted_scopes(request: object | None, *, stdio: bool) -> frozenset[str]:
     return frozenset()
 
 
+_CLIENT_ID = re.compile(r"mcp-token-([0-9]{1,18})")
+
+
+def requester(request: object | None, *, stdio: bool) -> tuple[int | None, str]:
+    """Who a tool call comes from, for `pipeline.run`'s approvals: `(None, "stdio")` over
+    stdio, else the token's row id and name (from the `AuthenticatedUser` `TokenAuth` set).
+    Raises the tool error `insufficient_scope` when an HTTP call has no such user."""
+    if stdio:
+        return None, "stdio"
+    user = getattr(request, "scope", {}).get("user") if request is not None else None
+    if isinstance(user, AuthenticatedUser):
+        found = _CLIENT_ID.fullmatch(user.access_token.client_id)
+        if found is not None:
+            return int(found.group(1)), user.access_token.subject or found.group(0)
+    raise ToolError("insufficient_scope: an authenticated token is required")
+
+
 def require_scope(request: object | None, needed: str, *, stdio: bool) -> None:
     """Raise the tool error `insufficient_scope` unless the request was granted `needed`."""
     if needed not in granted_scopes(request, stdio=stdio):
@@ -329,6 +347,7 @@ __all__ = [
     "granted_scopes",
     "match",
     "new_token",
+    "requester",
     "require_scope",
     "status",
     "token_digest",

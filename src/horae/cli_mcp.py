@@ -10,7 +10,12 @@ to stderr.
 request behind a bearer token (`horae.mcp_auth`; tokens are managed by `horae mcp token`,
 `horae.cli_mcp_token`). It binds to `127.0.0.1:8765` by default and **refuses to start** while
 no token is usable (none created, all revoked or expired). The listening address goes to
-stderr. It stops on SIGINT or SIGTERM. The tools (`horae.mcp_server`) only read the store.
+stderr. It stops on SIGINT or SIGTERM. The read tools (`horae.mcp_server`) only read the
+store.
+
+**`pipeline.run`** (#55, decision 77) runs a pipeline as a dry run and opens an approval that
+expires after `--approval-ttl` minutes (1 to 60, default 15); the user approves it with
+`horae approval approve <id>` at the instance's terminal, never through the server.
 
 Exit codes (`horae.cli_output`, decision 37): 0 the client closed the connection (stdio) or
 the server was stopped (HTTP), 1 configuration problem (no usable token, a port in use), 2
@@ -20,12 +25,14 @@ usage error, 70 internal error.
 import asyncio
 import re
 import signal
+from datetime import timedelta
 from pathlib import Path
 from typing import Annotated
 
 import typer
 from pydantic import TypeAdapter, ValidationError
 
+from horae.approval import DEFAULT_TTL, MAX_TTL_MINUTES, MIN_TTL_MINUTES
 from horae.cli_mcp_token import token_app
 from horae.cli_output import (
     EXIT_OK,
@@ -41,7 +48,14 @@ from horae.config import CONFIG_FILE, STORE_FILE, ProblemsError, read_yaml, vali
 from horae.contracts import InstanceConfig
 from horae.contracts.types import PipelineName
 from horae.mcp_auth import TokenVerifier
-from horae.mcp_server import DEFAULT_BRIEF_PIPELINE, MCP_PATH, Reader, build_http_app, build_server
+from horae.mcp_server import (
+    DEFAULT_BRIEF_PIPELINE,
+    MCP_PATH,
+    PipelineRuns,
+    Reader,
+    build_http_app,
+    build_server,
+)
 from horae.store import StoreError
 
 DEFAULT_HTTP_HOST = "127.0.0.1"
@@ -51,7 +65,7 @@ _HOSTNAME = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?")
 
 mcp_app = typer.Typer(
     name="mcp",
-    help="Horae as an MCP server for other agents (read-only).",
+    help="Horae as an MCP server for other agents (read tools, approval-gated pipeline.run).",
     no_args_is_help=True,
     add_completion=False,
     cls=JsonUsageGroup,
@@ -77,13 +91,19 @@ def _reader(instance: Path, brief_pipeline: str) -> Reader:
     return Reader(state_dir, state_dir / STORE_FILE, config.timezone, brief_pipeline)
 
 
-def _serve(instance: Path, brief_pipeline: str) -> int:
-    build_server(_reader(instance, brief_pipeline), stdio=True).run("stdio")
+def _serve(instance: Path, brief_pipeline: str, ttl: timedelta) -> int:
+    reader = _reader(instance, brief_pipeline)
+    build_server(reader, stdio=True, runs=PipelineRuns(instance, ttl)).run("stdio")
     return EXIT_OK
 
 
 def _serve_http(
-    instance: Path, brief_pipeline: str, host: str, port: int, allowed_hosts: list[str]
+    instance: Path,
+    brief_pipeline: str,
+    host: str,
+    port: int,
+    allowed_hosts: list[str],
+    ttl: timedelta,
 ) -> int:
     bad = [h for h in allowed_hosts if _HOSTNAME.fullmatch(h) is None]
     if bad:
@@ -122,7 +142,7 @@ def _serve_http(
             err=True,
         )
     config = uvicorn.Config(
-        build_http_app(reader, verifier, tuple(allowed_hosts)),
+        build_http_app(reader, verifier, tuple(allowed_hosts), PipelineRuns(instance, ttl)),
         log_config=None,  # Horae's redacting log record factory stays in place
         access_log=False,
         server_header=False,
@@ -185,26 +205,40 @@ def serve(
             help="With --http: a Host header to accept besides loopback names (repeatable).",
         ),
     ] = None,
+    approval_ttl: Annotated[
+        int,
+        typer.Option(
+            "--approval-ttl",
+            min=MIN_TTL_MINUTES,
+            max=MAX_TTL_MINUTES,
+            help="Minutes a pipeline.run approval stays valid.",
+        ),
+    ] = int(DEFAULT_TTL.total_seconds() // 60),
 ) -> None:
-    """Serve the read-only tools tasks.today, brief.latest and runs.recent.
+    """Serve the read-only tools tasks.today, brief.latest and runs.recent, and pipeline.run.
 
     Over stdio by default, for an MCP client to start (Claude Code: claude mcp add horae --
     horae mcp serve -i <instance>); no port, no token. With --http, streamable HTTP at
     http://127.0.0.1:8765/mcp where every request needs a token from `horae mcp token
     create` (Authorization: Bearer hmcp_...); it refuses to start without a usable token.
-    The tools read the store read-only and change nothing (over HTTP, only a token's last
-    use is recorded). Task titles, note paths and errors they return are untrusted text.
+    The read tools change nothing (over HTTP, only a token's last use is recorded). Task
+    titles, note paths and errors they return are untrusted text. pipeline.run (scope
+    pipeline.run) makes a dry run only and returns an approval id that expires after
+    --approval-ttl minutes; you approve it with `horae approval approve <id>`.
 
     Exit codes: 0 stopped, 1 configuration problem (no usable token, port in use), 2 usage
     error, 70 internal error."""
+    ttl = timedelta(minutes=approval_ttl)
     if http:
         hosts = allowed_host or []
         run_command(
-            "mcp serve", False, lambda: _serve_http(instance, brief_pipeline, host, port, hosts)
+            "mcp serve",
+            False,
+            lambda: _serve_http(instance, brief_pipeline, host, port, hosts, ttl),
         )
     if host != DEFAULT_HTTP_HOST or port != DEFAULT_HTTP_PORT or allowed_host:
         run_command("mcp serve", False, _http_only)
-    run_command("mcp serve", False, lambda: _serve(instance, brief_pipeline))
+    run_command("mcp serve", False, lambda: _serve(instance, brief_pipeline, ttl))
 
 
 def _http_only() -> int:
