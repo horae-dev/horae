@@ -9,9 +9,8 @@ schemas decision 73).
   path); a new or changed pack pipeline (a changed digest is new code the core runs); a
   personal field dropped (less protection, decision 68); a new repository or source. Not
   widening: anything removed, a secret moved between required and optional.
-- `user_grants(locked, manifest)`: the hosts and local endpoints the lock grants beyond what
-  the installed manifest declares, i.e. what the user added with `--allow-host` /
-  `--allow-local`; an upgrade keeps them (they are already approved).
+- `user_grants(locked)`: the hosts and local endpoints the user recorded in the lock entry
+  with `--allow-host` / `--allow-local`; an upgrade keeps them (they are already approved).
 - `Swap`: the renames that put an upgrade in place (old tree aside, new tree in), undone in
   reverse order on failure, so the old tree is left exactly where it was.
 """
@@ -153,14 +152,15 @@ def describe_diff(changes: Sequence[Change]) -> list[str]:
     return lines
 
 
-def user_grants(locked: Permissions, manifest: Permissions | None) -> tuple[list[str], list[str]]:
-    """The hosts and local endpoints `locked` grants beyond `manifest` (the installed
-    version's): what the user added at approval. Nothing when the manifest is unknown."""
-    if manifest is None:
+def user_grants(locked: LockedPlugin) -> tuple[list[str], list[str]]:
+    """The hosts and local endpoints the user recorded when `locked` was approved
+    (`LockedPlugin.user_grants`), still granted by it. Nothing for an entry without a record:
+    what the user added is never inferred from the installed manifest, which is not verified."""
+    if locked.user_grants is None:
         return [], []
     return (
-        sorted(set(locked.network) - set(manifest.network)),
-        sorted(set(locked.network_local) - set(manifest.network_local)),
+        sorted(set(locked.user_grants.network) & set(locked.permissions.network)),
+        sorted(set(locked.user_grants.network_local) & set(locked.permissions.network_local)),
     )
 
 

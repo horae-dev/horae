@@ -8,9 +8,10 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
 from horae import cli_plugin, cli_plugin_manage
-from horae.contracts.lockfile import LockedPlugin
+from horae.contracts.lockfile import LockedPlugin, UserGrants
 from horae.contracts.plugin import PluginManifest
 from horae.marketplace import InstallError, approval
 from horae.marketplace.upgrade import Swap, permission_diff, user_grants, widens
@@ -214,6 +215,74 @@ def test_hosts_the_user_added_are_kept_and_do_not_need_a_new_approval(
     assert "keeping the host you added: home.example.org" in err
     network = lock(inst)["plugins"]["demo"]["permissions"]["network"]
     assert network == ["api.example.org", "home.example.org"]
+
+
+def test_grants_are_recorded_in_the_lock_and_only_when_given(
+    inst: Path,  # noqa: F811
+    market: Market,  # noqa: F811
+) -> None:
+    add(inst)
+    assert "user_grants" not in lock(inst)["plugins"]["demo"]
+    _release(market, PERMISSIONS, PERSONAL)
+    code, out, _ = cli(inst, "upgrade", "demo", "--yes")
+    assert code == 0, out
+    assert "user_grants" not in lock(inst)["plugins"]["demo"]
+
+
+def test_explicit_grants_survive_two_upgrades(inst: Path, market: Market) -> None:  # noqa: F811
+    add(inst, "demo@1.0.0", "--allow-host", "home.example.org", "--allow-local", "10.0.0.7:80")
+    recorded = {"network": ["home.example.org"], "network_local": ["10.0.0.7:80"]}
+    assert lock(inst)["plugins"]["demo"]["user_grants"] == recorded
+    _release(market, PERMISSIONS, PERSONAL)
+    code, out, _ = cli(inst, "upgrade", "demo", "--yes")
+    assert code == 0, out
+    assert "keeping the local endpoint you added: 10.0.0.7:80" in out
+    assert lock(inst)["plugins"]["demo"]["user_grants"] == recorded
+    market.release("1.2.0", manifest("1.2.0", PERMISSIONS))
+    code, out, _ = cli(inst, "upgrade", "demo", "--yes")
+    assert code == 0, out
+    entry = lock(inst)["plugins"]["demo"]
+    assert entry["user_grants"] == recorded
+    assert "home.example.org" in entry["permissions"]["network"]
+
+
+def test_a_rewritten_installed_manifest_does_not_turn_declared_hosts_into_user_grants(
+    inst: Path,  # noqa: F811
+    market: Market,  # noqa: F811
+) -> None:
+    add(inst)  # v1 declares api.example.org; the user added nothing
+    installed = inst / "plugins" / "demo" / "plugin.yaml"
+    text = installed.read_text(encoding="utf-8")
+    assert "api.example.org" in text
+    installed.write_text(text.replace("api.example.org", "other.example.org"), encoding="utf-8")
+    _release(market, _with(network=[]), PERSONAL)  # v1.1.0 drops the host
+    code, out, _ = cli(inst, "upgrade", "demo", "--yes")
+    assert code == 0, out
+    assert "keeping the host" not in out
+    assert "note: horae.lock records no host you added" in out
+    assert "api.example.org" in out
+    assert lock(inst)["plugins"]["demo"]["permissions"]["network"] == []
+
+
+def test_a_lock_without_a_record_carries_nothing_and_says_so(
+    inst: Path,  # noqa: F811
+    market: Market,  # noqa: F811
+) -> None:
+    add(inst, "demo@1.0.0", "--allow-host", "home.example.org")
+    path = inst / "horae.lock"
+    data = lock(inst)
+    del data["plugins"]["demo"]["user_grants"]  # a lock written before the record existed
+    path.write_text(yaml.safe_dump(data), encoding="utf-8")
+    _release(market, PERMISSIONS, PERSONAL)
+    code, out, _ = cli(inst, "upgrade", "demo", "--yes")
+    assert code == 0, out
+    assert "keeping the host" not in out
+    assert "home.example.org" in out
+    assert "--allow-host" in out
+    assert lock(inst)["plugins"]["demo"]["permissions"]["network"] == ["api.example.org"]
+    code, out, _ = cli(inst, "upgrade", "demo", "--allow-host", "home.example.org", answer="y\n")
+    assert code == 0, out
+    assert lock(inst)["plugins"]["demo"]["user_grants"] == {"network": ["home.example.org"]}
 
 
 def test_a_new_grant_at_upgrade_needs_approval(inst: Path, market: Market) -> None:  # noqa: F811
@@ -466,11 +535,26 @@ def test_the_diff_of_pipelines_and_repository() -> None:
     assert widens(permission_diff(old, direct))
 
 
-def test_user_grants_are_what_the_lock_has_beyond_the_manifest() -> None:
-    locked = _entry(network=["a.example.org", "b.example.org"], network_local=["10.0.0.1:80"])
-    declared = _entry(network=["a.example.org"]).permissions
-    assert user_grants(locked.permissions, declared) == (["b.example.org"], ["10.0.0.1:80"])
-    assert user_grants(locked.permissions, None) == ([], [])
+def test_user_grants_are_only_what_the_lock_records() -> None:
+    plain = _entry(network=["a.example.org", "b.example.org"], network_local=["10.0.0.1:80"])
+    assert user_grants(plain) == ([], [])  # no record: nothing is inferred
+    recorded = plain.model_copy(
+        update={"user_grants": UserGrants(network=["b.example.org"], network_local=["10.0.0.1:80"])}
+    )
+    assert user_grants(recorded) == (["b.example.org"], ["10.0.0.1:80"])
+
+
+def test_a_lock_cannot_record_a_grant_it_does_not_give() -> None:
+    with pytest.raises(ValueError, match="which permissions do not grant"):
+        LockedPlugin.model_validate(
+            {
+                "version": "1.0.0",
+                "repo": PLUGIN_URL,
+                "commit": "a" * 40,
+                "permissions": {"network": ["a.example.org"]},
+                "user_grants": {"network": ["b.example.org"]},
+            }
+        )
 
 
 def test_lock_mismatch_compares_the_source() -> None:

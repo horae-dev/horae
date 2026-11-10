@@ -9,7 +9,7 @@ is sorted, so that a diff of two lockfiles shows only real changes. Reading acce
 """
 
 import re
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Self
 
 from pydantic import (
     AfterValidator,
@@ -19,6 +19,7 @@ from pydantic import (
     StringConstraints,
     field_serializer,
     model_serializer,
+    model_validator,
 )
 
 from horae.contracts.plugin import Permissions, PersonalFields
@@ -27,7 +28,9 @@ from horae.contracts.types import (
     MAX_ITEMS,
     CommitSha,
     Contract,
+    Hostname,
     JsonSchemaExtra,
+    LocalEndpoint,
     PipelineName,
     PluginName,
     SchemaVersion1,
@@ -73,6 +76,21 @@ def _sorted_lists(value: Any) -> Any:
     return value
 
 
+class UserGrants(Contract):
+    """The hosts and local endpoints the user added with `--allow-host` / `--allow-local`
+    (decision 73 D), as opposed to the ones the manifest declares."""
+
+    network: Annotated[list[Hostname], Field(max_length=MAX_ITEMS)] = Field(default_factory=list)
+    """Hosts added with `--allow-host` (sorted when written)."""
+    network_local: Annotated[list[LocalEndpoint], Field(max_length=MAX_ITEMS)] = Field(
+        default_factory=list
+    )
+    """Endpoints added with `--allow-local` (sorted when written)."""
+
+    def __bool__(self) -> bool:
+        return bool(self.network or self.network_local)
+
+
 class LockedPlugin(Contract):
     """One installed plugin, pinned to a commit."""
 
@@ -110,6 +128,34 @@ class LockedPlugin(Contract):
     checked); absent for a marketplace install, so a lock written before it reads the same.
     `horae plugin upgrade` reads it to apply the direct-install gate, and `--yes` compares it."""
 
+    user_grants: UserGrants | None = None
+    """What the user added with `--allow-host` / `--allow-local` when `add` or `upgrade`
+    approved this entry (decision 73 D, #175). `horae plugin upgrade` carries over only these
+    (never what it infers from the installed manifest, which is not verified). Always a subset
+    of `permissions` (the loader refuses a lock that lists a grant it does not give). Left out
+    when empty, so a lock without any, or written before it, is written exactly as before."""
+
+    @model_validator(mode="after")
+    def _grants_are_granted(self) -> Self:
+        if self.user_grants is not None:
+            extra = (set(self.user_grants.network) - set(self.permissions.network)) | (
+                set(self.user_grants.network_local) - set(self.permissions.network_local)
+            )
+            if extra:
+                raise ValueError(
+                    f"user_grants lists {sorted(extra)}, which permissions do not grant"
+                )
+        return self
+
+    @field_serializer("user_grants", mode="wrap")
+    def _canonical_user_grants(
+        self, value: UserGrants | None, handler: SerializerFunctionWrapHandler
+    ) -> Any:
+        data = handler(value)
+        if isinstance(data, dict):
+            data = {key: sorted(items) for key, items in data.items() if items}
+        return data
+
     @field_serializer("permissions", mode="wrap")
     def _canonical_permissions(
         self, value: Permissions, handler: SerializerFunctionWrapHandler
@@ -130,7 +176,7 @@ class LockedPlugin(Contract):
     def _omit_empty(self, handler: SerializerFunctionWrapHandler) -> Any:
         data = handler(self)
         if isinstance(data, dict):
-            for key in ("personal_fields", "pipelines", "source"):
+            for key in ("personal_fields", "pipelines", "source", "user_grants"):
                 if not data.get(key):
                     data.pop(key, None)
         return data
