@@ -379,13 +379,13 @@ def _mount(path: Path, writable: bool = True) -> Mount:
 def test_the_sweep_undoes_what_the_plugin_left_in_its_writable_paths(
     instance: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    monkeypatch.setattr(mounts, "CTIME_SLACK_S", 0.0)
+    monkeypatch.setattr(mounts, "CTIME_SLACK_S", 0.05)  # coarse kernel timestamps
     vault, inbox = instance / "vault", instance / "vault" / "inbox"
     (inbox / "old-link").symlink_to("/etc/hostname")  # the user's own, older: kept
     old_suid = inbox / "old-tool"
     old_suid.write_text("#!/bin/sh\n", encoding="utf-8")
     old_suid.chmod(0o4755)
-    time.sleep(0.05)
+    time.sleep(0.2)
     since = mounts.now()
     (inbox / "escape").symlink_to("/etc/passwd")
     (inbox / "climb").symlink_to("../note.md")  # into the read-only parent
@@ -397,7 +397,9 @@ def test_the_sweep_undoes_what_the_plugin_left_in_its_writable_paths(
     setuid.chmod(0o6755)
     plan = [_mount(vault, writable=False), _mount(inbox)]
     with caplog.at_level("WARNING", logger="horae.plugins.host.mounts"):
-        findings = sweep("jail", plan, since)
+        swept = sweep("jail", plan, since)
+    findings = swept.findings
+    assert swept.failures == []
     assert not os.path.lexists(inbox / "escape")
     assert not os.path.lexists(inbox / "climb")
     assert not os.path.lexists(inbox / "fifo")
@@ -413,37 +415,52 @@ def test_the_sweep_undoes_what_the_plugin_left_in_its_writable_paths(
 def test_the_sweep_leaves_read_only_paths_and_reports_a_replaced_path(
     instance: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(mounts, "CTIME_SLACK_S", 0.0)
+    monkeypatch.setattr(mounts, "CTIME_SLACK_S", 0.05)  # coarse kernel timestamps
     archive, inbox = instance / "vault" / "archive", instance / "vault" / "inbox"
     plan = [_mount(archive, writable=False), _mount(inbox)]
     since = mounts.now()
     (archive / "planted").symlink_to("/etc/passwd")  # not the plugin's: read-only for it
     os.rename(inbox, instance / "vault" / "moved")
     (instance / "vault" / "inbox").mkdir()
-    findings = sweep("jail", plan, since)
+    swept = sweep("jail", plan, since)
     assert os.path.islink(archive / "planted")
-    assert findings == [f"declared path {str(inbox)!r} was replaced or removed"]
+    replaced = [f"declared path {str(inbox)!r} was replaced or removed"]
+    assert swept.findings == swept.failures == replaced  # fail closed: quarantined
 
 
-def test_the_sweep_is_bounded_and_says_so(instance: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(mounts, "SWEEP_LIMIT", 3)
+def test_the_sweep_fails_closed_at_its_bounds(
+    instance: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(mounts, "CTIME_SLACK_S", 0.05)  # coarse kernel timestamps
     inbox = instance / "vault" / "inbox"
     for index in range(5):
-        (inbox / f"note-{index}.md").write_text("x", encoding="utf-8")
-    findings = sweep("jail", [_mount(inbox)], mounts.now() + 60)
-    assert findings == ["more than 3 entries: not every one was checked"]
+        (inbox / f"old-{index}.md").write_text("x", encoding="utf-8")
+    time.sleep(0.2)
+    since = mounts.now()
+    for index in range(5):
+        (inbox / f"new-{index}.md").write_text("x", encoding="utf-8")
+    monkeypatch.setattr(mounts, "NEW_LIMIT", 5)  # only new entries count: 5 fit
+    assert sweep("jail", [_mount(inbox)], since).failures == []
+    monkeypatch.setattr(mounts, "NEW_LIMIT", 3)
+    assert sweep("jail", [_mount(inbox)], since).failures == [
+        "more than 3 new entries: not every one was checked"
+    ]
+    monkeypatch.setattr(mounts, "WALK_LIMIT", 8)
+    assert sweep("jail", [_mount(inbox)], mounts.now() + 60).failures == [
+        "more than 8 entries: not every one was checked"
+    ]
 
 
 def test_the_sweep_logs_a_flood_as_a_count(
     instance: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    monkeypatch.setattr(mounts, "CTIME_SLACK_S", 0.0)
+    monkeypatch.setattr(mounts, "CTIME_SLACK_S", 0.05)  # coarse kernel timestamps
     inbox = instance / "vault" / "inbox"
     since = mounts.now()
     for index in range(mounts.REPORTED + 5):
         os.mkfifo(inbox / f"fifo-{index}")
     with caplog.at_level("WARNING", logger="horae.plugins.host.mounts"):
-        findings = sweep("jail", [_mount(inbox)], since)
+        findings = sweep("jail", [_mount(inbox)], since).findings
     assert len(findings) == mounts.REPORTED + 5
     assert len(caplog.records) == mounts.REPORTED + 1
     assert "5 more such findings" in caplog.records[-1].getMessage()
@@ -452,7 +469,7 @@ def test_the_sweep_logs_a_flood_as_a_count(
 def test_a_link_into_a_read_only_child_of_a_writable_path_is_removed(
     instance: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(mounts, "CTIME_SLACK_S", 0.0)
+    monkeypatch.setattr(mounts, "CTIME_SLACK_S", 0.05)  # coarse kernel timestamps
     vault, archive = instance / "vault", instance / "vault" / "archive"
     (archive / "kept.md").write_text("x", encoding="utf-8")
     plan = plan_mounts("jail", [str(archive)], [str(vault)], _policy(instance))
@@ -460,7 +477,7 @@ def test_a_link_into_a_read_only_child_of_a_writable_path_is_removed(
     (vault / "into-archive").symlink_to(archive / "kept.md")  # a host writer would edit it
     (vault / "inbox" / "sibling").symlink_to("../note.md")  # still in its writable path
     (archive / "users-own").symlink_to("/etc/hostname")  # not the plugin's: read-only for it
-    findings = sweep("jail", plan, since)
+    findings = sweep("jail", plan, since).findings
     assert not os.path.lexists(vault / "into-archive")
     assert os.path.islink(vault / "inbox" / "sibling")
     assert os.path.islink(archive / "users-own")
@@ -468,3 +485,129 @@ def test_a_link_into_a_read_only_child_of_a_writable_path_is_removed(
     assert mounts.writable_at(str(vault / "inbox"), plan)
     assert not mounts.writable_at(str(archive / "kept.md"), plan)
     assert not mounts.writable_at(str(instance / "state"), plan)
+
+
+def test_the_sweep_checks_a_writable_mount_itself(
+    instance: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(mounts, "CTIME_SLACK_S", 0.05)  # coarse kernel timestamps
+    note = instance / "vault" / "note.md"
+    plan = plan_mounts("jail", [], [str(note)], _policy(instance))
+    since = mounts.now()
+    note.chmod(0o4755)  # what a malicious plugin would do to its writable file
+    swept = sweep("jail", plan, since)
+    assert not note.stat().st_mode & stat.S_ISUID
+    assert swept.failures == []
+    assert len(swept.findings) == 1
+
+
+class _Entry:
+    """A directory entry whose `stat` reports another device."""
+
+    def __init__(self, path: str, device: int) -> None:
+        self.path = path
+        self._device = device
+
+    def stat(self, *, follow_symlinks: bool = True) -> Any:
+        values = list(os.lstat(self.path))
+        values[stat.ST_DEV] = self._device
+        return os.stat_result(values)
+
+
+def test_an_entry_on_another_device_fails_the_sweep_unless_it_is_a_mount_point(
+    instance: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inbox = instance / "vault" / "inbox"
+    other = str(inbox / "deep")
+    real_scandir = os.scandir
+
+    def scandir(path: Any) -> Any:
+        if str(path) == str(inbox):
+            return iter([_Entry(other, os.lstat(inbox).st_dev + 1)])
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", scandir)
+    swept = sweep("jail", [_mount(inbox)], mounts.now(), points=frozenset())
+    assert swept.failures == [f"{other!r} is on another device (not a mount)"]
+    assert sweep("jail", [_mount(inbox)], mounts.now(), points=frozenset({other})).failures == []
+
+
+def test_a_directory_the_sweep_cannot_list_fails_it(
+    instance: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inbox = instance / "vault" / "inbox"
+
+    def scandir(path: Any) -> Any:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(os, "scandir", scandir)
+    swept = sweep("jail", [_mount(inbox)], mounts.now())
+    assert swept.failures == [f"could not list {str(inbox)!r} (Permission denied)"]
+
+
+def test_mount_points_are_read_from_mountinfo() -> None:
+    points = mounts.mount_points()
+    if os.path.exists("/proc/self/mountinfo"):
+        assert "/" in points
+    else:
+        assert points == frozenset()
+
+
+def test_quarantine_refuses_the_next_start_until_its_file_is_removed(instance: Path) -> None:
+    policy = _policy(instance)
+    mounts.check_quarantine("jail", policy)
+    assert mounts.quarantine("jail", policy, ["could not list 'x'"])
+    with pytest.raises(PluginCallError, match="quarantined"):
+        mounts.check_quarantine("jail", policy)
+    mounts.check_quarantine("other", policy)
+    (instance / "state" / "quarantine" / "jail").unlink()
+    mounts.check_quarantine("jail", policy)
+    assert not mounts.quarantine("jail", MountPolicy(roots=(), sensitive=()), ["x"])
+
+
+def test_a_recheck_refuses_a_path_replaced_since_it_was_checked(instance: Path) -> None:
+    policy = _policy(instance)
+    inbox = instance / "vault" / "inbox"
+    plan = plan_mounts("jail", [str(inbox)], [], policy)
+    mounts.recheck("jail", plan, policy)
+    os.rename(inbox, instance / "vault" / "moved")
+    inbox.symlink_to(instance / "state")  # swapped for a link
+    with pytest.raises(PluginCallError, match="symbolic link"):
+        mounts.recheck("jail", plan, policy)
+    inbox.unlink()
+    inbox.mkdir()  # swapped for another directory
+    with pytest.raises(PluginCallError, match="replaced since it was checked"):
+        mounts.recheck("jail", plan, policy)
+
+
+def test_a_path_inside_another_plugins_writable_path_is_refused(instance: Path) -> None:
+    vault, inbox = str(instance / "vault"), str(instance / "vault" / "inbox")
+    policy = _policy(instance)
+    with pytest.raises(PluginCallError, match="which plugin writer may write"):
+        plan_mounts("jail", [inbox], [], policy, [("writer", vault)])
+    # The same path, or one holding the other's (sharing data): it cannot swap this one.
+    assert plan_mounts("jail", [vault], [], policy, [("writer", vault)])
+    assert plan_mounts("jail", [vault], [], policy, [("writer", inbox)])
+    assert plan_mounts("jail", [inbox], [], policy, [("jail", vault)])  # its own
+
+
+def test_the_started_container_must_have_exactly_the_planned_mounts() -> None:
+    plan = [Mount("/srv/vault", False, (1, 2)), Mount("/srv/vault/inbox", True, (1, 3))]
+
+    def bind(source: str, target: str, rw: bool) -> dict[str, Any]:
+        return {"Type": "bind", "Source": source, "Destination": target, "RW": rw}
+
+    good = [
+        bind("/srv/i/plugins/jail", "/plugin", False),
+        bind("/srv/vault", "/srv/vault", False),
+        bind("/srv/vault/inbox", "/srv/vault/inbox", True),
+    ]
+    assert mounts.mounts_problem(plan, good, "/plugin") is None
+    assert mounts.mounts_problem(plan, None, "/plugin") == "its mounts cannot be read"
+    assert mounts.mounts_problem(plan, good[:2], "/plugin") is not None
+    other = [*good[:2], bind("/home/u/.ssh", "/srv/vault/inbox", True)]
+    assert "not mounted from itself" in str(mounts.mounts_problem(plan, other, "/plugin"))
+    writable = [good[0], bind("/srv/vault", "/srv/vault", True), good[2]]
+    assert "with its declared access" in str(mounts.mounts_problem(plan, writable, "/plugin"))
+    volume = [*good, {"Type": "volume", "Destination": "/data"}]
+    assert "not a bind mount" in str(mounts.mounts_problem(plan, volume, "/plugin"))

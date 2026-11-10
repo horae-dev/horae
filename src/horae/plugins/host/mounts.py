@@ -26,7 +26,11 @@ host could trip over is undone and logged at WARNING: a symbolic link to a place
 could not write itself (outside its writable paths, or in a read-only child of one) is
 removed, a device, FIFO or socket is removed, a set-user-ID (or, on a file, set-group-ID) bit
 is cleared. Every declared path must still be the same file (device and
-inode) as when it was checked. Bind mounts cannot do this themselves: Docker's `--mount` takes
+inode) as when it was checked. What the sweep cannot check (a listing or `lstat` that fails, an
+entry on another device that is not a host mount point, more than `NEW_LIMIT` new or
+`WALK_LIMIT` entries, a replaced declared path) **quarantines** the plugin: a file in
+`<state_dir>/quarantine/` refuses its next start until the operator removes it. Bind mounts
+cannot do this themselves: Docker's `--mount` takes
 no `nosuid`/`nodev`/`nosymfollow`, so the mount has the host filesystem's own flags.
 """
 
@@ -36,7 +40,7 @@ import re
 import stat
 import time
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from horae.plugins.host.errors import PluginCallError
@@ -91,8 +95,13 @@ INSTANCE_ENTRIES = (
 )
 """Entries of the instance directory that steer Horae (besides its state and secrets)."""
 DOCKER_SOCKETS = ("/var/run/docker.sock", "/run/docker.sock", "/run/containerd")
-SWEEP_LIMIT = 200_000
-"""Entries `sweep` looks at, per plugin stop, before it gives up (and says so)."""
+NEW_LIMIT = 100_000
+"""Entries created or changed during the run that `sweep` checks; past it the plugin is
+quarantined (fail closed)."""
+WALK_LIMIT = 2_000_000
+"""Entries `sweep` walks in all; past it the plugin is quarantined (fail closed)."""
+QUARANTINE_DIR = "quarantine"
+"""Under the state directory: one file per quarantined plugin, which the operator removes."""
 CTIME_SLACK_S = 2.0
 """Taken off the start time: filesystems that keep coarse timestamps."""
 REPORTED = 50
@@ -109,6 +118,8 @@ class MountPolicy:
     """The instance directory and `container.mount_roots`, as real paths."""
     sensitive: tuple[str, ...]
     """Paths a declared path may neither be, contain nor lie inside (lexical and real forms)."""
+    quarantine: str | None = None
+    """The directory of quarantine files (`<state_dir>/quarantine`), `None` in tests."""
 
     @classmethod
     def for_instance(
@@ -133,11 +144,13 @@ class MountPolicy:
         return cls(
             roots=_unique(os.path.realpath(path) for path in roots),
             sensitive=_unique(_both(sensitive)),
+            quarantine=str(state_dir / QUARANTINE_DIR),
         )
 
     def with_sensitive(self, *paths: str) -> "MountPolicy":
         """This policy, with `paths` (e.g. the engine's socket) sensitive too."""
-        return MountPolicy(self.roots, _unique([*self.sensitive, *_both(paths)]))
+        sensitive = _unique([*self.sensitive, *_both(paths)])
+        return MountPolicy(self.roots, sensitive, self.quarantine)
 
 
 @dataclass(frozen=True)
@@ -213,21 +226,99 @@ def check_path(plugin: str, path: str, policy: MountPolicy) -> tuple[int, int]:
 
 
 def plan_mounts(
-    plugin: str, read: Sequence[str], write: Sequence[str], policy: MountPolicy | None
+    plugin: str,
+    read: Sequence[str],
+    write: Sequence[str],
+    policy: MountPolicy | None,
+    shared: Sequence[tuple[str, str]] = (),
 ) -> tuple[Mount, ...]:
     """The bind mounts of the locked `read` and `write` paths, parents first, or
     `runtime_unavailable` (fail closed: one refused path refuses the plugin). Without a policy
-    (a host built without an instance), any declared path is refused."""
+    (a host built without an instance), any declared path is refused. `shared` lists the
+    writable paths of the **other** container plugins (`(plugin, path)`): a declared path
+    strictly inside one is refused, since that plugin could swap a directory of it for a link
+    while this one starts (decision 78 B)."""
     access = dict.fromkeys(read, False) | dict.fromkeys(write, True)
     if not access:
         return ()
     if policy is None:
         first = sorted(access)[0]
         raise _refuse(plugin, first, "this host has no instance to check it against")
-    mounts = [
-        Mount(path, writable, check_path(plugin, path, policy)) for path, writable in access.items()
-    ]
-    return tuple(sorted(mounts, key=lambda mount: (mount.path.count("/"), mount.path)))
+    planned: list[Mount] = []
+    for path, writable in access.items():
+        identity = check_path(plugin, path, policy)
+        for other, written in shared:
+            if other != plugin and path != written and within(path, written):
+                raise _refuse(
+                    plugin, path, f"it lies inside {written!r}, which plugin {other} may write"
+                )
+        planned.append(Mount(path, writable, identity))
+    return tuple(sorted(planned, key=lambda mount: (mount.path.count("/"), mount.path)))
+
+
+def recheck(plugin: str, planned: Sequence[Mount], policy: MountPolicy | None) -> None:
+    """Check `planned` again, right before the engine mounts them: each path still passes
+    `check_path` and is the same file (device and inode); else `runtime_unavailable`."""
+    if policy is None:
+        return
+    for mount in planned:
+        if check_path(plugin, mount.path, policy) != mount.identity:
+            raise _refuse(plugin, mount.path, "it was replaced since it was checked")
+
+
+def mounts_problem(planned: Sequence[Mount], inspected: object, plugin_mount: str) -> str | None:
+    """Why a started container's mounts (`docker inspect`'s `.Mounts`) are not exactly the
+    plugin directory and `planned`, each from its own path and with its access, or `None`."""
+    if not isinstance(inspected, list):
+        return "its mounts cannot be read"
+    seen: dict[str, tuple[object, object]] = {}
+    for item in inspected:
+        if not isinstance(item, dict) or item.get("Type") != "bind":
+            return "it has a mount that is not a bind mount"
+        seen[str(item.get("Destination"))] = (item.get("Source"), item.get("RW"))
+    wanted = {mount.path: (mount.path, mount.writable) for mount in planned}
+    if set(seen) != set(wanted) | {plugin_mount}:
+        return "its mounts are not the declared ones"
+    for path, expected in wanted.items():
+        if seen[path] != expected:
+            return f"{path!r} is not mounted from itself with its declared access"
+    return None
+
+
+def _quarantine_file(policy: MountPolicy | None, plugin: str) -> Path | None:
+    if policy is None or policy.quarantine is None:
+        return None
+    return Path(policy.quarantine) / plugin
+
+
+def check_quarantine(plugin: str, policy: MountPolicy | None) -> None:
+    """`runtime_unavailable` while `plugin` is quarantined (`quarantine`)."""
+    marker = _quarantine_file(policy, plugin)
+    if marker is not None and os.path.lexists(marker):
+        raise PluginCallError(
+            "runtime_unavailable",
+            f"plugin {plugin} (runtime container) is quarantined: the check of its writable "
+            f"paths after its last run failed (reasons in {marker}). Check those paths, then "
+            "remove that file",
+        )
+
+
+def quarantine(plugin: str, policy: MountPolicy | None, reasons: Sequence[str]) -> bool:
+    """Record that `plugin` must not start again until the operator clears it; whether the
+    file could be written (the caller also keeps it in memory)."""
+    marker = _quarantine_file(policy, plugin)
+    if marker is None:
+        return False
+    text = "".join(f"{reason}\n" for reason in reasons[:REPORTED])
+    try:
+        marker.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            out.write(text)
+    except OSError:
+        return False
+    _log.warning("plugin %s (runtime container): quarantined (%s)", plugin, marker)
+    return True
 
 
 # --- after the run ------------------------------------------------------------------------------
@@ -273,10 +364,43 @@ def _fix(path: str, status: os.stat_result, mounts: Sequence[Mount]) -> str | No
     return None
 
 
-def sweep(plugin: str, mounts: Sequence[Mount], since: float) -> list[str]:
-    """Check `mounts` once the plugin's container is gone (see the module docstring); returns
-    what was found and done, each also logged at WARNING. Never raises."""
-    findings: list[str] = []
+@dataclass
+class Sweep:
+    """What `sweep` found and did."""
+
+    findings: list[str] = field(default_factory=list)
+    """Everything, logged at WARNING."""
+    failures: list[str] = field(default_factory=list)
+    """What it could not check or undo: the plugin is then quarantined (fail closed)."""
+
+    def fail(self, message: str) -> None:
+        self.findings.append(message)
+        self.failures.append(message)
+
+
+def mount_points() -> frozenset[str]:
+    """The host's mount points (`/proc/self/mountinfo`), empty where there is none."""
+    try:
+        with open("/proc/self/mountinfo", encoding="utf-8", errors="replace") as info:
+            lines = info.read().splitlines()
+    except OSError:
+        return frozenset()
+    points = set()
+    for line in lines:
+        fields = line.split(" ")
+        if len(fields) > 4:
+            points.add(re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), fields[4]))
+    return frozenset(points)
+
+
+def sweep(
+    plugin: str, mounts: Sequence[Mount], since: float, points: frozenset[str] | None = None
+) -> Sweep:
+    """Check `mounts` once the plugin's container is gone (see the module docstring). Never
+    raises: what it cannot check is a failure (`Sweep.failures`), never skipped quietly."""
+    result = Sweep()
+    points = mount_points() if points is None else points
+    cutoff = since - CTIME_SLACK_S
     for mount in mounts:
         try:
             status = os.lstat(mount.path)
@@ -284,51 +408,71 @@ def sweep(plugin: str, mounts: Sequence[Mount], since: float) -> list[str]:
         except OSError:
             same = False
         if not same:
-            findings.append(f"declared path {_shown(mount.path)} was replaced or removed")
+            result.fail(f"declared path {_shown(mount.path)} was replaced or removed")
+        elif mount.writable and status.st_ctime >= cutoff:
+            _check(result, mount.path, status, mounts)  # the mount itself: its bits
     writable = [mount.path for mount in mounts if mount.writable]
     tops = [path for path in writable if not any(p != path and within(path, p) for p in writable)]
-    cutoff = since - CTIME_SLACK_S
-    seen = 0
+    walked = new = 0
     for top in tops:
         try:
-            device = os.lstat(top).st_dev
+            status = os.lstat(top)
         except OSError:
-            continue
-        stack = [top]
+            continue  # reported above
+        if not stat.S_ISDIR(status.st_mode):
+            continue  # a file: checked above
+        device, stack = status.st_dev, [top]
         while stack:
             directory = stack.pop()
             try:
                 entries = list(os.scandir(directory))
-            except OSError:
+            except OSError as error:
+                result.fail(f"could not list {_shown(directory)} ({error.strerror})")
                 continue
             for entry in entries:
-                seen += 1
-                if seen > SWEEP_LIMIT:
-                    findings.append(f"more than {SWEEP_LIMIT} entries: not every one was checked")
-                    return _report(plugin, findings)
+                walked += 1
+                if walked > WALK_LIMIT:
+                    result.fail(f"more than {WALK_LIMIT} entries: not every one was checked")
+                    return _report(plugin, result)
                 try:
                     status = entry.stat(follow_symlinks=False)
-                    if status.st_dev != device:
-                        continue  # another filesystem: not part of the mount
-                    if stat.S_ISDIR(status.st_mode):
-                        stack.append(entry.path)
-                    if status.st_ctime < cutoff or not writable_at(entry.path, mounts):
-                        continue  # older than the run, or in a read-only child: not its own
-                    done = _fix(entry.path, status, mounts)
                 except OSError as error:
-                    done = f"could not check {_shown(entry.path)} ({error.strerror})"
-                if done is not None:
-                    findings.append(done)
-    return _report(plugin, findings)
+                    result.fail(f"could not check {_shown(entry.path)} ({error.strerror})")
+                    continue
+                if status.st_dev != device:
+                    if entry.path not in points:
+                        result.fail(f"{_shown(entry.path)} is on another device (not a mount)")
+                    continue  # a host mount point: not carried into the container
+                if stat.S_ISDIR(status.st_mode):
+                    stack.append(entry.path)
+                if status.st_ctime < cutoff or not writable_at(entry.path, mounts):
+                    continue  # older than the run, or in a read-only child: not its own
+                new += 1
+                if new > NEW_LIMIT:
+                    result.fail(f"more than {NEW_LIMIT} new entries: not every one was checked")
+                    return _report(plugin, result)
+                _check(result, entry.path, status, mounts)
+    return _report(plugin, result)
 
 
-def _report(plugin: str, findings: list[str]) -> list[str]:
+def _check(result: Sweep, path: str, status: os.stat_result, mounts: Sequence[Mount]) -> None:
+    try:
+        done = _fix(path, status, mounts)
+    except OSError as error:
+        result.fail(f"could not undo {_shown(path)} ({error.strerror})")
+        return
+    if done is not None:
+        result.findings.append(done)
+
+
+def _report(plugin: str, result: Sweep) -> Sweep:
+    findings = result.findings
     for finding in findings[:REPORTED]:
         _log.warning("plugin %s (runtime container): %s", plugin, finding)
     if len(findings) > REPORTED:
         more = len(findings) - REPORTED
         _log.warning("plugin %s (runtime container): %d more such findings", plugin, more)
-    return findings
+    return result
 
 
 def now() -> float:
@@ -342,8 +486,13 @@ __all__ = [
     "UNSAFE_MOUNT",
     "Mount",
     "MountPolicy",
+    "Sweep",
     "check_path",
+    "check_quarantine",
+    "mounts_problem",
     "plan_mounts",
+    "quarantine",
+    "recheck",
     "sweep",
     "within",
 ]

@@ -12,6 +12,7 @@ import itertools
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import time
@@ -511,6 +512,25 @@ if args[:2] == ["network", "create"]:
 if args[:2] == ["context", "inspect"]:
     print(fake["endpoint"])
     sys.exit(0)
+if args[:2] == ["container", "inspect"] and ".Mounts" in args[3]:
+    if fake["mounts"] is not None:
+        print(json.dumps(fake["mounts"]))
+        sys.exit(0)
+    run = json.load(open(os.path.join(config_dir, "run.json")))
+    mounts = []
+    for flag, value in zip(run, run[1:]):
+        if flag == "--mount":
+            fields = dict(part.partition("=")[::2] for part in value.split(","))
+            mounts.append(
+                {
+                    "Type": "bind",
+                    "Source": fields["source"],
+                    "Destination": fields["target"],
+                    "RW": "readonly" not in fields,
+                }
+            )
+    print(json.dumps(mounts))
+    sys.exit(0)
 if args[:2] == ["container", "inspect"] and "OOMKilled" in args[3]:
     print("true" if fake["oom"] else "false")
     sys.exit(0)
@@ -569,6 +589,7 @@ def _fake_docker(tmp_path: Path, **fake: Any) -> tuple[Path, Path]:
         "admit": True,
         "blocked": [],
         "oom": False,
+        "mounts": None,
         "mode": "normal",
         "proxy_networks": {
             f"horae-plugin-{name}": {"IPAddress": "192.168.155.2"} for name in ("raw", "jail")
@@ -1274,3 +1295,117 @@ def test_a_memory_kill_during_the_start_is_reported_as_oom_killed(tmp_path: Path
     cli, state = _fake_docker(tmp_path, oom=True, mode="exit")
     error = _first_error(tmp_path, plugin, docker=cli, state=state)
     assert error.kind == "oom_killed"
+
+
+def test_a_container_whose_mounts_are_not_the_checked_ones_is_stopped(tmp_path: Path) -> None:
+    plugin = _plugin_dir(tmp_path)
+    root, policy = _instance(tmp_path)
+    vault = str(root / "vault")
+    swapped = [
+        {"Type": "bind", "Source": str(plugin), "Destination": "/plugin", "RW": False},
+        {"Type": "bind", "Source": str(root / "state"), "Destination": vault, "RW": False},
+    ]
+    cli, state = _fake_docker(tmp_path, mounts=swapped)
+    error = _first_error(
+        tmp_path, plugin, docker=cli, state=state, paths={"read": [vault]}, mounts=policy
+    )
+    assert error.kind == "runtime_unavailable"
+    assert "not mounted from itself" in error.message
+    assert not (state / "proxy-stdin").exists()  # never admitted: no egress at all
+
+
+def test_a_path_inside_another_container_plugins_writable_path_is_refused(
+    tmp_path: Path,
+) -> None:
+    from horae.contracts import PluginManifest
+    from horae.plugins.host import HostRegistry
+
+    plugin = _plugin_dir(tmp_path)
+    cli, state = _fake_docker(tmp_path)
+    root, policy = _instance(tmp_path)
+    raw = _manifest(paths={"read": [str(root / "vault" / "inbox")]})
+    writer = {
+        "name": "writer",
+        "version": "0.1.0",
+        "horae": ">=0",
+        "provides": {"sources": ["writer.ok"]},
+        "permissions": {"paths": {"write": [str(root / "vault")]}},
+        "runtime": {"protocol": "mcp-stdio", "command": ["python", "-m", "writer"]},
+    }
+    models = {
+        name: PluginManifest.model_validate(m) for name, m in (("raw", raw), ("writer", writer))
+    }
+    registry = HostRegistry(lock_for(raw, writer), models, {"raw": plugin, "writer": plugin})
+
+    def run(writer_runtime: str) -> Any:
+        def timeouts(name: str) -> PluginDefaults:
+            runtime = writer_runtime if name == "writer" else "container"
+            return PluginDefaults(runtime=runtime, startup_timeout_s=30.0)  # type: ignore[arg-type]
+
+        h = PluginHost(
+            registry,
+            secrets=SecretResolver({}, secrets_dir(tmp_path, JAIL_TOKEN=TOKEN)),
+            work_dir=tmp_path / "work",
+            timeouts=timeouts,
+        )
+        h._containers = ContainerRuntime(
+            ContainerConfig(docker=str(cli)), mounts=policy, environ={"DOCKER_CONFIG": str(state)}
+        )
+
+        async def go() -> Any:
+            async with h:
+                try:
+                    return await h.call("raw.ok", {}, None)
+                except PluginCallError as error:
+                    return error
+
+        return asyncio.run(go())
+
+    refused = run("container")
+    assert isinstance(refused, PluginCallError)
+    assert "which plugin writer may write" in refused.message
+    # A process-runtime writer is unconfined anyway (T04): sharing the vault is allowed.
+    assert run("process").data == {"ok": True}
+
+
+def test_a_failed_sweep_quarantines_the_plugin_until_the_operator_clears_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from horae.plugins.host import mounts as mounts_module
+
+    plugin = _plugin_dir(tmp_path)
+    cli, state = _fake_docker(tmp_path)
+    root, policy = _instance(tmp_path)
+    inbox = str(root / "vault" / "inbox")
+    monkeypatch.setattr(mounts_module, "NEW_LIMIT", 0)
+    monkeypatch.setattr(mounts_module, "CTIME_SLACK_S", 0.05)  # coarse kernel timestamps
+
+    async def go() -> Any:
+        async with _host(
+            tmp_path, plugin, docker=cli, state=state, paths={"write": [inbox]}, mounts=policy
+        ) as h:
+            first = await h.call("raw.ok", {}, None)
+            (Path(inbox) / "new.md").write_text("x", encoding="utf-8")  # as if by the plugin
+            return first
+
+    assert asyncio.run(go()).data == {"ok": True}
+    marker = root / "state" / "quarantine" / "raw"
+    assert "more than 0 new entries" in marker.read_text(encoding="utf-8")
+    assert stat.S_IMODE(marker.stat().st_mode) == 0o600
+    runs = len([c for c in _calls(state) if c[0] == "run"])
+    error = _first_error(
+        tmp_path, plugin, docker=cli, state=state, paths={"write": [inbox]}, mounts=policy
+    )
+    assert error.kind == "runtime_unavailable"
+    assert "quarantined" in error.message
+    assert len([c for c in _calls(state) if c[0] == "run"]) == runs  # nothing started
+    marker.unlink()  # the operator checked the paths
+    monkeypatch.setattr(mounts_module, "NEW_LIMIT", 100)
+
+    async def again() -> Any:
+        async with _host(
+            tmp_path, plugin, docker=cli, state=state, paths={"write": [inbox]}, mounts=policy
+        ) as h:
+            return await h.call("raw.ok", {}, None)
+
+    assert asyncio.run(again()).data == {"ok": True}

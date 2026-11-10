@@ -743,6 +743,7 @@ class PluginHost:
                 paths_read=permissions.paths.read,
                 paths_write=permissions.paths.write,
                 limits=settings.limits,
+                shared=self._container_writers(name),
             )
         else:
             argv = resolve_command(list(runtime.command), entry.installed.root)
@@ -773,6 +774,17 @@ class PluginHost:
             stderr = process.capture.take(self.redactor())
             raise PluginCallError(process.error.host_kind, process.error.message, stderr=stderr)
         return process
+
+    def _container_writers(self, name: str) -> list[tuple[str, str]]:
+        """The locked writable paths of every other plugin that runs in a container (decision
+        78 B). Process-runtime plugins are left out: they run unconfined anyway (T04)."""
+        return [
+            (other.manifest.name, path)
+            for other in self.registry.plugins()
+            if other.manifest.name != name
+            and self._timeouts(other.manifest.name).runtime == "container"
+            for path in other.manifest.permissions.paths.write
+        ]
 
     async def _stderr(self, process: PluginProcess) -> str | None:
         """The call's stderr, once the pipe has been quiet (see the module docstring)."""

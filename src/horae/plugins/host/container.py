@@ -357,6 +357,10 @@ class ContainerRuntime:
         self.config = config or ContainerConfig()
         self.mounts = mounts
         """Where declared paths may come from (decision 78 B); `None`: none may be mounted."""
+        self._planned: dict[str, tuple[Mount, ...]] = {}
+        """Each running container's checked mounts, by container name."""
+        self._quarantined: set[str] = set()
+        """Plugins quarantined in this run (also on disk when the policy has a directory)."""
         self._socket: str | None = None
         """The engine's socket path, sensitive like the policy's paths."""
         self._uid = os.getuid() if uid is None else uid
@@ -383,6 +387,7 @@ class ContainerRuntime:
         paths_read: Sequence[str] = (),
         paths_write: Sequence[str] = (),
         limits: ContainerLimits | None = None,
+        shared: Sequence[tuple[str, str]] = (),
     ) -> Spawn:
         """The `Spawn` of `plugin`'s container, its egress proxy started with the locked
         `network` and `network_local` as policy, the locked `paths_read` and `paths_write`
@@ -392,6 +397,9 @@ class ContainerRuntime:
         limits = limits or ContainerLimits()
         if self._uid == 0:
             raise _unavailable(plugin, "Horae runs as root; plugin containers never do")
+        if plugin in self._quarantined:
+            raise _unavailable(plugin, "it is quarantined: its writable paths could not be checked")
+        mounts.check_quarantine(plugin, self.mounts)
         if root is None:
             raise _unavailable(plugin, "it has no installed directory")
         venv = check_venv(plugin, root)
@@ -401,7 +409,7 @@ class ContainerRuntime:
         policy = self.mounts
         if policy is not None and self._socket is not None:
             policy = policy.with_sensitive(self._socket)
-        declared = mounts.plan_mounts(plugin, paths_read, paths_write, policy)
+        declared = mounts.plan_mounts(plugin, paths_read, paths_write, policy, shared)
         await self._network(plugin, docker)
         await self._egress_network(plugin, docker)
         proxy = await self._start_proxy(plugin, docker, network, network_local)
@@ -434,22 +442,30 @@ class ContainerRuntime:
         )
 
         proxy.client_container = name
+        try:  # right before the engine mounts them (decision 78 B)
+            mounts.recheck(plugin, declared, policy)
+        except BaseException:
+            await proxy.stop()
+            raise
+        self._planned[name] = declared
         started = mounts.now()
 
         async def remove() -> None:
             try:
                 removed, _, _ = await self._run(docker, "rm", "--force", name)
             finally:
+                self._planned.pop(name, None)
                 await proxy.stop()
-            if not declared:
+            if not any(mount.writable for mount in declared):
                 return
             if removed != 0:
-                _log.warning(
-                    "plugin %s: its container could not be removed; paths not swept", plugin
-                )
-                return
-            # The plugin is gone: nothing races the sweep from inside.
-            await anyio.to_thread.run_sync(mounts.sweep, plugin, declared, started)
+                failures = ["its container could not be removed, so its paths were not swept"]
+            else:  # the plugin is gone: nothing races the sweep from inside
+                swept = await anyio.to_thread.run_sync(mounts.sweep, plugin, declared, started)
+                failures = swept.failures
+            if failures:  # fail closed: no next start until the operator has looked
+                self._quarantined.add(plugin)
+                mounts.quarantine(plugin, self.mounts, failures)
 
         async def diagnose() -> tuple[HostErrorKind, str] | None:
             return await self._oom_killed(docker, plugin, name, limits)
@@ -485,9 +501,14 @@ class ContainerRuntime:
     async def admit(self, plugin: str, proxy: egress.ProxyHandle) -> None:
         """Once the plugin's container runs, make it the only client its proxy serves
         (decision 76 C): its address on the plugin network, sent to the proxy, confirmed.
-        `runtime_unavailable` otherwise (the caller stops the plugin)."""
+        `runtime_unavailable` otherwise (the caller stops the plugin). First, its mounts must be
+        exactly the planned ones, still the files that were checked (decision 78 B): it has
+        had no egress so far."""
         docker = self._docker
         address = None
+        planned = self._planned.get(proxy.client_container)
+        if planned:
+            await self._verify_mounts(plugin, proxy.client_container, planned)
         if docker is not None:
             code, out, _ = await self._run(
                 docker,
@@ -504,6 +525,26 @@ class ContainerRuntime:
             address = egress.plugin_address(networks, network_name(plugin))
         if address is None or not await proxy.admit(address):
             raise _unavailable(plugin, "its egress proxy could not be bound to its container")
+
+    async def _verify_mounts(self, plugin: str, name: str, planned: Sequence[Mount]) -> None:
+        """`runtime_unavailable` unless the started container `name` has exactly the planned
+        mounts and each path is still the checked file (`mounts.recheck`)."""
+        problem: str | None = "the engine could not be asked"
+        if self._docker is not None:
+            code, out, _ = await self._run(
+                self._docker, "container", "inspect", "--format", "{{json .Mounts}}", name
+            )
+            try:
+                inspected = json.loads(out) if code == 0 else None
+            except ValueError:
+                inspected = None
+            problem = mounts.mounts_problem(planned, inspected, PLUGIN_MOUNT)
+        if problem is not None:
+            raise _unavailable(plugin, f"its mounts are not as checked: {problem}")
+        policy = self.mounts
+        if policy is not None and self._socket is not None:
+            policy = policy.with_sensitive(self._socket)
+        mounts.recheck(plugin, planned, policy)
 
     async def _start_proxy(
         self, plugin: str, docker: str, network: Sequence[str], network_local: Sequence[str]

@@ -251,7 +251,15 @@ and why). A path must:
    `.pypirc`; and the system directories (`/etc`, `/usr`, `/proc`, `/sys`, `/dev`, `/run`,
    `/root`, `/boot`, `/bin`, `/sbin`, `/lib*`, `/var/lib/docker`, ...). So the instance
    directory or your home directory as a whole are refused: declare the vault itself;
-6. not be `/tmp` itself (the container's own scratch space).
+6. not be `/tmp` itself (the container's own scratch space);
+7. not lie strictly inside a writable path of **another plugin that runs in a container**
+   (it could swap a directory of yours for a link while yours starts). The same path, or a
+   path holding the other's writable one, is fine: that is how plugins share a vault. Plugins
+   on `runtime: process` are not counted (they are unconfined anyway).
+
+The paths are checked again right before `docker run`, and once more after the container has
+started and before its egress proxy lets it out: `docker inspect` must show exactly the
+checked mounts, and each path must still be the same file. Otherwise the plugin is stopped.
 
 `horae doctor` does not check these yet: the first run with the plugin reports a refusal.
 
@@ -265,8 +273,15 @@ user. So when the container is gone, Horae **sweeps** each writable path: for wh
 or changed during the plugin's run (never your older files), it removes a symbolic link to a
 place the plugin could not write itself, removes a FIFO, socket or device, and clears a
 set-user-ID bit, logging each at WARNING. It also warns when a declared path was replaced
-(renamed away by a writable parent). The sweep looks at 200 000 entries at most and says so
-past that. While the plugin runs, what it wrote is on the host as it wrote it.
+(renamed away by a writable parent).
+
+**Quarantine.** The sweep fails closed. If it cannot finish its check (a directory it cannot
+list, an entry on another device that is not a mount point, more than 100 000 new or
+2 000 000 entries in all, a declared path replaced, a container that could not be removed),
+Horae writes `<state_dir>/quarantine/<plugin>` with the reasons and **refuses to start that
+plugin again** (`runtime_unavailable`, naming the file). Look at its writable paths, then
+remove the file to let it run again. While the plugin runs, what it wrote is on the host as it
+wrote it.
 
 **Example.** A plugin declaring `paths: {read: [/srv/vault], write: [/srv/vault/Inbox]}`,
 approved in the lock, with the vault outside the instance:
@@ -369,9 +384,11 @@ start, not their footprint. Not measured on such a server itself; re-run the ben
 ## Limits and follow-ups
 
 - **Declared paths** (decision 78 C): a writable path is the host's own filesystem while the
-  plugin runs; the sweep runs only once it stops. Between Horae's check and the engine's
-  mount, a process able to write a parent directory could swap a component for a symbolic
-  link (the next start's check, and the sweep, report it). Nesting a read-only path under a
+  plugin runs; the sweep runs only once it stops. A process that is not a container plugin
+  (a process-runtime plugin, the same plugin in a concurrent run, you) and can write a parent
+  directory could swap a component for a symbolic link and back in the instant between
+  Horae's last check and the engine's mount; `docker inspect` shows paths, not files, so that
+  is not seen. Nesting a read-only path under a
   writable one lets the plugin rename the directories in between (the read-only contents move
   along, unchanged; the sweep warns). `horae doctor` does not check paths yet.
 - **Podman** is not supported; **the Horae image** cannot start containers (above).

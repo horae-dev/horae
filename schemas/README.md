@@ -4842,8 +4842,24 @@ loosened later without breaking a valid file.
         `/var/lib/docker`, `/var/lib/containerd`, `/var/lock`, `/var/run`, and the
         container's own `/plugin`;
       - it is neither `/tmp` nor contains it (it may lie inside it: the bind is mounted over the
-        container's tmpfs).
-      A host built without an instance (tests, tools) refuses every declared path.
+        container's tmpfs);
+      - it does not lie strictly inside a writable path of **another container plugin** of the
+        lock: that plugin could swap a directory of it for a link while this one starts. The
+        same path, or one holding the other's writable path, is allowed: that is how two
+        plugins share data (one writes the vault, the other reads it), and swapping the
+        declared path itself needs write access to its parent. Process-runtime plugins are not
+        counted: they run unconfined as Horae's user anyway (T04), so excluding their paths
+        would refuse common setups (`file-sink` writing the vault) and protect nothing.
+      A host built without an instance (tests, tools) refuses every declared path. A plugin in
+      **quarantine** (C) is refused first.
+      The check is run three times: when the mounts are planned; again **right before** `docker
+      run`, after the egress proxy has started (`mounts.recheck`: each path still passes and is
+      the same file, device and inode); and once the container has started and finished its
+      handshake, **before its egress proxy admits it** (decision 76 C): `docker container
+      inspect` must show exactly the plugin directory and the planned bind mounts, each from its
+      own path with its declared access, and `recheck` must pass again; otherwise the plugin is
+      stopped (`runtime_unavailable`). It has then received its environment (secrets
+      included) but never had a route out.
     - **C, nesting, and what a bind mount cannot do.** Mounts are ordered parent first (Docker
       orders them by depth too), so each declared path behaves as declared: a writable child of
       a read-only parent is writable and the rest of the parent read-only; a read-only child of
@@ -4856,8 +4872,8 @@ loosened later without breaking a valid file.
       to anywhere (harmless inside, where it resolves in the container; dangerous to a host
       process following it), make a FIFO or a socket, set the set-user-ID bit on a file it owns
       (it is Horae's uid, so on the host that file runs as Horae's user). So once the
-      container is removed, `mounts.sweep` walks every writable mount (not following links,
-      not leaving its filesystem, at most 200 000 entries, then it says so) and, for each entry
+      container is removed, `mounts.sweep` checks each writable mount itself and walks it (not
+      following links) and, for each entry
       whose `st_ctime` is at or after the container's start (less 2 s; a plugin cannot set
       `ctime` back, so a user's own older files are never touched) and that the plugin could
       write (not in a read-only child): removes a symbolic link whose target, resolved
@@ -4865,11 +4881,23 @@ loosened later without breaking a valid file.
       writable paths, or in a read-only child of one: a host process following the link would
       act there for it); removes a device, FIFO or socket; clears a set-user-ID bit (and set-group-ID on a
       file). It also checks every declared path is still the same file (device and inode) as
-      when it was checked. Each finding is logged at WARNING (at most 50 lines a sweep, then a
+      when it was checked. **The sweep fails closed**: a declared path replaced or removed, a
+      directory it cannot list, an entry it cannot `lstat` or undo, an entry on another device
+      that is not a host mount point (`/proc/self/mountinfo`; a plugin cannot mount anything,
+      so anything else is unexplained), more than 100 000 entries new since the start or 2
+      000 000 in all, or a container `docker rm --force` could not remove (no sweep at all)
+      **quarantines** the plugin: a file `<state_dir>/quarantine/<plugin>` (0600) listing the
+      reasons refuses its next start (`runtime_unavailable`, naming the file) until the
+      operator has checked the paths and removed it; the runtime also remembers it for the
+      rest of the run. Each finding is logged at WARNING (at most 50 lines a sweep, then a
       count); like egress attempts after a plugin's last call (decision 76 F), they are not run
-      violations (the call they belong to is over). **Residual**: the window between the check
-      and the engine's mount (a writer of a parent directory could swap a component for a
-      link; the next start's check, and the sweep's identity check, see it); a writable parent
+      violations (the call they belong to is over). **Residual**: a swap of a path component
+      for a link and back between the last `recheck` and the engine's mount, by a writer of a
+      parent directory that is not another container plugin (a process-runtime plugin, a
+      concurrent run of the same plugin under its own writable parent, the user): `docker
+      inspect` shows paths, not files, so the post-start check cannot see a swap undone in
+      time (the in-container device and inode differ from the host's on Docker Desktop and
+      OrbStack, so they are not compared); a writable parent
       can rename the directories between it and a read-only child (the child's contents move
       along, still read-only, and its host path may then name a directory the plugin made: the
       sweep reports it); while the plugin runs, what it wrote is on the host as it wrote it.
