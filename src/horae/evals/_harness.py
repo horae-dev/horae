@@ -43,12 +43,19 @@ from horae.contracts.intents import IntentType
 from horae.contracts.pipeline import Budget
 from horae.contracts.plugin import PluginManifest
 from horae.contracts.run import Usage
-from horae.contracts.skill import outermost
 from horae.engine import TARGET_FIELDS, check_task_fingerprints, fill_target, secrets_in_viewed
 from horae.engine.guard import check_intents
-from horae.engine.personal import COLLECT_ROOT, merged_options, under
+from horae.engine.personal import COLLECT_ROOT, merged_options, reduce_personal, under
 from horae.engine.personal import values as personal_values
-from horae.engine.ports import DeidUnavailable, LlmError, LlmRequest, LlmResponse
+from horae.engine.ports import (
+    DeidUnavailable,
+    LlmError,
+    LlmRequest,
+    LlmResponse,
+    PluginRegistry,
+    ResolvedPlugin,
+    UnknownPlugin,
+)
 from horae.evals._cases import EvalError, LoadedCase
 from horae.evals._match import MatchTimeout
 from horae.evals._match import search as search_pattern
@@ -165,10 +172,29 @@ class CaseResult:
 
 @dataclass(frozen=True)
 class SkillUnderEval:
-    """The skill, the manifest of the plugin that ships it, and the plugin's name."""
+    """The skill, the manifest of the plugin that ships it, and the plugins a case's sources
+    resolve to."""
 
     skill: Skill
     plugin: PluginManifest
+    plugins: PluginRegistry | None = None
+    """Every plugin `horae eval` knows (#165): the instance's (`HostRegistry`, the manifests
+    and `horae.lock` as a run reads them) or those of `--plugin-dir` (`ManifestRegistry`). A
+    case element's `source` is resolved through it, as a `collect` step resolves its tools,
+    so a source of another plugin brings its declared personal fields too. `None`: the
+    skill's own plugin only."""
+
+    def personal_fields(self, ref: str) -> tuple[str, ...]:
+        """The personal fields declared for tool `ref` (decision 68), as the engine reads
+        them (`plugin_for_tool(ref).manifest.provides.personal_fields`); none for a tool no
+        plugin provides."""
+        if self.plugins is None:
+            return tuple(self.plugin.provides.personal_fields.get(ref, ()))
+        try:
+            manifest = self.plugins.plugin_for_tool(ref).manifest
+        except UnknownPlugin:
+            return ()
+        return tuple(manifest.provides.personal_fields.get(ref, ()))
 
     @property
     def source(self) -> str:
@@ -404,8 +430,8 @@ def judge_intents(sue: SkillUnderEval, loaded: LoadedCase, viewed: Any, result: 
 @dataclass(frozen=True)
 class CasePersonal:
     """The personal fields of a case (decision 68), read as the engine reads a `collect`
-    step's output: the elements of a list input whose `source` is a tool of the skill's own
-    plugin that declares `personal_fields`."""
+    step's output: the elements of a list input whose `source` is a tool, of any plugin
+    `horae eval` knows (`SkillUnderEval.plugins`, #165), that declares `personal_fields`."""
 
     paths: tuple[str, ...] = ()
     """The declared paths, under `[].data`."""
@@ -416,10 +442,11 @@ class CasePersonal:
 
 
 def case_personal(sue: SkillUnderEval, case_input: Any) -> CasePersonal:
-    """The personal fields of `case_input` (`CasePersonal`). Only the skill's own plugin is
-    known to `horae eval`: a source of another plugin is not recognised (decision 68 F)."""
-    declared = sue.plugin.provides.personal_fields
-    if not declared or not isinstance(case_input, list):
+    """The personal fields of `case_input` (`CasePersonal`): each element's `source` is
+    resolved as a run resolves a `collect` tool (`SkillUnderEval.personal_fields`). A case
+    is read as a `collect` output: the output of a transform is not recognised (decision 68
+    F, a limit)."""
+    if not isinstance(case_input, list):
         return CasePersonal()
     paths: list[str] = []
     found: dict[str, None] = {}
@@ -428,12 +455,46 @@ def case_personal(sue: SkillUnderEval, case_input: Any) -> CasePersonal:
         if not isinstance(item, dict) or not isinstance(item.get("source"), str):
             continue
         ref = item["source"]
-        fields = declared.get(ref, [])
+        fields = sue.personal_fields(ref)
+        if not fields:
+            continue
         paths.extend(under(COLLECT_ROOT, path) for path in fields)
         values, mismatched = personal_values(item.get("data"), fields)
         found.update(dict.fromkeys(values))
         problems.extend(f"{ref}: {path}" for path in mismatched)
-    return CasePersonal(outermost(paths), tuple(found), tuple(problems))
+    return CasePersonal(reduce_personal(paths), tuple(found), tuple(problems))
+
+
+class ManifestRegistry:
+    """A `PluginRegistry` over plugin manifests (`horae eval --plugin-dir`): no lock, so the
+    declarations in force are the manifests' own. Raises `ValueError` when two manifests
+    provide the same tool or skill (the host refuses that too)."""
+
+    def __init__(self, manifests: Sequence[PluginManifest]) -> None:
+        self._tools: dict[str, PluginManifest] = {}
+        self._skills: dict[str, PluginManifest] = {}
+        for manifest in manifests:
+            provides = manifest.provides
+            tools = [*provides.sources, *provides.transforms, *provides.sinks, *provides.notifiers]
+            for index, refs in ((self._tools, tools), (self._skills, provides.skills)):
+                for ref in refs:
+                    owner = index.setdefault(ref, manifest)
+                    if owner is not manifest:
+                        raise ValueError(
+                            f"{ref} is provided by both {owner.name} and {manifest.name}"
+                        )
+
+    def plugin_for_tool(self, ref: str) -> ResolvedPlugin:
+        try:
+            return ResolvedPlugin(self._tools[ref])
+        except KeyError:
+            raise UnknownPlugin(ref) from None
+
+    def plugin_for_skill(self, skill: str) -> ResolvedPlugin:
+        try:
+            return ResolvedPlugin(self._skills[skill])
+        except KeyError:
+            raise UnknownPlugin(skill) from None
 
 
 def classified(sue: SkillUnderEval, personal: CasePersonal | None = None) -> bool:
@@ -990,6 +1051,7 @@ __all__ = [
     "Check",
     "Complete",
     "LiveEval",
+    "ManifestRegistry",
     "Planned",
     "SkillUnderEval",
     "compare",

@@ -337,5 +337,6 @@ def test_the_manifest_refuses_a_bad_local_endpoint(entry: str) -> None:
         Permissions(network_local=[entry]).check()
 
 
-def test_the_version_is_0_8_0() -> None:
-    assert horae_sdk.__version__ == "0.8.0"
+def test_the_version_is_at_least_0_8_0() -> None:
+    major, minor, _ = (int(part) for part in horae_sdk.__version__.split("."))
+    assert (major, minor) >= (0, 8)

@@ -627,12 +627,14 @@ def _sent(llm: FakeLlm) -> str:
 
 
 def _no_name(text: str) -> None:
-    """No form of the declared name as a whole word of `text`, zero-width splits included."""
+    """No form of the declared name as a whole word of `text`, zero-width splits included,
+    nor glued to letters of another script (#165)."""
     folded = fold(text.replace("\u200b", ""))
     assert "zoe" not in re.findall(r"[^\W\d_]+", folded), text
+    assert "zoe" not in re.findall(r"[a-z]+", folded), text
 
 
-@pytest.mark.parametrize("attack", ["baseline", "variants", "key"])
+@pytest.mark.parametrize("attack", ["baseline", "variants", "key", "glued"])
 @pytest.mark.parametrize("drop_declaration", [False, True])
 def test_evil_deid_the_name_never_reaches_the_cloud_model(
     tmp_path: Path, attack: str, drop_declaration: bool
@@ -683,6 +685,18 @@ def test_evil_deid_a_name_the_scanner_misses_is_caught_by_the_backstop(
     assert kind == "deid_unavailable"
     assert "a declared personal value would be sent in clear: refused" in message
     assert "Zoé" not in message
+
+
+def test_evil_deid_a_name_in_a_script_without_spaces_never_reaches_the_cloud_model(
+    tmp_path: Path,
+) -> None:
+    """#165: a given name of two Han letters, inside sentences that have no spaces."""
+    record, llm = _deid(tmp_path, "cjk")
+    assert record.status == "ok", record.steps
+    sent = _sent(llm)
+    assert "花子" not in sent
+    assert "山田" not in sent
+    assert "今日は[PERSON_1]さんが来た" in sent
 
 
 def test_evil_deid_a_forged_pseudonym_is_neutralized(tmp_path: Path) -> None:

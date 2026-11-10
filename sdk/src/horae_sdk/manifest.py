@@ -12,7 +12,8 @@ against the generated JSON Schema and the pydantic model.
 `provides.personal_fields` from the `personal_fields` given when registering a source or a
 transform (horae-sdk 0.7, schemas decision 68): the view paths of the tool's output that hold
 personal data (`children[].first_name`), which the core de-identifies before any cloud model
-whatever the skill declares.
+whatever the skill declares. A free-text field that may mention personal data (a mail body)
+is declared scan-only, `free_text("messages[].body")` (horae-sdk 0.9, #165).
 
 The runtime is `mcp-stdio` with an argument list (no shell). The host resolves `argv[0]`: an
 absolute path is kept, a bare name is looked up on the child's fixed `PATH`
@@ -52,6 +53,16 @@ _VIEW_NAME = r"[A-Za-z_][A-Za-z0-9_-]*"
 _VIEW_PATH = re.compile(rf"({_VIEW_NAME}|\[\])(\.{_VIEW_NAME}|\[\])*")
 MAX_PERSONAL_FIELDS = 64
 """Most personal fields one tool declares (the core's `MAX_PERSONAL_FIELDS`)."""
+FREE_TEXT_FIELD = "free_text:"
+"""The prefix of a scan-only personal field (horae-sdk 0.9, the core's `FREE_TEXT_FIELD`):
+`free_text:messages[].body` is free text that may mention personal data. The core scans it
+for the other personal values instead of treating its whole content as one."""
+
+
+def free_text(path: str) -> str:
+    """`path` declared scan-only: `free_text("messages[].body")` is
+    `free_text:messages[].body`."""
+    return FREE_TEXT_FIELD + path
 
 
 def _is_str(value: object) -> bool:
@@ -153,8 +164,9 @@ def _personal_fields(
     declared: Mapping[str, Sequence[str]], tools: set[str]
 ) -> dict[str, list[str]]:
     """`provides.personal_fields`, checked: each key a source or transform of the plugin,
-    each value 1 to `MAX_PERSONAL_FIELDS` distinct view paths, none under another and none
-    disagreeing with another on a value's shape."""
+    each value 1 to `MAX_PERSONAL_FIELDS` distinct view paths (a scan-only one prefixed by
+    `free_text:`), none under another and none disagreeing with another on a value's shape,
+    prefix or not."""
     checked: dict[str, list[str]] = {}
     for ref, paths in declared.items():
         if ref not in tools:
@@ -165,11 +177,12 @@ def _personal_fields(
         if not 1 <= len(listed) <= MAX_PERSONAL_FIELDS:
             raise ManifestError(f"provides.personal_fields.{ref}: 1 to {MAX_PERSONAL_FIELDS} paths")
         for path in listed:
-            if not (_is_str(path) and len(path) <= 256 and _VIEW_PATH.fullmatch(path)):
+            bare = path.removeprefix(FREE_TEXT_FIELD) if _is_str(path) else path
+            if not (_is_str(bare) and len(bare) <= 256 and _VIEW_PATH.fullmatch(bare)):
                 raise ManifestError(f"provides.personal_fields.{ref}: {path!r} is not a path")
         if len(set(listed)) != len(listed):
             raise ManifestError(f"provides.personal_fields.{ref} lists a path twice")
-        steps = [_steps(path) for path in listed]
+        steps = [_steps(path.removeprefix(FREE_TEXT_FIELD)) for path in listed]
         for one in steps:
             for other in steps:
                 common = 0
@@ -204,8 +217,9 @@ def manifest(
 ) -> dict[str, Any]:
     """A `plugin.yaml` document (see the module docstring). `command` is the `mcp-stdio`
     argument list; without one the manifest has no runtime (a skill or pipeline pack).
-    `personal_fields` (`{<source or transform ref>: [view paths]}`, horae-sdk 0.7) becomes
-    `provides.personal_fields`, left out when empty."""
+    `personal_fields` (`{<source or transform ref>: [view paths]}`, horae-sdk 0.7; a
+    scan-only path prefixed by `free_text:`, 0.9) becomes `provides.personal_fields`, left
+    out when empty."""
     if not (_is_str(name) and _NAME.fullmatch(name)):
         raise ManifestError(f"name {name!r} must match ^[a-z][a-z0-9-]*$ (at most 64)")
     if not (_is_str(version) and _SEMVER.fullmatch(version)):

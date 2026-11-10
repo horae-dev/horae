@@ -255,7 +255,9 @@ step fails closed, before anything is sent: while planning (`deid_unavailable`, 
 (`deid_unavailable`, `degraded`) when an output contradicted the shape of a declared path, or
 when the policy finds a value it cannot match or one left in clear. A local alias is sent the
 viewed input unchanged. A path the skill's view does not select is not sent, and its values
-are still looked for in the strings that are.
+are still looked for in the strings that are. A scan-only path (`free_text:<path>`, #165) is
+followed the same way but classed `free_text`: its content is scanned, not collected as a
+value.
 
 **Step policy** (step status, then the effect on the run; the run status is the worst of
 `failed` > `degraded` > `noop` > `ok`):
@@ -350,7 +352,7 @@ from horae.contracts.skill import view_steps
 from horae.contracts.types import MAX_ITEMS, HttpsUrl, NotePath, Sha256Hex, Token
 from horae.engine.canonical import canonical_json, canonical_pipeline, pipeline_digest, sha256_hex
 from horae.engine.guard import GUARD_ERROR, guard_for
-from horae.engine.personal import COLLECT_ROOT, merged_options, outermost, under
+from horae.engine.personal import COLLECT_ROOT, merged_options, reduce_personal, under
 from horae.engine.personal import values as values_in
 from horae.engine.ports import (
     Deidentifier,
@@ -917,13 +919,13 @@ def _plan(
             else:
                 calls.append(_Call(ref, rendered, plugin, position, planned_call.timeout_s))
         if kind == "collect":
-            personal = outermost(
+            personal = reduce_personal(
                 under(COLLECT_ROOT, path) for call in calls for path in _declared(call)
             )
         elif kind == "transform":
             for call in calls:
                 if _declared(call):
-                    personal = outermost(_declared(call))
+                    personal = reduce_personal(_declared(call))
                 elif personal != ():
                     personal, lost_by = None, call.ref
         planned.append(_Planned(index, kind, calls=tuple(calls), entries=tuple(entries)))

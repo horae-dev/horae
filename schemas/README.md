@@ -124,8 +124,8 @@ JSON Schema cannot express these; the models enforce them and the tests pin the 
   (`<ns>.read`, `<ns>.apply`, `<ns>.restore`, `<ns>.parent_exists`, `<ns>.identity`,
   decision 36).
   Each key of `provides.personal_fields` is one of `sources` or `transforms`, and a tool's
-  paths may not overlap or disagree on a value's shape (decision 68; the same rule for the
-  lock's `personal_fields`).
+  paths may not overlap or disagree on a value's shape, a scan-only `free_text:` path
+  included (decision 68 K; the same rule for the lock's `personal_fields`).
 - Hosts (`permissions.network`, every `https` URL): a label starting with `xn--` must be a valid
   IDNA A-label. It must round-trip through Python's `idna` codec (IDNA2003, so no runtime
   dependency) and decode to letters, marks, digits and `-` only. The second rule rejects what
@@ -3955,14 +3955,15 @@ loosened later without breaking a valid file.
       The cache, a replay's reuse and the repair retry all use the same de-identified input
       (decision 47 E: an entry is reused only with the same de-identified digest).
     - **F, `horae eval`.** A case's input is read as a `collect` output: an element whose
-      `source` is a tool of the skill's own plugin with `personal_fields` gets the same paths
-      and values, offline and live. `horae eval` knows only that plugin's manifest: a source
-      of another plugin is not recognised (a limit).
+      `source` is a tool with `personal_fields` gets the same paths and values, offline and
+      live. Amended by M (#165): the source is resolved among every plugin `horae eval`
+      knows, not only the skill's own.
     - **G, limits.** Not matched: a value of fewer than 2 characters in text, a name part of
-      fewer than 3 letters (`Al` of `Al Martin`), nicknames, initials, typos and
-      transliterations (`Zoë` is `Zoe` by folding, `Zoja` is not). A number under a personal
-      path is protected where the path is located, not in text. Folding over-matches (`Zoe`
-      and `Zoé` are one name). The declaration is as good as the plugin that writes it.
+      fewer than 3 letters (`Al` of `Al Martin`; 2 in a script without spaces, J), nicknames,
+      initials, typos and transliterations (`Zoë` is `Zoe` by folding, `Zoja` is not). A whole
+      number of fewer than `MIN_NUMBER_DIGITS` digits, or a fraction, under a personal path is
+      protected where the path is located, not in text (L). Folding over-matches (`Zoe` and
+      `Zoé` are one name). The declaration is as good as the plugin that writes it.
     - **H, SDK 0.7.0.** `Plugin.source(ref, personal_fields=[...])`,
       `Plugin.transform(ref, personal_fields=[...])` (also the `personal_fields=` argument of
       `Source` / `Transform`), and `manifest(..., personal_fields={ref: [paths]})`, written as
@@ -3978,6 +3979,62 @@ loosened later without breaking a valid file.
       depth, and flip `tests/test_deid.py`'s accent test from documenting the gap to asserting
       that `Zoe` is caught, plus a test that a skill **without** classes sends no name; update
       the README's "Limits" (accent folding done, a skill without classes is now protected).
+
+    **Amendment (#165, the review of #163).** `DEID_VERSION` is 4 (the matching changed: older
+    cloud cache entries are a miss once). `plugin-manifest/v1.json` and `lockfile/v1.json` are
+    regenerated (a `personal_fields` path may carry the `free_text:` prefix); horae-sdk 0.9.0.
+    - **J, scripts without spaces, names glued to another script.** A letter run is cut where
+      its script changes (the first word of the letter's Unicode name: `LATIN`, `CYRILLIC`,
+      `GREEK`...), and into single letters (each with its combining marks) in a script written
+      without spaces between words: Han, kana, Bopomofo, Hangul (a particle is glued to a
+      name: `민수가`), Thai, Lao, Khmer, Myanmar, Tibetan, Yi (`horae.llm.deid._spans`). Known
+      values and scanned text are cut the same way, so `Zoé` is found in `Zoé様`, `宿題はZoéが`
+      and `ZoéΣ`, `山田` in `山田さんは`, `山田花子` in `今日は山田花子さんが`. Within one script
+      that has spaces the whole-word rule stands: `Léo` never matches inside `Léonard`, nor
+      `Zoé` inside `MarieZoé` (a limit: cutting at a case change would also cut `McDonald` or
+      `DeVries`, whose folded forms must keep matching `Mcdonald` and `DEVRIES`, and match
+      names inside ordinary words). A name part written in a script without spaces needs 2
+      letters, not 3 (`花子` of `山田 花子`; a Han or Hangul letter is a syllable); a single
+      letter is never looked for. The middle dots `·` and `・` separate name parts
+      (`玛丽·杜邦`, `マリー・デュポン`). In those scripts a value over-matches inside a longer word
+      (`山田` in `山田町`), privacy over meaning, and a value of more than 48 letters is too long
+      to be looked for (one token per letter). The check after rewriting (E) reads text with
+      the same tokens, so the scanner and the backstop share every rule.
+    - **K, scan-only free-text fields.** A `personal_fields` path may be prefixed by
+      `free_text:` (`free_text:messages[].body`): free text that may mention personal data.
+      It is followed through the plan like any personal path (a transform that drops it fails
+      closed for a cloud alias), its shape is checked, and at the `llm` step it is classed
+      `free_text` (scanned for the personal values and the vocabulary; the request is
+      `classified`, so de-identification runs, or a cloud alias without a policy is refused),
+      unless a classed path lies at, above or below it. Its content is **not** a personal
+      value: it is neither replaced as a whole nor looked for elsewhere, so a long body never
+      makes the step refuse. A plain personal field keeps the hard refusal of a value over 1
+      KiB or 48 tokens (E). A prefix, not a new key or an object: the declaration stays a list
+      of strings, so the installer copies it into the lock as before, the approval prompt
+      shows it, and `horae plugin upgrade` (decision 73) shows turning `x` into
+      `free_text:x` as a personal field removed, a widening that needs approval. In the
+      union of the manifest's and the lock's (B), a path personal in one and scan-only in the
+      other stays personal, and a scan-only path at or under a personal path is dropped. One
+      tool's paths, prefix or not, may not overlap or disagree on a shape.
+    - **L, personal numbers.** Every whole number (not a boolean) of at least
+      `MIN_NUMBER_DIGITS` (6) digits at or below a personal path is a personal value too (its
+      decimal digits, without a sign): it is looked for in text (a whole digit run), as a
+      phone number by its last nine digits whatever the separators when it has nine or more
+      (`33612345678` is found as `06 12 34 56 78`; also a personal string written as a phone
+      number), and it replaces a number of the input with the same digits outside its own
+      field (`[PERSON_n]`, a string). The check after rewriting looks for all three. Six
+      digits: phone numbers, national, student and account identifiers have six or more,
+      while years, days, counts, quantities and most amounts have fewer and would otherwise
+      be replaced all over the input. Shorter numbers and fractions are still pseudonymized
+      where they sit (their path is classed `person`).
+    - **M, `horae eval` across plugins.** A case element's `source` is resolved as a
+      `collect` step resolves its tool (`PluginRegistry.plugin_for_tool`), through every
+      plugin `horae eval` knows: the instance's `HostRegistry` (manifests and `horae.lock`,
+      the declarations in force a run uses, B), or, with `--plugin-dir`, every valid manifest
+      of the folder (`horae.evals.ManifestRegistry`; two plugins providing one tool are
+      refused, as the host does). A limit remains: a case is read as a `collect` output, so a
+      case that stands for a transform's output (no `source` elements) gets no declared
+      fields; eval cases are synthetic.
 
 ### Provisional decisions (#45, pending maintainer review)
 

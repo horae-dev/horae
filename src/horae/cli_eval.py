@@ -6,6 +6,12 @@
 a plugin folder (it holds `plugin.yaml`) or a folder of plugins, for a plugin's own
 repository and CI: no instance is read then, unless `--alias` or `--live` needs one.
 
+**Personal fields** (schemas decision 68 F and M). A case's input is read as a `collect`
+output: each element's `source` is resolved among every plugin known (the instance's
+manifests and `horae.lock`, as a run resolves it, or every valid manifest under
+`--plugin-dir`), and that tool's declared personal fields are de-identified before a cloud
+alias like a run's. A case standing for a transform's output gets none (a limit).
+
 **Offline** (the default): no network, no secret, no cost. Each case is rendered by the real
 provider backend of the recorded backend (or of `--alias`'s), and its recorded response goes
 through the same validator, intent check and action guard as a run's `llm` step
@@ -76,12 +82,13 @@ from horae.contracts.plugin import PluginManifest
 from horae.contracts.run import Usage
 from horae.contracts.types import SkillRef
 from horae.engine import UnknownPlugin
-from horae.engine.ports import LlmResponse
+from horae.engine.ports import LlmResponse, PluginRegistry
 from horae.evals import (
     CaseResult,
     EvalError,
     LiveEval,
     LoadedCase,
+    ManifestRegistry,
     Planned,
     SkillUnderEval,
     evals_dir,
@@ -151,7 +158,7 @@ def _manifests(directory: Path) -> tuple[list[tuple[Path, PluginManifest]], list
     return found, invalid
 
 
-def _from_plugin_dir(skill: str, directory: Path) -> tuple[Path, PluginManifest]:
+def _from_plugin_dir(skill: str, directory: Path) -> tuple[Path, PluginManifest, PluginRegistry]:
     if not directory.is_dir():
         raise CommandFailed(EXIT_USAGE, "usage", f"--plugin-dir {directory}: not a directory")
     found, invalid = _manifests(directory)
@@ -164,7 +171,12 @@ def _from_plugin_dir(skill: str, directory: Path) -> tuple[Path, PluginManifest]
             EXIT_PROBLEMS, "plugins_invalid", f"several plugins provide skill {skill}: {names}"
         )
     if providers:
-        return providers[0]
+        root, manifest = providers[0]
+        try:
+            registry = ManifestRegistry([found_manifest for _, found_manifest in found])
+        except ValueError as error:
+            raise CommandFailed(EXIT_PROBLEMS, "plugins_invalid", str(error)) from None
+        return root, manifest, registry
     if invalid:
         # The skill may be the one an invalid manifest declares: say so, not "unknown".
         detail = "; ".join(invalid[:5])
@@ -178,7 +190,7 @@ def _from_plugin_dir(skill: str, directory: Path) -> tuple[Path, PluginManifest]
     )
 
 
-def _from_instance(skill: str, instance: Instance) -> tuple[Path, PluginManifest]:
+def _from_instance(skill: str, instance: Instance) -> tuple[Path, PluginManifest, PluginRegistry]:
     try:
         registry = HostRegistry.from_directory(instance.lock, plugins_dir(instance.root))
     except (ProblemsError, RegistryError) as exc:
@@ -193,7 +205,7 @@ def _from_instance(skill: str, instance: Instance) -> tuple[Path, PluginManifest
     plugin = registry.installed(name)
     if plugin.root is None:  # pragma: no cover - from_directory sets every root
         raise CommandFailed(EXIT_PROBLEMS, "plugins_invalid", f"plugin {name} has no folder")
-    return plugin.root, plugin.manifest
+    return plugin.root, plugin.manifest, registry
 
 
 def locate(skill: str, instance: Instance | None, plugin_dir: Path | None) -> Located:
@@ -205,16 +217,18 @@ def locate(skill: str, instance: Instance | None, plugin_dir: Path | None) -> Lo
             EXIT_USAGE, "usage", f"not a skill name (`<namespace>/<skill>`): {skill[:64]!r}"
         ) from None
     if plugin_dir is not None:
-        root, manifest = _from_plugin_dir(skill, plugin_dir)
+        root, manifest, registry = _from_plugin_dir(skill, plugin_dir)
     else:
         if instance is None:  # pragma: no cover - the caller loads it
             raise CommandFailed(EXIT_PROBLEMS, "config_invalid", "no instance")
-        root, manifest = _from_instance(skill, instance)
+        root, manifest, registry = _from_instance(skill, instance)
     try:
         loaded = load_skill(root, skill, allowed_intents=manifest.permissions.intents)
     except SkillError as error:
         raise CommandFailed(EXIT_PROBLEMS, "skill_invalid", str(error)) from None
-    return Located(SkillUnderEval(loaded, manifest), evals_dir(root, skill), manifest.name)
+    # #165: a case's sources resolve through every plugin known, as a run's `collect` does.
+    sue = SkillUnderEval(loaded, manifest, registry)
+    return Located(sue, evals_dir(root, skill), manifest.name)
 
 
 def _cases(located: Located, case: str | None) -> tuple[list[LoadedCase], list[CaseResult]]:
