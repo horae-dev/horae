@@ -272,8 +272,9 @@ file grants nothing; a hard link cannot cross mounts). But in a **writable** pat
 leave things for the host to trip over: a symbolic link to `~/.ssh/authorized_keys` that Horae
 or Obsidian would follow, a FIFO that blocks a reader, a set-user-ID program that runs as your
 user. So when the container is gone, Horae **sweeps** each writable path: for what was created
-or changed during the plugin's run (never your older files), it removes a symbolic link to a
-place the plugin could not write itself, removes a FIFO, socket or device, and clears a
+or changed during the plugin's run (never your older files), it removes a symbolic link whose
+target is absolute or has a `..`, or that resolves (following every link, as the kernel does)
+to a place the plugin could not write itself, removes a FIFO, socket or device, and clears a
 set-user-ID bit, logging each at WARNING. It also warns when a declared path was replaced
 (renamed away by a writable parent).
 

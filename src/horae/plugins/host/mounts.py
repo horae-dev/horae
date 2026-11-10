@@ -22,11 +22,12 @@ the plugin (`runtime_unavailable`): nothing is mounted unless every declared pat
 
 `sweep` runs once the container is gone: in each writable mount, what the plugin created or
 changed during its run (`st_ctime` since its start, which a plugin cannot set back) that the
-host could trip over is undone and logged at WARNING: a symbolic link to a place the plugin
-could not write itself (outside its writable paths, or in a read-only child of one) is
-removed, a device, FIFO or socket is removed, a set-user-ID (or, on a file, set-group-ID) bit
-is cleared. Every declared path must still be the same file (device and
-inode) as when it was checked. What the sweep cannot check (a listing or `lstat` that fails, an
+host could trip over is undone and logged at WARNING: a symbolic link whose target is
+absolute or has a `..` component, or that resolves (`realpath`) to a place the plugin could not
+write itself (outside its writable paths, or in a read-only child of one), is removed; a
+device, FIFO or socket is removed; a set-user-ID (or, on a file, set-group-ID) bit is cleared.
+Every declared path must still be the same file (device and inode) as when it was checked.
+What the sweep cannot check (a listing or `lstat` that fails, an
 entry on another device that is not a host mount point, more than `NEW_LIMIT` new or
 `WALK_LIMIT` entries, a replaced declared path) **quarantines** the plugin: a file in
 `<state_dir>/quarantine/` refuses its next start until the operator removes it. Bind mounts
@@ -396,11 +397,13 @@ def writable_at(path: str, mounts: Sequence[Mount]) -> bool:
 
 
 def _escapes(link: str, target: str, mounts: Sequence[Mount]) -> bool:
-    """Whether a symbolic link at `link` to `target` names a place the plugin could not write
-    (lexically, as a host process following it would start): following it, the host would act
-    outside what the plugin was granted."""
-    joined = target if os.path.isabs(target) else os.path.join(os.path.dirname(link), target)
-    return not writable_at(os.path.normpath(joined), mounts)
+    """Whether a symbolic link the plugin made must go (strict, decision 78 C): its target is
+    absolute or has a `..` component, or the kernel's resolution of the link (`realpath`, the
+    container gone, so nothing changes it meanwhile) lands where the plugin could not write.
+    A chain of links or a `..` through a linked directory is resolved, never read lexically."""
+    if os.path.isabs(target) or ".." in target.split("/"):
+        return True
+    return not writable_at(os.path.realpath(link), mounts)
 
 
 def _shown(path: str) -> str:
@@ -414,7 +417,7 @@ def _fix(path: str, status: os.stat_result, mounts: Sequence[Mount]) -> str | No
         target = os.readlink(path)
         if _escapes(path, target, mounts):
             os.unlink(path)
-            return f"removed symbolic link {_shown(path)} -> {_shown(target)} (not writable)"
+            return f"removed symbolic link {_shown(path)} -> {_shown(target)} (may escape)"
         return None
     if stat.S_ISCHR(mode) or stat.S_ISBLK(mode) or stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode):
         os.unlink(path)

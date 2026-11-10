@@ -4881,10 +4881,13 @@ loosened later without breaking a valid file.
       following links) and, for each entry
       whose `st_ctime` is at or after the container's start (less 2 s; a plugin cannot set
       `ctime` back, so a user's own older files are never touched) and that the plugin could
-      write (not in a read-only child): removes a symbolic link whose target, resolved
-      lexically from where it is, is a place the plugin could not write itself (outside its
-      writable paths, or in a read-only child of one: a host process following the link would
-      act there for it); removes a device, FIFO or socket; clears a set-user-ID bit (and set-group-ID on a
+      write (not in a read-only child): removes a symbolic link **strictly** (when in doubt,
+      it goes): any whose target is absolute or has a `..` component, and any whose
+      resolution by the kernel (`realpath`, once the container has exited, so chains of links
+      and a `..` through a linked directory are followed, never read lexically) lands where
+      the plugin could not write itself (outside its writable paths, or in a read-only child
+      of one: a host process following the link would act there for it); removes a device,
+      FIFO or socket; clears a set-user-ID bit (and set-group-ID on a
       file). It also checks every declared path is still the same file (device and inode) as
       when it was checked. **The sweep fails closed**: a declared path replaced or removed, a
       directory it cannot list, an entry it cannot `lstat` or undo, an entry on another device
@@ -4906,6 +4909,10 @@ loosened later without breaking a valid file.
       can rename the directories between it and a read-only child (the child's contents move
       along, still read-only, and its host path may then name a directory the plugin made: the
       sweep reports it); while the plugin runs, what it wrote is on the host as it wrote it.
+      Horae's own host-side writer of notes (`horae.apply.local.LocalFileSink`, used by the
+      built-in sink and `file-sink`) already opens every path component relative to its
+      parent with `O_NOFOLLOW` (`O_DIRECTORY` for directories) and refuses a link anywhere,
+      so it does not follow a link a plugin left during its run either.
     - **D, resource limits.** Operator-set in `horae.yaml` like `runtime`: `plugin_defaults.limits`
       and `plugins.<name>.limits`, each field of which wins over the default's (the manifest
       and the lock carry none, so a plugin cannot ask for more). Flags: `--cpus`, `--memory`

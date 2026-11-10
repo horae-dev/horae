@@ -404,12 +404,12 @@ def test_the_sweep_undoes_what_the_plugin_left_in_its_writable_paths(
     assert not os.path.lexists(inbox / "climb")
     assert not os.path.lexists(inbox / "fifo")
     assert os.path.islink(inbox / "inner")
-    assert os.path.islink(inbox / "absolute-inner")
+    assert not os.path.lexists(inbox / "absolute-inner")  # absolute: removed, strict
     assert stat.S_IMODE(os.stat(setuid).st_mode) == 0o755
     assert os.path.islink(inbox / "old-link")  # older than the run: never touched
     assert os.stat(old_suid).st_mode & stat.S_ISUID
-    assert len(findings) == 4, findings
-    assert len([r for r in caplog.records if r.levelname == "WARNING"]) == 4
+    assert len(findings) == 5, findings
+    assert len([r for r in caplog.records if r.levelname == "WARNING"]) == 5
 
 
 def test_the_sweep_leaves_read_only_paths_and_reports_a_replaced_path(
@@ -475,11 +475,14 @@ def test_a_link_into_a_read_only_child_of_a_writable_path_is_removed(
     plan = plan_mounts("jail", [str(archive)], [str(vault)], _policy(instance))
     since = mounts.now()
     (vault / "into-archive").symlink_to(archive / "kept.md")  # a host writer would edit it
-    (vault / "inbox" / "sibling").symlink_to("../note.md")  # still in its writable path
+    (vault / "inbox" / "sibling").symlink_to("deep")  # relative, inside: kept
     (archive / "users-own").symlink_to("/etc/hostname")  # not the plugin's: read-only for it
     findings = sweep("jail", plan, since).findings
     assert not os.path.lexists(vault / "into-archive")
     assert os.path.islink(vault / "inbox" / "sibling")
+    (vault / "into-archive").symlink_to("archive/kept.md")  # relative, into the read-only child
+    assert len(sweep("jail", plan, since).findings) == 1
+    assert not os.path.lexists(vault / "into-archive")
     assert os.path.islink(archive / "users-own")
     assert len(findings) == 1, findings
     assert mounts.writable_at(str(vault / "inbox"), plan)
@@ -653,3 +656,63 @@ def test_a_case_variant_of_a_sensitive_path_is_refused(instance: Path) -> None:
     assert "which no plugin may see" in _refused(str(instance / "STATE"), policy)
     assert "which no plugin may see" in _refused(str(instance / "Plugins" / "x"), policy)
     assert check_path("jail", str(instance / "VAULT"), policy)  # not sensitive in any case
+
+
+def test_a_two_hop_chain_of_links_cannot_escape(
+    instance: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(mounts, "CTIME_SLACK_S", 0.05)  # coarse kernel timestamps
+    inbox = instance / "vault" / "inbox"
+    since = mounts.now()
+    # `a -> deep/b` reads as inside; `deep/b` climbs out. Each link is judged as the kernel
+    # resolves it, and a `..` target is removed outright.
+    (inbox / "a").symlink_to("deep/b")
+    (inbox / "deep" / "b").symlink_to("../../../state")
+    swept = sweep("jail", [_mount(inbox)], since)
+    assert not os.path.lexists(inbox / "deep" / "b")
+    assert not os.path.lexists(inbox / "a") or os.path.realpath(inbox / "a") == str(
+        inbox / "deep" / "b"
+    )  # either removed, or now dangling inside the inbox
+    assert swept.failures == []
+
+
+def test_a_link_resolving_out_through_a_linked_directory_is_removed(
+    instance: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(mounts, "CTIME_SLACK_S", 0.05)  # coarse kernel timestamps
+    vault, inbox = instance / "vault", instance / "vault" / "inbox"
+    plan = plan_mounts("jail", [], [str(inbox)], _policy(instance))
+    (vault / "elsewhere").mkdir()
+    (vault / "elsewhere" / "secret.md").write_text("x", encoding="utf-8")
+    time.sleep(0.2)
+    since = mounts.now()
+    # `deep` replaced by an absolute link out (removed); `through` reaches it via `hop`, so
+    # it either resolves outside (removed) or, once `deep` is gone, dangles inside.
+    (inbox / "hop").symlink_to("deep")
+    os.rmdir(inbox / "deep")
+    os.symlink(str(vault / "elsewhere"), inbox / "deep")  # absolute: removed
+    (inbox / "through").symlink_to("hop/secret.md")  # resolves into vault/elsewhere
+    swept = sweep("jail", plan, since)
+    assert not os.path.lexists(inbox / "deep")
+    assert not os.path.lexists(inbox / "through") or os.path.realpath(inbox / "through").startswith(
+        str(inbox)
+    )
+    assert swept.failures == []
+
+
+def test_a_dotdot_through_an_old_linked_directory_is_removed(
+    instance: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(mounts, "CTIME_SLACK_S", 0.05)  # coarse kernel timestamps
+    vault, inbox = instance / "vault", instance / "vault" / "inbox"
+    (vault / "elsewhere" / "sub").mkdir(parents=True)
+    (inbox / "linked").symlink_to(vault / "elsewhere" / "sub")  # the user's own, older: kept
+    time.sleep(0.2)
+    since = mounts.now()
+    (inbox / "dotdot").symlink_to("linked/../secret.md")  # lexically inside, really outside
+    (inbox / "plain").symlink_to("linked/x.md")  # no `..`, but resolves outside
+    swept = sweep("jail", [_mount(inbox)], since)
+    assert not os.path.lexists(inbox / "dotdot")
+    assert not os.path.lexists(inbox / "plain")
+    assert os.path.islink(inbox / "linked")
+    assert len(swept.findings) == 2
