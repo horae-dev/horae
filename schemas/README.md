@@ -4010,19 +4010,26 @@ loosened later without breaking a valid file.
       value: it is neither replaced as a whole nor looked for elsewhere, so a long body never
       makes the step refuse. A plain personal field keeps the hard refusal of a value over 1
       KiB or 48 tokens (E). A prefix, not a new key or an object: the declaration stays a list
-      of strings, so the installer copies it into the lock as before, the approval prompt
-      shows it, and `horae plugin upgrade` (decision 73) shows turning `x` into
-      `free_text:x` as a personal field removed, a widening that needs approval. In the
+      of strings, so the installer copies it into the lock as before; the approval prompt
+      lists scan-only paths apart ("scanned ... not de-identified as values"), and
+      `horae plugin upgrade` (decision 73) shows turning `x` into `free_text:x` as the
+      personal field `x` removed, a widening that needs approval, and `x (scan-only free
+      text, not de-identified as a value)` added. In the
       union of the manifest's and the lock's (B), a path personal in one and scan-only in the
       other stays personal, and a scan-only path at or under a personal path is dropped. One
       tool's paths, prefix or not, may not overlap or disagree on a shape.
     - **L, personal numbers.** Every whole number (not a boolean) of at least
       `MIN_NUMBER_DIGITS` (6) digits at or below a personal path is a personal value too (its
-      decimal digits, without a sign): it is looked for in text (a whole digit run), as a
-      phone number by its last nine digits whatever the separators when it has nine or more
-      (`33612345678` is found as `06 12 34 56 78`; also a personal string written as a phone
-      number), and it replaces a number of the input with the same digits outside its own
-      field (`[PERSON_n]`, a string). The check after rewriting looks for all three. Six
+      decimal digits, without a sign; an integral float too): it is looked for in text (a
+      whole digit run), whatever the separators in a run of digits and phone separators: by
+      its last nine digits anywhere in the run when it has nine or more (`33612345678` is
+      found as `06 12 34 56 78`), by all its digits at the end of the run after at most four
+      other digits (a trunk `0`, a country code) when it has 6 to 8 (`91234567` in
+      `+65 9123 4567`, `123456` in `123-456` and `0123456`); the same for a personal string
+      written as a phone number. A number of the input (an integral float too) outside its
+      own field is replaced (`[PERSON_n]`, a string) when its digits equal a personal
+      number's or match it by the same rule (`612345678` for `33612345678`). The check after
+      rewriting applies the same rules to text and numbers. Six
       digits: phone numbers, national, student and account identifiers have six or more,
       while years, days, counts, quantities and most amounts have fewer and would otherwise
       be replaced all over the input. Shorter numbers and fractions are still pseudonymized

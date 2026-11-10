@@ -15,6 +15,7 @@ functions the engine and `horae eval` share:
   the core applies them whatever the skill declares.
 """
 
+import math
 import unicodedata
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
@@ -47,7 +48,8 @@ def under(root: str, path: str) -> str:
 def values(data: Any, paths: Sequence[str]) -> tuple[list[str], list[str]]:
     """`(values, mismatched)`: every string leaf and object key at or below each personal
     path of `data` (NFC, in document order, without duplicates or empty strings), each whole
-    number of at least `MIN_NUMBER_DIGITS` digits there (its decimal text), and the paths at
+    number (an integral float too) of at least `MIN_NUMBER_DIGITS` digits there (its decimal
+    text), and the paths at
     which `data` holds a value of the wrong shape (an object where the path reads an array,
     a scalar where it reads either): such a field cannot be located, so a step that would
     send it to a cloud model fails closed. An absent key, or `null`, is not a mismatch. A
@@ -85,8 +87,10 @@ def _walk(value: Any, steps: tuple[str, ...], found: dict[str, None], *, collect
         item = stack.pop()
         if isinstance(item, str):
             _add(found, item)
-        elif isinstance(item, int) and not isinstance(item, bool):
-            digits = str(abs(item))
+        elif (isinstance(item, int) and not isinstance(item, bool)) or (
+            isinstance(item, float) and math.isfinite(item) and item.is_integer()
+        ):
+            digits = str(abs(int(item)))
             if len(digits) >= MIN_NUMBER_DIGITS:
                 found.setdefault(digits, None)
         elif isinstance(item, list):

@@ -432,3 +432,95 @@ def test_eval_plugin_dir_resolves_the_sources_of_every_plugin(tmp_path: Path) ->
     (tmp_path / "contacts" / "plugin.yaml").write_text(yaml.safe_dump(OTHER))
     located = locate("school/summary", None, tmp_path)
     assert case_personal(located.sue, CASE).values == ("Zoé Martin",)
+
+
+# --- review of #187: short personal numbers, number-to-number, the approval text ----------------
+
+
+@pytest.mark.parametrize(
+    ("text", "number"),
+    [
+        ("call 9123 4567", "91234567"),
+        ("call +65 9123 4567", "91234567"),
+        ("call (65) 9123-4567", "91234567"),
+        ("id 123 456", "123456"),
+        ("id 123-456", "123456"),
+        ("id 0123456", "123456"),
+        ("id 1234567", "1234567"),
+    ],
+)
+def test_a_short_personal_number_is_found_with_separators_or_a_prefix(
+    text: str, number: str
+) -> None:
+    sent = _personal(text, number)
+    assert "[PERSON_1]" in sent
+    assert number[-4:] not in sent
+    assert not deid._leaked({"t": sent}, [number])
+    assert deid._leaked({"t": text}, [number])  # the backstop sees it too
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "order 99123456789",  # a longer number that only contains it
+        "id 9123456789",  # more digits after it in the same run
+        "ref 1234591234567",  # a prefix of more than four digits
+    ],
+)
+def test_a_short_personal_number_inside_a_longer_one_is_not_matched(text: str) -> None:
+    assert _personal(text, "91234567") == text
+    assert not deid._leaked({"t": text}, ["91234567"])
+
+
+@pytest.mark.parametrize("number", [612345678, 612345678.0, 33612345678.0, 6591234567])
+def test_a_number_matches_a_personal_number_by_its_phone_digits(number: Any) -> None:
+    personal = ["91234567"] if number == 6591234567 else ["33612345678"]
+    sent = pseudonymize({"n": number, "t": "x"}, {}, None, personal).data
+    assert sent["n"] == "[PERSON_1]"
+    assert deid._leaked({"n": number}, personal)
+
+
+def test_other_numbers_are_left_alone() -> None:
+    data = {"a": 2026, "b": 1.5, "c": 12345678, "d": True, "e": 1e300, "f": float("nan")}
+    sent = pseudonymize({**data, "t": "x"}, {}, None, ["91234567"]).data
+    assert {key: sent[key] for key in "abcde"} == {key: data[key] for key in "abcde"}
+    assert not deid._leaked({key: data[key] for key in "abcde"}, ["91234567"])
+
+
+def test_integral_floats_under_a_personal_path_are_values() -> None:
+    assert values({"n": 612345678.0}, ["n"])[0] == ["612345678"]
+
+
+def test_the_approval_text_lists_scan_only_fields_apart() -> None:
+    from horae.contracts.plugin import Permissions
+    from horae.marketplace.approval import PERSONAL_NOTE, SCAN_ONLY_NOTE, describe
+
+    lines = describe(
+        "mail",
+        "1.0.0",
+        Permissions(),
+        Permissions(),
+        {MAIL: ["messages[].from", "free_text:messages[].body"], "mail.notes": ["free_text:t"]},
+    )
+    text = "\n".join(lines)
+    personal, scanned = text.index(PERSONAL_NOTE), text.index(SCAN_ONLY_NOTE)
+    assert personal < text.index(f"- {MAIL}: messages[].from") < scanned
+    assert scanned < text.index(f"- {MAIL}: messages[].body")
+    assert "- mail.notes: t" in text
+    assert "free_text:" not in text.replace("(`free_text:`)", "")
+    only = "\n".join(describe("m", "1.0.0", Permissions(), Permissions(), {MAIL: ["free_text:b"]}))
+    assert PERSONAL_NOTE not in only
+    assert SCAN_ONLY_NOTE in only
+
+
+def test_the_upgrade_diff_shows_a_field_turned_scan_only_as_dropped() -> None:
+    from horae.contracts.lockfile import LockedPlugin
+    from horae.marketplace.upgrade import describe_diff, permission_diff, widens
+
+    old = LockedPlugin.model_validate({**LOCKED, "personal_fields": {MAIL: ["body"]}})
+    new = old.model_copy(update={"personal_fields": {MAIL: ["free_text:body"]}})
+    changes = permission_diff(old, new)
+    assert widens(changes)
+    text = "\n".join(describe_diff(changes))
+    assert f"- {MAIL}: body  (new: needs approval)" in text
+    assert f"+ {MAIL}: body (scan-only free text, not de-identified as a value)" in text

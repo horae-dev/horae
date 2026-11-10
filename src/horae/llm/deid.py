@@ -108,7 +108,7 @@ import math
 import re
 import unicodedata
 from bisect import bisect_right
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any
@@ -164,6 +164,13 @@ MIN_UNSPACED_NAME_PART_LETTERS = 2
 MIN_PHONE_DIGITS = 9
 """A phone number is also matched by its last `MIN_PHONE_DIGITS` digits, whatever the
 separators (`06 12 34 56 78`, `+33 (0)6.12.34.56.78`)."""
+MIN_PERSONAL_NUMBER_DIGITS = 6
+"""Shortest personal value written as a number matched as one in text (the engine collects
+whole numbers of at least `horae.engine.personal.MIN_NUMBER_DIGITS`, the same 6, #165): a
+shorter one would match every small number."""
+MAX_NUMBER_PREFIX = 4
+"""Most digits allowed before a personal number shorter than `MIN_PHONE_DIGITS` in a run of
+digits (a trunk `0`, a country code: `91234567` is found in `+65 9123 4567`)."""
 MIN_AMOUNT_DIGITS = 3
 """Shortest rendering of an amount (in digits) matched in text."""
 MAX_NOTES = 16
@@ -867,9 +874,14 @@ class _Pseudonymizer:
             return bucket(value, spec[1])
         if isinstance(value, str):
             return self.scan(value)
-        if isinstance(value, int) and not isinstance(value, bool):
-            known = self.numbers.get(str(abs(value)))
-            if known is not None:  # a personal number, outside its own field (#165)
+        digits = _whole_digits(value)
+        if digits is not None:  # a personal number, outside its own field (#165)
+            known = self.numbers.get(digits)
+            if known is None and self.phones:
+                match = next(_phone_matches(digits, self.phones), None)
+                if match is not None:
+                    known = self.phones[digits[match[0] : match[0] + match[1]]]
+            if known is not None:
                 self.count(FREE_TEXT)
                 return self.assigner.token(known)
         return value
@@ -949,24 +961,22 @@ class _Pseudonymizer:
 
     def _phone_spans(self, text: str) -> Iterator[tuple[int, int, _Known]]:
         """Spans of `text` holding a known phone number's last `MIN_PHONE_DIGITS` digits,
-        whatever the separators, with up to four digits of prefix (country or trunk code)."""
+        whatever the separators, with up to four digits of prefix (country or trunk code), or
+        a shorter personal number's digits at the end of a run of digits (`_phone_matches`)."""
         if not self.phones:
             return
         for run in _PHONE_RUN.finditer(text):
             positions = [run.start() + i for i, char in enumerate(run.group()) if char.isdecimal()]
             digits = _digits(run.group())
-            index, floor = 0, run.start()
-            while index + MIN_PHONE_DIGITS <= len(digits):
-                known = self.phones.get(digits[index : index + MIN_PHONE_DIGITS])
-                if known is None:
-                    index += 1
-                    continue
-                start, end = positions[index], positions[index + MIN_PHONE_DIGITS - 1] + 1
+            floor = run.start()
+            for index, length in _phone_matches(digits, self.phones):
+                known = self.phones[digits[index : index + length]]
+                start, end = positions[index], positions[index + length - 1] + 1
                 prefix = 0
                 while start > floor:
                     char = text[start - 1]
                     if char.isdecimal():
-                        if prefix == 4:
+                        if prefix == MAX_NUMBER_PREFIX:
                             break
                         prefix += 1
                     elif not (char.isspace() or char in _PHONE_SEPARATORS):
@@ -975,22 +985,62 @@ class _Pseudonymizer:
                 while text[start] not in "+(" and not text[start].isdecimal():
                     start += 1
                 yield start, end, known
-                index += MIN_PHONE_DIGITS
                 floor = end
+
+
+def _phone_matches(digits: str, keys: Collection[str]) -> Iterator[tuple[int, int]]:
+    """`(index, length)` of each phone key of `keys` found in a run's `digits`, left to
+    right, longest first: a key of `MIN_PHONE_DIGITS` digits anywhere; a shorter one (a
+    personal number of 6 to 8 digits, #165) only at the end of the run, after at most
+    `MAX_NUMBER_PREFIX` digits not already matched (`0123456`, `65 9123 4567`)."""
+    lengths = sorted({len(key) for key in keys}, reverse=True)
+    index = consumed = 0
+    while index < len(digits):
+        for length in lengths:
+            key = digits[index : index + length]
+            if len(key) != length or key not in keys:
+                continue
+            if length < MIN_PHONE_DIGITS and (
+                index + length != len(digits) or index - consumed > MAX_NUMBER_PREFIX
+            ):
+                continue
+            yield index, length
+            index = consumed = index + length
+            break
+        else:
+            index += 1
+
+
+def _whole_digits(value: Any) -> str | None:
+    """The decimal digits of a whole number (an `int`, not a boolean, or an integral finite
+    `float`), without its sign; `None` for anything else."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, float):
+        if not (math.isfinite(value) and value.is_integer()):
+            return None
+        value = int(value)
+    if isinstance(value, int):
+        return str(abs(value))
+    return None
 
 
 def _phone_key(text: str, *, shaped: bool = False) -> str | None:
     """The last `MIN_PHONE_DIGITS` digits of a value with at least that many, or `None`;
     with `shaped`, only of a value written as a phone number (digits and phone separators
-    only). A `phone` value is matched by them; so is a personal value shaped like one (#165:
-    a number under a personal path, `33612345678`, is also found as `06 12 34 56 78`)."""
+    only), and then also all the digits of one of `MIN_PERSONAL_NUMBER_DIGITS` to 8. A
+    `phone` value is matched by them; so is a personal value shaped like one (#165: a number
+    under a personal path, `33612345678`, is also found as `06 12 34 56 78`, and `91234567`
+    as `+65 9123 4567`)."""
     cleaned = _clean(text).strip()
     if shaped and not _PHONE_RUN.fullmatch(cleaned):
         return None
     digits = _digits(cleaned)
-    if len(digits) < MIN_PHONE_DIGITS:
-        return None
-    return digits[-MIN_PHONE_DIGITS:]
+    if len(digits) >= MIN_PHONE_DIGITS:
+        return digits[-MIN_PHONE_DIGITS:]
+    if shaped and len(digits) >= MIN_PERSONAL_NUMBER_DIGITS:
+        return digits
+    return None
 
 
 def _overlaps(start: int, end: int, spans: list[tuple[int, int, str]]) -> bool:
@@ -1033,8 +1083,9 @@ def _leaked(sent: Any, personal: Sequence[str]) -> bool:
     phones = {key for value in personal if (key := _phone_key(value, shaped=True)) is not None}
     if not (trie.size or phones):
         return False
-    if numbers and any(str(abs(number)) in numbers for number in _whole_numbers(sent)):
-        return True
+    for digits in _whole_numbers(sent):
+        if digits in numbers or next(_phone_matches(digits, phones), None) is not None:
+            return True
     for text in _strings(sent):
         cleaned = _clean(TOKEN.sub(" ", text))
         for seen in _forms(cleaned):
@@ -1042,22 +1093,21 @@ def _leaked(sent: Any, personal: Sequence[str]) -> bool:
             if next(trie.matches(tokens), None) is not None:
                 return True
             if phones and any(
-                digits[index : index + MIN_PHONE_DIGITS] in phones
+                next(_phone_matches(_digits(run.group()), phones), None) is not None
                 for run in _PHONE_RUN.finditer(seen)
-                for digits in (_digits(run.group()),)
-                for index in range(len(digits) - MIN_PHONE_DIGITS + 1)
             ):
                 return True
     return False
 
 
-def _whole_numbers(value: Any) -> Iterator[int]:
-    """Every whole number (not a boolean) of plain JSON `value`."""
+def _whole_numbers(value: Any) -> Iterator[str]:
+    """The digits of every whole number of plain JSON `value` (`_whole_digits`)."""
     stack = [value]
     while stack:
         item = stack.pop()
-        if isinstance(item, int) and not isinstance(item, bool):
-            yield item
+        digits = _whole_digits(item)
+        if digits is not None:
+            yield digits
         elif isinstance(item, list):
             stack.extend(item)
         elif isinstance(item, dict):
