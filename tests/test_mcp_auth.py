@@ -545,7 +545,7 @@ def test_the_real_command_serves_http_on_loopback_with_a_token(
         url = found[1]
         assert post(url, {}).status_code == 401
         names, _ = tools_over_http(url, token)
-        assert names == TOOLS
+        assert names == TOOLS | {"pipeline.run"}  # listed; a `read` token cannot call it
     finally:
         proc.terminate()
         _, err = proc.communicate(timeout=20)
@@ -621,3 +621,53 @@ def test_a_flood_of_bad_tokens_logs_one_line(
         assert post(served.url, {"authorization": f"Bearer {new_token()}"}).status_code == 401
     refusals = [r for r in caplog.records if "refused" in r.getMessage()]
     assert len(refusals) == 1
+
+
+# --- pipeline.run (#55): the scope, the requester -------------------------------------------
+
+
+def call_tool(url: str, token: str, name: str, args: dict[str, Any]) -> Any:
+    async def go() -> Any:
+        headers = {"authorization": f"Bearer {token}"}
+        async with (
+            httpx2.AsyncClient(headers=headers, timeout=10) as http,
+            Client(streamable_http_client(url, http_client=http)) as client,
+        ):
+            return await client.call_tool(name, args)
+
+    return asyncio.run(asyncio.wait_for(go(), 30))
+
+
+def test_a_read_token_cannot_call_pipeline_run(
+    root: Path, store_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from contextlib import asynccontextmanager
+    from types import SimpleNamespace
+
+    from horae import approval
+    from horae.apply import StaticSinks
+    from horae.mcp_server import PipelineRuns
+    from horae.runner import Ports
+    from runner_fixtures import Plugins
+
+    @asynccontextmanager
+    async def live_ports(instance: Any) -> Any:
+        plugins = Plugins()
+        yield SimpleNamespace(ports=Ports(plugins, plugins), sinks=StaticSinks())
+
+    monkeypatch.setattr(approval, "live_ports", live_ports)
+    reader_token = add(store_path, "reader")
+    runner_token = add(store_path, "runner", (SCOPE_READ, SCOPE_PIPELINE_RUN))
+    app = build_http_app(
+        http_reader(root, store_path), TokenVerifier(store_path), runs=PipelineRuns(root)
+    )
+    with serving(app) as s:
+        refused = call_tool(s.url, reader_token, "pipeline.run", {"pipeline": "collect"})
+        allowed = call_tool(s.url, runner_token, "pipeline.run", {"pipeline": "collect"})
+    assert refused.is_error
+    assert "insufficient_scope" in json.dumps([c.model_dump() for c in refused.content])
+    assert not allowed.is_error
+    with Store.open(store_path) as store:
+        rows = store.approvals()
+        runner_id = next(t.id for t in store.mcp_tokens() if t.name == "runner")
+    assert [(r.requested_by, r.token_id) for r in rows] == [("runner", runner_id)]

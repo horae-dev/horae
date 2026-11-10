@@ -1,0 +1,1 @@
+{"schema_version":1,"pipeline":"daily-brief","dry_run_id":"20261110T060000000000Z-daily-brief-1a2b3c","run_status":"ok","approval":null,"reason":"nothing_to_apply","counts":{"notes":1,"tasks":0,"notifications":0,"http_calls":0,"problems":0},"changes":[{"kind":"note","action":"modify","target":"Daily/2026-11-10.assistant.md","diff":"+ secret line"}],"truncated":false}

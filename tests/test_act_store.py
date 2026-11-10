@@ -33,7 +33,7 @@ def test_the_migration_adds_the_table_and_keeps_existing_runs(tmp_path: Path) ->
         "INSERT INTO runs (id, pipeline, status, dry_run, started_at, finished_at, error, "
         "abandoned_at) VALUES ('r1', 'brief', 'failed', 0, 'x', 'y', 'gone', 'y')"
     )
-    assert migrate(conn) == SCHEMA_VERSION == len(load_migrations()) == 9
+    assert migrate(conn) == SCHEMA_VERSION == len(load_migrations()) == 10
     assert conn.execute("SELECT id, pipeline, status FROM runs").fetchall() == [
         ("r1", "brief", "failed")
     ]

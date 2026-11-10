@@ -313,5 +313,5 @@ def test_claude_code_style_client_over_stdio_with_the_real_command(
             return names, dict(result.structured_content or {})
 
     names, out = asyncio.run(asyncio.wait_for(go(), 60))
-    assert names == TOOLS
+    assert names == TOOLS | {"pipeline.run"}  # #55: the command serves the dry-run tool too
     assert RunsRecent.model_validate(out).runs[0].id == "r1"

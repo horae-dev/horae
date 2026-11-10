@@ -104,6 +104,15 @@ class ActTokenUsed(StoreError):
         super().__init__("the action link was already used")
 
 
+class ApprovalLimited(StoreError):
+    """A requester already has too many open approvals, or asked too often (#55): `kind` is
+    `too_many_pending` or `rate_limited`. Nothing was written."""
+
+    def __init__(self, kind: str, message: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+
+
 class UnknownJournalEntry(StoreError):
     """No journal entry with this id."""
 

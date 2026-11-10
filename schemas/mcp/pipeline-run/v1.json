@@ -1,0 +1,199 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/horae-dev/horae/main/schemas/mcp/pipeline-run/v1.json",
+  "$defs": {
+    "PendingApproval": {
+      "additionalProperties": false,
+      "description": "The approval the user must give, out of band, before anything is applied.",
+      "properties": {
+        "id": {
+          "pattern": "^apr-[a-z2-7]{12}$",
+          "title": "Id",
+          "type": "string"
+        },
+        "status": {
+          "const": "pending",
+          "title": "Status",
+          "type": "string"
+        },
+        "expires_at": {
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+          "title": "Expires At",
+          "type": "string"
+        },
+        "approve_with": {
+          "description": "The command the user runs on the instance's terminal. A client cannot approve.",
+          "maxLength": 200,
+          "title": "Approve With",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "status",
+        "expires_at",
+        "approve_with"
+      ],
+      "title": "PendingApproval",
+      "type": "object"
+    },
+    "PlanCounts": {
+      "additionalProperties": false,
+      "properties": {
+        "notes": {
+          "minimum": 0,
+          "title": "Notes",
+          "type": "integer"
+        },
+        "tasks": {
+          "minimum": 0,
+          "title": "Tasks",
+          "type": "integer"
+        },
+        "notifications": {
+          "minimum": 0,
+          "title": "Notifications",
+          "type": "integer"
+        },
+        "http_calls": {
+          "minimum": 0,
+          "title": "Http Calls",
+          "type": "integer"
+        },
+        "problems": {
+          "minimum": 0,
+          "title": "Problems",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "notes",
+        "tasks",
+        "notifications",
+        "http_calls",
+        "problems"
+      ],
+      "title": "PlanCounts",
+      "type": "object"
+    },
+    "PlannedChange": {
+      "additionalProperties": false,
+      "description": "One change the dry run would apply (or an intent it could not plan): what, never its\ncontent (no note body, diff, notification text or HTTP body).",
+      "properties": {
+        "kind": {
+          "enum": [
+            "note",
+            "task",
+            "notification",
+            "http",
+            "problem"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "action": {
+          "description": "`create`, `modify`, `unchanged` (note); `create`, `update`, `existing`, `update_status`\n(task); `send`, `duplicate` (notification); `post` (http); the problem's kind.",
+          "pattern": "^[a-z_]{1,32}$",
+          "title": "Action",
+          "type": "string"
+        },
+        "target": {
+          "description": "UNTRUSTED. A note path, a task fingerprint, the notifier, a URL (clipped, redacted).",
+          "maxLength": 256,
+          "title": "Target",
+          "type": "string",
+          "x-untrusted": true
+        }
+      },
+      "required": [
+        "kind",
+        "action",
+        "target"
+      ],
+      "title": "PlannedChange",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Result of `pipeline.run`: a dry run (nothing applied), what it would apply, and the\napproval the user must give for it (`null` with a `reason` when there is nothing to\napprove).",
+  "properties": {
+    "schema_version": {
+      "const": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "pipeline": {
+      "pattern": "^[A-Za-z0-9._:-]{1,128}$",
+      "title": "Pipeline",
+      "type": "string"
+    },
+    "dry_run_id": {
+      "pattern": "^[A-Za-z0-9._:-]{1,128}$",
+      "title": "Dry Run Id",
+      "type": "string"
+    },
+    "run_status": {
+      "enum": [
+        "running",
+        "ok",
+        "noop",
+        "degraded",
+        "failed",
+        "undone"
+      ],
+      "title": "Run Status",
+      "type": "string"
+    },
+    "approval": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PendingApproval"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "reason": {
+      "anyOf": [
+        {
+          "pattern": "^[a-z_]{1,32}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Why there is no approval: `run_failed`, `plan_has_problems`, `nothing_to_apply`, or a\nrefusal (`run_failed`, `run_undone`, `already_applied`).",
+      "title": "Reason"
+    },
+    "counts": {
+      "$ref": "#/$defs/PlanCounts"
+    },
+    "changes": {
+      "items": {
+        "$ref": "#/$defs/PlannedChange"
+      },
+      "maxItems": 50,
+      "title": "Changes",
+      "type": "array"
+    },
+    "truncated": {
+      "title": "Truncated",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "schema_version",
+    "pipeline",
+    "dry_run_id",
+    "run_status",
+    "approval",
+    "reason",
+    "counts",
+    "changes",
+    "truncated"
+  ],
+  "title": "Horae MCP tool result: pipeline.run",
+  "type": "object"
+}

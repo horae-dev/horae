@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """The SQLite store: runs, step records, journal, LLM cache, task index, notification state,
-MCP token digests.
+MCP token digests, `pipeline.run` approvals.
 
 See ADR 0006. The schema is created and upgraded by numbered SQL migrations shipped in
 `horae/store/migrations/`; `PRAGMA user_version` is the schema version. Every failure is a
@@ -9,6 +9,7 @@ See ADR 0006. The schema is created and upgraded by numbered SQL migrations ship
 
 from horae.store._errors import (
     ActTokenUsed,
+    ApprovalLimited,
     InvalidRow,
     JournalTooLarge,
     McpTokenExists,
@@ -32,12 +33,16 @@ from horae.store._store import (
     ACT_OUTCOMES,
     ACT_PIPELINE,
     ACT_RETENTION_S,
+    APPROVAL_FINAL,
     DEFAULT_BUSY_TIMEOUT_MS,
     EVAL_PIPELINE_PREFIX,
     HEARTBEAT_BUSY_TIMEOUT_MS,
     MAX_JOURNAL_BYTES,
     MAX_LIST_RUNS,
     MAX_NESTING,
+    ApprovalEvent,
+    ApprovalRow,
+    ApprovalStatus,
     CacheEntry,
     DaySpend,
     JournalEntry,
@@ -56,6 +61,7 @@ __all__ = [
     "ACT_OUTCOMES",
     "ACT_PIPELINE",
     "ACT_RETENTION_S",
+    "APPROVAL_FINAL",
     "DEFAULT_BUSY_TIMEOUT_MS",
     "EVAL_PIPELINE_PREFIX",
     "HEARTBEAT_BUSY_TIMEOUT_MS",
@@ -64,6 +70,10 @@ __all__ = [
     "MAX_NESTING",
     "SCHEMA_VERSION",
     "ActTokenUsed",
+    "ApprovalEvent",
+    "ApprovalLimited",
+    "ApprovalRow",
+    "ApprovalStatus",
     "CacheEntry",
     "DaySpend",
     "InvalidRow",

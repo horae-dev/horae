@@ -90,6 +90,15 @@ resolves every secret the instance names (`Instance.prime_redaction`) before it 
 lock, so the store's secret gate, the engine's plan-time refusal of a secret in a `--var` or
 a parameter, the LLM layer and the logs know them all from the start.
 
+**Applying an approved plan** (#55, schemas decision 77). `Runner.apply_planned(dry, verify,
+claim=)` applies the intents a finished dry run proposed without running the pipeline again:
+with the pipeline lock held and `claim()` true (the approval's single use; `ClaimRefused`
+otherwise, nothing written), it begins a new run whose record is the dry run's (same steps,
+inputs, intents and context; not a dry run, no LLM call or cost of its own), then plans it
+under the apply lock and calls `verify(record, planned)` before anything is applied: a
+message there fails the run with nothing applied. The apply, shielding, saving and crash
+handling are those of step 5 and 6.
+
 **The CLI.** `horae run` (`horae.cli_run`, #26) cancels the run on SIGINT and SIGTERM, as
 above, and exits 130 / 143; `on_begin(run_id)` tells it the run's id as soon as the row
 exists, so it can name the run whatever happens next.
@@ -106,7 +115,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from horae.api.act import act_minter
-from horae.apply import ActMinter, SinkRegistry, apply_changes, plan_changes
+from horae.apply import ActMinter, ChangeSet, SinkRegistry, apply_changes, plan_changes
 from horae.config import Instance
 from horae.contracts import (
     ActStep,
@@ -206,6 +215,15 @@ class PipelineLocked(RunnerError):
         )
 
 
+class ClaimRefused(RunnerError):
+    """`apply_planned`'s claim was refused (the approval is no longer pending): nothing was
+    written."""
+
+    def __init__(self, pipeline: str) -> None:
+        super().__init__(f"the plan of pipeline {pipeline!r} can no longer be applied")
+        self.pipeline = pipeline
+
+
 class RunLost(RunnerError):
     """The run's row was abandoned by someone else while it was running; it was stopped."""
 
@@ -294,6 +312,27 @@ def _timed_out(record: RunRecord, timeout_s: float) -> RunRecord:
 def _failed(record: RunRecord, error: str) -> RunRecord:
     """`record`, `failed` with `error`, nothing applied."""
     return record.model_copy(update={"status": "failed", "error": error})
+
+
+Verify = Callable[[RunRecord, ChangeSet], str | None]
+"""Checks a planned change set before it is applied: `None` to apply, else why not."""
+
+
+def _reapplied(dry: RunRecord, run_id: str, started_at: datetime) -> RunRecord:
+    """The record of a run applying what dry run `dry` proposed: its steps, inputs, intents
+    and context under `run_id`, not a dry run, with no LLM call or cost of its own (the dry
+    run made and paid for them)."""
+    data = dry.model_dump(mode="json")
+    data.update(
+        id=run_id,
+        dry_run=False,
+        started_at=started_at.isoformat(),
+        finished_at=started_at.isoformat(),
+        changes=[],
+        llm=[],
+        cost=Usage(tokens_in=0, tokens_out=0, usd=0.0).model_dump(mode="json", exclude_none=True),
+    )
+    return RunRecord.model_validate(data)
 
 
 def recover_pipeline(
@@ -460,6 +499,50 @@ class Runner:
         finally:
             lock.release()
 
+    async def apply_planned(
+        self,
+        dry: RunRecord,
+        verify: Verify,
+        *,
+        claim: Callable[[], bool],
+        on_begin: Callable[[str], object] | None = None,
+    ) -> RunRecord:
+        """Apply what finished dry run `dry` proposed, as a new run, if `verify` accepts the
+        plan made under the apply lock (see the module docstring); its saved record.
+
+        `claim()` is called once the pipeline lock is held, before anything is written:
+        false raises `ClaimRefused`. Raises what `run` raises otherwise (`PipelineLocked`,
+        `RunLost`, a cancellation after the record is saved, a crash: the run is abandoned)."""
+        if not dry.dry_run or dry.status not in {"ok", "noop", "degraded"}:
+            raise ValueError("only a finished dry run that did not fail can be applied")
+        name = dry.pipeline
+        self._pipeline(name)
+        logs.install()
+        self.instance.prime_redaction()
+        lock = await self._lock(name)
+        try:
+            self._recover(name)
+            if not claim():
+                raise ClaimRefused(name)
+            started_at = self.clock()
+            state = _State(self._begin(name, started_at, False))
+            try:
+                if on_begin is not None:
+                    on_begin(state.run_id)
+                record = _reapplied(dry, state.run_id, started_at)
+                record, cancelled = await self._shielded_apply(state, record, verify)
+                record = record.model_copy(update={"finished_at": max(self.clock(), started_at)})
+                self._save(state, record, None)
+                if cancelled:
+                    raise asyncio.CancelledError
+                return record
+            except BaseException as exc:
+                if not state.settled:
+                    self._abandon_crashed(state, exc)
+                raise
+        finally:
+            lock.release()
+
     def _abandon_crashed(self, state: _State, exc: BaseException) -> None:
         # Only the exception's type: its message may hold data from a plugin or the store.
         run_id = state.run_id
@@ -576,11 +659,13 @@ class Runner:
                 return lock
             await asyncio.sleep(_APPLY_LOCK_POLL_S)
 
-    async def _shielded_apply(self, state: _State, record: RunRecord) -> tuple[RunRecord, bool]:
+    async def _shielded_apply(
+        self, state: _State, record: RunRecord, verify: Verify | None = None
+    ) -> tuple[RunRecord, bool]:
         """`_apply` in its own task, shielded from the caller's cancellation: a cancellation
         is remembered (`state.stop_requested`) and the apply finishes. Returns the record
         and whether the caller cancelled meanwhile."""
-        applying = asyncio.create_task(self._apply(state, record))
+        applying = asyncio.create_task(self._apply(state, record, verify))
         cancelled = False
         while True:
             try:
@@ -592,8 +677,11 @@ class Runner:
                 cancelled = True
                 state.stop_requested = True
 
-    async def _apply(self, state: _State, record: RunRecord) -> RunRecord:
-        """Plan and apply the record's intents (see the module docstring, step 5)."""
+    async def _apply(
+        self, state: _State, record: RunRecord, verify: Verify | None = None
+    ) -> RunRecord:
+        """Plan and apply the record's intents (see the module docstring, step 5); with
+        `verify`, only when it accepts the plan (`apply_planned`)."""
         sinks = self.ports.sinks
         if sinks is None or not self._applies(record):
             return record
@@ -624,6 +712,9 @@ class Runner:
                     known_task=self.store.get_task,
                     call_timeout_s=timeout_s,
                 )
+                refusal = None if verify is None else verify(record, planned)
+                if refusal is not None:
+                    return _failed(record, refusal)
                 result = await apply_changes(
                     record,
                     planned,
@@ -791,6 +882,7 @@ __all__ = [
     "DEFAULT_HEARTBEAT_S",
     "LOCK_RETRY_S",
     "STOP_GRACE_S",
+    "ClaimRefused",
     "PipelineLocked",
     "Ports",
     "RunLost",
@@ -798,6 +890,7 @@ __all__ = [
     "Runner",
     "RunnerError",
     "UnknownPipeline",
+    "Verify",
     "new_run_id",
     "recover_pipeline",
 ]

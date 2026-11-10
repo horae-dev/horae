@@ -94,6 +94,7 @@ from horae.engine.ports import PreviousLlm
 from horae.secrets.redact import current as current_redactor
 from horae.store._errors import (
     ActTokenUsed,
+    ApprovalLimited,
     InvalidRow,
     JournalTooLarge,
     McpTokenExists,
@@ -457,6 +458,58 @@ class McpTokenRow:
     expires_at: datetime | None
     last_used_at: datetime | None
     revoked_at: datetime | None
+
+
+ApprovalStatus = Literal[
+    "planning",
+    "pending",
+    "approving",
+    "applied",
+    "failed",
+    "refused",
+    "denied",
+    "revoked",
+    "expired",
+    "void",
+]
+"""Where a `pipeline.run` approval stands (#55, schemas decision 77 D)."""
+APPROVAL_FINAL: frozenset[str] = frozenset(
+    {"applied", "failed", "refused", "denied", "revoked", "expired", "void"}
+)
+_APPROVAL_COLUMNS = (
+    "id, pipeline, token_id, requested_by, status, created_at, expires_at, decided_at, "
+    "dry_run_id, applied_run_id, binding_sha256, reason"
+)
+
+
+@dataclass(frozen=True)
+class ApprovalRow:
+    """A `pipeline.run` request and where its approval stands (#55)."""
+
+    id: str
+    pipeline: str
+    token_id: int | None
+    """The MCP token that asked; `None` over stdio."""
+    requested_by: str
+    """The token's name, or `stdio`."""
+    status: ApprovalStatus
+    created_at: datetime
+    expires_at: datetime | None
+    decided_at: datetime | None
+    dry_run_id: str | None
+    applied_run_id: str | None
+    binding_sha256: str | None
+    reason: str | None
+
+
+@dataclass(frozen=True)
+class ApprovalEvent:
+    """One transition of an approval, from its append-only journal (`approval_events`)."""
+
+    at: datetime
+    event: ApprovalStatus
+    run_id: str | None
+    detail: str | None
 
 
 @dataclass(frozen=True)
@@ -2050,6 +2103,272 @@ class Store:
                 "UPDATE mcp_tokens SET last_used_at = ? WHERE id = ? AND revoked_at IS NULL",
                 (_ts(at), token_id),
             )
+
+    # --- pipeline.run approvals (#55, schemas decision 77) -----------------------------------
+
+    @staticmethod
+    def _approval(row: tuple[Any, ...]) -> ApprovalRow:
+        return ApprovalRow(
+            id=str(row[0]),
+            pipeline=str(row[1]),
+            token_id=None if row[2] is None else int(row[2]),
+            requested_by=str(row[3]),
+            status=row[4],
+            created_at=_dt(row[5]),
+            expires_at=_opt_dt(row[6]),
+            decided_at=_opt_dt(row[7]),
+            dry_run_id=row[8],
+            applied_run_id=row[9],
+            binding_sha256=row[10],
+            reason=row[11],
+        )
+
+    def _approval_event(
+        self,
+        approval_id: str,
+        event: str,
+        at: datetime,
+        run_id: str | None = None,
+        detail: str | None = None,
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO approval_events (approval_id, at, event, run_id, detail) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (approval_id, _ts(at), event, run_id, detail),
+        )
+
+    def _reason(self, reason: str | None) -> str | None:
+        if reason is None:
+            return None
+        text = self._text(reason, "an approval's reason")[0]
+        return text[:500] or None
+
+    @_api
+    def approval_open(
+        self,
+        approval_id: str,
+        pipeline: str,
+        *,
+        token_id: int | None,
+        requested_by: str,
+        at: datetime,
+        max_open: int,
+        max_per_hour: int,
+    ) -> None:
+        """Record a new `planning` request of `requested_by` (`token_id`, `None` for stdio).
+
+        Raises `ApprovalLimited` (nothing written) when that requester already has `max_open`
+        requests `planning` (begun within the hour) or `pending` (not expired), or made
+        `max_per_hour` requests in the last hour. The check and the insert are one
+        transaction."""
+        stamp, hour_ago = _ts(at), _ts(at - timedelta(hours=1))
+        with self.transaction():
+            (open_count,) = self._conn.execute(
+                "SELECT count(*) FROM approvals WHERE token_id IS ? AND ("
+                "(status = 'planning' AND created_at > ?) "
+                "OR (status = 'pending' AND expires_at > ?))",
+                (token_id, hour_ago, stamp),
+            ).fetchone()
+            if open_count >= max_open:
+                raise ApprovalLimited(
+                    "too_many_pending",
+                    f"{open_count} approvals are already waiting for the user (at most "
+                    f"{max_open}); ask them to approve or deny one first",
+                )
+            (recent,) = self._conn.execute(
+                "SELECT count(*) FROM approvals WHERE token_id IS ? AND created_at > ?",
+                (token_id, hour_ago),
+            ).fetchone()
+            if recent >= max_per_hour:
+                raise ApprovalLimited(
+                    "rate_limited", f"at most {max_per_hour} pipeline.run requests an hour"
+                )
+            self._conn.execute(
+                "INSERT INTO approvals (id, pipeline, token_id, requested_by, status, "
+                "created_at) VALUES (?, ?, ?, ?, 'planning', ?)",
+                (approval_id, pipeline, token_id, requested_by, stamp),
+            )
+            self._approval_event(approval_id, "planning", at, detail=requested_by)
+
+    def _approval_move(
+        self,
+        approval_id: str,
+        sources: tuple[str, ...],
+        target: str,
+        at: datetime,
+        *,
+        run_id: str | None = None,
+        reason: str | None = None,
+        extra: str = "",
+        args: tuple[Any, ...] = (),
+        condition: str = "",
+        condition_args: tuple[Any, ...] = (),
+    ) -> bool:
+        """Move one approval from one of `sources` to `target` (a compare-and-set), with its
+        event, in one transaction; whether it moved."""
+        marks = ", ".join("?" for _ in sources)
+        why = self._reason(reason)
+        with self.transaction():
+            cur = self._conn.execute(
+                f"UPDATE approvals SET status = ?, reason = coalesce(?, reason){extra} "  # noqa: S608
+                f"WHERE id = ? AND status IN ({marks}){condition}",
+                (target, why, *args, approval_id, *sources, *condition_args),
+            )
+            if cur.rowcount != 1:
+                return False
+            self._approval_event(approval_id, target, at, run_id, why)
+        return True
+
+    @_api
+    def approval_planned(
+        self,
+        approval_id: str,
+        *,
+        dry_run_id: str,
+        binding_sha256: str,
+        expires_at: datetime,
+        at: datetime,
+    ) -> bool:
+        """`planning` → `pending`: the dry run `dry_run_id` planned something to approve."""
+        if re.fullmatch(r"[0-9a-f]{64}", binding_sha256) is None:
+            raise ValueError("a binding digest is 64 lowercase hex characters")
+        return self._approval_move(
+            approval_id,
+            ("planning",),
+            "pending",
+            at,
+            run_id=dry_run_id,
+            extra=", dry_run_id = ?, binding_sha256 = ?, expires_at = ?",
+            args=(dry_run_id, binding_sha256, _ts(expires_at)),
+        )
+
+    @_api
+    def approval_void(
+        self, approval_id: str, *, at: datetime, reason: str, dry_run_id: str | None = None
+    ) -> bool:
+        """`planning` → `void`: nothing to approve (the run failed, or planned nothing)."""
+        return self._approval_move(
+            approval_id,
+            ("planning",),
+            "void",
+            at,
+            run_id=dry_run_id,
+            reason=reason,
+            extra=", decided_at = ?, dry_run_id = ?",
+            args=(_ts(at), dry_run_id),
+        )
+
+    @_api
+    def approval_decide(
+        self,
+        approval_id: str,
+        status: Literal["denied", "revoked", "expired", "refused"],
+        *,
+        at: datetime,
+        reason: str | None = None,
+    ) -> bool:
+        """`pending` → `status`; whether it was pending."""
+        if status not in {"denied", "revoked", "expired", "refused"}:
+            raise ValueError(f"not a decision: {status}")
+        return self._approval_move(
+            approval_id,
+            ("pending",),
+            status,
+            at,
+            reason=reason,
+            extra=", decided_at = ?",
+            args=(_ts(at),),
+        )
+
+    @_api
+    def approval_claim(self, approval_id: str, *, at: datetime) -> bool:
+        """`pending` → `approving`, only while not expired at `at`: the single use of an
+        approval (decision 77 E). Of two concurrent claims one wins."""
+        return self._approval_move(
+            approval_id,
+            ("pending",),
+            "approving",
+            at,
+            extra=", decided_at = ?",
+            args=(_ts(at),),
+            condition=" AND expires_at > ?",
+            condition_args=(_ts(at),),
+        )
+
+    @_api
+    def approval_finish(
+        self,
+        approval_id: str,
+        status: Literal["applied", "failed", "refused"],
+        *,
+        at: datetime,
+        run_id: str | None,
+        reason: str | None = None,
+    ) -> bool:
+        """`approving` → `status`, naming the run that applied (or refused) it."""
+        if status not in {"applied", "failed", "refused"}:
+            raise ValueError(f"not an outcome: {status}")
+        return self._approval_move(
+            approval_id,
+            ("approving",),
+            status,
+            at,
+            run_id=run_id,
+            reason=reason,
+            extra=", applied_run_id = ?",
+            args=(run_id,),
+        )
+
+    @_api
+    def approval_expire(self, *, at: datetime) -> list[str]:
+        """Mark every `pending` approval whose TTL has passed at `at` `expired`; their ids."""
+        stamp = _ts(at)
+        with self.transaction():
+            rows = self._conn.execute(
+                "SELECT id FROM approvals WHERE status = 'pending' AND expires_at <= ? "
+                "ORDER BY created_at, id",
+                (stamp,),
+            ).fetchall()
+            for (approval_id,) in rows:
+                self._conn.execute(
+                    "UPDATE approvals SET status = 'expired', decided_at = ? WHERE id = ?",
+                    (stamp, approval_id),
+                )
+                self._approval_event(approval_id, "expired", at)
+        return [str(r[0]) for r in rows]
+
+    @_api
+    def approval(self, approval_id: str) -> ApprovalRow | None:
+        row = self._conn.execute(
+            f"SELECT {_APPROVAL_COLUMNS} FROM approvals WHERE id = ?",  # noqa: S608
+            (approval_id,),
+        ).fetchone()
+        return None if row is None else self._approval(row)
+
+    @_api
+    def approvals(
+        self, *, status: ApprovalStatus | None = None, limit: int = 50
+    ) -> list[ApprovalRow]:
+        """Approvals newest first, of one `status` or all, at most `limit`."""
+        if not 1 <= limit <= MAX_LIST_RUNS:
+            raise ValueError(f"limit must be between 1 and {MAX_LIST_RUNS}")
+        rows = self._conn.execute(
+            f"SELECT {_APPROVAL_COLUMNS} FROM approvals "  # noqa: S608
+            "WHERE (:status IS NULL OR status = :status) "
+            "ORDER BY created_at DESC, id DESC LIMIT :limit",
+            {"status": status, "limit": limit},
+        ).fetchall()
+        return [self._approval(row) for row in rows]
+
+    @_api
+    def approval_events(self, approval_id: str) -> list[ApprovalEvent]:
+        """The journal of one approval, oldest first."""
+        rows = self._conn.execute(
+            "SELECT at, event, run_id, detail FROM approval_events WHERE approval_id = ? "
+            "ORDER BY id",
+            (approval_id,),
+        ).fetchall()
+        return [ApprovalEvent(_dt(r[0]), r[1], r[2], r[3]) for r in rows]
 
     # --- notification state ----------------------------------------------------------------
 

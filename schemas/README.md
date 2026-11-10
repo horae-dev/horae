@@ -4592,8 +4592,10 @@ loosened later without breaking a valid file.
       one tap with a small screen for the diff, and `/act` intents are fixed task actions, not
       an arbitrary run's plan. The API behind the SSO proxy was rejected because `horae serve`
       is optional and has no write route today. Both remain possible later, on top of the same
-      store transitions. The MCP server registers no approve, deny or revoke tool, and the
-      store's approval transitions are not reachable from `horae.mcp_server`.
+      store transitions. The MCP server registers no approve, deny or revoke tool; it imports
+      only `request_dry_run`, and the approving transitions (`approval_claim`,
+      `approval_decide`, `approval_finish`, `Runner.apply_planned`) are not referenced from
+      `horae.mcp_server`.
     - **C, what an approval is bound to.** The approval row keeps a **binding digest**,
       SHA-256 of the canonical JSON of: the pipeline name; the pipeline's digest, the instance's
       `config_digest` and `lock_digest`; the run context (date, time zone, variables) and the
