@@ -8,12 +8,16 @@
 - `horae.plugins.host.transport`: spawn (argv, exact env, new session), JSON-RPC pipes,
   shutdown;
 - `horae.plugins.host.session`: one process, its MCP session and tool calls;
+- `horae.plugins.host.container`: the `runtime: container` spawn, one Docker container per
+  plugin (#49, schemas decision 74);
 - `horae.plugins.host.capture`: stderr capture; `horae.plugins.host.redact` re-exports the
   shared redactor (`horae.secrets.redact`, #53);
 - `horae.plugins.host.logs` re-exports the log scrubber (`horae.secrets.logs`, #53);
 - `horae.plugins.host.errors`: the error kinds.
 
-**Not enforced until M5** (ADR 0003, "declared" tier). A plugin runs as the same user as Horae:
+**Not enforced until M5** (ADR 0003, "declared" tier), and still the case with the default
+`runtime: process` (`runtime: container`, #49, isolates the plugin's files, processes and
+network; see `horae.plugins.host.container`). A plugin runs as the same user as Horae:
 it can reach any host, read and write any path the user can (its empty `HOME`, `TMPDIR` and
 working directory are hygiene, not isolation), use unbounded CPU and memory, and on Linux read
 `/proc/<horae-pid>/environ`, i.e. every secret Horae itself got through **its own**

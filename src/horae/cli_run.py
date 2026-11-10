@@ -110,7 +110,13 @@ MAX_VAR_CHARS = 4096
 _SHOWN_NAME = 64
 """Characters of a malformed `--var`'s name echoed (never its value)."""
 PLUGIN_START_KINDS = frozenset(
-    {"plugin_unavailable", "spawn_failed", "startup_timeout", "handshake_failed"}
+    {
+        "plugin_unavailable",
+        "spawn_failed",
+        "runtime_unavailable",
+        "startup_timeout",
+        "handshake_failed",
+    }
 )
 """Plan problem kinds of a sink plugin that could not start: a dry run with one exits 1."""
 _SIGNALS = (signal.SIGINT, signal.SIGTERM)

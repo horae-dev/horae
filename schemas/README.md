@@ -4349,10 +4349,121 @@ loosened later without breaking a valid file.
       `upgrade`, a bad name or grant), 3 refused as above, 5 `lock_busy`. `audit`: 0 no drift,
       1 configuration problem or invalid lock, 4 drift.
 
+### Provisional decisions (#49, pending maintainer review)
+
+74. **A per-plugin container runtime (#49).** One additive schema change to `instance/v1.json`:
+    `plugin_defaults.runtime`, `plugins.<name>.runtime` and a `container` section (A, G). Code in
+    `horae.plugins.host.container`; operator guide in
+    [docs/operations/plugin-containers.md](../docs/operations/plugin-containers.md).
+    - **A, where it is chosen.** `runtime: process | container`, in `horae.yaml`:
+      `plugin_defaults.runtime` (default `process`, the behaviour before #49) and
+      `plugins.<name>.runtime`, which wins. The operator chooses, never the plugin: the manifest
+      and the lock do not carry it, so a plugin cannot opt out. A plugin of `horae.lock` without a
+      `plugins.<name>` entry gets the default.
+    - **B, the engine: Docker, through its CLI.** `docker run --interactive` speaks MCP over the
+      container's stdin and stdout, as the process runtime does over a child's pipes; the host's
+      transport, timeouts, restarts and redaction are unchanged. Podman is not supported yet: its
+      networking (netavark) and rootless user mapping differ, and the guarantees below were
+      verified on Docker only. The CLI is `container.docker` (an absolute path) or `docker` on the
+      base `PATH` (`/usr/local/bin:/usr/bin:/bin`); it runs with an allow-listed environment (the
+      `DOCKER_*` connection variables, `HOME`, `XDG_*`), never a plugin secret. The engine must be
+      **local**: `DOCKER_HOST`, when set, and the endpoint of the context the CLI uses (`docker
+      context inspect`) must be a `unix://` socket; `tcp://`, `ssh://` or anything else is
+      refused (a remote engine would receive the secrets over the network and bind its own
+      host's paths).
+    - **C, the container.** `docker run --interactive --rm --init --pull never --log-driver none
+      --user <uid>:<gid> --read-only --cap-drop ALL --security-opt no-new-privileges --tmpfs
+      /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777 --network horae-plugin-<name> --mount
+      type=bind,source=<plugin dir>,target=/plugin,readonly --workdir /tmp --entrypoint
+      /usr/local/bin/python3 <image> -I -S -c <launcher> <command>`. Docker's default seccomp
+      profile applies (no `--security-opt seccomp=` is ever passed, nor `--privileged`,
+      `--cap-add`, `--device` or a host namespace). The user is Horae's own uid and gid (so the
+      plugin can read its tree, owned by Horae), and Horae refuses to start a container as root
+      (uid 0). Only the plugin's directory is mounted, read-only; it holds the plugin's venv
+      (`.venv`, decision 69), so nothing else of the host is visible: not `horae.yaml`, the
+      store, `/run/secrets`, other plugins or Horae's environment. `--init` makes Docker's init
+      PID 1, so a plugin's children are reaped and signalled with it. `--log-driver none`: the
+      daemon keeps no copy of what a plugin writes (stderr may echo a secret). `--pull never`:
+      nothing is fetched at run time.
+    - **D, the network.** Each plugin gets its own bridge network, `horae-plugin-<name>`, created
+      on first use with `--internal` (no route out), `com.docker.network.bridge.enable_icc=false`
+      (no container talks to another) and `com.docker.network.bridge.inhibit_ipv4=true` (the host
+      gets no address on it). The last one matters: on a plain internal network the host's own
+      bridge address is the gateway, and every host service listening on `0.0.0.0` (Horae's API
+      on a bare-metal install, sshd, a database) is reachable from the plugin; it was measured on
+      Docker 29. Before every run's first start of a plugin, the network is inspected and must
+      have exactly these properties, carry the label `dev.horae.network=plugin`, be neither
+      `ConfigOnly` nor take its configuration from another network (`ConfigFrom`), and every
+      container already attached must be labelled `dev.horae.plugin=<name>` (a concurrent run of
+      the same plugin) or `dev.horae.egress-proxy` (reserved for #50's proxy); a network of that
+      name that does not (created by hand, by an older Horae) is **refused**, never repaired or
+      deleted. Containers that join after that check are not re-checked during the run. #50 attaches its egress proxy to
+      these networks; until then a container has no egress at all, and `permissions.network` and
+      `network_local` grant nothing in this runtime (they still travel in `_meta`).
+    - **E, secrets.** Never on a command line and never in the container's configuration (`docker
+      inspect` shows the image's `ENV` only). The host sends the plugin's environment (the same
+      one the process runtime builds, decision 28, with container paths: `HOME=/tmp/home`,
+      `TMPDIR=/tmp/tmp`, `VIRTUAL_ENV=/plugin/.venv`, its declared secrets) as the first line of
+      the container's stdin, one JSON object; a launcher run by the image's interpreter (`python3
+      -I -S -c`, its source is a constant of `horae.plugins.host.container`, visible in `docker
+      inspect` and secret-free) reads exactly that line, byte by byte so nothing of the MCP
+      stream is consumed, sets `umask 077`, creates the directories, and `execve`s the plugin
+      command with exactly that environment. The values cross the CLI's connection to the daemon
+      (the local socket) and live in the plugin process inside the container, readable by root
+      on the host as any process's environment is. The host zeroes the preamble's bytearray once
+      written, **best effort only**: the values were also strings (`Secret.reveal()`, the
+      environment mapping, the `json.dumps` output) and the event loop may copy the bytes, so
+      copies remain in Horae's heap until collected. The write is bounded by the plugin's
+      startup timeout (`startup_timeout` past it), so an engine that stalls cannot hang a run.
+    - **F, the command.** Resolved against the plugin's venv only: a bare `command[0]` must exist
+      in `<plugin>/.venv/bin` (`python`, a console script) and runs as
+      `/plugin/.venv/bin/<name>`; a relative path must stay inside the plugin directory (as in
+      the process runtime) and runs as `/plugin/<path>`. An absolute command names a host path
+      and is refused, and so is a plugin without its own venv (the built-in plugins, which run
+      from Horae's own interpreter: set `plugins.<name>.runtime: process` for them).
+    - **G, the image.** `container.image`, default `python:3.12-slim-bookworm@sha256:<digest>`:
+      the **same pinned base image the Horae image is built from** (the `PYTHON_IMAGE` of the
+      `Dockerfile`; a test keeps both equal and Renovate bumps them together). It must be pinned
+      by digest (`@sha256:` and 64 hex characters), else `horae.yaml` is invalid. No image is
+      built: a plugin's venv is linked to the interpreter that built it (decision 69 D), and the
+      Horae image builds venvs with `/usr/local/bin/python3.12`, which this image has at the
+      same path. So before a start the venv's `pyvenv.cfg` must name `home = /usr/local/bin`
+      and a 3.12 version, else the plugin is refused with a message saying so (a venv built by
+      another interpreter, e.g. on a developer's machine, cannot run in it). The image must be
+      present (`docker pull <image>` once; checked with `docker image inspect` on each run's
+      first container start).
+    - **H, fail closed.** With `runtime: container`, a missing CLI, an unreachable daemon, a
+      missing image, a network that is not as in D, a venv as in G, a refused command, Horae
+      running as root, or a path Docker's `--mount` cannot carry (a `,` or `"`) fails the plugin
+      with the new host error kind **`runtime_unavailable`** (nothing started; the plugin is
+      unavailable for the rest of the run, like any failed start). The process runtime is never
+      used instead.
+    - **I, stop.** As in the process runtime (stdin closed, then `SIGTERM`, then `SIGKILL` of
+      the CLI's process group; the CLI forwards the signals to the container), then always
+      `docker rm --force <name>` (bounded, 10 s): a container whose plugin ignores EOF and
+      signals is removed with everything it started. Containers are named
+      `horae-<plugin>-<random>` and labelled `dev.horae.plugin=<name>`. A Horae killed with
+      `SIGKILL` leaves its CLI's container running until the plugin exits on EOF; `docker ps
+      --filter label=dev.horae.plugin` lists such leftovers (no automatic sweep: it could
+      remove the container of a concurrent run).
+    - **J, Horae inside Docker.** The image ships no Docker CLI and mounts no socket: the
+      container runtime is not available to the Horae image as published. The options and
+      their risks are documented in the operator guide (a socket mount is host root, T26; a
+      socket proxy narrows the API but not what `docker run` can do; rootless Docker or Podman
+      on the host; a sidecar). Enabling one is a follow-up, and so is lifting the M5 tier gate
+      (`approval.DIRECT_INSTALLS` and the `first-party` rule, decision 70 E), which needs #50,
+      #51 and #52 too.
+    - **K, left to the sibling stories.** CPU, memory and PID limits and declared mounts are
+      #51; the egress proxy is #50; the malicious-plugin suite is #52. The argument builder
+      (`run_argv`) is the one place they add flags.
+    - **L, cost.** Measured (operator guide, "Latency and sizing"): a container start adds about
+      0.25 s and a stop about 0.2 s per plugin; a call costs the same as in the process runtime;
+      an idle container holds about 9 MiB. Threat rows T26, T27 and T42 to T45 of
+      `docs/security.md`.
+
 ### Provisional decisions (#56, pending maintainer review)
 
-75. **MCP server authentication (#56).** Decision 74 is taken by #49 in parallel; renumber if
-    needed. `horae mcp serve` gains a network transport, streamable HTTP (`--http`), and every
+75. **MCP server authentication (#56).** `horae mcp serve` gains a network transport, streamable HTTP (`--http`), and every
     request on it needs a bearer token. New module `horae.mcp_auth`, commands
     `horae mcp token create|list|revoke` (`horae.cli_mcp_token`), store migration 9
     (`mcp_tokens`). The tools and their contracts (decision 65) are unchanged.

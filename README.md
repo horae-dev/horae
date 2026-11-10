@@ -92,6 +92,19 @@ plugin with its version, source, tier, permissions and last run, and reports dri
 `horae.lock` and the disk (exit 4)
 ([schemas decision 73](schemas/README.md#provisional-decisions-47-pending-maintainer-review)).
 
+**Plugin containers** (M5, #49): with `runtime: container` in `horae.yaml`
+(`plugin_defaults.runtime`, or `plugins.<name>.runtime`, which wins; the default is `process`)
+a plugin runs in its own Docker container instead of as a child process: non-root, read-only
+root filesystem, no capability, Docker's default seccomp profile, a `noexec` tmpfs on `/tmp`,
+only its own directory (tree and venv) mounted read-only, and its own internal network with no
+egress and no route to the host (the egress proxy is #50). Secrets reach it through stdin, never
+its command line or `docker inspect`. If the container cannot start (no Docker, image not
+pulled, a venv the image cannot run), the plugin fails with `runtime_unavailable`: it never
+falls back to a process. Prerequisites, the Horae-in-Docker options (the published image mounts
+no Docker socket), and measured latency (about 0.25 s more per plugin start, the same per call):
+[docs/operations/plugin-containers.md](docs/operations/plugin-containers.md),
+[schemas decision 74](schemas/README.md#provisional-decisions-49-pending-maintainer-review).
+
 `-i` defaults to the current directory (or `HORAE_INSTANCE`). Every command takes `--json`
 for scripting (one JSON document on stdout, `schema_version: 1`, errors too) and prints no
 colour unless asked. `horae run` has no LLM backend in M1: a pipeline with an `llm` step

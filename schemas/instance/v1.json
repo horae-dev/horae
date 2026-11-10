@@ -61,6 +61,37 @@
       "title": "CacheConfig",
       "type": "object"
     },
+    "ContainerConfig": {
+      "additionalProperties": false,
+      "description": "The container runtime's engine and image (schemas decision 74 B, G).",
+      "properties": {
+        "image": {
+          "default": "python:3.12-slim-bookworm@sha256:e697c81897302a4c4333bade000d98038fbb21eb064f8ee1fd42d02ebcd9d337",
+          "description": "The image every plugin container runs, pinned by digest. It must provide\n`/usr/local/bin/python3.12`, the interpreter plugin venvs link to.",
+          "maxLength": 512,
+          "pattern": "^[a-z0-9][a-z0-9._/:-]*@sha256:[0-9a-f]{64}$",
+          "title": "Image",
+          "type": "string"
+        },
+        "docker": {
+          "anyOf": [
+            {
+              "maxLength": 1024,
+              "pattern": "^/[^\\x00-\\x1f\\x7f]*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The Docker CLI, as an absolute path. When omitted, `docker` on\n`/usr/local/bin:/usr/bin:/bin`.",
+          "title": "Docker"
+        }
+      },
+      "title": "ContainerConfig",
+      "type": "object"
+    },
     "DailyBudget": {
       "additionalProperties": false,
       "anyOf": [
@@ -562,7 +593,7 @@
     },
     "PluginDefaults": {
       "additionalProperties": false,
-      "description": "Timeouts for every plugin without its own setting (the #24 plugin host reads them).",
+      "description": "Timeouts and runtime for every plugin without its own setting (the #24 plugin host reads\nthem).",
       "properties": {
         "startup_timeout_s": {
           "default": 10.0,
@@ -579,6 +610,16 @@
           "minimum": 1.0,
           "title": "Call Timeout S",
           "type": "number"
+        },
+        "runtime": {
+          "default": "process",
+          "description": "`process` (default) or `container` (schemas decision 74). With `container` a plugin that\ncannot run in a container is refused (`runtime_unavailable`), never run as a process.",
+          "enum": [
+            "process",
+            "container"
+          ],
+          "title": "Runtime",
+          "type": "string"
         }
       },
       "title": "PluginDefaults",
@@ -617,6 +658,23 @@
           "default": null,
           "description": "Seconds one tool call may take. When omitted, `plugin_defaults` applies.",
           "title": "Call Timeout S"
+        },
+        "runtime": {
+          "anyOf": [
+            {
+              "enum": [
+                "process",
+                "container"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "`process` or `container`. When omitted, `plugin_defaults.runtime` applies.",
+          "title": "Runtime"
         }
       },
       "title": "PluginSettings",
@@ -803,7 +861,7 @@
     },
     "plugin_defaults": {
       "$ref": "#/$defs/PluginDefaults",
-      "description": "Timeouts for every plugin, unless `plugins.<name>` overrides them."
+      "description": "Timeouts and runtime for every plugin, unless `plugins.<name>` overrides them."
     },
     "plugins": {
       "description": "Per-plugin settings, by plugin name.",
@@ -819,6 +877,10 @@
       "title": "Plugins",
       "type": "object",
       "additionalProperties": false
+    },
+    "container": {
+      "$ref": "#/$defs/ContainerConfig",
+      "description": "The container runtime's engine and image (used by plugins with `runtime: container`)."
     },
     "secrets": {
       "$ref": "#/$defs/SecretsConfig"

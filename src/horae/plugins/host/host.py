@@ -36,6 +36,11 @@ run's `ToolCaller`:
   (`horae.plugins.host.transport`) with the environment of `horae.plugins.host.env` and an
   empty working directory, and the MCP handshake and
   `tools/list` must finish within the plugin's `startup_timeout_s` (`startup_timeout`);
+- **runtime** (schemas decision 74): the plugin's effective `runtime` (`horae.yaml`) picks the
+  spawn. `process` is the above; `container` starts the same MCP session in the plugin's own
+  Docker container (`horae.plugins.host.container`: read-only, no network, only its directory
+  mounted, secrets through stdin). Whatever it lacks is `runtime_unavailable` and the plugin
+  does not start: there is no fallback to `process`;
 - **calls**: the tool must be in the manifest's `provides` and in `tools/list`
   (`tool_missing`); each call is bounded by its pipeline `timeout_s`, else the plugin's
   `call_timeout_s` (`horae.yaml`), else `plugin_defaults.call_timeout_s`;
@@ -85,7 +90,8 @@ decision 35 A): every plugin runs as the same user, so while two plugins run at 
 one can read the other's environment, hence its declared secrets (`/proc/<pid>/environ` on
 Linux, `ps eww` on some systems). This is accepted for first-party plugins only (the
 "declared" tier) and narrowed by stopping each plugin after its last planned call, so a plugin
-is not alive during later steps that do not use it.
+is not alive during later steps that do not use it. A plugin with `runtime: container` sees
+neither Horae's nor another plugin's processes, files or environment.
 """
 
 import json
@@ -106,7 +112,7 @@ import mcp_types
 
 from horae.config import Instance
 from horae.config.documents import read_yaml, validate
-from horae.contracts.instance import PluginDefaults
+from horae.contracts.instance import ContainerConfig, PluginDefaults
 from horae.contracts.lockfile import LockedPlugin, Lockfile
 from horae.contracts.plugin import (
     SINK_OPERATIONS,
@@ -123,6 +129,7 @@ from horae.engine.ports import ResolvedPlugin, ToolResult, UnknownPlugin
 from horae.marketplace.install import INSTALL_RECORD
 from horae.plugins.host import logs
 from horae.plugins.host.capture import StderrCapture
+from horae.plugins.host.container import ContainerRuntime
 from horae.plugins.host.env import BASE_PATH, build_env, check_names, plugin_venv
 from horae.plugins.host.errors import HostErrorKind, PluginCallError
 from horae.plugins.host.redact import MAX_EXPANSION, Redactor, SecretInKey
@@ -380,12 +387,15 @@ class PluginHost:
         work_dir: Path,
         timezone: str = "UTC",
         timeouts: Callable[[str], PluginDefaults] | None = None,
+        container: ContainerConfig | None = None,
     ) -> None:
         self.registry = registry
         self.secrets = secrets
         self.timezone = timezone
         self._work_root = work_dir
         self._timeouts = timeouts or (lambda _name: PluginDefaults())
+        self._containers = ContainerRuntime(container)
+        """Starts the plugins whose runtime is `container` (schemas decision 74)."""
         self._entries: dict[str, _Entry] = {}
         self._group: anyio.abc.TaskGroup | None = None
         self._run_dir: Path | None = None
@@ -673,25 +683,39 @@ class PluginHost:
                 values[secret] = self.secrets.resolve(secret)
             except SecretError:
                 continue  # absent from the environment: the plugin says so if a call needs it
-        argv = resolve_command(list(runtime.command), entry.installed.root)
         if self._run_dir is None or self._group is None:  # pragma: no cover (checked in _call)
             raise PluginCallError("host_error", "the plugin host is not open")
+        settings = self._timeouts(name)
         base = self._run_dir / f"{name}.{entry.starts}"
-        home, tmpdir, cwd = base / "home", base / "tmp", base / "cwd"
-        for directory in (home, tmpdir, cwd):
-            directory.mkdir(mode=0o700, parents=True)
-        env = build_env(
-            name,
-            home=home,
-            tmpdir=tmpdir,
-            timezone=self.timezone,
-            secrets=values,
-            venv=plugin_venv(entry.installed.root),
-        )
-        startup = self._timeouts(name).startup_timeout_s
-        process = PluginProcess(
-            Spawn(name, tuple(argv), env, cwd, startup), StderrCapture(CAPTURE_MARGIN)
-        )
+        cwd = base / "cwd"
+        spawn: Spawn
+        if settings.runtime == "container":
+            # Fail closed (decision 74 H): `runtime_unavailable`, never the process runtime.
+            cwd.mkdir(mode=0o700, parents=True)
+            spawn = await self._containers.spawn(
+                name,
+                root=entry.installed.root,
+                command=list(runtime.command),
+                secrets=values,
+                timezone=self.timezone,
+                cwd=cwd,
+                startup_timeout_s=settings.startup_timeout_s,
+            )
+        else:
+            argv = resolve_command(list(runtime.command), entry.installed.root)
+            home, tmpdir = base / "home", base / "tmp"
+            for directory in (home, tmpdir, cwd):
+                directory.mkdir(mode=0o700, parents=True)
+            env = build_env(
+                name,
+                home=home,
+                tmpdir=tmpdir,
+                timezone=self.timezone,
+                secrets=values,
+                venv=plugin_venv(entry.installed.root),
+            )
+            spawn = Spawn(name, tuple(argv), env, cwd, settings.startup_timeout_s)
+        process = PluginProcess(spawn, StderrCapture(CAPTURE_MARGIN))
         self._group.start_soon(process.serve)
         await process.ready.wait()
         if process.error is not None:
@@ -750,14 +774,16 @@ class PluginHost:
 def host_for_instance(
     instance: Instance, registry: HostRegistry, *, secrets: SecretResolver | None = None
 ) -> PluginHost:
-    """A `PluginHost` for `instance` (`horae.config.Instance`): its time zone, plugin timeouts,
-    secret resolver and `<state_dir>/plugin-runs` as the work directory."""
+    """A `PluginHost` for `instance` (`horae.config.Instance`): its time zone, plugin timeouts
+    and runtimes, container settings, secret resolver and `<state_dir>/plugin-runs` as the work
+    directory."""
     return PluginHost(
         registry,
         secrets=secrets or instance.secret_resolver(),
         work_dir=instance.state_dir / "plugin-runs",
         timezone=instance.config.timezone,
         timeouts=instance.plugin_timeouts,
+        container=instance.config.container,
     )
 
 

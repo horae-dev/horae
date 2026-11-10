@@ -377,13 +377,23 @@ DEFAULT_STARTUP_TIMEOUT_S = 10.0
 DEFAULT_CALL_TIMEOUT_S = 30.0
 
 
+PluginRuntime = Literal["process", "container"]
+"""How the host runs a plugin (schemas decision 74 A): `process`, a child process of Horae
+with the same uid, network and filesystem (the "declared" tier); `container`, its own Docker
+container (read-only, no network, only its own directory mounted, #49)."""
+
+
 class PluginDefaults(Contract):
-    """Timeouts for every plugin without its own setting (the #24 plugin host reads them)."""
+    """Timeouts and runtime for every plugin without its own setting (the #24 plugin host reads
+    them)."""
 
     startup_timeout_s: Timeout = DEFAULT_STARTUP_TIMEOUT_S
     """Seconds a plugin may take to start and answer the MCP handshake."""
     call_timeout_s: Timeout = DEFAULT_CALL_TIMEOUT_S
     """Seconds one tool call may take."""
+    runtime: PluginRuntime = "process"
+    """`process` (default) or `container` (schemas decision 74). With `container` a plugin that
+    cannot run in a container is refused (`runtime_unavailable`), never run as a process."""
 
 
 class PluginSettings(Contract):
@@ -393,6 +403,38 @@ class PluginSettings(Contract):
     """Seconds the plugin may take to start. When omitted, `plugin_defaults` applies."""
     call_timeout_s: Timeout | None = None
     """Seconds one tool call may take. When omitted, `plugin_defaults` applies."""
+    runtime: PluginRuntime | None = None
+    """`process` or `container`. When omitted, `plugin_defaults.runtime` applies."""
+
+
+DEFAULT_CONTAINER_IMAGE = (
+    # renovate: datasource=docker depName=python
+    "python:3.12-slim-bookworm@sha256:e697c81897302a4c4333bade000d98038fbb21eb064f8ee1fd42d02ebcd9d337"
+)
+"""The plugin container image (schemas decision 74 G): the base image the Horae image is built
+from (`PYTHON_IMAGE` in the `Dockerfile`, kept equal by a test), whose interpreter is the one
+plugin venvs are built with."""
+
+PinnedImage = Annotated[
+    str,
+    Strict(),
+    StringConstraints(
+        pattern=r"^[a-z0-9][a-z0-9._/:-]*@sha256:[0-9a-f]{64}$",
+        max_length=512,
+    ),
+]
+"""An image reference pinned by digest: `<name>[:<tag>]@sha256:<64 hex>`."""
+
+
+class ContainerConfig(Contract):
+    """The container runtime's engine and image (schemas decision 74 B, G)."""
+
+    image: PinnedImage = DEFAULT_CONTAINER_IMAGE
+    """The image every plugin container runs, pinned by digest. It must provide
+    `/usr/local/bin/python3.12`, the interpreter plugin venvs link to."""
+    docker: CommandPath | None = None
+    """The Docker CLI, as an absolute path. When omitted, `docker` on
+    `/usr/local/bin:/usr/bin:/bin`."""
 
 
 MIN_RUN_TIMEOUT_S = 1.0
@@ -640,11 +682,13 @@ class InstanceConfig(Contract):
     )
     """Model aliases, by name."""
     plugin_defaults: PluginDefaults = Field(default_factory=PluginDefaults)
-    """Timeouts for every plugin, unless `plugins.<name>` overrides them."""
+    """Timeouts and runtime for every plugin, unless `plugins.<name>` overrides them."""
     plugins: Annotated[dict[PluginName, PluginSettings], Field(max_length=MAX_ITEMS)] = Field(
         default_factory=dict
     )
     """Per-plugin settings, by plugin name."""
+    container: ContainerConfig = Field(default_factory=ContainerConfig)
+    """The container runtime's engine and image (used by plugins with `runtime: container`)."""
     secrets: SecretsConfig = Field(default_factory=SecretsConfig)
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
     runs: RunsConfig = Field(default_factory=RunsConfig)
@@ -678,7 +722,8 @@ class InstanceConfig(Contract):
         return self
 
     def plugin_timeouts(self, plugin: str) -> PluginDefaults:
-        """The effective timeouts of `plugin`: its own settings, else `plugin_defaults`."""
+        """The effective timeouts and runtime of `plugin`: its own settings, else
+        `plugin_defaults`."""
         own = self.plugins.get(plugin, PluginSettings())
         defaults = self.plugin_defaults
         return PluginDefaults(
@@ -690,4 +735,5 @@ class InstanceConfig(Contract):
             call_timeout_s=(
                 defaults.call_timeout_s if own.call_timeout_s is None else own.call_timeout_s
             ),
+            runtime=defaults.runtime if own.runtime is None else own.runtime,
         )

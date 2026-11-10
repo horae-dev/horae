@@ -5,7 +5,7 @@ Horae instance without becoming its brain. This is the read-only part (#54) and 
 authentication (#56); `pipeline.run` with approval (#55) is a separate story. Design:
 [decision 65](../schemas/README.md#provisional-decisions-54-pending-maintainer-review) and
 [decision 75](../schemas/README.md#provisional-decisions-56-pending-maintainer-review), threats
-[T17, T42, T43](security.md).
+[T17, T46, T47](security.md).
 
 - **Transport: stdio by default.** The client starts `horae mcp serve` and talks to it over
   the process's stdin and stdout. Horae opens no port and asks for no token: whoever can start
