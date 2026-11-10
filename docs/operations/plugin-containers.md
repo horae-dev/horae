@@ -36,8 +36,11 @@ The operator chooses, never the plugin: the runtime is not in `plugin.yaml` nor 
 **Prerequisites**, checked before each run's first container start; anything missing **fails
 the plugin** with `runtime_unavailable` (it is not started, and never run as a process instead):
 
-1. A Docker CLI that reaches a Docker Engine (the `DOCKER_HOST`, `DOCKER_CONTEXT` or
-   `DOCKER_CONFIG` of Horae's environment are honoured; nothing else of it is passed to the CLI).
+1. A Docker CLI that reaches a **local** Docker Engine through a `unix://` socket (the
+   `DOCKER_HOST`, `DOCKER_CONTEXT` or `DOCKER_CONFIG` of Horae's environment are honoured;
+   nothing else of it is passed to the CLI). A `tcp://` or `ssh://` engine, set by `DOCKER_HOST`
+   or by the current context, is refused: it would receive the plugin's secrets over the network
+   and mount paths of its own host.
 2. The image, pulled once: `docker pull <image>` (runs use `--pull never`, nothing is fetched at
    run time).
 3. Horae running as a non-root user: the container runs as Horae's own uid and gid (so it can
@@ -88,8 +91,12 @@ and checks on each run:
   container publishing a port) answers there: this was measured on Docker 29 before choosing
   the option, and the live test checks a host listener on `0.0.0.0` is not reachable.
 
-A network of that name that does not have exactly these properties (IPv6 on, another driver, made
-by hand) is refused, never changed or deleted: `docker network rm horae-plugin-<name>` and the
+It must also carry the label `dev.horae.network=plugin`, must not be a configuration-only
+network or take its configuration from another one, and every container already attached to it
+must be labelled `dev.horae.plugin=<name>` (the same plugin in a concurrent run) or
+`dev.horae.egress-proxy` (reserved for the #50 proxy). A network of that name that does not
+pass all of this (IPv6 on, another driver, made by hand, a foreign container attached) is
+refused, never changed or deleted: `docker network rm horae-plugin-<name>` and the
 next run recreates it. Until #50 adds the egress proxy a container has **no network access at
 all**: no DNS, no Internet, no LAN. A plugin that needs `permissions.network` or
 `network_local` fails its calls under this runtime until then (the grants still travel in
@@ -106,7 +113,11 @@ stdin**, one JSON object. A launcher (`python3 -I -S -c <source>`, a constant in
 line, one byte at a time so nothing of the MCP stream is consumed, and `execve`s the plugin with
 exactly that environment. The values cross the CLI's connection to the Docker daemon (its local
 socket) and live in the plugin's process, where root on the host can read them as it can any
-process's environment. Horae zeroes its buffer once the line is written.
+process's environment. Horae zeroes the line's buffer once it is written, but that is **best
+effort**: the values also passed through Python strings (the resolved secret, the environment
+mapping, the JSON text) and the event loop's write buffer, so copies stay in Horae's memory
+until the garbage collector reuses it. The write is bounded by the plugin's startup timeout: an
+engine that does not take it fails the start with `startup_timeout`.
 
 ### Stopping
 

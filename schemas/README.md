@@ -4366,7 +4366,11 @@ loosened later without breaking a valid file.
       networking (netavark) and rootless user mapping differ, and the guarantees below were
       verified on Docker only. The CLI is `container.docker` (an absolute path) or `docker` on the
       base `PATH` (`/usr/local/bin:/usr/bin:/bin`); it runs with an allow-listed environment (the
-      `DOCKER_*` connection variables, `HOME`, `XDG_*`), never a plugin secret.
+      `DOCKER_*` connection variables, `HOME`, `XDG_*`), never a plugin secret. The engine must be
+      **local**: `DOCKER_HOST`, when set, and the endpoint of the context the CLI uses (`docker
+      context inspect`) must be a `unix://` socket; `tcp://`, `ssh://` or anything else is
+      refused (a remote engine would receive the secrets over the network and bind its own
+      host's paths).
     - **C, the container.** `docker run --interactive --rm --init --pull never --log-driver none
       --user <uid>:<gid> --read-only --cap-drop ALL --security-opt no-new-privileges --tmpfs
       /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777 --network horae-plugin-<name> --mount
@@ -4388,8 +4392,12 @@ loosened later without breaking a valid file.
       bridge address is the gateway, and every host service listening on `0.0.0.0` (Horae's API
       on a bare-metal install, sshd, a database) is reachable from the plugin; it was measured on
       Docker 29. Before every run's first start of a plugin, the network is inspected and must
-      have exactly these properties; a network of that name that does not (created by hand, by an
-      older Horae) is **refused**, never repaired or deleted. #50 attaches its egress proxy to
+      have exactly these properties, carry the label `dev.horae.network=plugin`, be neither
+      `ConfigOnly` nor take its configuration from another network (`ConfigFrom`), and every
+      container already attached must be labelled `dev.horae.plugin=<name>` (a concurrent run of
+      the same plugin) or `dev.horae.egress-proxy` (reserved for #50's proxy); a network of that
+      name that does not (created by hand, by an older Horae) is **refused**, never repaired or
+      deleted. Containers that join after that check are not re-checked during the run. #50 attaches its egress proxy to
       these networks; until then a container has no egress at all, and `permissions.network` and
       `network_local` grant nothing in this runtime (they still travel in `_meta`).
     - **E, secrets.** Never on a command line and never in the container's configuration (`docker
@@ -4402,7 +4410,11 @@ loosened later without breaking a valid file.
       stream is consumed, sets `umask 077`, creates the directories, and `execve`s the plugin
       command with exactly that environment. The values cross the CLI's connection to the daemon
       (the local socket) and live in the plugin process inside the container, readable by root
-      on the host as any process's environment is. The host's buffer is zeroed once written.
+      on the host as any process's environment is. The host zeroes the preamble's bytearray once
+      written, **best effort only**: the values were also strings (`Secret.reveal()`, the
+      environment mapping, the `json.dumps` output) and the event loop may copy the bytes, so
+      copies remain in Horae's heap until collected. The write is bounded by the plugin's
+      startup timeout (`startup_timeout` past it), so an engine that stalls cannot hang a run.
     - **F, the command.** Resolved against the plugin's venv only: a bare `command[0]` must exist
       in `<plugin>/.venv/bin` (`python`, a console script) and runs as
       `/plugin/.venv/bin/<name>`; a relative path must stay inside the plugin directory (as in

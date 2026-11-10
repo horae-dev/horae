@@ -64,6 +64,9 @@ NETWORK_PREFIX = "horae-plugin-"
 PLUGIN_LABEL = "dev.horae.plugin"
 """Label of every plugin container (value: the plugin name)."""
 NETWORK_LABEL = "dev.horae.network"
+"""Label of every plugin network (value `plugin`); a network without it is refused."""
+EGRESS_LABEL = "dev.horae.egress-proxy"
+"""Reserved for #50: a container with this label may join a plugin network (its proxy)."""
 NETWORK_OPTIONS = {
     "com.docker.network.bridge.enable_icc": "false",
     "com.docker.network.bridge.inhibit_ipv4": "true",
@@ -396,6 +399,7 @@ class ContainerRuntime:
             docker = self.config.docker or shutil.which("docker", path=BASE_PATH)
             if docker is None or not os.path.isfile(docker) or not os.access(docker, os.X_OK):
                 raise _unavailable(plugin, "the Docker CLI is not installed")
+            await self._check_local(plugin, docker)
             image = self.config.image
             code, _, error = await self._run(
                 docker, "image", "inspect", "--format", "{{.Id}}", image
@@ -408,6 +412,27 @@ class ContainerRuntime:
                 )
             self._docker = docker
             return docker
+
+    async def _check_local(self, plugin: str, docker: str) -> None:
+        """Refuse an engine that is not a local `unix://` socket (decision 74 B): a remote one
+        would get the secrets over the network and bind its own host's paths. `DOCKER_HOST`
+        first, then the endpoint of the context the CLI uses (which reflects `DOCKER_HOST`,
+        `DOCKER_CONTEXT` and the configured current context)."""
+        host = self._env.get("DOCKER_HOST")
+        if host is not None and not is_local_endpoint(host):
+            raise _unavailable(plugin, f"DOCKER_HOST is not a local unix socket ({_scheme(host)})")
+        code, out, error = await self._run(
+            docker, "context", "inspect", "--format", "{{.Endpoints.docker.Host}}"
+        )
+        if code != 0:
+            raise _unavailable(
+                plugin, f"the Docker context cannot be inspected: {_first_line(error)}"
+            )
+        endpoint = out.decode("utf-8", errors="replace").strip()
+        if not is_local_endpoint(endpoint):
+            raise _unavailable(
+                plugin, f"the Docker engine is not a local unix socket ({_scheme(endpoint)})"
+            )
 
     async def _network(self, plugin: str, docker: str) -> None:
         """Create the plugin's network if needed, and check it (decision 74 D)."""
@@ -430,12 +455,41 @@ class ContainerRuntime:
             found = await self._inspect_network(docker, name)  # created here, or concurrently
         if found is None:
             raise _unavailable(plugin, f"network {name} cannot be created")
-        problem = network_problem(found)
+        problem = network_problem(found) or await self._intruders(docker, plugin, found)
         if problem is not None:
             raise _unavailable(
                 plugin, f"network {name} exists but {problem}: remove it (`docker network rm`)"
             )
         self._networks.add(name)
+
+    async def _intruders(
+        self, docker: str, plugin: str, network: Mapping[str, object]
+    ) -> str | None:
+        """Why a container attached to the plugin's network does not belong there, or `None`:
+        each must carry `dev.horae.plugin=<plugin>` (another container of this plugin, a
+        concurrent run) or `EGRESS_LABEL` (#50's proxy)."""
+        attached = network.get("Containers")
+        if not attached:
+            return None
+        if not isinstance(attached, dict):
+            return "lists its containers in an unknown form"
+        ids = sorted(str(key) for key in attached)
+        code, out, _ = await self._run(
+            docker, "container", "inspect", "--format", "{{json .Config.Labels}}", *ids
+        )
+        if code != 0:
+            return "has containers that cannot be inspected"
+        lines = out.decode("utf-8", errors="replace").splitlines()
+        if len(lines) != len(ids):
+            return "has containers that cannot be inspected"
+        for line in lines:
+            try:
+                labels = json.loads(line)
+            except ValueError:
+                return "has containers that cannot be inspected"
+            if not isinstance(labels, dict) or not container_belongs(labels, plugin):
+                return "has a container attached that is not this plugin's"
+        return None
 
     async def _inspect_network(self, docker: str, name: str) -> dict[str, object] | None:
         code, out, _ = await self._run(docker, "network", "inspect", "--format", "{{json .}}", name)
@@ -456,6 +510,14 @@ def network_problem(network: Mapping[str, object]) -> str | None:
         return "is not internal"
     if network.get("EnableIPv6") is True:
         return "has IPv6 enabled"
+    if network.get("ConfigOnly") is True:
+        return "is a configuration-only network"
+    config_from = network.get("ConfigFrom")
+    if isinstance(config_from, dict) and config_from.get("Network"):
+        return "takes its configuration from another network"
+    labels = network.get("Labels")
+    if not isinstance(labels, dict) or labels.get(NETWORK_LABEL) != "plugin":
+        return f"has no {NETWORK_LABEL}=plugin label"
     options = network.get("Options")
     if not isinstance(options, dict):
         return "has no driver options"
@@ -465,12 +527,29 @@ def network_problem(network: Mapping[str, object]) -> str | None:
     return None
 
 
+def container_belongs(labels: Mapping[str, object], plugin: str) -> bool:
+    """Whether a container with `labels` may be on `plugin`'s network: one of its own
+    containers, or #50's egress proxy (`EGRESS_LABEL`)."""
+    return labels.get(PLUGIN_LABEL) == plugin or EGRESS_LABEL in labels
+
+
+def is_local_endpoint(endpoint: str) -> bool:
+    """Whether a Docker endpoint is a local socket (`unix:///...`)."""
+    return endpoint.startswith("unix:///")
+
+
+def _scheme(endpoint: str) -> str:
+    scheme, separator, _ = endpoint.partition("://")
+    return f"{scheme}://" if separator and scheme.isalnum() else "unknown endpoint"
+
+
 def secrets_token() -> str:
     """The random part of a container name."""
     return secrets.token_hex(6)
 
 
 __all__ = [
+    "EGRESS_LABEL",
     "ENGINE_ENV_KEYS",
     "IMAGE_PYTHON",
     "LAUNCHER",
@@ -480,8 +559,10 @@ __all__ = [
     "TMPFS",
     "ContainerRuntime",
     "check_venv",
+    "container_belongs",
     "container_command",
     "engine_env",
+    "is_local_endpoint",
     "mount_source",
     "network_name",
     "network_problem",

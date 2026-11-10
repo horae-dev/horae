@@ -14,6 +14,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -294,7 +295,11 @@ def _network(**changes: Any) -> dict[str, Any]:
         "Driver": "bridge",
         "Internal": True,
         "EnableIPv6": False,
+        "ConfigOnly": False,
+        "ConfigFrom": {"Network": ""},
+        "Labels": {"dev.horae.network": "plugin"},
         "Options": dict(NETWORK_OPTIONS),
+        "Containers": {},
     } | changes
 
 
@@ -305,6 +310,13 @@ def test_only_an_isolated_network_is_accepted() -> None:
     assert network_problem(_network(Driver="macvlan")) == "is not a bridge network"
     assert network_problem(_network(EnableIPv6=True)) == "has IPv6 enabled"
     assert network_problem(_network(Options=None)) == "has no driver options"
+    assert network_problem(_network(Labels={})) == "has no dev.horae.network=plugin label"
+    assert network_problem(_network(Labels=None)) == "has no dev.horae.network=plugin label"
+    assert network_problem(_network(ConfigOnly=True)) == "is a configuration-only network"
+    assert (
+        network_problem(_network(ConfigFrom={"Network": "elsewhere"}))
+        == "takes its configuration from another network"
+    )
     for key in NETWORK_OPTIONS:
         options = dict(NETWORK_OPTIONS)
         del options[key]
@@ -471,6 +483,13 @@ if args[:2] == ["network", "create"]:
     with open(os.path.join(config_dir, "network.json"), "w") as handle:
         handle.write(json.dumps(fake["created"]))
     sys.exit(0)
+if args[:2] == ["context", "inspect"]:
+    print(fake["endpoint"])
+    sys.exit(0)
+if args[:2] == ["container", "inspect"]:
+    for container in args[4:]:
+        print(json.dumps(fake["labels"][container]))
+    sys.exit(0)
 if args[:1] == ["rm"]:
     sys.exit(0)
 if args[:1] == ["run"]:
@@ -491,7 +510,13 @@ def _fake_docker(tmp_path: Path, **fake: Any) -> tuple[Path, Path]:
     """A fake Docker CLI and its state directory (passed as `DOCKER_CONFIG`)."""
     state = tmp_path / "docker-state"
     state.mkdir()
-    settings = {"image": True, "created": _network(), "server": str(RAW_SERVER)} | fake
+    settings = {
+        "image": True,
+        "created": _network(),
+        "server": str(RAW_SERVER),
+        "endpoint": "unix:///var/run/docker.sock",
+        "labels": {},
+    } | fake
     (state / "fake.json").write_text(json.dumps(settings), encoding="utf-8")
     cli = tmp_path / "bin" / "docker"
     cli.parent.mkdir()
@@ -526,6 +551,7 @@ def _host(
     state: Path | None = None,
     uid: int | None = None,
     runtime: str = "container",
+    environ: dict[str, str] | None = None,
 ) -> PluginHost:
     from horae.contracts import PluginManifest
     from horae.plugins.host import HostRegistry
@@ -542,8 +568,8 @@ def _host(
         timeouts=lambda _name: PluginDefaults(runtime=runtime, startup_timeout_s=30.0),  # type: ignore[arg-type]
         container=config,
     )
-    environ = {} if state is None else {"DOCKER_CONFIG": str(state)}
-    h._containers = ContainerRuntime(config, uid=uid, environ=environ)
+    engine = {} if state is None else {"DOCKER_CONFIG": str(state)}
+    h._containers = ContainerRuntime(config, uid=uid, environ=engine | (environ or {}))
     return h
 
 
@@ -586,7 +612,8 @@ def test_a_container_plugin_runs_through_the_cli_with_its_environment_on_stdin(
     assert env["JAIL_TOKEN"] == TOKEN
     calls = _calls(state)
     kinds = [call[:2] for call in calls]
-    assert kinds[:4] == [
+    assert kinds[:5] == [
+        ["context", "inspect"],
         ["image", "inspect"],
         ["network", "inspect"],
         ["network", "create"],
@@ -739,3 +766,108 @@ def test_secrets_in_the_preamble_are_zeroed_once_sent(tmp_path: Path) -> None:
     assert seen[0] is not None
     assert all(byte == 0 for byte in seen[0])
     assert os.environ.get("JAIL_TOKEN") is None
+
+
+@pytest.mark.parametrize(
+    ("environ", "endpoint", "refused"),
+    [
+        ({"DOCKER_HOST": "tcp://192.0.2.10:2375"}, "tcp://192.0.2.10:2375", "tcp://"),
+        ({"DOCKER_HOST": "ssh://someone@engine.example.test"}, "unix:///x.sock", "ssh://"),
+        ({}, "tcp://192.0.2.10:2376", "tcp://"),
+        ({}, "ssh://someone@engine.example.test", "ssh://"),
+        ({}, "npipe:////./pipe/docker_engine", "npipe://"),
+        ({}, "", "unknown endpoint"),
+        (
+            {"DOCKER_HOST": "unix:///run/user/1000/docker.sock"},
+            "unix:///run/user/1000/docker.sock",
+            None,
+        ),
+        ({}, "unix:///var/run/docker.sock", None),
+    ],
+)
+def test_only_a_local_engine_is_used(
+    tmp_path: Path, environ: dict[str, str], endpoint: str, refused: str | None
+) -> None:
+    plugin = _plugin_dir(tmp_path)
+    cli, state = _fake_docker(tmp_path, endpoint=endpoint)
+
+    async def go() -> Any:
+        async with _host(tmp_path, plugin, docker=cli, state=state, environ=environ) as h:
+            return await h.call("raw.ok", {}, None)
+
+    if refused is None:
+        assert asyncio.run(go()).data == {"ok": True}
+        return
+    error = _first_error(tmp_path, plugin, docker=cli, state=state, environ=environ)
+    assert error.kind == "runtime_unavailable"
+    assert "local unix socket" in error.message
+    assert refused in error.message
+    assert "192.0.2.10" not in error.message  # the endpoint is not echoed
+    assert not any(call[:2] == ["image", "inspect"] or call[0] == "run" for call in _calls(state))
+
+
+@pytest.mark.parametrize(
+    ("labels", "accepted"),
+    [
+        ({"dev.horae.plugin": "raw"}, True),
+        ({"dev.horae.egress-proxy": "1"}, True),
+        ({"dev.horae.plugin": "other"}, False),
+        ({}, False),
+        (None, False),
+    ],
+)
+def test_a_foreign_container_on_the_network_is_refused(
+    tmp_path: Path, labels: dict[str, str] | None, accepted: bool
+) -> None:
+    plugin = _plugin_dir(tmp_path)
+    attached = {"c0ffee": {"Name": "somebody"}}
+    cli, state = _fake_docker(tmp_path, labels={"c0ffee": labels})
+    network = _network(Name="horae-plugin-raw", Containers=attached)
+    (state / "network.json").write_text(json.dumps(network), encoding="utf-8")
+
+    async def go() -> Any:
+        async with _host(tmp_path, plugin, docker=cli, state=state) as h:
+            return await h.call("raw.ok", {}, None)
+
+    if accepted:
+        assert asyncio.run(go()).data == {"ok": True}
+        return
+    error = _first_error(tmp_path, plugin, docker=cli, state=state)
+    assert error.kind == "runtime_unavailable"
+    assert "not this plugin's" in error.message
+    assert not any(call[0] == "run" for call in _calls(state))
+
+
+def test_a_stalled_preamble_write_is_a_startup_timeout(tmp_path: Path) -> None:
+    from horae.plugins.host.capture import StderrCapture
+    from horae.plugins.host.session import PluginProcess, Spawn
+
+    # A process that never reads stdin: a preamble larger than the pipe buffer never drains.
+    spawn = Spawn(
+        "raw",
+        (sys.executable, "-c", "import time; time.sleep(60)"),
+        {},
+        tmp_path,
+        1.0,
+        preamble=bytearray(b"x" * (300 * 1024) + b"\n"),
+    )
+    process = PluginProcess(spawn, StderrCapture(1024))
+
+    async def go() -> tuple[float, PluginCallError | None]:
+        import anyio
+
+        start = time.monotonic()
+        async with anyio.create_task_group() as group:
+            group.start_soon(process.serve)
+            with anyio.fail_after(30):
+                await process.ready.wait()
+            await process.stop(forced=True)
+        return time.monotonic() - start, process.error
+
+    elapsed, error = asyncio.run(go())
+    assert error is not None
+    assert error.kind == "startup_timeout"
+    assert elapsed < 15
+    assert spawn.preamble is not None
+    assert not any(spawn.preamble)
+    assert process.state.returncode is not None  # killed, not left behind
