@@ -243,7 +243,7 @@ def test_explicit_grants_survive_two_upgrades(inst: Path, market: Market) -> Non
     assert code == 0, out
     entry = lock(inst)["plugins"]["demo"]
     assert entry["user_grants"] == recorded
-    assert "home.example.org" in entry["permissions"]["network"]
+    assert entry["permissions"]["network"] == ["api.example.org", "home.example.org"]
 
 
 def test_a_rewritten_installed_manifest_does_not_turn_declared_hosts_into_user_grants(
@@ -253,14 +253,14 @@ def test_a_rewritten_installed_manifest_does_not_turn_declared_hosts_into_user_g
     add(inst)  # v1 declares api.example.org; the user added nothing
     installed = inst / "plugins" / "demo" / "plugin.yaml"
     text = installed.read_text(encoding="utf-8")
-    assert "api.example.org" in text
+    assert text.count("api.example.org") == 1
     installed.write_text(text.replace("api.example.org", "other.example.org"), encoding="utf-8")
     _release(market, _with(network=[]), PERSONAL)  # v1.1.0 drops the host
     code, out, _ = cli(inst, "upgrade", "demo", "--yes")
     assert code == 0, out
     assert "keeping the host" not in out
     assert "note: horae.lock records no host you added" in out
-    assert "api.example.org" in out
+    assert "dropped: api.example.org" in out
     assert lock(inst)["plugins"]["demo"]["permissions"]["network"] == []
 
 
@@ -277,7 +277,7 @@ def test_a_lock_without_a_record_carries_nothing_and_says_so(
     code, out, _ = cli(inst, "upgrade", "demo", "--yes")
     assert code == 0, out
     assert "keeping the host" not in out
-    assert "home.example.org" in out
+    assert "dropped: home.example.org" in out
     assert "--allow-host" in out
     assert lock(inst)["plugins"]["demo"]["permissions"]["network"] == ["api.example.org"]
     code, out, _ = cli(inst, "upgrade", "demo", "--allow-host", "home.example.org", answer="y\n")
