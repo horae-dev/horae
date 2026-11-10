@@ -55,6 +55,7 @@ def test_the_proxy_container_is_hardened_like_a_plugin() -> None:
         ("--log-driver", "none"),
         ("--pids-limit", "64"),
         ("--memory", "128m"),
+        ("--sysctl", "net.ipv4.ip_forward=0"),
         ("--label", "dev.horae.egress-proxy=jail"),
         ("--entrypoint", IMAGE_PYTHON),
     ):
@@ -207,7 +208,11 @@ def test_a_plugin_container_gets_the_proxy_and_nothing_bypasses_it() -> None:
         ),
         ({"event": "blocked", "host": "x.test", "port": 1, "reason": "Not A Code"}, None),
         ({"event": "ready", "port": 3128}, None),
-        ({"event": "suppressed"}, "jail: more blocked egress attempts (not listed)"),
+        ({"event": "suppressed", "count": 3}, None),  # counted by the handle
+        (
+            {"event": "blocked", "host": "", "port": 0, "reason": "malformed_target"},
+            "jail: egress refused, unreadable target (malformed_target)",
+        ),
         ("blocked", None),
     ],
 )
@@ -229,6 +234,9 @@ def test_reports_are_kept_until_taken_and_capped() -> None:
     taken = handle.take()
     assert len(taken) == MAX_EVENTS + 1
     assert taken[-1] == "jail: 3 more blocked egress attempts"
+    handle.feed(json.dumps({"event": "suppressed", "count": 7}).encode())
+    handle.feed(json.dumps({"event": "suppressed", "count": "7"}).encode())  # ignored
+    assert handle.take() == ["jail: 7 more blocked egress attempts"]
     violations = egress.violations(taken[:1])
     assert [violation.kind for violation in violations] == ["egress_blocked"]
 

@@ -381,6 +381,8 @@ class ContainerRuntime:
             command=inside,
         )
 
+        proxy.client_container = name
+
         async def remove() -> None:
             try:
                 await self._run(docker, "rm", "--force", name)
@@ -397,6 +399,29 @@ class ContainerRuntime:
             cleanup=remove,
             egress=proxy,
         )
+
+    async def admit(self, plugin: str, proxy: egress.ProxyHandle) -> None:
+        """Once the plugin's container runs, make it the only client its proxy serves
+        (decision 76 C): its address on the plugin network, sent to the proxy, confirmed.
+        `runtime_unavailable` otherwise (the caller stops the plugin)."""
+        docker = self._docker
+        address = None
+        if docker is not None:
+            code, out, _ = await self._run(
+                docker,
+                "container",
+                "inspect",
+                "--format",
+                "{{json .NetworkSettings.Networks}}",
+                proxy.client_container,
+            )
+            try:
+                networks = json.loads(out) if code == 0 else None
+            except ValueError:
+                networks = None
+            address = egress.plugin_address(networks, network_name(plugin))
+        if address is None or not await proxy.admit(address):
+            raise _unavailable(plugin, "its egress proxy could not be bound to its container")
 
     async def _start_proxy(
         self, plugin: str, docker: str, network: Sequence[str], network_local: Sequence[str]

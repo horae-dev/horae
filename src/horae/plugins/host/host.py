@@ -757,6 +757,11 @@ class PluginHost:
             self._group.start_soon(spawn.egress.watch)
         self._group.start_soon(process.serve)
         await process.ready.wait()
+        if process.error is None and spawn.egress is not None:
+            try:  # its proxy serves this container only (decision 76 C)
+                await self._containers.admit(name, spawn.egress)
+            except PluginCallError as error:
+                process.error = error
         if process.error is not None:
             await process.stop(forced=True)
             stderr = process.capture.take(self.redactor())

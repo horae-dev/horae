@@ -15,13 +15,18 @@ The policy is the plugin's **locked** `permissions.network` (public host names) 
   C); it is forwarded in origin form with `Connection: close`, the `Proxy-*` headers dropped;
 - an IP literal only when it is exactly a `network_local` endpoint (canonical form);
 - names are resolved **here**, once per connection: every answer of a public name must be a
-  globally routable address, every answer of a local name a private or link-local one
-  (decision 66 B); a metadata address (`METADATA`) and loopback (this container's own) are
-  always refused. The connection goes to the **checked** address (the first IPv4 answer), never
-  to a name resolved again, so DNS rebinding cannot swap it.
+  globally routable address (no IPv6 form embedding an IPv4 one), every answer of a local
+  name a private one, never link-local (decision 66 B, 76 E); a metadata address (`METADATA`)
+  and loopback (this container's own) are always refused. The connection goes to the
+  **checked** address (the first IPv4 answer), never to a name resolved again, so DNS
+  rebinding cannot swap it.
 
-Each refusal writes one JSON line to stdout, `{"event": "blocked", "host", "port", "reason"}`
-(a fixed `reason` code; never a URL, path, query, header or body), at most `MAX_EVENTS` lines;
+It listens on its own address on the plugin network only, and serves only the client the host
+admits on stdin (`{"client": "<address>"}`, answered by `{"event": "admitted"}`): the plugin's
+container, never a sibling run's (decision 76 C). Each refusal writes one JSON line to stdout,
+`{"event": "blocked", "host", "port", "reason"}` (a fixed `reason` code; never a URL, path,
+query, header or body; `host` empty for a target it cannot parse), at most `MAX_EVENTS` per
+`EVENT_WINDOW_S`, the rest counted in `{"event": "suppressed", "count"}` every `FLUSH_S`;
 `{"event": "ready", "port"}` once listening. The proxy exits when its stdin closes.
 """
 
@@ -31,6 +36,7 @@ import json
 import re
 import socket
 import sys
+import time
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 
@@ -47,7 +53,10 @@ IDLE_TIMEOUT_S = 300.0
 """A tunnel with no byte in either direction for this long is closed."""
 MAX_CONNECTIONS = 64
 MAX_EVENTS = 200
-"""Blocked attempts reported per proxy; later ones are counted in one `suppressed` line."""
+"""Refusals reported per `EVENT_WINDOW_S`; later ones in the window are only counted, and the
+count is reported (`suppressed`) every `FLUSH_S` while it is not zero."""
+EVENT_WINDOW_S = 60.0
+FLUSH_S = 1.0
 _CHUNK = 64 * 1024
 _STREAM_LIMIT = 64 * 1024
 
@@ -59,6 +68,7 @@ METADATA = frozenset(
         "169.254.170.23",
         "fd00:ec2::254",
         "fd00:ec2::23",
+        "168.63.129.16",  # Azure's wireserver: a public address, a metadata service
     )
 )
 """Cloud metadata services: refused whatever the grant (decision 66 B)."""
@@ -74,10 +84,15 @@ LOCAL_NETS = tuple(
     )
 )
 """Where a `network_local` endpoint may resolve to (decision 66 B, loopback aside)."""
+LINK_LOCAL_NETS = tuple(ipaddress.ip_network(net) for net in ("169.254.0.0/16", "fe80::/10"))
+"""Reached only through a literal grant: a name never resolves into them (decision 76 E)."""
 _EMBEDDING_NETS = tuple(
-    ipaddress.ip_network(net) for net in ("64:ff9b::/96", "64:ff9b:1::/48", "2002::/16")
+    ipaddress.ip_network(net)
+    for net in ("64:ff9b::/96", "64:ff9b:1::/48", "2002::/16", "::/96", "::ffff:0:0/96")
 )
-"""IPv6 prefixes that carry an IPv4 address (NAT64, 6to4): never a public answer."""
+"""IPv6 prefixes that carry an IPv4 address (NAT64, 6to4, IPv4-compatible, IPv4-mapped): never
+a public answer."""
+_SITE_LOCAL = ipaddress.ip_network("fec0::/10")
 
 _LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
 _NAME = re.compile(rf"{_LABEL}(?:\.{_LABEL})*")
@@ -205,20 +220,22 @@ def _unwrap(address: Address) -> Address:
 
 def public_problem(address: Address) -> str | None:
     """Why a public name may not connect to `address`, or `None`."""
-    address = _unwrap(address)
-    if address in METADATA:
+    if _unwrap(address) in METADATA:
         return "metadata_address"
-    if address.is_loopback:
+    if address.is_loopback or _unwrap(address).is_loopback:
         return "loopback_address"
-    if not address.is_global or address.is_multicast:
-        return "private_address"
     if any(address in net for net in _EMBEDDING_NETS):
+        return "embedded_address"
+    if address in _SITE_LOCAL:
+        return "private_address"
+    if not address.is_global or address.is_multicast:
         return "private_address"
     return None
 
 
-def local_problem(address: Address) -> str | None:
-    """Why a `network_local` grant may not connect to `address`, or `None`."""
+def local_problem(address: Address, *, literal: bool = False) -> str | None:
+    """Why a `network_local` grant may not connect to `address`, or `None`. Link-local
+    addresses only for a `literal` grant (an IP literal), never as a name's answer."""
     address = _unwrap(address)
     if address in METADATA:
         return "metadata_address"
@@ -226,6 +243,8 @@ def local_problem(address: Address) -> str | None:
         return "loopback_address"  # the proxy's own container, never the user's machine
     if not any(address in net for net in LOCAL_NETS):
         return "not_local_address"
+    if not literal and any(address in net for net in LINK_LOCAL_NETS):
+        return "link_local_address"
     return None
 
 
@@ -259,13 +278,16 @@ def pin(target: Target, answers: Iterable[str]) -> str:
     """The address to connect to: every answer must pass (`public_problem` or `local_problem`),
     so a resolver mixing a good and a bad answer is refused as a whole; then the first IPv4
     answer (the egress network has no IPv6). `Refused` otherwise."""
-    check = local_problem if target.local else public_problem
+    literal = _ip(target.host) is not None
     addresses: list[Address] = []
     for answer in answers:
         address = _ip(answer.split("%", 1)[0])
         if address is None:
             raise Refused("dns_failed", target.host, target.port, status=502)
-        problem = check(address)
+        if target.local:
+            problem = local_problem(address, literal=literal)
+        else:
+            problem = public_problem(address)
         if problem is not None:
             raise Refused(problem, target.host, target.port)
         addresses.append(_unwrap(address))
@@ -331,20 +353,20 @@ def http_target(target: str) -> tuple[str, int, str]:
     """`(host, port, origin-form path)` of an absolute `http://` target; `Refused` for user
     info, a missing or malformed host, or anything but `http`."""
     if not target.startswith("http://"):
-        raise Refused("bad_request", status=400)
+        raise Refused("malformed_target", status=400)
     rest = target[len("http://") :]
     end = min((i for i in (rest.find("/"), rest.find("?")) if i >= 0), default=len(rest))
     authority, path = rest[:end], rest[end:]
     if "@" in authority or "\\" in target or "#" in target:
-        raise Refused("bad_request", status=400)
+        raise Refused("malformed_target", status=400)
     if not path.startswith("/"):
         path = "/" + path
     if any(ord(c) <= 0x20 or ord(c) == 0x7F for c in path):
-        raise Refused("bad_request", status=400)
+        raise Refused("malformed_target", status=400)
     has_port = "]:" in authority if authority.startswith("[") else ":" in authority
     parsed = split_authority(authority if has_port else f"{authority}:80")
     if parsed is None:
-        raise Refused("bad_request", status=400)
+        raise Refused("malformed_target", status=400)
     return parsed[0], parsed[1], path
 
 
@@ -371,26 +393,51 @@ class EgressProxy:
         emit: Emit,
         resolver: Resolver = resolve,
         connector: Connector = connect,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.policy = policy
         self._emit = emit
         self._resolver = resolver
         self._connector = connector
+        self._clock = clock
         self._active = 0
+        self._window = clock()
         self._events = 0
         self._suppressed = 0
+        self.client: Address | None = None
+        """The one address that may use the proxy, once `admit`ted (see `_client_allowed`)."""
+
+    def admit(self, address: str) -> bool:
+        """Let `address` (the plugin container's, inside `policy.clients`) use the proxy; only
+        the first admission counts. Whether it was accepted."""
+        client = _ip(address)
+        clients = self.policy.clients
+        if self.client is not None or client is None or clients is None:
+            return False
+        if not any(client in net for net in clients):
+            return False
+        self.client = client
+        return True
 
     def blocked(self, refused: Refused) -> None:
-        """Report one refusal (at most `MAX_EVENTS`, then a count)."""
+        """Report one refusal: at most `MAX_EVENTS` per `EVENT_WINDOW_S`, the rest counted."""
+        now = self._clock()
+        if now - self._window >= EVENT_WINDOW_S:
+            self.flush()
+            self._window, self._events = now, 0
         if self._events >= MAX_EVENTS:
             self._suppressed += 1
-            if self._suppressed == 1:
-                self._emit({"event": "suppressed"})
             return
         self._events += 1
         event: dict[str, object] = {"event": "blocked", "host": refused.host}
         event.update(port=refused.port, reason=refused.reason)
         self._emit(event)
+
+    def flush(self) -> None:
+        """Report how many refusals were counted but not listed since the last flush."""
+        if self._suppressed:
+            self._emit({"event": "suppressed", "count": self._suppressed})
+            self._suppressed = 0
 
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         """One client connection: one request, then a tunnel or a forwarded HTTP exchange."""
@@ -409,12 +456,13 @@ class EgressProxy:
             self._active -= 1
 
     def _client_allowed(self, writer: asyncio.StreamWriter) -> bool:
-        clients = self.policy.clients
-        if clients is None:
+        """Only the admitted plugin container (decision 76 C): nobody before `admit`, never a
+        sibling run's container on the same network. (No `policy.clients`: tests only.)"""
+        if self.policy.clients is None:
             return True
         peer = writer.get_extra_info("peername")
         address = _ip(str(peer[0])) if isinstance(peer, tuple) and peer else None
-        return address is not None and any(_unwrap(address) in net for net in clients)
+        return address is not None and self.client is not None and _unwrap(address) == self.client
 
     async def _serve(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
@@ -423,7 +471,7 @@ class EgressProxy:
             if request.method == "CONNECT":
                 parsed = split_authority(request.target)
                 if parsed is None:
-                    raise Refused("bad_request", status=400)
+                    raise Refused("malformed_target", status=400)
                 host, port = parsed
                 forward = b""
                 target = decide(self.policy, host, port, plain_http=False)
@@ -433,8 +481,7 @@ class EgressProxy:
                 forward = _origin_head(request, path)
             address = await self._pin(target)
         except Refused as refused:
-            if refused.status == 403:
-                self.blocked(refused)
+            self.blocked(refused)  # policy, malformed target, resolution: all reported
             await _close(writer, _response(refused.status, refused.reason))
             return
         except (TimeoutError, asyncio.IncompleteReadError, asyncio.LimitOverrunError, OSError):
@@ -465,7 +512,7 @@ class EgressProxy:
             raise Refused("dns_failed", target.host, target.port, status=502) from None
         return pin(target, answers)
 
-    async def serve(self, host: str = "0.0.0.0", port: int = LISTEN_PORT) -> asyncio.Server:  # noqa: S104 (its own container)
+    async def serve(self, host: str, port: int = LISTEN_PORT) -> asyncio.Server:
         """Start listening."""
         return await asyncio.start_server(self.handle, host, port, limit=_STREAM_LIMIT)
 
@@ -542,22 +589,65 @@ def _print(event: dict[str, object]) -> None:
     sys.stdout.flush()
 
 
-async def _stdin_closed() -> None:
+async def _commands(proxy: EgressProxy) -> None:
+    """Read stdin until it closes: `{"client": "<address>"}` admits the plugin container."""
     loop = asyncio.get_running_loop()
-    reader = asyncio.StreamReader()
+    reader = asyncio.StreamReader(limit=_STREAM_LIMIT)
     await loop.connect_read_pipe(lambda: asyncio.StreamReaderProtocol(reader), sys.stdin)
-    while await reader.read(_CHUNK):
-        pass
+    while True:
+        try:
+            line = await reader.readline()
+        except (ValueError, asyncio.LimitOverrunError):
+            continue
+        if not line:
+            return
+        try:
+            command = json.loads(line)
+        except ValueError:
+            continue
+        client = command.get("client") if isinstance(command, dict) else None
+        if isinstance(client, str) and proxy.admit(client):
+            _print({"event": "admitted"})
+
+
+async def _flushing(proxy: EgressProxy) -> None:
+    while True:
+        await asyncio.sleep(FLUSH_S)
+        proxy.flush()
+
+
+def listen_address(policy: Policy) -> str:
+    """This container's own address on the plugin network (the first of `policy.clients`):
+    the source address the kernel picks towards that subnet (a UDP `connect` sends nothing)."""
+    if not policy.clients:
+        raise ValueError("no plugin network to listen on")
+    network = policy.clients[0]
+    probe = socket.socket(
+        socket.AF_INET if network.version == 4 else socket.AF_INET6, socket.SOCK_DGRAM
+    )
+    try:
+        probe.connect((str(network.broadcast_address - 1), 9))
+        address = _ip(str(probe.getsockname()[0]))
+    finally:
+        probe.close()
+    if address is None or address not in network:
+        raise ValueError("this container has no address on the plugin network")
+    return str(address)
 
 
 async def main(policy_json: str) -> None:
-    """Listen on `LISTEN_PORT` with the policy `policy_json`, until stdin closes."""
-    proxy = EgressProxy(Policy.from_json(json.loads(policy_json)), emit=_print)
-    server = await proxy.serve()
+    """Listen on `LISTEN_PORT` of the plugin-network address with the policy `policy_json`,
+    until stdin closes."""
+    policy = Policy.from_json(json.loads(policy_json))
+    proxy = EgressProxy(policy, emit=_print)
+    server = await proxy.serve(listen_address(policy))
     _print({"event": "ready", "port": LISTEN_PORT})
+    flushing = asyncio.create_task(_flushing(proxy))
     try:
-        await _stdin_closed()
+        await _commands(proxy)
     finally:
+        flushing.cancel()
+        proxy.flush()
         server.close()
 
 

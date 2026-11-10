@@ -11,7 +11,8 @@ and run with `runtime: container`. `python -m jail_server [<mode> [<prefix>]]`; 
   filesystem, `/plugin` and `/tmp` are writable and `/tmp` executable;
 - `jail.connect` (`host`, `port`): whether a TCP connection succeeds (2 s);
 - `jail.resolve` (`name`): whether a name resolves;
-- `jail.tunnel` (`host`, `port`): a `CONNECT` through `HTTPS_PROXY` (#50), then, once
+- `jail.tunnel` (`host`, `port`, optional `via`): a `CONNECT` through `HTTPS_PROXY` (or the
+  proxy URL `via`, #50), then, once
   established, `GET /` through the tunnel; returns the proxy's status line and the answer's
   first bytes;
 - `jail.fetch` (`url`): a plain `urllib` request, which uses `HTTP_PROXY` from the
@@ -120,8 +121,8 @@ def resolve(name: str) -> dict[str, Any]:
     return {"resolved": True, "error": None}
 
 
-def tunnel(host: str, port: int) -> dict[str, Any]:
-    proxy = urllib.parse.urlsplit(os.environ.get("HTTPS_PROXY", ""))
+def tunnel(host: str, port: int, via: str | None = None) -> dict[str, Any]:
+    proxy = urllib.parse.urlsplit(via or os.environ.get("HTTPS_PROXY", ""))
     try:
         with socket.create_connection((proxy.hostname, proxy.port), timeout=20) as conn:
             conn.sendall(f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n".encode())
@@ -162,7 +163,7 @@ def call(request_id: Any, name: str, arguments: dict[str, Any]) -> None:
     elif name == "resolve":
         result(request_id, resolve(arguments["name"]))
     elif name == "tunnel":
-        result(request_id, tunnel(arguments["host"], int(arguments["port"])))
+        result(request_id, tunnel(arguments["host"], int(arguments["port"]), arguments.get("via")))
     elif name == "fetch":
         result(request_id, fetch(arguments["url"]))
 

@@ -120,7 +120,7 @@ with `--allow-host` / `--allow-local`. It is the plugin's only way out:
 |---|---|
 | `CONNECT name:443` (HTTPS) | `name` is in `network`, and every address it resolves to is public |
 | `CONNECT name:port` on another port | never for a `network` host (the lock has no port for them: 443 only) |
-| `CONNECT host:port` or plain `http://host:port/…` | `host:port` is exactly a `network_local` entry, and a name resolves only to private or link-local addresses |
+| `CONNECT host:port` or plain `http://host:port/…` | `host:port` is exactly a `network_local` entry, and a name resolves only to private addresses (link-local 169.254.x.y only through a literal grant of that address) |
 | an IP address | only when it is exactly a `network_local` entry |
 | anything else | refused (`403`), and recorded |
 
@@ -137,9 +137,12 @@ evil.example.net:443 (host_not_allowed)`, and Horae logs it at WARNING. Only the
 and the reason are recorded, never the URL, its query or headers. Reasons are
 `host_not_allowed` (not in the lock: add it with `horae plugin add --allow-host` if you trust
 it), `port_not_allowed`, `plain_http_not_allowed`, `ip_literal`, `private_address`,
-`metadata_address`, `loopback_address` and `not_local_address` (a local name resolved
-elsewhere). A name that does not resolve, or a server that does not answer, is `502` and not
-recorded. At most 200 attempts are listed per plugin start.
+`embedded_address` (an IPv6 answer carrying an IPv4 address), `link_local_address`,
+`metadata_address`, `loopback_address`, `not_local_address` (a local name resolved
+elsewhere), `malformed_target` (a target it cannot parse, such as `127.1` or user info:
+recorded without the host), and `dns_failed` / `no_ipv4_address` (`502`). A server that does
+not answer is `502` and not recorded. At most 200 attempts are listed per minute; beyond that
+the run records `N more blocked egress attempts`.
 
 **The proxy container.** `docker run --interactive --rm --init` from the same pinned image,
 running `python3 -I -S -c <the proxy's source> <policy>`, as `65534:65534` (nobody), with
@@ -148,11 +151,17 @@ running `python3 -I -S -c <the proxy's source> <policy>`, as `65534:65534` (nobo
 `horae-egress-<plugin>-<random>` and labelled `dev.horae.egress-proxy=<plugin>`. It is attached
 to the plugin's network and to **`horae-egress`**, a plain bridge Horae creates on first use
 (labelled `dev.horae.network=egress`, `enable_icc=false` so proxies do not reach each other,
-no IPv6) and checks on each run like the plugin networks. The proxy answers only clients
-from the plugin's network. Its `docker inspect` shows the policy (host names, not secrets).
+no IPv6) and checks on each run like the plugin networks. It also runs with
+`--sysctl net.ipv4.ip_forward=0`. The proxy listens only on its address on the plugin's
+network, and serves **only its plugin's container**: once the plugin has started, Horae tells
+the proxy that container's address, and every other client (a concurrent run of the same
+plugin on the same network included) is dropped without an answer. `enable_icc=false` is not
+enforced by every engine (OrbStack ignores it), so this client check, not the bridge option,
+is what keeps containers off each other's proxies. Its `docker inspect` shows the policy (host
+names, not secrets).
 
-**Fail closed.** A proxy that cannot start, or that has no address on the plugin's network,
-means the plugin is not started (`runtime_unavailable`). When the plugin stops, its proxy is
+**Fail closed.** A proxy that cannot start, has no address on the plugin's network, or cannot
+be bound to the plugin's container means the plugin is not started (`runtime_unavailable`). When the plugin stops, its proxy is
 stopped and removed with it (`docker rm --force`). If Horae is killed, a leftover proxy exits
 when its standard input closes; list them with `docker ps --filter label=dev.horae.egress-proxy`.
 

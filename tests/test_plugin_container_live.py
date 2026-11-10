@@ -394,9 +394,11 @@ def test_egress_goes_through_the_proxy_and_only_where_the_lock_allows(
     assert [v.detail for v in seen["ip_literal"].violations] == [
         "jail-egress: egress blocked to 192.0.2.1:443 (ip_literal)"
     ]
-    # Declared: past the allow-list, then refused by DNS (`.test` never resolves), unrecorded.
+    # Declared: past the allow-list, then refused by DNS (`.test` never resolves), recorded.
     assert seen["declared"].data["status"] == "HTTP/1.1 502 Bad Gateway"
-    assert seen["declared"].violations == ()
+    assert [v.detail for v in seen["declared"].violations] == [
+        "jail-egress: egress blocked to api.example.test:443 (dns_failed)"
+    ]
     assert seen["direct"].data["connected"] is False  # no route but the proxy
 
     data = seen["inspect"]
@@ -411,6 +413,7 @@ def test_egress_goes_through_the_proxy_and_only_where_the_lock_allows(
     assert "no-new-privileges" in host["SecurityOpt"]
     assert host["LogConfig"]["Type"] == "none"
     assert host["PidsLimit"] == 64
+    assert host["Sysctls"] == {"net.ipv4.ip_forward": "0"}
     assert data["Mounts"] == []
     assert TOKEN not in json.dumps(data)
     assert set(data["NetworkSettings"]["Networks"]) == {f"horae-plugin-{name}", "horae-egress"}
@@ -421,3 +424,35 @@ def test_egress_goes_through_the_proxy_and_only_where_the_lock_allows(
     ).stdout.strip():
         assert time.monotonic() < deadline, "the proxy outlived the run"
         time.sleep(0.2)
+
+
+def test_a_sibling_run_cannot_use_another_runs_proxy(
+    tmp_path: Path, plugin_dir: Path, lan_server: tuple[str, int]
+) -> None:
+    """Two concurrent runs of one plugin share its network: each proxy serves its own plugin
+    container only (decision 76 C), so a sibling's tunnel through it gets no answer at all."""
+    gateway, port = lan_server
+    network = {"network_local": [f"{gateway}:{port}"]}
+    name = "jail-egress"
+
+    async def go() -> tuple[Any, Any, Any]:
+        first = _host(tmp_path / "a", plugin_dir, name, network=network)
+        second = _host(tmp_path / "b", plugin_dir, name, network=network)
+        async with first as a, second as b:
+            env_a = (await a.call(f"{name}.env", {}, None)).data["env"]
+            own = await b.call(f"{name}.tunnel", {"host": gateway, "port": port}, None)
+            stolen = await b.call(
+                f"{name}.tunnel",
+                {"host": gateway, "port": port, "via": env_a["HTTPS_PROXY"]},
+                None,
+            )
+            mine = await a.call(f"{name}.tunnel", {"host": gateway, "port": port}, None)
+            return own, stolen, mine
+
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    own, stolen, mine = asyncio.run(go())
+    assert own.data["status"] == "HTTP/1.1 200 Connection established", own.data
+    assert mine.data["status"] == "HTTP/1.1 200 Connection established", mine.data
+    assert not stolen.data["status"], stolen.data  # dropped: no status line
+    assert stolen.data["answer"] == ""

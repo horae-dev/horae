@@ -519,8 +519,11 @@ if args[:1] == ["run"] and any(a.startswith("dev.horae.egress-proxy=") for a in 
     print(json.dumps({"event": "ready", "port": 3128}), flush=True)
     for event in fake["blocked"]:
         print(json.dumps(event), flush=True)
-    while os.read(0, 4096):
-        pass
+    for line in sys.stdin.buffer:
+        with open(os.path.join(config_dir, "proxy-stdin"), "ab") as handle:
+            handle.write(line)
+        if fake["admit"] and json.loads(line).get("client"):
+            print(json.dumps({"event": "admitted"}), flush=True)
     with open(os.path.join(config_dir, "proxy-stopped"), "a") as handle:
         handle.write("stdin closed\\n")
     sys.exit(0)
@@ -550,6 +553,7 @@ def _fake_docker(tmp_path: Path, **fake: Any) -> tuple[Path, Path]:
         "labels": {},
         "egress_created": _egress(),
         "proxy": "ok",
+        "admit": True,
         "blocked": [],
         "proxy_networks": {
             f"horae-plugin-{name}": {"IPAddress": "192.168.155.2"} for name in ("raw", "jail")
@@ -1088,3 +1092,39 @@ def test_the_proxy_policy_is_the_locked_one(tmp_path: Path) -> None:
     }
     assert spawn.egress is not None
     assert spawn.egress.url == "http://192.168.155.2:3128"
+
+
+def test_the_proxy_serves_the_plugin_container_only(tmp_path: Path) -> None:
+    plugin = _plugin_dir(tmp_path)
+    cli, state = _fake_docker(tmp_path)
+
+    async def go() -> Any:
+        async with _host(tmp_path, plugin, docker=cli, state=state) as h:
+            return await h.call("raw.ok", {}, None)
+
+    assert asyncio.run(go()).data == {"ok": True}
+    assert json.loads((state / "proxy-stdin").read_bytes()) == {"client": "192.168.155.2"}
+    run = [call for call in _calls(state) if call[0] == "run"][1]
+    plugin_name = run[run.index("--name") + 1]
+    assert [
+        "container",
+        "inspect",
+        "--format",
+        "{{json .NetworkSettings.Networks}}",
+        plugin_name,
+    ] in (_calls(state))
+
+
+def test_a_proxy_that_cannot_be_bound_to_the_plugin_means_no_plugin(tmp_path: Path) -> None:
+    plugin = _plugin_dir(tmp_path)
+    cli, state = _fake_docker(tmp_path, admit=False)
+    from horae.plugins.host import egress
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(egress, "ADMIT_TIMEOUT_S", 0.5)
+        error = _first_error(tmp_path, plugin, docker=cli, state=state)
+    assert error.kind == "runtime_unavailable"
+    assert "could not be bound" in error.message
+    runs = [call for call in _calls(state) if call[0] == "run"]
+    for started in runs:  # the plugin and its proxy are both removed
+        assert ["rm", "--force", started[started.index("--name") + 1]] in _calls(state)

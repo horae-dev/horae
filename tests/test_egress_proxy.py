@@ -115,6 +115,7 @@ def _outcome(function: Callable[[], str], host: str | None = None, port: int = 0
 
 PUBLIC_TARGET = ep.Target("api.example.org", 443, local=False)
 LOCAL_TARGET = ep.Target("printer.lan", 8080, local=True)
+LITERAL_LINK_LOCAL = ep.Target("169.254.10.10", 80, local=True)
 
 
 @pytest.mark.parametrize(
@@ -135,10 +136,14 @@ LOCAL_TARGET = ep.Target("printer.lan", 8080, local=True)
         (PUBLIC_TARGET, ["fd00:ec2::254"], "metadata_address"),
         (PUBLIC_TARGET, ["169.254.1.1"], "private_address"),
         (PUBLIC_TARGET, ["fe80::1%eth0"], "private_address"),
-        (PUBLIC_TARGET, ["::ffff:10.0.0.1"], "private_address"),  # IPv4-mapped
+        (PUBLIC_TARGET, ["::ffff:10.0.0.1"], "embedded_address"),  # IPv4-mapped
+        (PUBLIC_TARGET, ["::ffff:1.2.3.4"], "embedded_address"),  # even of a public address
+        (PUBLIC_TARGET, ["::1.2.3.4"], "embedded_address"),  # IPv4-compatible
+        (PUBLIC_TARGET, ["fec0::1"], "private_address"),  # site-local
+        (PUBLIC_TARGET, ["168.63.129.16"], "metadata_address"),  # Azure wireserver, public
         (PUBLIC_TARGET, ["::ffff:169.254.169.254"], "metadata_address"),
-        (PUBLIC_TARGET, ["64:ff9b::a00:1"], "private_address"),  # NAT64 of 10.0.0.1
-        (PUBLIC_TARGET, ["2002:a00:1::1"], "private_address"),  # 6to4 of 10.0.0.1
+        (PUBLIC_TARGET, ["64:ff9b::a00:1"], "embedded_address"),  # NAT64 of 10.0.0.1
+        (PUBLIC_TARGET, ["2002:a00:1::1"], "embedded_address"),  # 6to4 of 10.0.0.1
         (PUBLIC_TARGET, [PUBLIC, "10.0.0.1"], "private_address"),  # one bad answer: all refused
         (PUBLIC_TARGET, ["10.0.0.1", PUBLIC], "private_address"),
         (PUBLIC_TARGET, ["2606:4700::1"], "no_ipv4_address"),
@@ -151,6 +156,10 @@ LOCAL_TARGET = ep.Target("printer.lan", 8080, local=True)
         (LOCAL_TARGET, ["169.254.169.254"], "metadata_address"),
         (LOCAL_TARGET, ["169.254.170.2"], "metadata_address"),
         (LOCAL_TARGET, ["127.0.0.1"], "loopback_address"),  # the proxy's own container
+        (LOCAL_TARGET, ["169.254.10.10"], "link_local_address"),  # never as a name's answer
+        (LOCAL_TARGET, ["fe80::10"], "link_local_address"),
+        (LOCAL_TARGET, ["168.63.129.16"], "metadata_address"),
+        (LITERAL_LINK_LOCAL, ["169.254.10.10"], "169.254.10.10"),  # an explicit literal grant
         (LOCAL_TARGET, ["192.168.1.20", PUBLIC], "not_local_address"),
     ],
 )
@@ -204,19 +213,28 @@ def test_requests_are_parsed_strictly() -> None:
             ep.http_target(target)
 
 
-def test_reports_are_capped() -> None:
+def test_reports_are_capped_per_window_and_never_silenced() -> None:
+    """Junk requests cannot hide later blocks: the cap is per window, and what it hides is
+    counted and reported (`flush`, every `FLUSH_S` in the container)."""
     events: list[dict[str, object]] = []
-    proxy = ep.EgressProxy(POLICY, emit=events.append)
+    now = [1000.0]
+    proxy = ep.EgressProxy(POLICY, emit=events.append, clock=lambda: now[0])
     for index in range(ep.MAX_EVENTS + 5):
         proxy.blocked(ep.Refused("host_not_allowed", f"h{index}.example.net", 443))
-    assert len(events) == ep.MAX_EVENTS + 1
-    assert events[-1] == {"event": "suppressed"}
-    assert events[0] == {
-        "event": "blocked",
-        "host": "h0.example.net",
-        "port": 443,
-        "reason": "host_not_allowed",
-    }
+    assert len(events) == ep.MAX_EVENTS
+    assert events[0] == blocked("h0.example.net", 443, "host_not_allowed")
+    proxy.flush()
+    assert events[-1] == {"event": "suppressed", "count": 5}
+    proxy.flush()
+    assert len(events) == ep.MAX_EVENTS + 1  # nothing more to report
+    proxy.blocked(ep.Refused("host_not_allowed", "late.example.net", 443))
+    assert len(events) == ep.MAX_EVENTS + 1  # still in the window: counted
+    now[0] += ep.EVENT_WINDOW_S
+    proxy.blocked(ep.Refused("host_not_allowed", "later.example.net", 443))
+    assert events[-2:] == [
+        {"event": "suppressed", "count": 1},
+        blocked("later.example.net", 443, "host_not_allowed"),  # a new window lists again
+    ]
 
 
 def test_the_source_runs_alone_with_the_standard_library_only() -> None:
@@ -428,14 +446,19 @@ def test_ip_literals_are_refused_unless_granted() -> None:
         async with Lab(answers({})) as lab:
             for authority in (f"{PUBLIC}:443", "[2606:4700::1]:443", "10.0.0.1:443"):
                 assert (await lab.connect(authority))[0].endswith(b"403 Forbidden")
-            assert (await lab.connect("127.1:443"))[0].endswith(b"400 Bad Request")
+            for authority in ("127.1:443", "0x7f000001:443", "0177.0.0.1:443", "x.org.:443"):
+                assert (await lab.connect(authority))[0].endswith(b"400 Bad Request")
+            plain = b"GET http://user@printer.lan:8080/ HTTP/1.1\r\n\r\n"
+            assert (await lab.send(plain)).startswith(b"HTTP/1.1 400")
             return lab
 
     lab = run(go)
+    malformed = blocked("", 0, "malformed_target")
     assert lab.events == [
         blocked(PUBLIC, 443, "ip_literal"),
         blocked("2606:4700::1", 443, "ip_literal"),
         blocked("10.0.0.1", 443, "ip_literal"),
+        *[malformed] * 5,  # reported too, without what the plugin wrote
     ]
     assert lab.dialled == []
     assert lab.lookups == []
@@ -530,7 +553,16 @@ def test_a_name_that_does_not_resolve_is_a_bad_gateway() -> None:
 
     lab = run(go)
     assert lab.dialled == []
-    assert lab.events == []  # not a policy refusal
+    assert lab.events == [blocked("api.example.org", 443, "dns_failed")]
+
+
+def test_a_name_without_an_ipv4_answer_is_reported() -> None:
+    async def go() -> Lab:
+        async with Lab(answers({"api.example.org": ["2606:4700::1"]})) as lab:
+            assert (await lab.connect("api.example.org:443"))[0].endswith(b"502 Bad Gateway")
+            return lab
+
+    assert run(go).events == [blocked("api.example.org", 443, "no_ipv4_address")]
 
 
 def test_an_unreachable_upstream_is_a_bad_gateway() -> None:
@@ -588,3 +620,49 @@ def test_only_the_plugin_network_may_use_the_proxy() -> None:
     assert lab.lookups == []
     with pytest.raises(ValueError, match="clients"):
         ep.Policy.from_json({"clients": "10.0.0.0/8"})
+
+
+def test_only_the_admitted_plugin_container_may_use_the_proxy() -> None:
+    """A sibling run's container on the same network is dropped: only the address the host
+    admitted is served, and nobody before that (decision 76 C)."""
+    loopback = ep.Policy.from_json({"network": ["api.example.org"], "clients": ["127.0.0.0/8"]})
+
+    async def go() -> tuple[Lab, list[bytes]]:
+        async with Lab(answers({"api.example.org": [PUBLIC]}), loopback) as lab:
+            before = await _raw_connect(lab.port)
+            assert not lab.proxy.admit("10.0.0.2")  # outside the plugin network
+            assert lab.proxy.admit("127.0.0.2")  # another container (a sibling's view)
+            sibling = await _raw_connect(lab.port)  # we come from 127.0.0.1: not admitted
+            assert not lab.proxy.admit("127.0.0.1")  # only the first admission counts
+            return lab, [before, sibling]
+
+    lab, replies = run(go)
+    assert replies == [b"", b""]
+    assert lab.dialled == []
+
+    async def admitted() -> bytes:
+        async with Lab(answers({"api.example.org": [PUBLIC]}), loopback) as lab:
+            assert lab.proxy.admit("127.0.0.1")
+            return (await lab.connect("api.example.org:443"))[0]
+
+    assert run(admitted) == b"HTTP/1.1 200 Connection established"
+
+
+async def _raw_connect(port: int) -> bytes:
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    writer.write(b"CONNECT api.example.org:443 HTTP/1.1\r\n\r\n")
+    try:
+        data = await asyncio.wait_for(reader.read(65536), 10)
+    except ConnectionResetError:
+        data = b""
+    writer.close()
+    return data
+
+
+def test_the_proxy_listens_on_its_plugin_network_address_only() -> None:
+    policy = ep.Policy.from_json({"clients": ["127.0.0.0/8"]})
+    assert ep.listen_address(policy).startswith("127.")
+    with pytest.raises(ValueError, match="no plugin network"):
+        ep.listen_address(ep.Policy())
+    with pytest.raises(ValueError, match="no address"):
+        ep.listen_address(ep.Policy.from_json({"clients": ["192.0.2.0/24"]}))

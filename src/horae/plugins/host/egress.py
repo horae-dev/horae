@@ -7,7 +7,9 @@ For each plugin container start, `ContainerRuntime.spawn` first starts **its own
 network (`horae-plugin-<name>`, where the plugin reaches it) and `EGRESS_NETWORK` (the way out).
 It is hardened like the plugin (decision 74 C) and runs as `nobody`. The plugin then gets the
 proxy's address in `HTTPS_PROXY`, `HTTP_PROXY` (and their lowercase forms) and
-`HORAE_EGRESS_PROXY`; its container has no other route.
+`HORAE_EGRESS_PROXY`; its container has no other route. Once the plugin's container has
+started, `ContainerRuntime.admit` sends the proxy that container's address, the only client it
+then serves (`ProxyHandle.admit`, decision 76 C).
 
 The proxy reports each refusal as one JSON line on its stdout; `ProxyHandle.watch` reads them,
 logs each at WARNING and keeps them (capped) until the host takes them as `egress_blocked`
@@ -42,6 +44,10 @@ EGRESS_NETWORK_OPTIONS = {"com.docker.network.bridge.enable_icc": "false"}
 PROXY_USER = "65534:65534"
 """The proxy reads no file: it runs as `nobody`."""
 PROXY_LIMITS = ("--pids-limit", "64", "--memory", "128m")
+PROXY_SYSCTLS = ("--sysctl", "net.ipv4.ip_forward=0")
+"""The proxy never routes between its two networks (on top of having no capability)."""
+ADMIT_TIMEOUT_S = 10.0
+"""How long the proxy may take to confirm it admitted the plugin container."""
 READY_TIMEOUT_S = 30.0
 """How long a proxy may take to report ready."""
 STOP_WAIT_S = 2.0
@@ -50,7 +56,7 @@ MAX_KEPT = egress_proxy.MAX_EVENTS
 PROXY_SOURCE = Path(egress_proxy.__file__).read_text(encoding="utf-8")
 """The proxy's source, run with `python3 -I -S -c` (visible in `docker inspect`: no secret)."""
 _MAX_LINE = 4096
-_HOST = re.compile(r"[a-z0-9.:\-]{1,253}")
+_HOST = re.compile(r"[a-z0-9.:\-]{0,253}")
 _REASON = re.compile(r"[a-z_]{1,40}")
 
 _log = logging.getLogger("horae.plugins.host.egress")
@@ -120,6 +126,7 @@ def proxy_argv(
         "--security-opt",
         "no-new-privileges",
         *PROXY_LIMITS,
+        *PROXY_SYSCTLS,
         "--network",
         plugin_network,
         "--network",
@@ -163,8 +170,9 @@ def egress_network_problem(network: Mapping[str, object]) -> str | None:
 
 
 def plugin_address(networks: object, plugin_network: str) -> str | None:
-    """The proxy's IPv4 address on `plugin_network`, from `docker container inspect`'s
-    `NetworkSettings.Networks`; `None` when absent or not an IPv4 address."""
+    """A container's (the proxy's, the plugin's) IPv4 address on `plugin_network`, from
+    `docker container inspect`'s `NetworkSettings.Networks`; `None` when absent or not an IPv4
+    address."""
     if not isinstance(networks, dict):
         return None
     entry = networks.get(plugin_network)
@@ -180,12 +188,9 @@ def plugin_address(networks: object, plugin_network: str) -> str | None:
 
 def blocked_detail(plugin: str, event: object) -> str | None:
     """The violation detail of one proxy line (`{"event": "blocked", ...}`), or `None` for any
-    other line. Only a host, a port and a reason code, each checked again here."""
-    if not isinstance(event, dict):
-        return None
-    if event.get("event") == "suppressed":
-        return f"{plugin}: more blocked egress attempts (not listed)"
-    if event.get("event") != "blocked":
+    other line. Only a host, a port and a reason code, each checked again here; an empty host
+    is a request whose target could not be parsed (`malformed_target`)."""
+    if not isinstance(event, dict) or event.get("event") != "blocked":
         return None
     host, port, reason = event.get("host"), event.get("port"), event.get("reason")
     if not isinstance(reason, str) or _REASON.fullmatch(reason) is None:
@@ -194,6 +199,8 @@ def blocked_detail(plugin: str, event: object) -> str | None:
         host = "?"
     if type(port) is not int or not 0 <= port <= 65535:
         port = 0
+    if host == "":
+        return f"{plugin}: egress refused, unreadable target ({reason})"
     shown = f"[{host}]" if ":" in host else host
     return f"{plugin}: egress blocked to {shown}:{port} ({reason})"
 
@@ -217,6 +224,9 @@ class ProxyHandle:
         self._kept: list[str] = []
         self._dropped = 0
         self._stopped = False
+        self.client_container = ""
+        """The plugin container the proxy serves (`admit`)."""
+        self._admitted = anyio.Event()
 
     async def ready(self, timeout_s: float = READY_TIMEOUT_S) -> bool:
         """Wait for the proxy's `ready` line; `False` if it ends or times out first."""
@@ -283,8 +293,18 @@ class ProxyHandle:
                     self.feed(line)
 
     def feed(self, line: bytes) -> None:
-        """Keep one event line (a blocked attempt) and log it."""
-        detail = blocked_detail(self.plugin, _event(line))
+        """Handle one event line: keep and log a blocked attempt, add a `suppressed` count."""
+        event = _event(line)
+        if isinstance(event, dict) and event.get("event") == "admitted":
+            self._admitted.set()
+            return
+        if isinstance(event, dict) and event.get("event") == "suppressed":
+            count = event.get("count")
+            if type(count) is int and 0 < count <= 10**9:
+                _log.warning("%s: %d more blocked egress attempts", self.plugin, count)
+                self._dropped += count
+            return
+        detail = blocked_detail(self.plugin, event)
         if detail is None:
             return
         _log.warning("%s", detail)
@@ -292,6 +312,20 @@ class ProxyHandle:
             self._kept.append(detail)
         else:
             self._dropped += 1
+
+    async def admit(self, address: str) -> bool:
+        """Tell the proxy the plugin container's address (the only client it will serve) and
+        wait for its confirmation; `False` if it does not confirm in time."""
+        stdin = self._process.stdin
+        if stdin is None:  # pragma: no cover (always piped)
+            return False
+        try:
+            await stdin.send(json.dumps({"client": address}).encode() + b"\n")
+        except (anyio.ClosedResourceError, anyio.BrokenResourceError, OSError):
+            return False
+        with anyio.move_on_after(ADMIT_TIMEOUT_S):
+            await self._admitted.wait()
+        return self._admitted.is_set()
 
     def take(self) -> list[str]:
         """The blocked attempts seen since the last call (and empties the list)."""
@@ -360,6 +394,7 @@ __all__ = [
     "EGRESS_NETWORK_LABEL",
     "EGRESS_NETWORK_OPTIONS",
     "PROXY_SOURCE",
+    "PROXY_SYSCTLS",
     "PROXY_USER",
     "ProxyHandle",
     "blocked_detail",
