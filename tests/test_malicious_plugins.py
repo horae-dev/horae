@@ -55,7 +55,9 @@ from test_engine_skills import CONTEXT, START
 pytestmark = pytest.mark.malicious
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "malicious"
-EVIL_TOKEN = "sentinel-value-for-evil-plugin"  # noqa: S105 (synthetic)
+EVIL_TOKEN = 'evil/tok+en é"~?>'  # noqa: S105 (synthetic)
+"""Synthetic, and chosen so that every encoding the redactor knows differs from the value:
+percent- and JSON-escaped, base64 with a `+` (so URL-safe base64 differs too)."""
 SIBLING_TOKEN = "sentinel-value-for-sibling-plugin"  # noqa: S105 (synthetic)
 CORE_KEY = "sentinel-value-for-the-core-act-key"  # synthetic, in Horae's own environment
 RUN_ID = "20261027T053000Z-malicious-01"
@@ -209,6 +211,8 @@ def test_evil_intents_control_a_bound_note_is_routed(tmp_path: Path) -> None:
     ("attack", "kind", "reason"),
     [
         ("undeclared", "intent_rejected", "intent_undeclared"),
+        ("private_literal", "intent_rejected", "intent_invalid"),
+        ("loopback", "intent_rejected", "intent_invalid"),
         ("unknown_type", "intent_rejected", "intent_invalid"),
         ("exfiltrate", "intent_rejected", "host_undeclared"),
         ("userinfo", "intent_rejected", "intent_invalid"),
@@ -323,8 +327,11 @@ def test_evil_secrets_every_leak_of_its_own_secret_is_redacted_and_flagged(
     )
     marker = "[REDACTED:EVIL_TOKEN]"
     echoed = _ok(echo)
-    for name, value in echoed.data.items():
-        assert marker in value, name
+    forms = _module("evil_secrets").encodings(EVIL_TOKEN)
+    assert len(set(forms.values())) == len(forms)  # each encoding is its own string
+    assert echoed.data == {**dict.fromkeys(forms, marker), "embedded": echoed.data["embedded"]}
+    assert echoed.data["embedded"].startswith("Authorization: Basic ")
+    assert marker in echoed.data["embedded"]
     assert echoed.intents == [{"type": "notify.push", "body": f"token={marker}"}]
     assert [(v.kind, v.detail) for v in echoed.violations] == [
         (
@@ -508,7 +515,7 @@ def test_evil_injection_control_and_injected_text_that_only_fills_a_field(tmp_pa
         ("write_elsewhere", "failed", "intent_unrouted", "note.create intent_unrouted"),
         ("embed", "degraded", "guard_violation", "embed"),
         ("invented_url", "degraded", "guard_violation", "a link not in the input"),
-        ("many", "degraded", "guard_violation", "note.create"),
+        ("many", "degraded", "guard_violation", "the skill allows 1"),
         ("call_tool", "failed", "intent_rejected", "intent_undeclared"),
         ("approve", "failed", "intent_rejected", "intent_invalid"),
     ],
@@ -640,14 +647,41 @@ def test_evil_deid_the_name_never_reaches_the_cloud_model(
     assert record.steps[1].output == {"summary": "Bravo Zoé"}  # re-identified, after the call
 
 
-@pytest.mark.parametrize("attack", ["wrong_shape", "long"])
-def test_evil_deid_a_name_it_hides_from_matching_fails_closed(tmp_path: Path, attack: str) -> None:
+@pytest.mark.parametrize(
+    ("attack", "reason"),
+    [
+        ("wrong_shape", "does not have the shape of its declared personal field"),
+        ("long", "so it cannot be found in text"),
+    ],
+)
+def test_evil_deid_a_name_it_hides_from_matching_fails_closed(
+    tmp_path: Path, attack: str, reason: str
+) -> None:
     record, llm = _deid(tmp_path, attack)
     assert llm.requests == []  # nothing sent
     assert record.llm == []
     assert record.steps[1].status == "degraded"
     kind, message = _error(record, 1)
     assert kind == "deid_unavailable"
+    assert reason in message
+    assert "Zoé" not in message
+
+
+def test_evil_deid_a_name_the_scanner_misses_is_caught_by_the_backstop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fault injection, not an attack: no input of `evil-deid` gets past the scanner (the
+    backstop is the same matcher, run again on what would be sent). Turning the scanner off
+    shows the backstop alone still refuses the step before anything is sent."""
+    import horae.llm.deid as deid
+
+    monkeypatch.setattr(deid._Pseudonymizer, "scan", lambda self, text: text)
+    record, llm = _deid(tmp_path, "baseline")
+    assert llm.requests == []
+    assert record.steps[1].status == "degraded"
+    kind, message = _error(record, 1)
+    assert kind == "deid_unavailable"
+    assert "a declared personal value would be sent in clear: refused" in message
     assert "Zoé" not in message
 
 
@@ -699,11 +733,13 @@ def mcp_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 def test_a_malicious_mcp_client_cannot_run_or_approve_a_pipeline(mcp_root: Path) -> None:
+    import httpx2
+
     from horae.config import STORE_FILE
     from horae.mcp_auth import SCOPE_PIPELINE_RUN, SCOPE_READ, TokenVerifier
     from horae.mcp_server import PipelineRuns, build_http_app
     from horae.store import Store
-    from test_mcp_auth import add, call_tool, http_reader, serving
+    from test_mcp_auth import ACCEPT, INIT, add, call_tool, http_reader, serving
 
     store_path = mcp_root / "state" / STORE_FILE
     reader = add(store_path, "reader")
@@ -712,6 +748,8 @@ def test_a_malicious_mcp_client_cannot_run_or_approve_a_pipeline(mcp_root: Path)
         http_reader(mcp_root, store_path), TokenVerifier(store_path), runs=PipelineRuns(mcp_root)
     )
     with serving(app) as s:
+        # No token at all: refused before any tool.
+        anonymous = httpx2.post(s.url, json=INIT, headers=ACCEPT, timeout=10)
         # A read token cannot even ask.
         refused = call_tool(s.url, reader, "pipeline.run", {"pipeline": "dry-brief"})
         # A pipeline.run token asks, then tries every way to approve its own request.
@@ -730,6 +768,8 @@ def test_a_malicious_mcp_client_cannot_run_or_approve_a_pipeline(mcp_root: Path)
             "pipeline.run",
             {"pipeline": "dry-brief", "approve": approval_id, "approved": True, "code": "QWERTY"},
         )
+    assert anonymous.status_code == 401
+    assert anonymous.json()["error"] == "invalid_token"
     assert refused.is_error
     assert "insufficient_scope" in json.dumps([c.model_dump() for c in refused.content])
     assert not asked.is_error
@@ -740,7 +780,13 @@ def test_a_malicious_mcp_client_cannot_run_or_approve_a_pipeline(mcp_root: Path)
         rows = {row.id: row for row in store.approvals()}
         runs = store.list_runs()
     assert rows[approval_id].status == "pending"  # still waiting for the user
-    assert all(row.status in ("pending", "planning") for row in rows.values())
-    if not again.is_error:  # extra arguments ignored: one more request, pending as well
-        assert len(rows) == 2
+    # Approval arguments are ignored: the call is one more ordinary request, a new pending
+    # approval of its own, and the first one is untouched.
+    assert not again.is_error
+    second = again.structured_content["approval"]["id"]
+    assert second != approval_id
+    assert {row_id: row.status for row_id, row in rows.items()} == {
+        approval_id: "pending",
+        second: "pending",
+    }
     assert all(run.dry_run for run in runs)  # nothing was applied

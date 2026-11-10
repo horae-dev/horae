@@ -21,6 +21,7 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import secrets
 import shutil
 import subprocess
@@ -39,6 +40,7 @@ from horae.contracts.instance import (
     PluginDefaults,
 )
 from horae.plugins.host import HostRegistry, PluginCallError, PluginHost
+from horae.plugins.host import egress as egress_module
 from horae.plugins.host.env import BASE_PATH, PLUGIN_KEYS, PROXY_KEYS
 from horae.plugins.host.mounts import MountPolicy
 from horae.secrets import SecretResolver
@@ -52,13 +54,15 @@ SIBLING_TOKEN = "sentinel-value-for-sibling-plugin"  # noqa: S105 (synthetic)
 CORE_KEY = "sentinel-value-for-the-core-act-key"  # synthetic, in Horae's own environment
 REBIND = "rebind.horae.test"
 """A "public" name the egress network's DNS answers with a private address."""
-PLUGINS = (
-    "evil-network",
-    "evil-sibling",
-    "evil-secrets",
-    "evil-paths",
-    "evil-resources",
+SUFFIX = secrets.token_hex(3)
+"""Every name this module gives Docker carries it, so concurrent runs never collide."""
+NETWORK, SIBLING, SECRETS, PATHS, RESOURCES = (
+    f"evil-{kind}-{SUFFIX}" for kind in ("network", "sibling", "secrets", "paths", "resources")
 )
+PLUGINS = (NETWORK, SIBLING, SECRETS, PATHS, RESOURCES)
+EGRESS = f"horae-egress-test-{SUFFIX}"
+"""This module's own egress network (`horae.plugins.host.egress.EGRESS_NETWORK` is set to it
+for the module): the real `horae-egress` is never touched, nor joined by a test container."""
 
 
 def _docker(*args: str, timeout: float = 120) -> subprocess.CompletedProcess[str]:
@@ -89,10 +93,23 @@ def engine() -> Iterator[None]:
         pulled = _docker("pull", "--quiet", DEFAULT_CONTAINER_IMAGE, timeout=600)
         if pulled.returncode != 0:
             pytest.skip("the plugin image cannot be pulled")
-    yield
-    for name in PLUGINS:
-        _docker("network", "rm", f"horae-plugin-{name}")
-    _docker("network", "rm", "horae-egress")  # fails harmlessly while another run uses it
+    created = _docker(
+        "network",
+        "create",
+        "--driver=bridge",
+        "--opt=com.docker.network.bridge.enable_icc=false",
+        "--label=dev.horae.network=egress",
+        EGRESS,
+    )
+    assert created.returncode == 0, created.stderr
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(egress_module, "EGRESS_NETWORK", EGRESS)
+        try:
+            yield
+        finally:
+            for name in PLUGINS:
+                _docker("network", "rm", f"horae-plugin-{name}")
+            _docker("network", "rm", EGRESS)
 
 
 @pytest.fixture(scope="module")
@@ -192,7 +209,7 @@ def _rebinding() -> Iterator[None]:
         "--detach",
         "--rm",
         "--network",
-        "horae-egress",
+        EGRESS,
         "--network-alias",
         REBIND,
         "--name",
@@ -209,23 +226,31 @@ def _rebinding() -> Iterator[None]:
         _docker("rm", "--force", name)
 
 
+LAN_SERVER = """
+import http.server, sys
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/redirect":
+            self.send_response(302)
+            self.send_header("Location", "http://undeclared.example.net/")
+        else:
+            self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+    def log_message(self, *args):
+        pass
+http.server.HTTPServer((sys.argv[1], int(sys.argv[2])), Handler).serve_forever()
+"""
+"""A local server: `200` at `/`, a redirect to an undeclared host at `/redirect`."""
+
+
 @pytest.fixture(scope="module")
 def egress(engine: None) -> Iterator[tuple[str, int]]:
-    """The egress network as Horae creates it, and a local HTTP server on the Docker host,
-    reached by the proxy at the network's gateway (`gateway:port`)."""
-    if _docker("network", "inspect", "horae-egress").returncode != 0:
-        created = _docker(
-            "network",
-            "create",
-            "--driver=bridge",
-            "--opt=com.docker.network.bridge.enable_icc=false",
-            "--label=dev.horae.network=egress",
-            "horae-egress",
-        )
-        assert created.returncode == 0, created.stderr
-    inspected = json.loads(_docker("network", "inspect", "horae-egress").stdout)[0]
+    """A local HTTP server on the Docker host, bound to this module's egress network's
+    gateway only (the host's own address there), where the proxy reaches it (`gateway:port`)."""
+    inspected = json.loads(_docker("network", "inspect", EGRESS).stdout)[0]
     gateway = inspected["IPAM"]["Config"][0]["Gateway"]
-    lan = f"horae-test-evil-lan-{secrets.token_hex(4)}"
+    lan = f"horae-test-evil-lan-{SUFFIX}"
     port = 20000 + secrets.randbelow(20000)
     started = _docker(
         "run",
@@ -237,16 +262,15 @@ def egress(engine: None) -> Iterator[tuple[str, int]]:
         lan,
         DEFAULT_CONTAINER_IMAGE,
         "python",
-        "-m",
-        "http.server",
+        "-c",
+        LAN_SERVER,
+        gateway,
         str(port),
-        "--bind",
-        "0.0.0.0",  # noqa: S104 (the egress gateway is one of the host's addresses)
     )
     assert started.returncode == 0, started.stderr
     try:
         deadline = time.monotonic() + 30
-        probe = f"import socket; socket.create_connection(('127.0.0.1', {port}), timeout=1)"
+        probe = f"import socket; socket.create_connection(('{gateway}', {port}), timeout=1)"
         while _docker("exec", lan, "python", "-c", probe).returncode != 0:
             assert time.monotonic() < deadline, "the LAN server did not start"
             time.sleep(0.2)
@@ -255,7 +279,7 @@ def egress(engine: None) -> Iterator[tuple[str, int]]:
         _docker("rm", "--force", lan)
 
 
-NETWORK_TOOLS = ("env", "connect", "resolve", "raw", "tunnel", "http")
+NETWORK_TOOLS = ("env", "connect", "resolve", "raw", "tunnel", "http", "fetch")
 
 
 def test_evil_network_reaches_nothing_but_its_grants_and_every_attempt_is_recorded(
@@ -264,7 +288,7 @@ def test_evil_network_reaches_nothing_but_its_grants_and_every_attempt_is_record
     gateway, port = egress
     local = f"{gateway}:{port}"
     network = {"network": ["api.example.test", REBIND], "network_local": [local]}
-    name = "evil-network"
+    name = NETWORK
     manifest = _manifest(name, NETWORK_TOOLS, network=network)
 
     async def go() -> dict[str, Any]:
@@ -304,6 +328,9 @@ def test_evil_network_reaches_nothing_but_its_grants_and_every_attempt_is_record
                     "http", url=f"http://{local}@undeclared.example.net/", host_header=local
                 ),
             }
+            # A redirect from the granted endpoint to an undeclared host: a standard client
+            # follows it with a new request, which the proxy checks again (T07).
+            seen["redirect"] = await tool("fetch", url=f"http://{local}/redirect")
             with _rebinding():
                 seen["rebinding"] = await tool("tunnel", host=REBIND, port=443)
             return seen
@@ -331,6 +358,12 @@ def test_evil_network_reaches_nothing_but_its_grants_and_every_attempt_is_record
     refused("metadata", "403 Forbidden", "169.254.169.254", 80, "ip_literal")
     refused("metadata_http", "403 Forbidden", "169.254.169.254", 80, "ip_literal")
     refused("loopback", "403 Forbidden", "127.0.0.1", 3128, "ip_literal")
+    redirect = seen["redirect"]
+    assert redirect.data["status"] == 403, redirect.data  # the redirect's target, refused
+    assert redirect.data["url"] == "http://undeclared.example.net/"
+    assert _details(redirect) == [
+        f"{name}: egress blocked to undeclared.example.net:80 (host_not_allowed)"
+    ]
     refused("rebinding", "403 Forbidden", REBIND, 443, "private_address")
     # The decision is taken on the request target, never on a header.
     refused("host_header", "403 Forbidden", "undeclared.example.net", 80, "host_not_allowed")
@@ -349,30 +382,32 @@ def test_evil_network_cannot_borrow_a_sibling_plugins_proxy(
     """Another plugin's proxy holds another allow-list: it is on that plugin's network only,
     so the attacker cannot even reach it (and it serves its own container only, T48)."""
     gateway, port = egress
-    evil = _manifest("evil-network", NETWORK_TOOLS)
-    sibling = _manifest(
-        "evil-sibling", NETWORK_TOOLS, network={"network_local": [f"{gateway}:{port}"]}
-    )
+    evil = _manifest(NETWORK, NETWORK_TOOLS)
+    sibling = _manifest(SIBLING, NETWORK_TOOLS, network={"network_local": [f"{gateway}:{port}"]})
 
     async def go() -> tuple[Any, Any, Any]:
         async with _host(tmp_path, plugin_dir, evil, sibling) as h:
-            env = (await h.call("evil-sibling.env", {}, None)).data["env"]
-            own = await h.call("evil-sibling.tunnel", {"host": gateway, "port": port}, None)
+            env = (await h.call(f"{SIBLING}.env", {}, None)).data["env"]
+            own = await h.call(f"{SIBLING}.tunnel", {"host": gateway, "port": port}, None)
             stolen = await h.call(
-                "evil-network.tunnel",
+                f"{NETWORK}.tunnel",
                 {"host": gateway, "port": port, "via": env["HTTPS_PROXY"]},
                 None,
             )
-            mine = await h.call("evil-network.tunnel", {"host": gateway, "port": port}, None)
+            mine = await h.call(f"{NETWORK}.tunnel", {"host": gateway, "port": port}, None)
             return own, stolen, mine
 
     own, stolen, mine = asyncio.run(go())
     assert own.data["status"] == "HTTP/1.1 200 Connection established", own.data  # control
     assert stolen.data["status"] == "", stolen.data  # no route to the sibling's proxy
-    assert stolen.data["error"]
+    # A connection-level failure: the sibling's proxy is on a network this one is not on.
+    assert re.search(
+        r"timed out|No route to host|Connection refused|Network is unreachable",
+        stolen.data["error"],
+    ), stolen.data
     assert stolen.violations == ()
     assert mine.data["status"] == "HTTP/1.1 403 Forbidden"  # its own proxy: not granted
-    assert _details(mine) == [f"evil-network: egress blocked to {gateway}:{port} (ip_literal)"]
+    assert _details(mine) == [f"{NETWORK}: egress blocked to {gateway}:{port} (ip_literal)"]
 
 
 # --- secrets: T03, T09, T43 -----------------------------------------------------------------------
@@ -386,16 +421,16 @@ def test_evil_secrets_finds_no_secret_it_did_not_declare(
     `/proc`. Its own secret comes back redacted, flagged `secret_in_output`."""
     monkeypatch.setenv("HORAE_ACT_KEY", CORE_KEY)
     monkeypatch.setenv("SIBLING_TOKEN", SIBLING_TOKEN)
-    evil = _manifest("evil-secrets", ("env", "read", "proc"), secret="EVIL_TOKEN")  # noqa: S106 (a name)
-    sibling = _manifest("evil-sibling", ("env",), secret="SIBLING_TOKEN")  # noqa: S106 (a name)
+    evil = _manifest(SECRETS, ("env", "read", "proc"), secret="EVIL_TOKEN")  # noqa: S106 (a name)
+    sibling = _manifest(SIBLING, ("env",), secret="SIBLING_TOKEN")  # noqa: S106 (a name)
     secrets_path = tmp_path / "secrets"
 
     async def go() -> dict[str, Any]:
         async with _host(tmp_path, plugin_dir, evil, sibling) as h:
-            await h.call("evil-sibling.env", {}, None)  # running, its preamble delivered
+            await h.call(f"{SIBLING}.env", {}, None)  # running, its preamble delivered
 
             async def tool(tool: str, **params: Any) -> Any:
-                return await h.call(f"evil-secrets.{tool}", params, None)
+                return await h.call(f"{SECRETS}.{tool}", params, None)
 
             return {
                 "env": await tool("env"),
@@ -410,7 +445,7 @@ def test_evil_secrets_finds_no_secret_it_did_not_declare(
     assert set(env) == PLUGIN_KEYS | {"VIRTUAL_ENV", "EVIL_TOKEN", *PROXY_KEYS}
     assert env["EVIL_TOKEN"] == "[REDACTED:EVIL_TOKEN]"  # noqa: S105 (a redaction marker)
     assert _details(seen["env"]) == [
-        "evil-secrets.env returned secret EVIL_TOKEN in its output (redacted)"
+        f"{SECRETS}.env returned secret EVIL_TOKEN in its output (redacted)"
     ]
     proc = seen["proc"]
     assert len(proc.data["pids"]) <= 3, proc.data["pids"]  # docker-init and itself
@@ -432,23 +467,27 @@ def test_evil_secrets_finds_no_secret_it_did_not_declare(
 # --- paths: T04, T51, T53 -------------------------------------------------------------------------
 
 
-def _instance(tmp_path: Path) -> tuple[Path, MountPolicy]:
+def _instance(tmp_path: Path, secrets_in: bool = False) -> tuple[Path, MountPolicy]:
     """A synthetic instance: a vault (read-only grant) with an inbox (writable grant), an
-    undeclared directory and the instance's own controls."""
+    undeclared directory and the instance's own controls (the secrets directory inside it
+    with `secrets_in`, so that only the sensitive-path rule can refuse it)."""
     root = (tmp_path / "instance").resolve()
-    for directory in ("vault/inbox", "undeclared", "state", "plugins"):
+    for directory in ("vault/inbox", "undeclared", "state", "plugins", "secrets"):
         (root / directory).mkdir(parents=True)
     (root / "vault" / "note.md").write_text("vault note\n", encoding="utf-8")
     (root / "undeclared" / "private.md").write_text("not for plugins\n", encoding="utf-8")
     (root / "horae.lock").write_text("schema_version: 1\n", encoding="utf-8")
     (root / "horae.yaml").write_text("timezone: UTC\n", encoding="utf-8")
     policy = MountPolicy.for_instance(
-        root, state_dir=root / "state", secrets_dir=tmp_path / "secrets", home=tmp_path / "home"
+        root,
+        state_dir=root / "state",
+        secrets_dir=root / "secrets" if secrets_in else tmp_path / "secrets",
+        home=tmp_path / "home",
     )
     return root, policy
 
 
-PATH_TOOLS = ("env", "fs", "read", "write", "plant", "hook")
+PATH_TOOLS = ("env", "fs", "read", "write", "plant", "hook", "caps")
 
 
 def test_evil_paths_sees_only_its_grants_and_its_traps_are_undone(
@@ -456,7 +495,7 @@ def test_evil_paths_sees_only_its_grants_and_its_traps_are_undone(
 ) -> None:
     root, policy = _instance(tmp_path)
     vault, inbox = root / "vault", root / "vault" / "inbox"
-    name = "evil-paths"
+    name = PATHS
     paths = {"read": [str(vault)], "write": [str(inbox)]}
     manifest = _manifest(name, PATH_TOOLS, paths=paths)
     private = root / "undeclared" / "private.md"
@@ -476,6 +515,9 @@ def test_evil_paths_sees_only_its_grants_and_its_traps_are_undone(
                 "dotdot": await tool("read", path=f"{inbox}/../../undeclared/private.md"),
                 "read_only_file": await tool("write", path=str(vault / "note.md")),
                 "read_only_dir": await tool("write", path=str(vault / "new.md")),
+                # World-writable in the image (1777): only the read-only root stops it.
+                "root_fs": await tool("write", path="/var/tmp/evil"),  # noqa: S108
+                "caps": await tool("caps"),
                 "planted": await tool(
                     "plant", path=str(inbox), outside=str(private), source=str(vault / "note.md")
                 ),
@@ -490,6 +532,17 @@ def test_evil_paths_sees_only_its_grants_and_its_traps_are_undone(
     assert seen["dotdot"] == {"read": None, "error": "No such file or directory"}
     assert seen["read_only_file"] == {"written": "Read-only file system"}
     assert seen["read_only_dir"] == {"written": "Read-only file system"}
+    assert seen["root_fs"] == {"written": "Read-only file system"}
+    # Non-root has no effective capability anyway; `--cap-drop ALL` also empties the bounding
+    # set, which is what a set-user-ID or file-capability program could otherwise gain.
+    caps = seen["caps"]
+    assert {key: int(caps[key], 16) for key in ("CapPrm", "CapEff", "CapBnd", "CapAmb")} == {
+        "CapPrm": 0,
+        "CapEff": 0,
+        "CapBnd": 0,
+        "CapAmb": 0,
+    }
+    assert caps["NoNewPrivs"] == "1"
     assert (vault / "note.md").read_text(encoding="utf-8") == "vault note\n"
     assert not (vault / "new.md").exists()
     planted = seen["planted"]
@@ -512,11 +565,45 @@ def test_evil_paths_sees_only_its_grants_and_its_traps_are_undone(
     # ...and once the container is gone, the sweep undoes every trap left for the host.
     for trap in ("escape", "dotdot", "fifo", "hardlink", "null"):
         assert not os.path.lexists(inbox / trap), trap
-    if planted["setuid"] is True:
-        assert not os.stat(inbox / "setuid").st_mode & 0o6000
+    assert planted["setuid"] is True  # the bits stuck in the container...
+    assert not os.stat(inbox / "setuid").st_mode & 0o6000  # ...and the sweep cleared them
     assert private.read_text(encoding="utf-8") == "not for plugins\n"
     assert not (root / "state" / "quarantine" / name).exists()  # a clean sweep
     _gone(f"dev.horae.plugin={name}")
+
+
+@pytest.mark.parametrize(
+    ("access", "target"),
+    [
+        ("read", "horae.lock"),
+        ("write", "state"),
+        ("read", "secrets"),
+        ("read", ""),  # the instance itself: an ancestor of every sensitive entry
+    ],
+)
+def test_evil_paths_asking_for_a_sensitive_path_never_starts(
+    tmp_path: Path, plugin_dir: Path, access: str, target: str
+) -> None:
+    """The lock grants it (an approved manifest asked), yet a path that is, holds or lies in
+    the instance's controls, state or secrets is never mounted: the plugin does not start.
+    Everything here lies in the instance, so only the sensitive-path rule can refuse it."""
+    root, policy = _instance(tmp_path, secrets_in=True)
+    path = str(root / target) if target else str(root)
+    name = PATHS
+    manifest = _manifest(name, PATH_TOOLS, paths={access: [path]})
+
+    async def go() -> PluginCallError:
+        async with _host(tmp_path, plugin_dir, manifest, mounts=policy) as h:
+            with pytest.raises(PluginCallError) as info:
+                await h.call(f"{name}.env", {}, None)
+            return info.value
+
+    error = asyncio.run(go())
+    assert error.kind == "runtime_unavailable"
+    assert "which no plugin may see" in error.message, error.message
+    assert not _docker(
+        "ps", "--all", "--quiet", "--filter", f"label=dev.horae.plugin={name}"
+    ).stdout.strip()  # nothing was started
 
 
 def test_evil_paths_planting_a_git_hook_quarantines_the_plugin(
@@ -526,7 +613,7 @@ def test_evil_paths_planting_a_git_hook_quarantines_the_plugin(
     and the plugin's next start is refused until the operator removes the quarantine file."""
     root, policy = _instance(tmp_path)
     inbox = root / "vault" / "inbox"
-    name = "evil-paths"
+    name = PATHS
     manifest = _manifest(name, PATH_TOOLS, paths={"write": [str(inbox)]})
 
     async def plant() -> Any:
@@ -559,7 +646,7 @@ RESOURCE_TOOLS = ("env", "fork", "fds", "fill", "hog", "daemon")
 def test_evil_resources_hits_every_limit_and_leaves_nothing_behind(
     tmp_path: Path, plugin_dir: Path
 ) -> None:
-    name = "evil-resources"
+    name = RESOURCES
     limits = ContainerLimits(pids=32, nofile=256, tmp_mb=8, memory_mb=128)
     manifest = _manifest(name, RESOURCE_TOOLS)
 
@@ -590,7 +677,7 @@ def test_evil_resources_hits_every_limit_and_leaves_nothing_behind(
 
 
 def test_evil_resources_memory_hog_is_killed_and_reported(tmp_path: Path, plugin_dir: Path) -> None:
-    name = "evil-resources"
+    name = RESOURCES
     manifest = _manifest(name, RESOURCE_TOOLS)
     limits = ContainerLimits(memory_mb=64, tmp_mb=8)
 

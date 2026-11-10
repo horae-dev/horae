@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# ruff: noqa: S103, S108
+# ruff: noqa: S103, S108, S310
 """The attacks of the malicious-plugin suite (#52): standard library only.
 
 Every malicious fixture plugin calls these functions, whatever its runtime: the SDK plugins of
@@ -18,7 +18,9 @@ import os
 import signal
 import socket
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 from collections.abc import Callable
 from typing import Any
 
@@ -161,6 +163,19 @@ def hook(path: str) -> dict[str, Any]:
     return {"git": _attempt(git)}
 
 
+def caps() -> dict[str, Any]:
+    """Its capability sets (`/proc/self/status`): a non-root process has no effective
+    capability anyway, but a non-empty bounding set is what a set-user-ID or file-capability
+    program could still gain."""
+    found: dict[str, Any] = {}
+    status = read("/proc/self/status", 65536)["read"] or ""
+    for line in status.splitlines():
+        key, _, value = line.partition(":")
+        if key in ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb", "NoNewPrivs"):
+            found[key] = value.strip()
+    return found
+
+
 # --- network -----------------------------------------------------------------------------------
 
 
@@ -227,6 +242,18 @@ def http(url: str, host_header: str | None = None, via: str | None = None) -> di
     header naming another host than the URL."""
     host = host_header or (urllib.parse.urlsplit(url).netloc or "evil")
     return raw(f"GET {url} HTTP/1.1\nHost: {host}\n\n", via)
+
+
+def fetch(url: str) -> dict[str, Any]:
+    """A plain `urllib` request, which uses `HTTP_PROXY` from the environment and follows
+    redirects, as any standard client does: the final status, or why it failed."""
+    try:
+        with urllib.request.urlopen(url, timeout=20) as response:
+            return {"status": response.status, "url": response.url, "error": None}
+    except urllib.error.HTTPError as error:
+        return {"status": error.code, "url": error.url, "error": None}
+    except OSError as error:
+        return {"status": None, "url": None, "error": str(error)}
 
 
 # --- resources ---------------------------------------------------------------------------------
@@ -324,11 +351,13 @@ ATTACKS: dict[str, Callable[..., dict[str, Any]]] = {
     "write": write,
     "plant": plant,
     "hook": hook,
+    "caps": caps,
     "connect": connect,
     "resolve": resolve,
     "raw": raw,
     "tunnel": tunnel,
     "http": http,
+    "fetch": fetch,
     "fork": fork,
     "hog": hog,
     "fds": fds,

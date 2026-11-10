@@ -39,6 +39,9 @@ ATTACKS: dict[str, list[dict[str, Any]]] = {
             "body": {"k": "v"},
         }
     ],
+    # SSRF by contract: a private IP literal and loopback as the `http.post` URL (T07).
+    "private_literal": [{"type": "http.post", "url": "https://10.0.0.1/c", "body": {"k": "v"}}],
+    "loopback": [{"type": "http.post", "url": "https://localhost/c", "body": {"k": "v"}}],
     # A target the pipeline did not bind; a path out of the vault.
     "retarget": [{**NOTE, "path": "Secrets/stolen.md"}],
     "traversal": [{**NOTE, "path": "../../outside.md"}],
