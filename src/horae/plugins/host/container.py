@@ -99,6 +99,10 @@ NETWORK_OPTIONS = {
 inter-container traffic is on, so the plugin reaches its proxy; only its own containers and its
 own proxy may be attached)."""
 ENGINE_TIMEOUT_S = 10.0
+OOM_POLL_S = 1.0
+"""How long a `SIGKILL` exit (137) with `OOMKilled` still false is re-inspected (#188)."""
+OOM_POLL_STEP_S = 0.05
+SIGKILLED = 137
 """Each Docker CLI call but `run` (inspect, create, rm) may take this long."""
 MAX_PREAMBLE = 1024 * 1024
 """The longest environment line the launcher reads."""
@@ -580,12 +584,32 @@ class ContainerRuntime:
         self, docker: str, plugin: str, name: str, limits: ContainerLimits
     ) -> tuple[HostErrorKind, str] | None:
         """`oom_killed` if the kernel killed something in `name` for its memory limit (decision
-        78 E), else `None` (the plugin's failure stays what it was)."""
-        code, out, _ = await self._run(
-            docker, "container", "inspect", "--format", "{{json .State.OOMKilled}}", name
-        )
-        if code != 0 or out.strip() != b"true":
-            return None
+        78 E), else `None` (the plugin's failure stays what it was).
+
+        The engine sets `.State.OOMKilled` from the cgroup's OOM event, which can reach it after
+        the container's exit (#188): a process that died of `SIGKILL` (exit 137) with the flag
+        still unset is asked again, for `OOM_POLL_S` at most. Other exits are asked once. The
+        engine is the one source: the cgroup's `memory.events` goes away with the container, and
+        `docker events` carries the same OOM event the flag is built from. The caller never asks
+        for a container Horae stopped itself (a timeout or a stop kills with `SIGKILL` too)."""
+        deadline = anyio.current_time() + OOM_POLL_S
+        while True:
+            code, out, _ = await self._run(
+                docker,
+                "container",
+                "inspect",
+                "--format",
+                "{{json .State.OOMKilled}} {{json .State.ExitCode}}",
+                name,
+            )
+            flag, _, exit_code = out.decode("ascii", "replace").strip().partition(" ")
+            if code != 0 or flag not in ("true", "false"):
+                return None
+            if flag == "true":
+                break
+            if exit_code != str(SIGKILLED) or anyio.current_time() >= deadline:
+                return None
+            await anyio.sleep(OOM_POLL_STEP_S)
         return (
             "oom_killed",
             f"plugin {plugin} (runtime container) was killed by its memory limit "

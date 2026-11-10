@@ -532,7 +532,10 @@ if args[:2] == ["container", "inspect"] and ".Mounts" in args[3]:
     print(json.dumps(mounts))
     sys.exit(0)
 if args[:2] == ["container", "inspect"] and "OOMKilled" in args[3]:
-    print("true" if fake["oom"] else "false")
+    counter = os.path.join(config_dir, "oom-inspects")
+    seen = int(open(counter).read()) if os.path.exists(counter) else 0
+    open(counter, "w").write(str(seen + 1))
+    print(("true" if fake["oom"] and seen >= fake["oom_after"] else "false"), fake["exit_code"])
     sys.exit(0)
 if args[:2] == ["container", "inspect"] and "NetworkSettings" in args[3]:
     print(json.dumps(fake["proxy_networks"]))
@@ -593,6 +596,8 @@ def _fake_docker(tmp_path: Path, **fake: Any) -> tuple[Path, Path]:
         "admit": True,
         "blocked": [],
         "oom": False,
+        "oom_after": 0,
+        "exit_code": 137,
         "mounts": None,
         "leftovers": {},
         "mode": "normal",
@@ -1276,7 +1281,11 @@ def test_a_memory_kill_during_a_call_is_reported_as_oom_killed(tmp_path: Path) -
     assert error.kind == "oom_killed"
     assert "memory limit (512 MiB" in error.message
     calls = _calls(state)
-    inspect = next(i for i, call in enumerate(calls) if "{{json .State.OOMKilled}}" in call)
+    inspect = next(
+        i
+        for i, call in enumerate(calls)
+        if "{{json .State.OOMKilled}} {{json .State.ExitCode}}" in call
+    )
     run = next(call for call in calls if call[0] == "run" and "dev.horae.plugin=raw" in call)
     name = run[run.index("--name") + 1]
     assert calls.index(["rm", "--force", name]) > inspect  # inspected before it is removed
@@ -1300,6 +1309,67 @@ def test_a_memory_kill_during_the_start_is_reported_as_oom_killed(tmp_path: Path
     cli, state = _fake_docker(tmp_path, oom=True, mode="exit")
     error = _first_error(tmp_path, plugin, docker=cli, state=state)
     assert error.kind == "oom_killed"
+
+
+def _inspects(state: Path) -> int:
+    counter = state / "oom-inspects"
+    return int(counter.read_text(encoding="utf-8")) if counter.exists() else 0
+
+
+def test_an_oom_flag_set_after_the_exit_is_still_reported_as_oom_killed(tmp_path: Path) -> None:
+    """#188: the engine can set `OOMKilled` after the container's exit (137): asked again."""
+    plugin = _plugin_dir(tmp_path)
+    cli, state = _fake_docker(tmp_path, oom=True, oom_after=4, mode="exit")
+    error = _first_error(tmp_path, plugin, docker=cli, state=state)
+    assert error.kind == "oom_killed"
+    assert _inspects(state) == 5
+
+
+def test_a_sigkill_exit_without_an_oom_flag_is_asked_again_for_a_bounded_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from horae.plugins.host import container
+
+    monkeypatch.setattr(container, "OOM_POLL_S", 0.3)
+    plugin = _plugin_dir(tmp_path)
+    cli, state = _fake_docker(tmp_path, mode="exit")  # exit 137, the flag never comes
+    error = _first_error(tmp_path, plugin, docker=cli, state=state)
+    assert error.kind == "handshake_failed"
+    assert 2 <= _inspects(state) < 40
+
+
+def test_an_exit_other_than_sigkill_is_asked_once(tmp_path: Path) -> None:
+    plugin = _plugin_dir(tmp_path)
+    cli, state = _fake_docker(tmp_path, exit_code=1, mode="exit")
+    error = _first_error(tmp_path, plugin, docker=cli, state=state)
+    assert error.kind == "handshake_failed"
+    assert _inspects(state) == 1
+
+
+def test_a_container_horae_stopped_is_never_reported_as_oom_killed(tmp_path: Path) -> None:
+    import anyio
+
+    from horae.plugins.host import session
+    from horae.plugins.host.capture import StderrCapture
+
+    asked: list[bool] = []
+
+    async def diagnose() -> tuple[Any, str] | None:
+        asked.append(True)
+        return ("oom_killed", "memory")
+
+    async def go() -> list[Any]:
+        spawn = session.Spawn("raw", ("true",), {}, tmp_path, 1.0, diagnose=diagnose)
+        process = session.PluginProcess(spawn, StderrCapture(1024))
+        crashed = await process._diagnose()  # it died by itself: asked
+        process._stop.set()  # Horae stops it (a timeout or a stop)
+        stopped = await process._diagnose()
+        process._stop = anyio.Event()
+        process._host_kill = True  # Horae ended a stalled start
+        return [crashed, stopped, await process._diagnose()]
+
+    assert asyncio.run(go()) == [("oom_killed", "memory"), None, None]
+    assert asked == [True]
 
 
 def test_a_container_whose_mounts_are_not_the_checked_ones_is_stopped(tmp_path: Path) -> None:
