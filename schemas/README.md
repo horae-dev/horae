@@ -4794,3 +4794,107 @@ loosened later without breaking a valid file.
     - **H, not done here.** No approval over ntfy or the HTTP API (B); no template variables
       from the client; approvals are not shown in `runs.recent` or `/runs` (the run view keeps
       its contract; the approval log is `horae approval list`).
+
+### Provisional decisions (#51, pending maintainer review)
+
+78. **Declared mounts and resource limits of plugin containers (#51).** One additive schema
+    change to `instance/v1.json`: `plugin_defaults.limits`, `plugins.<name>.limits` and
+    `container.mount_roots`. One new host error kind, `oom_killed`. Code in
+    `horae.plugins.host.mounts` (the mount plan and the sweep) and `run_argv`
+    (`horae.plugins.host.container`, still the one place container flags are built); operator
+    guide in
+    [docs/operations/plugin-containers.md](../docs/operations/plugin-containers.md#declared-paths).
+    Only `runtime: container` (decision 74) changes; the process runtime is unchanged (T04).
+    - **A, the same path inside.** Each path of the plugin's **locked**
+      `permissions.paths` (decision 70: what the user approved, never the manifest's own) is
+      bind-mounted at **the same path** in the container: `--mount
+      type=bind,source=<path>,target=<path>,bind-recursive=disabled` plus `,readonly` unless
+      the path is in `write` (`write` implies read; a path in both is writable). The plugin
+      learns where its paths are through **the existing configuration channel**,
+      `_meta["dev.horae/paths"]` on every request (decision 35, unchanged): since the paths are
+      the same inside, that list, a pipeline parameter naming a file under them, and a path in
+      a plugin's result all mean the same file on both sides. No environment variable
+      is added. `bind-recursive=disabled` (Docker 25, already required by decision 76 B): a
+      filesystem mounted below a declared path on the host is not carried in, so it cannot
+      appear, nor stay writable under a read-only mount (kernels before 5.12 have no recursive
+      read-only).
+    - **B, what may be mounted.** Every declared path is checked before anything starts (the
+      egress proxy included); one refused path refuses the plugin, `runtime_unavailable`
+      naming the path and why (**fail closed**, decision 74 H). In order:
+      - `--mount` must carry it: no `,`, `"` or control character (as decision 74 H for the
+        plugin directory);
+      - canonical: `realpath(path) == path`, so **no symbolic link anywhere in it** (the host
+        could otherwise be steered by a link a plugin planted in a writable parent, and the
+        container would see the link's target under the declared name). The operator declares
+        the real path;
+      - it exists and is a directory or a regular file (never a socket, device or FIFO: the
+        Docker socket itself is refused here);
+      - it is, or lies inside, the instance directory or a `container.mount_roots` entry
+        (operator-set in `horae.yaml`, default none: a vault outside the instance must be
+        listed there);
+      - it neither is, contains nor lies inside a **sensitive path**, compared in both lexical
+        and real forms: the instance's `horae.yaml`, `horae.lock`, `plugins/`, `pipelines/`,
+        `skills/`, `.git/`, its `state_dir` and `secrets.dir`; the engine's socket (the
+        context's endpoint) and `/var/run/docker.sock`, `/run/docker.sock`,
+        `/run/containerd`; in Horae's home `.ssh`, `.gnupg`, `.docker`, `.aws`, `.azure`,
+        `.kube`, `.config`, `.netrc`, `.git-credentials`, `.pypirc`; and `/bin`, `/boot`,
+        `/dev`, `/etc`, `/lib*`, `/proc`, `/root`, `/run`, `/sbin`, `/sys`, `/usr`,
+        `/var/lib/docker`, `/var/lib/containerd`, `/var/lock`, `/var/run`, and the
+        container's own `/plugin`;
+      - it is neither `/tmp` nor contains it (it may lie inside it: the bind is mounted over the
+        container's tmpfs).
+      A host built without an instance (tests, tools) refuses every declared path.
+    - **C, nesting, and what a bind mount cannot do.** Mounts are ordered parent first (Docker
+      orders them by depth too), so each declared path behaves as declared: a writable child of
+      a read-only parent is writable and the rest of the parent read-only; a read-only child of
+      a writable parent stays read-only. Docker's `--mount type=bind` takes **no `nosuid`,
+      `nodev`, `noexec` or `nosymfollow`**: a declared mount has the host filesystem's flags.
+      What holds instead: no capability (`--cap-drop ALL`: no `mknod` of a device, no
+      `chown`, no `CAP_FSETID`), a non-root user, `no-new-privileges` (a set-user-ID file never
+      raises privileges inside), and a hard link cannot cross mounts (`EXDEV`). What a plugin
+      **can** do in a writable path, and the host must then not trip over: make a symbolic link
+      to anywhere (harmless inside, where it resolves in the container; dangerous to a host
+      process following it), make a FIFO or a socket, set the set-user-ID bit on a file it owns
+      (it is Horae's uid, so on the host that file runs as Horae's user). So once the
+      container is removed, `mounts.sweep` walks every writable mount (not following links,
+      not leaving its filesystem, at most 200 000 entries, then it says so) and, for each entry
+      whose `st_ctime` is at or after the container's start (less 2 s; a plugin cannot set
+      `ctime` back, so a user's own older files are never touched): removes a symbolic link
+      whose target, resolved lexically from where it is, lies outside the plugin's writable
+      paths; removes a device, FIFO or socket; clears a set-user-ID bit (and set-group-ID on a
+      file). It also checks every declared path is still the same file (device and inode) as
+      when it was checked. Each finding is logged at WARNING (at most 50 lines a sweep, then a
+      count); like egress attempts after a plugin's last call (decision 76 F), they are not run
+      violations (the call they belong to is over). **Residual**: the window between the check
+      and the engine's mount (a writer of a parent directory could swap a component for a
+      link; the next start's check, and the sweep's identity check, see it); a writable parent
+      can rename the directories between it and a read-only child (the child's contents move
+      along, still read-only, and its host path may then name a directory the plugin made: the
+      sweep reports it); while the plugin runs, what it wrote is on the host as it wrote it.
+    - **D, resource limits.** Operator-set in `horae.yaml` like `runtime`: `plugin_defaults.limits`
+      and `plugins.<name>.limits`, each field of which wins over the default's (the manifest
+      and the lock carry none, so a plugin cannot ask for more). Flags: `--cpus`, `--memory`
+      with `--memory-swap` equal (no swap), `--pids-limit`, `--ulimit nofile=N:N`, and the
+      `/tmp` tmpfs `size`. Defaults, for a 4-core / 16 GB home server running a handful of
+      plugins (each with its proxy, decision 76 B) at once: `cpus: 1.0` (one plugin never takes
+      more than a core), `memory_mb: 512` (ten plugins at their limit still leave over 10 GB),
+      `pids: 128` (a Python plugin with a thread pool and a few children; a fork loop stops
+      there), `tmp_mb: 64` (#49's size), `nofile: 1024`. Bounds in the schema: `cpus` 0.1 to 64,
+      `memory_mb` 64 to 65 536, `pids` 16 to 4096, `tmp_mb` 1 to 1024 and less than
+      `memory_mb` (the tmpfs is charged to the container's memory; pydantic-only rule, checked
+      for the merged limits of every `plugins.<name>`), `nofile` 64 to 65 536. A `cpus` above
+      the host's CPU count is refused by the engine when the container starts.
+    - **E, an out-of-memory kill is reported as such.** The plugin container is no longer
+      `--rm`: when its process dies during a call or its start, the host asks the engine
+      (`docker container inspect --format {{json .State.OOMKilled}}`) before removing it, and
+      a kill by the memory limit fails the call with the new host error kind **`oom_killed`**
+      (`plugin <name> (runtime container) was killed by its memory limit (512 MiB, ...)`)
+      instead of `plugin_crashed` or `handshake_failed`; the restart rule is unchanged (one
+      restart a run). `docker rm --force` still always runs once the CLI is gone (decision 74
+      I); a Horae killed with `SIGKILL` may now also leave an *exited* container (`docker ps
+      --all --filter label=dev.horae.plugin`). A PID-limit hit is not a kill: the plugin's
+      `fork` fails (`EAGAIN`) and the plugin reports it. CPU is throttled, never killed.
+    - **F, left to #52.** The malicious-plugin suite exercises these: an undeclared path, a
+      write to a read-only path, an escaping link, a fork bomb, a memory hog. Threat rows T51
+      to T53 of `docs/security.md`. `horae doctor` does not check mounts yet (a follow-up):
+      the first run reports them.
