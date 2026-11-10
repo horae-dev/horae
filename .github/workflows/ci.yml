@@ -91,6 +91,32 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+  malicious:
+    name: Malicious-plugin suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: ${{ env.UV_VERSION }}
+          cache-python: true
+      - run: uv sync
+      # Every fixture's attack must fail (#52, docs/security.md §6.9). The container cases need
+      # the runner's Docker engine: they must run here, not skip.
+      - name: Check the Docker engine
+        run: docker info --format '{{.ServerVersion}}'
+      - name: Run the suite (no case may be skipped)
+        run: |
+          set -euo pipefail
+          uv run pytest -m malicious -rs | tee "${RUNNER_TEMP}/malicious.txt"
+          if grep -E '^SKIPPED' "${RUNNER_TEMP}/malicious.txt"; then
+            echo "a malicious-plugin case was skipped" >&2
+            exit 1
+          fi
+
   sdk:
     name: SDK package (horae-sdk)
     runs-on: ubuntu-latest
@@ -260,7 +286,7 @@ jobs:
   ci-ok:
     name: CI OK
     if: ${{ always() }}
-    needs: [lock, lint, types, test, sdk, gitleaks, codeql, image, deploy]
+    needs: [lock, lint, types, test, malicious, sdk, gitleaks, codeql, image, deploy]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions: {}

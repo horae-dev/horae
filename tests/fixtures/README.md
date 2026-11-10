@@ -32,6 +32,22 @@ Synthetic plugins for the plugin host tests (#24), both run with the test interp
   oversized messages, error responses, a sampling request, a startup that never answers, a
   process that ignores `SIGTERM`).
 
+## malicious/
+
+The malicious-plugin suite (#52, docs/security.md §6.9). Each fixture tries to break one
+guarantee; `tests/test_malicious_plugins.py` (process runtime, engine, MCP server) and
+`tests/test_malicious_plugins_container.py` (container runtime, live Docker) assert how each
+attack fails. Synthetic names and hosts only (`.test`, `.example`, documentation addresses);
+the secret values are written by the tests to a temporary secrets directory.
+
+- `malicious_attacks.py`: the attacks, standard library only, shared by both runtimes.
+- `evil_sdk.py`: `EvilPlugin`, a `horae_sdk.Plugin` with the SDK's own checks taken out.
+- `evil_intents.py`, `evil_secrets.py`, `evil_flood.py`, `evil_injection.py`, `evil_deid.py`:
+  the process-runtime fixtures, `horae-sdk` plugins run with the test interpreter.
+- `jailbreak.py`: a stdlib stdio MCP server serving every attack as `<plugin>.<attack>`, copied
+  with `malicious_attacks.py` into a venv the plugin image builds; the container fixtures
+  (`evil-network`, `evil-secrets`, `evil-paths`, `evil-resources`) are its manifests.
+
 ## llm/anthropic/
 
 Recorded-response fixtures for the `anthropic` backend tests (#28,
