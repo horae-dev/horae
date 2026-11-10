@@ -242,3 +242,20 @@ def test_a_sink_operation_gets_the_list_too() -> None:
     assert apply([])["details"] == {"allowed": False}
     assert apply(None)["details"] == {"allowed": None}
     assert sink.seen[-1].network.known is False
+
+
+def test_the_egress_proxy_is_read_from_the_environment() -> None:
+    from horae_sdk import egress_proxy
+
+    assert egress_proxy({}) is None
+    assert egress_proxy({"HORAE_EGRESS_PROXY": "http://192.168.155.2:3128"}) == (
+        "http://192.168.155.2:3128"
+    )
+    for bad in (
+        "https://192.168.155.2:3128",
+        "http://proxy.example.org:3128",
+        "http://1.2.3.4",
+        "",
+    ):
+        assert egress_proxy({"HORAE_EGRESS_PROXY": bad}) is None
+    assert egress_proxy({"HTTPS_PROXY": "http://192.168.155.2:3128"}) is None  # only the core's

@@ -20,6 +20,11 @@
   strings such as `127.0.0.1:1143`, `[::1]:1143` or `homeassistant.local:8123`, matched by
   exact host and port, plain `http` allowed. A core that sends `horae/network` without it
   (decision 63 only) granted no local endpoint: the SDK reads it as an empty list.
+- In a plugin container (`runtime: container`, M5, schemas decision 76) the core sets
+  `HORAE_EGRESS_PROXY` (and `HTTPS_PROXY` / `HTTP_PROXY`) in the plugin's environment: the
+  plugin's only way out, an allow-list proxy built from its locked permissions. A client that
+  reads the environment (`urllib`, `httpx`'s default `trust_env`) uses it as is; one that does
+  not passes `egress_proxy()` as its proxy (horae-sdk 0.8).
 - Messages are capped at `MAX_MESSAGE_BYTES` (8 MiB) by the host: a larger one costs the
   plugin its process (`output_too_large`). The SDK refuses such a result before sending it
   (a tool error, or a sink operation's `output_too_large`), keeping `MESSAGE_MARGIN` for the
@@ -41,6 +46,7 @@ INTENTS_META = "dev.horae/intents"
 PATHS_META = "dev.horae/paths"
 NETWORK_META = "horae/network"
 NETWORK_LOCAL_META = "horae/network_local"
+EGRESS_PROXY_ENV = "HORAE_EGRESS_PROXY"
 MAX_MESSAGE_BYTES = 8 * 1024 * 1024
 MESSAGE_MARGIN = 64 * 1024
 MAX_INTENTS = 256
@@ -296,12 +302,28 @@ class Network:
         return f"{host}:{port}" in self.local
 
 
+_EGRESS_PROXY = re.compile(r"http://[0-9]{1,3}(?:\.[0-9]{1,3}){3}:[1-9][0-9]{0,4}\Z")
+
+
+def egress_proxy(environ: Mapping[str, str] | None = None) -> str | None:
+    """The egress proxy the core set (`http://<address>:<port>`), or `None` outside a plugin
+    container (connect directly, as before M5). When it is set, send **every** connection
+    through it, HTTP or not (`CONNECT host:port`): the container has no other route, and the
+    proxy refuses what `horae.lock` does not approve. A malformed value reads as `None`; in a
+    container a direct connection then fails anyway (closed)."""
+    value = (os.environ if environ is None else environ).get(EGRESS_PROXY_ENV)
+    if value is None or _EGRESS_PROXY.match(value) is None:
+        return None
+    return value
+
+
 def meta_of(meta: Any) -> Mapping[str, Any]:
     """A request's `_meta` as a mapping (`{}` when absent)."""
     return meta if isinstance(meta, Mapping) else {}
 
 
 __all__ = [
+    "EGRESS_PROXY_ENV",
     "INPUT_META",
     "INTENTS_META",
     "MAX_INTENTS",
@@ -313,6 +335,7 @@ __all__ = [
     "PATHS_META",
     "Network",
     "Paths",
+    "egress_proxy",
     "local_endpoint",
     "local_host",
     "meta_of",

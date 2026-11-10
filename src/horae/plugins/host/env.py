@@ -17,6 +17,11 @@ copied from `os.environ`, and Horae never puts a resolved secret into its own en
 A plugin installed with its own venv (`<plugin>/.venv`, #45, decision 69) also gets
 `VIRTUAL_ENV=<plugin>/.venv`, and `PATH` starts with `<plugin>/.venv/bin`.
 
+A plugin container (`runtime: container`, #50, schemas decision 76) also gets its egress
+proxy's URL in `PROXY_KEYS` (`HTTPS_PROXY`, `HTTP_PROXY`, their lowercase forms and
+`HORAE_EGRESS_PROXY`), set by the core only: a secret can never be named so (deny list below).
+`NO_PROXY` is never set.
+
 **Deny list** (schemas decisions 8, 28 and 35): a declared secret may not be one of the base
 keys or a variable that changes how a runtime, its loader, its TLS stack or its package manager
 behaves (compared case-insensitively):
@@ -46,6 +51,8 @@ OFFLINE_ENV = {"UV_OFFLINE": "1", "UV_PYTHON_DOWNLOADS": "never", "PIP_NO_INDEX"
 """In every plugin child: a package manager it runs fetches nothing (#45)."""
 PLUGIN_KEYS = BASE_KEYS | frozenset(OFFLINE_ENV)
 """The keys of every plugin child's environment, but its secrets and `VIRTUAL_ENV`."""
+PROXY_KEYS = ("HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy", "HORAE_EGRESS_PROXY")
+"""The variables a plugin container gets its egress proxy's URL in (decision 76 D)."""
 VENV_DIR = ".venv"
 """A plugin's own venv, in its directory (#45, decision 69)."""
 
@@ -148,9 +155,10 @@ def build_env(
     timezone: str,
     secrets: Mapping[str, Secret],
     venv: Path | None = None,
+    proxy: str | None = None,
 ) -> dict[str, str]:
-    """The child environment: `base_env`, `OFFLINE_ENV`, the plugin's `venv` if any, and each
-    declared secret, revealed here only."""
+    """The child environment: `base_env`, `OFFLINE_ENV`, the plugin's `venv` if any, its
+    egress `proxy` URL in `PROXY_KEYS` if any, and each declared secret, revealed here only."""
     check_names(plugin, list(secrets))
     env = base_env(home=home, tmpdir=tmpdir, timezone=timezone) | OFFLINE_ENV
     if venv is not None:
@@ -158,6 +166,8 @@ def build_env(
             raise PluginCallError("spawn_failed", f"plugin {plugin}: its venv path holds a ':'")
         env["PATH"] = f"{venv / 'bin'}:{BASE_PATH}"
         env["VIRTUAL_ENV"] = str(venv)
+    if proxy is not None:
+        env.update(dict.fromkeys(PROXY_KEYS, proxy))
     for name, secret in secrets.items():
         value = secret.reveal()
         if "\x00" in value:
@@ -172,6 +182,7 @@ __all__ = [
     "BASE_PATH",
     "OFFLINE_ENV",
     "PLUGIN_KEYS",
+    "PROXY_KEYS",
     "VENV_DIR",
     "base_env",
     "build_env",

@@ -5,8 +5,10 @@ Marked `container`; skipped when no Docker CLI on the base `PATH` reaches a daem
 plugin image cannot be pulled (set `HORAE_SKIP_CONTAINER_TESTS=1` to skip them anyway). The
 plugin is `tests/fixtures/plugins/jail/jail_server.py`, a stdlib-only MCP server installed in a
 venv that the plugin image's own interpreter builds, which reports what it can do from inside.
-Names are synthetic; the only addresses are a documentation one (192.0.2.1) and the plugin
-network's own subnet.
+Names are synthetic; the only addresses are a documentation one (192.0.2.1), the plugin
+network's own subnet and the egress network's gateway, where a local test server is published
+(the egress proxy tests, #50). Nothing reaches the public internet: the only declared public
+host is under `.test`, which never resolves.
 """
 
 import asyncio
@@ -26,7 +28,7 @@ import pytest
 from horae.contracts import PluginManifest
 from horae.contracts.instance import DEFAULT_CONTAINER_IMAGE, ContainerConfig, PluginDefaults
 from horae.plugins.host import HostRegistry, PluginCallError, PluginHost
-from horae.plugins.host.env import BASE_PATH, PLUGIN_KEYS
+from horae.plugins.host.env import BASE_PATH, PLUGIN_KEYS, PROXY_KEYS
 from horae.secrets import SecretResolver
 from plugin_fixtures import lock_for, secrets_dir
 
@@ -34,8 +36,8 @@ pytestmark = pytest.mark.container
 
 JAIL_SERVER = Path(__file__).resolve().parent / "fixtures" / "plugins" / "jail" / "jail_server.py"
 TOKEN = "sentinel-value-for-jail-live"  # noqa: S105 (synthetic)
-TOOLS = ["env", "probe", "connect", "resolve"]
-PLUGINS = ("jail", "jail-stubborn", "jail-open")
+TOOLS = ["env", "probe", "connect", "resolve", "tunnel", "fetch"]
+PLUGINS = ("jail", "jail-stubborn", "jail-open", "jail-egress")
 
 
 def _docker(*args: str, timeout: float = 120) -> subprocess.CompletedProcess[str]:
@@ -61,6 +63,7 @@ def engine() -> Iterator[None]:
     yield
     for name in PLUGINS:
         _docker("network", "rm", f"horae-plugin-{name}")
+    _docker("network", "rm", "horae-egress")  # fails harmlessly while another run uses it
 
 
 @pytest.fixture(scope="module")
@@ -89,14 +92,16 @@ def plugin_dir(engine: None, tmp_path_factory: pytest.TempPathFactory) -> Path:
     return root
 
 
-def _manifest(name: str, mode: str = "normal") -> dict[str, Any]:
+def _manifest(
+    name: str, mode: str = "normal", network: dict[str, list[str]] | None = None
+) -> dict[str, Any]:
     command = ["python", "-m", "jail_server", mode, name]
     return {
         "name": name,
         "version": "0.1.0",
         "horae": ">=0",
         "provides": {"sources": [f"{name}.{tool}" for tool in TOOLS]},
-        "permissions": {"secrets": ["JAIL_TOKEN"]},
+        "permissions": {"secrets": ["JAIL_TOKEN"]} | (network or {}),
         "runtime": {"protocol": "mcp-stdio", "command": command},
     }
 
@@ -107,8 +112,9 @@ def _host(
     name: str = "jail",
     mode: str = "normal",
     image: str | None = None,
+    network: dict[str, list[str]] | None = None,
 ) -> PluginHost:
-    manifest = _manifest(name, mode)
+    manifest = _manifest(name, mode, network)
     registry = HostRegistry(
         lock_for(manifest), {name: PluginManifest.model_validate(manifest)}, {name: plugin_dir}
     )
@@ -137,7 +143,8 @@ def test_a_plugin_runs_in_its_container_with_exactly_its_environment(
     env = asyncio.run(go())["env"]
     # Delivered through stdin, not the command line; the host redacts it on the way back.
     assert env["JAIL_TOKEN"] == "[REDACTED:JAIL_TOKEN]"  # noqa: S105 (a redaction marker)
-    assert set(env) == PLUGIN_KEYS | {"VIRTUAL_ENV", "JAIL_TOKEN"}
+    assert set(env) == PLUGIN_KEYS | {"VIRTUAL_ENV", "JAIL_TOKEN", *PROXY_KEYS}
+    assert env["HTTPS_PROXY"].startswith("http://")
     assert env["VIRTUAL_ENV"] == "/plugin/.venv"
     assert env["PATH"].startswith("/plugin/.venv/bin:")
 
@@ -286,3 +293,166 @@ def test_a_network_that_is_not_internal_is_refused(tmp_path: Path, plugin_dir: P
         _docker("network", "rm", "horae-plugin-jail-open")
     assert error.kind == "runtime_unavailable"
     assert "is not internal" in error.message
+
+
+# --- the egress proxy (#50, schemas decision 76) -------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def lan_server(engine: None) -> Iterator[tuple[str, int]]:
+    """A local HTTP server on the Docker host's network, and the address the egress proxy
+    reaches it at: `horae-egress`'s gateway (a private address, the host's own there) and its
+    port. The egress network is created here as Horae would, so its gateway is known for the
+    grant."""
+    if _docker("network", "inspect", "horae-egress").returncode != 0:
+        created = _docker(
+            "network",
+            "create",
+            "--driver=bridge",
+            "--opt=com.docker.network.bridge.enable_icc=false",
+            "--label=dev.horae.network=egress",
+            "horae-egress",
+        )
+        assert created.returncode == 0, created.stderr
+    inspected = json.loads(_docker("network", "inspect", "horae-egress").stdout)[0]
+    gateway = inspected["IPAM"]["Config"][0]["Gateway"]
+    name = f"horae-test-lan-{secrets.token_hex(4)}"
+    port = 20000 + secrets.randbelow(20000)
+    # On the host's network: the proxy reaches it at the egress gateway (the host's own address
+    # there), so no traffic crosses from one bridge to another.
+    started = _docker(
+        "run",
+        "--detach",
+        "--rm",
+        "--network",
+        "host",
+        "--name",
+        name,
+        DEFAULT_CONTAINER_IMAGE,
+        "python",
+        "-m",
+        "http.server",
+        str(port),
+        "--bind",
+        "0.0.0.0",  # noqa: S104 (the egress gateway is one of the host's addresses)
+    )
+    assert started.returncode == 0, started.stderr
+    try:
+        deadline = time.monotonic() + 30
+        probe = f"import socket; socket.create_connection(('127.0.0.1', {port}), timeout=1)"
+        while _docker("exec", name, "python", "-c", probe).returncode != 0:
+            assert time.monotonic() < deadline, "the LAN server did not start"
+            time.sleep(0.2)
+        yield gateway, port
+    finally:
+        _docker("rm", "--force", name)
+
+
+def test_egress_goes_through_the_proxy_and_only_where_the_lock_allows(
+    tmp_path: Path, plugin_dir: Path, lan_server: tuple[str, int]
+) -> None:
+    gateway, port = lan_server
+    network = {"network": ["api.example.test"], "network_local": [f"{gateway}:{port}"]}
+    name = "jail-egress"
+
+    async def go() -> dict[str, Any]:
+        async with _host(tmp_path, plugin_dir, name, network=network) as h:
+
+            async def tool(tool: str, **params: Any) -> Any:
+                return await h.call(f"{name}.{tool}", params, None)
+
+            seen: dict[str, Any] = {
+                "granted": await tool("tunnel", host=gateway, port=port),
+                "plain_http": await tool("fetch", url=f"http://{gateway}:{port}/"),
+                "undeclared": await tool("tunnel", host="undeclared.example.net", port=443),
+                "ungranted_port": await tool("tunnel", host=gateway, port=22),
+                "ip_literal": await tool("tunnel", host="192.0.2.1", port=443),
+                "declared": await tool("tunnel", host="api.example.test", port=443),
+                "direct": await tool("connect", host=gateway, port=port),
+            }
+            listed = _docker("ps", "--quiet", "--filter", f"label=dev.horae.egress-proxy={name}")
+            ids = listed.stdout.split()
+            assert len(ids) == 1, listed
+            seen["inspect"] = json.loads(_docker("inspect", ids[0]).stdout)[0]
+            return seen
+
+    seen = asyncio.run(go())
+    granted = seen["granted"]
+    assert granted.data["status"] == "HTTP/1.1 200 Connection established", granted.data
+    assert granted.data["answer"].startswith("HTTP/1.0 200")
+    assert granted.violations == ()
+    assert seen["plain_http"].data["status"] == 200, seen["plain_http"].data
+    undeclared = seen["undeclared"]
+    assert undeclared.data["status"] == "HTTP/1.1 403 Forbidden"
+    assert [v.detail for v in undeclared.violations] == [
+        "jail-egress: egress blocked to undeclared.example.net:443 (host_not_allowed)"
+    ]
+    assert seen["ungranted_port"].data["status"] == "HTTP/1.1 403 Forbidden"
+    assert [v.detail for v in seen["ungranted_port"].violations] == [
+        f"jail-egress: egress blocked to {gateway}:22 (ip_literal)"
+    ]
+    assert [v.detail for v in seen["ip_literal"].violations] == [
+        "jail-egress: egress blocked to 192.0.2.1:443 (ip_literal)"
+    ]
+    # Declared: past the allow-list, then refused by DNS (`.test` never resolves), recorded.
+    assert seen["declared"].data["status"] == "HTTP/1.1 502 Bad Gateway"
+    assert [v.detail for v in seen["declared"].violations] == [
+        "jail-egress: egress blocked to api.example.test:443 (dns_failed)"
+    ]
+    assert seen["direct"].data["connected"] is False  # no route but the proxy
+
+    data = seen["inspect"]
+    config, host = data["Config"], data["HostConfig"]
+    assert config["User"] == "65534:65534"
+    assert config["Labels"]["dev.horae.egress-proxy"] == name
+    assert "dev.horae.plugin" not in config["Labels"]
+    assert host["ReadonlyRootfs"] is True
+    assert host["CapDrop"] == ["ALL"]
+    assert not host["CapAdd"]
+    assert host["Privileged"] is False
+    assert "no-new-privileges" in host["SecurityOpt"]
+    assert host["LogConfig"]["Type"] == "none"
+    assert host["PidsLimit"] == 64
+    assert host["Sysctls"] == {"net.ipv4.ip_forward": "0"}
+    assert data["Mounts"] == []
+    assert TOKEN not in json.dumps(data)
+    assert set(data["NetworkSettings"]["Networks"]) == {f"horae-plugin-{name}", "horae-egress"}
+
+    deadline = time.monotonic() + 30
+    while _docker(
+        "ps", "--all", "--quiet", "--filter", f"label=dev.horae.egress-proxy={name}"
+    ).stdout.strip():
+        assert time.monotonic() < deadline, "the proxy outlived the run"
+        time.sleep(0.2)
+
+
+def test_a_sibling_run_cannot_use_another_runs_proxy(
+    tmp_path: Path, plugin_dir: Path, lan_server: tuple[str, int]
+) -> None:
+    """Two concurrent runs of one plugin share its network: each proxy serves its own plugin
+    container only (decision 76 C), so a sibling's tunnel through it gets no answer at all."""
+    gateway, port = lan_server
+    network = {"network_local": [f"{gateway}:{port}"]}
+    name = "jail-egress"
+
+    async def go() -> tuple[Any, Any, Any]:
+        first = _host(tmp_path / "a", plugin_dir, name, network=network)
+        second = _host(tmp_path / "b", plugin_dir, name, network=network)
+        async with first as a, second as b:
+            env_a = (await a.call(f"{name}.env", {}, None)).data["env"]
+            own = await b.call(f"{name}.tunnel", {"host": gateway, "port": port}, None)
+            stolen = await b.call(
+                f"{name}.tunnel",
+                {"host": gateway, "port": port, "via": env_a["HTTPS_PROXY"]},
+                None,
+            )
+            mine = await a.call(f"{name}.tunnel", {"host": gateway, "port": port}, None)
+            return own, stolen, mine
+
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    own, stolen, mine = asyncio.run(go())
+    assert own.data["status"] == "HTTP/1.1 200 Connection established", own.data
+    assert mine.data["status"] == "HTTP/1.1 200 Connection established", mine.data
+    assert not stolen.data["status"], stolen.data  # dropped: no status line
+    assert stolen.data["answer"] == ""

@@ -6,7 +6,7 @@ and `pipeline.run`, which only *asks* for a run that you approve yourself (#55).
 [decision 65](../schemas/README.md#provisional-decisions-54-pending-maintainer-review),
 [decision 75](../schemas/README.md#provisional-decisions-56-pending-maintainer-review) and
 [decision 77](../schemas/README.md#provisional-decisions-55-pending-maintainer-review), threats
-[T17, T46 to T49](security.md).
+[T17, T46, T47, T49, T50](security.md).
 
 - **Transport: stdio by default.** The client starts `horae mcp serve` and talks to it over
   the process's stdin and stdout. Horae opens no port and asks for no token: whoever can start
