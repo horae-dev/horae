@@ -4848,8 +4848,12 @@ loosened later without breaking a valid file.
         container's own `/plugin`;
       - it is neither `/tmp` nor contains it (it may lie inside it: the bind is mounted over the
         container's tmpfs);
-      - a **writable** path is not and does not lie inside a git repository (`.git` as a
-        component, or a `.git` entry in it): a plugin could plant hooks the user's `git` runs;
+      - a **writable** path is not in, nor holds, a git repository: no `.git` (in any letter
+        case, since volumes may ignore it) as one of its components, in any directory from it
+        up to the mount root that holds it (a work tree around it), or anywhere below it (a
+        walk of at most 100 000 entries, which refuses at its bound); a plugin could plant
+        hooks the user's `git` runs. A vault inside a git-tracked instance must then be kept
+        outside the work tree (`container.mount_roots`), or be read-only;
       - it does not lie strictly inside a writable path of **another container plugin** of the
         lock: that plugin could swap a directory of it for a link while this one starts. A
         **writable** path also must not be, nor hold, another container plugin's writable
@@ -4912,7 +4916,10 @@ loosened later without breaking a valid file.
       `O_NOFOLLOW`; failing to write it refuses the start) and removes it only after a clean
       sweep or a written quarantine; found at a start (taken under the run lock), it
       quarantines the plugin. A quarantine file that cannot be written leaves the marker, and
-      the plugin is refused for the rest of the run. **The sweep fails closed**: a declared path replaced or removed, a
+      the plugin is refused for the rest of the run. The quarantine and the marker are checked
+      again once the run lock is held, so a concurrent run that quarantined the plugin in
+      between is seen. **The sweep fails closed**: a new `.git` entry (any case) anywhere in a
+      writable path, a declared path replaced or removed, a
       directory it cannot list, an entry it cannot `lstat` or undo, an entry on another device
       that is not a host mount point (`/proc/self/mountinfo`; a plugin cannot mount anything,
       so anything else is unexplained), more than 100 000 entries new since the start or 2

@@ -413,7 +413,12 @@ class ContainerRuntime:
         writes = any(mount.writable for mount in declared)
         lock = mounts.lock_plugin(plugin, self.mounts) if writes else None
         try:
-            if writes:
+            if writes:  # again, now that no other run of it can quarantine it meanwhile
+                if plugin in self._quarantined:
+                    raise _unavailable(
+                        plugin, "it is quarantined: its writable paths could not be checked"
+                    )
+                mounts.check_quarantine(plugin, self.mounts)
                 mounts.check_pending(plugin, self.mounts)
             return await self._prepare(
                 plugin,

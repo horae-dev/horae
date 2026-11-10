@@ -183,11 +183,54 @@ def test_a_writable_git_repository_is_refused(instance: Path) -> None:
     vault = instance / "vault"
     (vault / ".git").mkdir()
     policy = _policy(instance)
-    with pytest.raises(PluginCallError, match="git repository"):
+    with pytest.raises(PluginCallError, match="hold a git repository"):
         plan_mounts("jail", [], [str(vault)], policy)
-    with pytest.raises(PluginCallError, match="git repository"):
+    with pytest.raises(PluginCallError, match="in a git repository"):
         plan_mounts("jail", [], [str(vault / ".git")], policy)
     assert plan_mounts("jail", [str(vault)], [], policy)  # read-only is fine
+
+
+@pytest.mark.parametrize("name", [".GIT", ".Git"])
+def test_a_git_entry_in_another_case_is_refused(instance: Path, name: str) -> None:
+    vault = instance / "vault"
+    (vault / "archive" / name).mkdir()
+    policy = _policy(instance)
+    with pytest.raises(PluginCallError, match="git"):
+        plan_mounts("jail", [], [str(vault)], policy)  # below it
+    with pytest.raises(PluginCallError, match="in a git repository"):
+        plan_mounts("jail", [], [str(vault / "archive" / name)], policy)  # a component
+
+
+def test_a_writable_path_inside_a_git_work_tree_is_refused(instance: Path) -> None:
+    (instance / "vault" / ".Git").mkdir()  # the work tree's root, in another case
+    with pytest.raises(PluginCallError, match="git work tree"):
+        plan_mounts("jail", [], [str(instance / "vault" / "inbox")], _policy(instance))
+
+
+def test_a_deep_git_repository_below_a_writable_path_is_refused(instance: Path) -> None:
+    deep = instance / "vault" / "inbox" / "deep" / "a" / "b"
+    deep.mkdir(parents=True)
+    (deep / ".git").write_text("gitdir: elsewhere\n", encoding="utf-8")  # a worktree file
+    with pytest.raises(PluginCallError, match="hold a git repository"):
+        plan_mounts("jail", [], [str(instance / "vault")], _policy(instance))
+
+
+def test_the_git_walk_refuses_at_its_bound(instance: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(mounts, "GIT_SCAN_LIMIT", 2)
+    with pytest.raises(PluginCallError, match="entries below it to look for git"):
+        plan_mounts("jail", [], [str(instance / "vault")], _policy(instance))
+
+
+@pytest.mark.parametrize("name", [".git", ".GIT"])
+def test_a_new_git_entry_fails_the_sweep(
+    instance: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    monkeypatch.setattr(mounts, "CTIME_SLACK_S", 0.05)  # coarse kernel timestamps
+    inbox = instance / "vault" / "inbox"
+    since = mounts.now()
+    (inbox / "deep" / name).mkdir()
+    swept = sweep("jail", [_mount(inbox)], since)
+    assert any("new git entry" in failure for failure in swept.failures)
 
 
 def test_secrets_and_state_outside_the_instance_stay_sensitive(tmp_path: Path) -> None:

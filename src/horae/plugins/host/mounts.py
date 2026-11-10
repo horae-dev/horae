@@ -288,8 +288,10 @@ def plan_mounts(
     planned: list[Mount] = []
     for path, writable in access.items():
         identity = check_path(plugin, path, policy)
-        if writable and (".git" in path.split("/") or os.path.lexists(os.path.join(path, ".git"))):
-            raise _refuse(plugin, path, "a writable path may not be or hold a git repository")
+        if writable:
+            problem = git_problem(path, policy)
+            if problem is not None:
+                raise _refuse(plugin, path, problem)
         for ancestor in _ancestors(plugin, path):
             for other, written, written_identity in writers:
                 if ancestor == written_identity:
@@ -306,6 +308,53 @@ def plan_mounts(
                     )
         planned.append(Mount(path, writable, identity))
     return tuple(sorted(planned, key=lambda mount: (mount.path.count("/"), mount.path)))
+
+
+GIT_SCAN_LIMIT = 100_000
+"""Entries looked at below a writable path for a `.git`; past it the path is refused."""
+
+
+def _is_git(name: str) -> bool:
+    return name.casefold() == ".git"
+
+
+def git_problem(path: str, policy: MountPolicy) -> str | None:
+    """Why the writable `path` may not be mounted for a git repository, or `None`: a `.git`
+    (in any letter case: volumes may ignore it) as one of its components, in any directory from
+    it up to the mount root that holds it (it would be in a work tree), or anywhere below it
+    (a bounded walk that refuses when it hits its bound). A plugin could plant hooks there that
+    the user's `git` runs."""
+    if any(_is_git(part) for part in path.split("/")):
+        return "a writable path may not be in a git repository"
+    holding = [root for root in policy.roots if within(path, root)]
+    top = max(holding, key=len) if holding else path
+    current = os.path.dirname(path)
+    while within(current, top):
+        try:
+            names = os.listdir(current)
+        except OSError as error:
+            return f"{current!r} cannot be listed to look for git ({error.strerror})"
+        if any(_is_git(name) for name in names):
+            return f"a writable path may not be in a git work tree ({current!r} has one)"
+        if current == top:
+            break
+        current = os.path.dirname(current)
+    seen, stack = 0, [path] if os.path.isdir(path) else []
+    while stack:
+        directory = stack.pop()
+        try:
+            entries = list(os.scandir(directory))
+        except OSError as error:
+            return f"{directory!r} cannot be listed to look for git ({error.strerror})"
+        for entry in entries:
+            seen += 1
+            if seen > GIT_SCAN_LIMIT:
+                return f"more than {GIT_SCAN_LIMIT} entries below it to look for git"
+            if _is_git(entry.name):
+                return f"a writable path may not hold a git repository ({entry.path!r})"
+            if entry.is_dir(follow_symlinks=False):
+                stack.append(entry.path)
+    return None
 
 
 def _writer_identities(
@@ -659,6 +708,8 @@ class _Walk:
                 children.append((name, child, status))
             if status.st_ctime < self.cutoff or not writable_at(child, self.mounts):
                 continue  # older than the run, or in a read-only child: not its own
+            if _is_git(name):
+                self.fail(f"{_shown(child)} is a new git entry (hooks the user's git would run)")
             self.new += 1
             if self.new > NEW_LIMIT:
                 self.fail(f"more than {NEW_LIMIT} new entries: not every one was checked")

@@ -1504,3 +1504,28 @@ def test_a_quarantine_that_cannot_be_written_keeps_the_pending_marker(
         tmp_path, plugin, docker=cli, state=state, paths={"write": [inbox]}, mounts=policy
     )
     assert "ended before its writable paths were checked" in error.message
+
+
+def test_a_quarantine_written_while_waiting_for_the_run_lock_is_seen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from horae.plugins.host import mounts as mounts_module
+
+    plugin = _plugin_dir(tmp_path)
+    cli, state = _fake_docker(tmp_path)
+    root, policy = _instance(tmp_path)
+    inbox = str(root / "vault" / "inbox")
+    real_lock = mounts_module.lock_plugin
+
+    def lock_after_a_concurrent_quarantine(name: str, guard: MountPolicy | None) -> int:
+        # Another run of the plugin quarantines it between the first check and the lock.
+        assert mounts_module.quarantine(name, guard, ["a concurrent run's sweep failed"])
+        return real_lock(name, guard)
+
+    monkeypatch.setattr(mounts_module, "lock_plugin", lock_after_a_concurrent_quarantine)
+    error = _first_error(
+        tmp_path, plugin, docker=cli, state=state, paths={"write": [inbox]}, mounts=policy
+    )
+    assert error.kind == "runtime_unavailable"
+    assert "quarantined" in error.message
+    assert not any(call[0] == "run" for call in _calls(state))
