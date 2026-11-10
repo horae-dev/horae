@@ -300,9 +300,10 @@ def test_a_network_that_is_not_internal_is_refused(tmp_path: Path, plugin_dir: P
 
 @pytest.fixture(scope="module")
 def lan_server(engine: None) -> Iterator[tuple[str, int]]:
-    """A local HTTP server published on the Docker host, and the address the egress proxy
-    reaches it at: `horae-egress`'s gateway (a private address) and the published port. The
-    egress network is created here as Horae would, so its gateway is known for the grant."""
+    """A local HTTP server on the Docker host's network, and the address the egress proxy
+    reaches it at: `horae-egress`'s gateway (a private address, the host's own there) and its
+    port. The egress network is created here as Horae would, so its gateway is known for the
+    grant."""
     if _docker("network", "inspect", "horae-egress").returncode != 0:
         created = _docker(
             "network",
@@ -316,26 +317,29 @@ def lan_server(engine: None) -> Iterator[tuple[str, int]]:
     inspected = json.loads(_docker("network", "inspect", "horae-egress").stdout)[0]
     gateway = inspected["IPAM"]["Config"][0]["Gateway"]
     name = f"horae-test-lan-{secrets.token_hex(4)}"
+    port = 20000 + secrets.randbelow(20000)
+    # On the host's network: the proxy reaches it at the egress gateway (the host's own address
+    # there), so no traffic crosses from one bridge to another.
     started = _docker(
         "run",
         "--detach",
         "--rm",
+        "--network",
+        "host",
         "--name",
         name,
-        "--publish",
-        "8000",
         DEFAULT_CONTAINER_IMAGE,
         "python",
         "-m",
         "http.server",
-        "8000",
+        str(port),
+        "--bind",
+        "0.0.0.0",  # noqa: S104 (the egress gateway is one of the host's addresses)
     )
     assert started.returncode == 0, started.stderr
     try:
-        mapped = _docker("port", name, "8000/tcp").stdout.split()
-        port = int(next(line for line in mapped if line.startswith("0.0.0.0:")).rsplit(":", 1)[1])
         deadline = time.monotonic() + 30
-        probe = "import socket; socket.create_connection(('127.0.0.1', 8000), timeout=1)"
+        probe = f"import socket; socket.create_connection(('127.0.0.1', {port}), timeout=1)"
         while _docker("exec", name, "python", "-c", probe).returncode != 0:
             assert time.monotonic() < deadline, "the LAN server did not start"
             time.sleep(0.2)
