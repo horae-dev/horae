@@ -208,9 +208,9 @@ container) and `SIGKILL`; then Horae always runs `docker rm --force <name>`, so 
 ignores end-of-file and signals, or started background processes, is removed with them, and
 then sweeps its writable paths ([below](#declared-paths)). If Horae itself is killed with
 `SIGKILL`, a container may be left running until its plugin exits on end-of-file, or left
-stopped (containers are no longer `--rm`); list such leftovers with `docker ps --all --filter
-label=dev.horae.plugin` and remove them with `docker rm` (Horae does not sweep them: it could
-remove the container of a concurrent run).
+stopped (containers are no longer `--rm`): before each start of a plugin Horae removes its
+stopped containers (`docker rm`, never a running one). List leftovers with `docker ps --all
+--filter label=dev.horae.plugin`.
 
 ## Declared paths
 
@@ -242,19 +242,26 @@ and why). A path must:
    <path>` prints it);
 3. exist, and be a directory or a regular file (never a socket, device or FIFO);
 4. lie in the instance directory, or in a directory you list in `container.mount_roots` (a vault
-   kept elsewhere, e.g. `/srv/vault`);
+   kept elsewhere, e.g. `/srv/vault`). `/`, Horae's home directory or one of its parents
+   are refused as `mount_roots`: list the vault itself;
 5. neither be, contain nor lie inside a **sensitive path**: the instance's `horae.yaml`,
    `horae.lock`, `plugins/`, `pipelines/`, `skills/`, `.git/`, state directory and secrets
    directory (`secrets.dir`, `/run/secrets` by default); the Docker socket (the one the CLI uses,
    `/var/run/docker.sock`, `/run/docker.sock`, `/run/containerd`); in Horae's home `.ssh`,
-   `.gnupg`, `.docker`, `.aws`, `.azure`, `.kube`, `.config`, `.netrc`, `.git-credentials`,
-   `.pypirc`; and the system directories (`/etc`, `/usr`, `/proc`, `/sys`, `/dev`, `/run`,
+   `.gnupg`, `.docker`, `.aws`, `.azure`, `.kube`, `.config`, `.local`, `.netrc`,
+   `.git-credentials`, `.pypirc`, the shell start-up files (`.bashrc`, `.bash_profile`,
+   `.profile`, `.zshrc`, `.zprofile`), `Library/LaunchAgents` and `Library/Keychains`; macOS's
+   `/System`, `/Library` and `/Applications`; and the system directories (`/etc`, `/usr`, `/proc`, `/sys`, `/dev`, `/run`,
    `/root`, `/boot`, `/bin`, `/sbin`, `/lib*`, `/var/lib/docker`, ...). So the instance
    directory or your home directory as a whole are refused: declare the vault itself;
 6. not be `/tmp` itself (the container's own scratch space);
 7. not lie strictly inside a writable path of **another plugin that runs in a container**
-   (it could swap a directory of yours for a link while yours starts). The same path, or a
-   path holding the other's writable one, is fine: that is how plugins share a vault. Plugins
+   (it could swap a directory of yours for a link while yours starts); and a **writable**
+   path must not be or hold another container plugin's writable path (two container plugins
+   never write the same tree). Reading the same path, or a path holding the other's writable
+   one, is fine: that is how plugins share a vault;
+8. if writable, not be or hold a git repository (a `.git` in it or above it): a plugin could
+   plant hooks that your `git` would run. Plugins
    on `runtime: process` are not counted (they are unconfined anyway). These comparisons
    also use the files' identities, so another letter case (macOS volumes ignore case) or a
    link to the same directory is recognised.
@@ -278,12 +285,20 @@ to a place the plugin could not write itself, removes a FIFO, socket or device, 
 set-user-ID bit, logging each at WARNING. It also warns when a declared path was replaced
 (renamed away by a writable parent).
 
+**One run at a time.** A plugin with a writable path holds a lock
+(`<state_dir>/quarantine/<plugin>.lock`) from its start until its sweep is done: a second run
+of the same plugin at the same time is refused (`runtime_unavailable`), so nothing in a
+container writes there while the sweep works. The sweep itself never follows a link: it works
+through open directory descriptors and refuses anything that changed under it.
+
 **Quarantine.** The sweep fails closed. If it cannot finish its check (a directory it cannot
 list, an entry on another device that is not a mount point, more than 100 000 new or
 2 000 000 entries in all, a declared path replaced, a container that could not be removed),
 Horae writes `<state_dir>/quarantine/<plugin>` with the reasons and **refuses to start that
-plugin again** (`runtime_unavailable`, naming the file). Look at its writable paths, then
-remove the file to let it run again. While the plugin runs, what it wrote is on the host as it
+plugin again** (`runtime_unavailable`, naming the file). The same happens when a run ended
+before its sweep (Horae killed): `<state_dir>/quarantine/<plugin>.pending`, written before
+each start and removed after a clean sweep, is still there. Look at the plugin's writable
+paths, then remove the file to let it run again. While the plugin runs, what it wrote is on the host as it
 wrote it.
 
 **Example.** A plugin declaring `paths: {read: [/srv/vault], write: [/srv/vault/Inbox]}`,

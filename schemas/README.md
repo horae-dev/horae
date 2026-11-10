@@ -4831,23 +4831,32 @@ loosened later without breaking a valid file.
         Docker socket itself is refused here);
       - it is, or lies inside, the instance directory or a `container.mount_roots` entry
         (operator-set in `horae.yaml`, default none: a vault outside the instance must be
-        listed there);
+        listed there). An entry that is `/`, Horae's home or an ancestor of it is refused
+        (it is dropped from the roots, and a path under it is refused naming it): list the
+        vault itself;
       - it neither is, contains nor lies inside a **sensitive path**, compared in both lexical
         and real forms: the instance's `horae.yaml`, `horae.lock`, `plugins/`, `pipelines/`,
         `skills/`, `.git/`, its `state_dir` and `secrets.dir`; the engine's socket (the
         context's endpoint) and `/var/run/docker.sock`, `/run/docker.sock`,
         `/run/containerd`; in Horae's home `.ssh`, `.gnupg`, `.docker`, `.aws`, `.azure`,
-        `.kube`, `.config`, `.netrc`, `.git-credentials`, `.pypirc`; and `/bin`, `/boot`,
+        `.kube`, `.config`, `.local`, `.netrc`, `.git-credentials`, `.pypirc`, the shell
+        start-up files `.bashrc`, `.bash_profile`, `.profile`, `.zshrc`, `.zprofile`, and
+        `Library/LaunchAgents`, `Library/Keychains`; macOS's `/System`, `/Library`,
+        `/Applications`; and `/bin`, `/boot`,
         `/dev`, `/etc`, `/lib*`, `/proc`, `/root`, `/run`, `/sbin`, `/sys`, `/usr`,
         `/var/lib/docker`, `/var/lib/containerd`, `/var/lock`, `/var/run`, and the
         container's own `/plugin`;
       - it is neither `/tmp` nor contains it (it may lie inside it: the bind is mounted over the
         container's tmpfs);
+      - a **writable** path is not and does not lie inside a git repository (`.git` as a
+        component, or a `.git` entry in it): a plugin could plant hooks the user's `git` runs;
       - it does not lie strictly inside a writable path of **another container plugin** of the
-        lock: that plugin could swap a directory of it for a link while this one starts. The
-        same path, or one holding the other's writable path, is allowed: that is how two
-        plugins share data (one writes the vault, the other reads it), and swapping the
-        declared path itself needs write access to its parent. Process-runtime plugins are not
+        lock: that plugin could swap a directory of it for a link while this one starts. A
+        **writable** path also must not be, nor hold, another container plugin's writable
+        path: no two container plugins write the same tree, so nothing in a container races
+        a sweep (C). A read-only path that is or holds another's writable one is allowed:
+        that is how two plugins share data (one writes the vault, the other reads it), and
+        swapping the declared path itself needs write access to its parent. Process-runtime plugins are not
         counted: they run unconfined as Horae's user anyway (T04), so excluding their paths
         would refuse common setups (`file-sink` writing the vault) and protect nothing.
       The sensitive-path and other-plugin comparisons are made on path strings **and on file
@@ -4889,7 +4898,21 @@ loosened later without breaking a valid file.
       of one: a host process following the link would act there for it); removes a device,
       FIFO or socket; clears a set-user-ID bit (and set-group-ID on a
       file). It also checks every declared path is still the same file (device and inode) as
-      when it was checked. **The sweep fails closed**: a declared path replaced or removed, a
+      when it was checked. **No race with the sweep**: it walks with directory descriptors
+      (each directory opened relative to its parent with `O_DIRECTORY|O_NOFOLLOW`, listed by
+      descriptor, entries `lstat`ed, `readlink`ed and `unlink`ed relative to it; a file opened
+      `O_NOFOLLOW|O_NONBLOCK` and checked by `fstat` to be the object `lstat` saw before its
+      `fchmod`); any object that changed in between is a failure. A plugin with a writable
+      path holds a per-plugin run lock (`flock` on `<state_dir>/quarantine/<plugin>.lock`)
+      from before `docker run` until its sweep is done, so a concurrent run of the same
+      plugin is refused (`runtime_unavailable`), and B keeps other container plugins out of
+      its writable tree; only writers outside containers (a process plugin, the user) can
+      still race it, and they meet the descriptors. **A sweep that never ran**: before
+      `docker run` the host writes `<state_dir>/quarantine/<plugin>.pending` (`O_EXCL`,
+      `O_NOFOLLOW`; failing to write it refuses the start) and removes it only after a clean
+      sweep or a written quarantine; found at a start (taken under the run lock), it
+      quarantines the plugin. A quarantine file that cannot be written leaves the marker, and
+      the plugin is refused for the rest of the run. **The sweep fails closed**: a declared path replaced or removed, a
       directory it cannot list, an entry it cannot `lstat` or undo, an entry on another device
       that is not a host mount point (`/proc/self/mountinfo`; a plugin cannot mount anything,
       so anything else is unexplained), more than 100 000 entries new since the start or 2
@@ -4901,8 +4924,8 @@ loosened later without breaking a valid file.
       count); like egress attempts after a plugin's last call (decision 76 F), they are not run
       violations (the call they belong to is over). **Residual**: a swap of a path component
       for a link and back between the last `recheck` and the engine's mount, by a writer of a
-      parent directory that is not another container plugin (a process-runtime plugin, a
-      concurrent run of the same plugin under its own writable parent, the user): `docker
+      parent directory that is not another container plugin (a process-runtime plugin, the user;
+      a concurrent run of the same plugin now waits for the run lock): `docker
       inspect` shows paths, not files, so the post-start check cannot see a swap undone in
       time (the in-container device and inode differ from the host's on Docker Desktop and
       OrbStack, so they are not compared); a writable parent
@@ -4933,8 +4956,11 @@ loosened later without breaking a valid file.
       (`plugin <name> (runtime container) was killed by its memory limit (512 MiB, ...)`)
       instead of `plugin_crashed` or `handshake_failed`; the restart rule is unchanged (one
       restart a run). `docker rm --force` still always runs once the CLI is gone (decision 74
-      I); a Horae killed with `SIGKILL` may now also leave an *exited* container (`docker ps
-      --all --filter label=dev.horae.plugin`). A PID-limit hit is not a kill: the plugin's
+      I); a Horae killed with `SIGKILL` may now also leave an *exited* container: before each
+      start of a plugin, its exited or dead containers (`label=dev.horae.plugin=<name>`) are
+      removed with `docker rm` (never `--force`, never a running one). A concurrent run's
+      container that has just exited may go with them, and its kill is then reported as a
+      crash. A PID-limit hit is not a kill: the plugin's
       `fork` fails (`EAGAIN`) and the plugin reports it. CPU is throttled, never killed.
     - **F, left to #52.** The malicious-plugin suite exercises these: an undeclared path, a
       write to a read-only path, an escaping link, a fork bomb, a memory hog. Threat rows T51

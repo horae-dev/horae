@@ -35,12 +35,14 @@ cannot do this themselves: Docker's `--mount` takes
 no `nosuid`/`nodev`/`nosymfollow`, so the mount has the host filesystem's own flags.
 """
 
+import fcntl
 import logging
 import os
 import re
 import stat
 import time
 from collections.abc import Iterable, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -49,6 +51,9 @@ from horae.plugins.host.errors import PluginCallError
 UNSAFE_MOUNT = re.compile(r'[,"\x00-\x1f\x7f]')
 """What `--mount` (a CSV field) cannot carry in a path."""
 SYSTEM_PATHS = (
+    "/Applications",
+    "/Library",
+    "/System",
     "/bin",
     "/boot",
     "/dev",
@@ -76,16 +81,24 @@ CONTAINER_ONLY = ("/tmp",)  # noqa: S108 (the container's tmpfs)
 HOME_SECRETS = (
     ".aws",
     ".azure",
+    ".bash_profile",
+    ".bashrc",
     ".config",
     ".docker",
     ".git-credentials",
     ".gnupg",
     ".kube",
+    ".local",
     ".netrc",
+    ".profile",
     ".pypirc",
     ".ssh",
+    ".zprofile",
+    ".zshrc",
+    "Library/Keychains",
+    "Library/LaunchAgents",
 )
-"""Credential files and directories in Horae's home directory."""
+"""Credentials, shell start-up files and auto-started programs in Horae's home directory."""
 INSTANCE_ENTRIES = (
     "horae.yaml",
     "horae.lock",
@@ -121,6 +134,8 @@ class MountPolicy:
     """Paths a declared path may neither be, contain nor lie inside (lexical and real forms)."""
     quarantine: str | None = None
     """The directory of quarantine files (`<state_dir>/quarantine`), `None` in tests."""
+    refused_roots: tuple[str, ...] = ()
+    """`container.mount_roots` entries refused: `/`, Horae's home or one of its ancestors."""
 
     @classmethod
     def for_instance(
@@ -141,17 +156,24 @@ class MountPolicy:
         sensitive += [str(state_dir), str(secrets_dir), *SYSTEM_PATHS, *DOCKER_SOCKETS]
         if home is not None:
             sensitive += [str(home / name) for name in HOME_SECRETS]
-        roots = [str(root), *mount_roots]
+        real_home = None if home is None else os.path.realpath(home)
+        roots: list[str] = [os.path.realpath(root)]
+        refused: list[str] = []
+        for entry in mount_roots:
+            real = os.path.realpath(entry)
+            too_wide = real == "/" or (real_home is not None and within(real_home, real))
+            (refused if too_wide else roots).append(entry if too_wide else real)
         return cls(
-            roots=_unique(os.path.realpath(path) for path in roots),
+            roots=_unique(roots),
             sensitive=_unique(_both(sensitive)),
             quarantine=str(state_dir / QUARANTINE_DIR),
+            refused_roots=_unique(refused),
         )
 
     def with_sensitive(self, *paths: str) -> "MountPolicy":
         """This policy, with `paths` (e.g. the engine's socket) sensitive too."""
         sensitive = _unique([*self.sensitive, *_both(paths)])
-        return MountPolicy(self.roots, sensitive, self.quarantine)
+        return MountPolicy(self.roots, sensitive, self.quarantine, self.refused_roots)
 
 
 @dataclass(frozen=True)
@@ -214,6 +236,14 @@ def check_path(plugin: str, path: str, policy: MountPolicy) -> tuple[int, int]:
     if not (stat.S_ISDIR(status.st_mode) or stat.S_ISREG(status.st_mode)):
         raise _refuse(plugin, path, "it is not a directory or a regular file")
     if not any(within(path, root) for root in policy.roots):
+        refused = [root for root in policy.refused_roots if within(path, os.path.realpath(root))]
+        if refused:
+            raise _refuse(
+                plugin,
+                path,
+                f"`container.mount_roots` entry {refused[0]!r} is refused: it is `/` or holds "
+                "Horae's home directory (list the vault itself)",
+            )
         raise _refuse(
             plugin, path, "it is outside the instance directory and `container.mount_roots`"
         )
@@ -258,11 +288,21 @@ def plan_mounts(
     planned: list[Mount] = []
     for path, writable in access.items():
         identity = check_path(plugin, path, policy)
+        if writable and (".git" in path.split("/") or os.path.lexists(os.path.join(path, ".git"))):
+            raise _refuse(plugin, path, "a writable path may not be or hold a git repository")
         for ancestor in _ancestors(plugin, path):
             for other, written, written_identity in writers:
                 if ancestor == written_identity:
                     raise _refuse(
                         plugin, path, f"it lies inside {written!r}, which plugin {other} may write"
+                    )
+        if writable:  # no two container plugins write the same tree (decision 78 C)
+            for other, written, written_identity in writers:
+                if written_identity == identity or identity in _chain(written):
+                    raise _refuse(
+                        plugin,
+                        path,
+                        f"it is or holds {written!r}, which plugin {other} also writes",
                     )
         planned.append(Mount(path, writable, identity))
     return tuple(sorted(planned, key=lambda mount: (mount.path.count("/"), mount.path)))
@@ -366,6 +406,83 @@ def check_quarantine(plugin: str, policy: MountPolicy | None) -> None:
         )
 
 
+def _guard_dir(plugin: str, policy: MountPolicy | None) -> Path | None:
+    marker = _quarantine_file(policy, plugin)
+    return None if marker is None else marker.parent
+
+
+def _fatal(plugin: str, why: str) -> PluginCallError:
+    return PluginCallError("runtime_unavailable", f"plugin {plugin} (runtime container): {why}")
+
+
+def lock_plugin(plugin: str, policy: MountPolicy | None) -> int:
+    """Hold `plugin`'s run lock (`<state_dir>/quarantine/<plugin>.lock`, `flock`), from before
+    `docker run` until its sweep is done, so no two runs of a plugin share its writable paths
+    (decision 78 C); `runtime_unavailable` if another run holds it, it cannot be taken, or
+    there is no state directory to keep it in (no sweep could be guarded: fail closed)."""
+    directory = _guard_dir(plugin, policy)
+    if directory is None:
+        raise _fatal(plugin, "there is no state directory to guard its writable paths")
+    try:
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC
+        fd = os.open(directory / f"{plugin}.lock", flags, 0o600)
+    except OSError as error:
+        raise _fatal(plugin, f"its run lock cannot be taken ({error.strerror})") from None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        raise _fatal(plugin, "another run of it is using its writable paths") from None
+    return fd
+
+
+def unlock_plugin(fd: int | None) -> None:
+    """Release `lock_plugin`'s lock."""
+    if fd is not None:
+        with suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _pending_file(plugin: str, policy: MountPolicy | None) -> Path | None:
+    directory = _guard_dir(plugin, policy)
+    return None if directory is None else directory / f"{plugin}.pending"
+
+
+def check_pending(plugin: str, policy: MountPolicy | None) -> None:
+    """`runtime_unavailable` if an earlier run of `plugin` ended before its sweep (its pending
+    marker is still there). Called with the run lock held."""
+    marker = _pending_file(plugin, policy)
+    if marker is not None and os.path.lexists(marker):
+        raise _fatal(
+            plugin,
+            f"it is quarantined: an earlier run ended before its writable paths were checked "
+            f"({marker}). Check those paths, then remove that file",
+        )
+
+
+def mark_pending(plugin: str, policy: MountPolicy | None) -> None:
+    """Write the sweep-pending marker before `docker run` (`O_EXCL`, `O_NOFOLLOW`); it goes
+    only after a clean sweep. `runtime_unavailable` if it cannot be written."""
+    marker = _pending_file(plugin, policy)
+    if marker is None:
+        return
+    try:
+        fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except OSError as error:
+        raise _fatal(plugin, f"its sweep marker cannot be written ({error.strerror})") from None
+    os.close(fd)
+
+
+def clear_pending(plugin: str, policy: MountPolicy | None) -> None:
+    """Remove the sweep-pending marker (after a clean sweep, or a written quarantine)."""
+    marker = _pending_file(plugin, policy)
+    if marker is not None:
+        with suppress(FileNotFoundError):
+            os.unlink(marker)
+
+
 def quarantine(plugin: str, policy: MountPolicy | None, reasons: Sequence[str]) -> bool:
     """Record that `plugin` must not start again until the operator clears it; whether the
     file could be written (the caller also keeps it in memory)."""
@@ -410,25 +527,6 @@ def _shown(path: str) -> str:
     return repr(path[:_SHOWN])
 
 
-def _fix(path: str, status: os.stat_result, mounts: Sequence[Mount]) -> str | None:
-    """Undo what the plugin left at `path` that the host could trip over; what was done."""
-    mode = status.st_mode
-    if stat.S_ISLNK(mode):
-        target = os.readlink(path)
-        if _escapes(path, target, mounts):
-            os.unlink(path)
-            return f"removed symbolic link {_shown(path)} -> {_shown(target)} (may escape)"
-        return None
-    if stat.S_ISCHR(mode) or stat.S_ISBLK(mode) or stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode):
-        os.unlink(path)
-        return f"removed special file {_shown(path)}"
-    bits = stat.S_ISUID | (stat.S_ISGID if stat.S_ISREG(mode) else 0)
-    if mode & bits:
-        os.chmod(path, stat.S_IMODE(mode) & ~bits)  # a regular file or a directory (lstat)
-        return f"cleared the set-user/group-ID bit of {_shown(path)}"
-    return None
-
-
 @dataclass
 class Sweep:
     """What `sweep` found and did."""
@@ -458,14 +556,144 @@ def mount_points() -> frozenset[str]:
     return frozenset(points)
 
 
+_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+_NODE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+MAX_DEPTH = 256
+"""Directory depth `sweep` follows; deeper fails it (quarantine)."""
+
+
+def _same(status: os.stat_result, other: os.stat_result) -> bool:
+    return (status.st_dev, status.st_ino) == (other.st_dev, other.st_ino)
+
+
+class _Walk:
+    """One sweep's walk: every file-system call is relative to a directory descriptor opened
+    with `O_NOFOLLOW`, and every object is checked to be the one `lstat` saw before it is
+    changed, so a concurrent writer swapping a name for a link cannot turn the sweep against
+    another file (decision 78 C). A mismatch is a failure, never skipped."""
+
+    def __init__(
+        self, result: Sweep, mounts: Sequence[Mount], cutoff: float, points: frozenset[str]
+    ) -> None:
+        self.result = result
+        self.mounts = mounts
+        self.cutoff = cutoff
+        self.points = points
+        self.walked = 0
+        self.new = 0
+        self.stopped = False
+
+    def fail(self, message: str) -> None:
+        self.result.fail(message)
+
+    def node(self, fd: int, path: str, status: os.stat_result) -> None:
+        """Clear the set-user/group-ID bits of the file or directory `fd` (already open)."""
+        mode = status.st_mode
+        bits = stat.S_ISUID | (stat.S_ISGID if stat.S_ISREG(mode) else 0)
+        if mode & bits:
+            os.fchmod(fd, stat.S_IMODE(mode) & ~bits)
+            self.result.findings.append(f"cleared the set-user/group-ID bit of {_shown(path)}")
+
+    def entry(self, dir_fd: int, name: str, path: str, status: os.stat_result) -> None:
+        """Undo what the plugin left at `name` in `dir_fd` that the host could trip over."""
+        mode = status.st_mode
+        if stat.S_ISLNK(mode):
+            target = os.readlink(name, dir_fd=dir_fd)
+            if _escapes(path, target, self.mounts):
+                self._unlink(dir_fd, name, path, status)
+                self.result.findings.append(
+                    f"removed symbolic link {_shown(path)} -> {_shown(target)} (may escape)"
+                )
+            return
+        if stat.S_ISCHR(mode) or stat.S_ISBLK(mode) or stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode):
+            self._unlink(dir_fd, name, path, status)
+            self.result.findings.append(f"removed special file {_shown(path)}")
+            return
+        if not mode & (stat.S_ISUID | stat.S_ISGID):
+            return
+        fd = os.open(name, _NODE_FLAGS, dir_fd=dir_fd)
+        try:
+            if not _same(os.fstat(fd), status):
+                self.fail(f"{_shown(path)} changed while it was checked")
+                return
+            self.node(fd, path, status)
+        finally:
+            os.close(fd)
+
+    def _unlink(self, dir_fd: int, name: str, path: str, status: os.stat_result) -> None:
+        if not _same(os.stat(name, dir_fd=dir_fd, follow_symlinks=False), status):
+            raise OSError(0, "it changed while it was checked")
+        os.unlink(name, dir_fd=dir_fd)
+
+    def directory(self, fd: int, path: str, device: int, depth: int) -> None:
+        """Check every entry of the directory `fd` (open, `O_NOFOLLOW`), then its children."""
+        if depth > MAX_DEPTH:
+            self.fail(f"{_shown(path)} is deeper than {MAX_DEPTH} levels: not checked")
+            return
+        try:
+            with os.scandir(fd) as listing:
+                entries = list(listing)
+        except OSError as error:
+            self.fail(f"could not list {_shown(path)} ({error.strerror})")
+            return
+        children: list[tuple[str, str, os.stat_result]] = []
+        for entry in entries:
+            if self.stopped:
+                return
+            self.walked += 1
+            if self.walked > WALK_LIMIT:
+                self.fail(f"more than {WALK_LIMIT} entries: not every one was checked")
+                self.stopped = True
+                return
+            name, child = entry.name, os.path.join(path, entry.name)
+            try:
+                status = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            except OSError as error:
+                self.fail(f"could not check {_shown(child)} ({error.strerror})")
+                continue
+            if status.st_dev != device:
+                if child not in self.points:
+                    self.fail(f"{_shown(child)} is on another device (not a mount)")
+                continue  # a host mount point: not carried into the container
+            if stat.S_ISDIR(status.st_mode):
+                children.append((name, child, status))
+            if status.st_ctime < self.cutoff or not writable_at(child, self.mounts):
+                continue  # older than the run, or in a read-only child: not its own
+            self.new += 1
+            if self.new > NEW_LIMIT:
+                self.fail(f"more than {NEW_LIMIT} new entries: not every one was checked")
+                self.stopped = True
+                return
+            try:
+                self.entry(fd, name, child, status)
+            except OSError as error:
+                self.fail(f"could not undo {_shown(child)} ({error.strerror or error})")
+        for name, child, status in children:
+            if self.stopped:
+                return
+            try:
+                sub = os.open(name, _DIR_FLAGS, dir_fd=fd)
+            except OSError as error:
+                self.fail(f"could not open {_shown(child)} ({error.strerror})")
+                continue
+            try:
+                if _same(os.fstat(sub), status):
+                    self.directory(sub, child, device, depth + 1)
+                else:
+                    self.fail(f"{_shown(child)} changed while it was checked")
+            finally:
+                os.close(sub)
+
+
 def sweep(
     plugin: str, mounts: Sequence[Mount], since: float, points: frozenset[str] | None = None
 ) -> Sweep:
     """Check `mounts` once the plugin's container is gone (see the module docstring). Never
     raises: what it cannot check is a failure (`Sweep.failures`), never skipped quietly."""
     result = Sweep()
-    points = mount_points() if points is None else points
-    cutoff = since - CTIME_SLACK_S
+    walk = _Walk(
+        result, mounts, since - CTIME_SLACK_S, mount_points() if points is None else points
+    )
     for mount in mounts:
         try:
             status = os.lstat(mount.path)
@@ -474,60 +702,28 @@ def sweep(
             same = False
         if not same:
             result.fail(f"declared path {_shown(mount.path)} was replaced or removed")
-        elif mount.writable and status.st_ctime >= cutoff:
-            _check(result, mount.path, status, mounts)  # the mount itself: its bits
-    writable = [mount.path for mount in mounts if mount.writable]
-    tops = [path for path in writable if not any(p != path and within(path, p) for p in writable)]
-    walked = new = 0
-    for top in tops:
+    writable = [mount for mount in mounts if mount.writable]
+    paths = [mount.path for mount in writable]
+    for mount in writable:
+        top = not any(p != mount.path and within(mount.path, p) for p in paths)
         try:
-            status = os.lstat(top)
-        except OSError:
-            continue  # reported above
-        if not stat.S_ISDIR(status.st_mode):
-            continue  # a file: checked above
-        device, stack = status.st_dev, [top]
-        while stack:
-            directory = stack.pop()
-            try:
-                entries = list(os.scandir(directory))
-            except OSError as error:
-                result.fail(f"could not list {_shown(directory)} ({error.strerror})")
-                continue
-            for entry in entries:
-                walked += 1
-                if walked > WALK_LIMIT:
-                    result.fail(f"more than {WALK_LIMIT} entries: not every one was checked")
-                    return _report(plugin, result)
-                try:
-                    status = entry.stat(follow_symlinks=False)
-                except OSError as error:
-                    result.fail(f"could not check {_shown(entry.path)} ({error.strerror})")
-                    continue
-                if status.st_dev != device:
-                    if entry.path not in points:
-                        result.fail(f"{_shown(entry.path)} is on another device (not a mount)")
-                    continue  # a host mount point: not carried into the container
-                if stat.S_ISDIR(status.st_mode):
-                    stack.append(entry.path)
-                if status.st_ctime < cutoff or not writable_at(entry.path, mounts):
-                    continue  # older than the run, or in a read-only child: not its own
-                new += 1
-                if new > NEW_LIMIT:
-                    result.fail(f"more than {NEW_LIMIT} new entries: not every one was checked")
-                    return _report(plugin, result)
-                _check(result, entry.path, status, mounts)
+            fd = os.open(mount.path, _NODE_FLAGS)
+        except OSError as error:
+            result.fail(f"could not open {_shown(mount.path)} ({error.strerror})")
+            continue
+        try:
+            status = os.fstat(fd)
+            if (status.st_dev, status.st_ino) != mount.identity:
+                continue  # reported above
+            if status.st_ctime >= walk.cutoff:
+                walk.node(fd, mount.path, status)  # the mount itself: its bits
+            if top and stat.S_ISDIR(status.st_mode) and not walk.stopped:
+                walk.directory(fd, mount.path, status.st_dev, 0)
+        except OSError as error:
+            result.fail(f"could not check {_shown(mount.path)} ({error.strerror})")
+        finally:
+            os.close(fd)
     return _report(plugin, result)
-
-
-def _check(result: Sweep, path: str, status: os.stat_result, mounts: Sequence[Mount]) -> None:
-    try:
-        done = _fix(path, status, mounts)
-    except OSError as error:
-        result.fail(f"could not undo {_shown(path)} ({error.strerror})")
-        return
-    if done is not None:
-        result.findings.append(done)
 
 
 def _report(plugin: str, result: Sweep) -> Sweep:

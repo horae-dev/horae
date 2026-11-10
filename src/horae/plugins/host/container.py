@@ -410,6 +410,53 @@ class ContainerRuntime:
         if policy is not None and self._socket is not None:
             policy = policy.with_sensitive(self._socket)
         declared = mounts.plan_mounts(plugin, paths_read, paths_write, policy, shared)
+        writes = any(mount.writable for mount in declared)
+        lock = mounts.lock_plugin(plugin, self.mounts) if writes else None
+        try:
+            if writes:
+                mounts.check_pending(plugin, self.mounts)
+            return await self._prepare(
+                plugin,
+                docker,
+                root,
+                venv,
+                inside,
+                source,
+                secrets,
+                timezone,
+                cwd,
+                startup_timeout_s,
+                network,
+                network_local,
+                limits,
+                policy,
+                declared,
+                lock,
+            )
+        except BaseException:
+            mounts.unlock_plugin(lock)
+            raise
+
+    async def _prepare(
+        self,
+        plugin: str,
+        docker: str,
+        root: Path,
+        venv: Path,
+        inside: list[str],
+        source: str,
+        secrets: Mapping[str, Secret],
+        timezone: str,
+        cwd: Path,
+        startup_timeout_s: float,
+        network: Sequence[str],
+        network_local: Sequence[str],
+        limits: ContainerLimits,
+        policy: MountPolicy | None,
+        declared: tuple[Mount, ...],
+        lock: int | None,
+    ) -> Spawn:
+        """The rest of `spawn`, once the mounts are planned and the run lock (if any) held."""
         await self._network(plugin, docker)
         await self._egress_network(plugin, docker)
         proxy = await self._start_proxy(plugin, docker, network, network_local)
@@ -442,8 +489,11 @@ class ContainerRuntime:
         )
 
         proxy.client_container = name
-        try:  # right before the engine mounts them (decision 78 B)
-            mounts.recheck(plugin, declared, policy)
+        try:
+            await self._remove_exited(docker, plugin)
+            mounts.recheck(plugin, declared, policy)  # right before the engine mounts them
+            if lock is not None:
+                mounts.mark_pending(plugin, self.mounts)  # gone only after a clean sweep
         except BaseException:
             await proxy.stop()
             raise
@@ -456,16 +506,12 @@ class ContainerRuntime:
             finally:
                 self._planned.pop(name, None)
                 await proxy.stop()
-            if not any(mount.writable for mount in declared):
+            if lock is None:
                 return
-            if removed != 0:
-                failures = ["its container could not be removed, so its paths were not swept"]
-            else:  # the plugin is gone: nothing races the sweep from inside
-                swept = await anyio.to_thread.run_sync(mounts.sweep, plugin, declared, started)
-                failures = swept.failures
-            if failures:  # fail closed: no next start until the operator has looked
-                self._quarantined.add(plugin)
-                mounts.quarantine(plugin, self.mounts, failures)
+            try:
+                await self._sweep(plugin, declared, started, removed == 0)
+            finally:
+                mounts.unlock_plugin(lock)
 
         async def diagnose() -> tuple[HostErrorKind, str] | None:
             return await self._oom_killed(docker, plugin, name, limits)
@@ -481,6 +527,49 @@ class ContainerRuntime:
             egress=proxy,
             diagnose=diagnose,
         )
+
+    async def _sweep(
+        self, plugin: str, declared: tuple[Mount, ...], started: float, removed: bool
+    ) -> None:
+        """Sweep `plugin`'s writable paths, its container removed (decision 78 C). The plugin
+        is gone and its run lock keeps every other run of it away; another container plugin
+        never writes the same tree (`plan_mounts`). Writers outside containers (a process
+        plugin, the user) can still race it: the sweep works through directory descriptors
+        and fails on any change it sees. A failure quarantines the plugin; the pending marker
+        goes only after a clean sweep or a written quarantine."""
+        if not removed:
+            failures = ["its container could not be removed, so its paths were not swept"]
+        else:
+            swept = await anyio.to_thread.run_sync(mounts.sweep, plugin, declared, started)
+            failures = swept.failures
+        if not failures:
+            mounts.clear_pending(plugin, self.mounts)
+            return
+        self._quarantined.add(plugin)  # fail closed for the rest of this run in any case
+        if mounts.quarantine(plugin, self.mounts, failures):
+            mounts.clear_pending(plugin, self.mounts)
+        else:  # the pending marker stays: the next run refuses it too
+            _log.error("plugin %s: its quarantine file could not be written", plugin)
+
+    async def _remove_exited(self, docker: str, plugin: str) -> None:
+        """Remove `plugin`'s stopped containers left by an earlier, killed Horae (decision 78
+        E): exited or dead ones only, never a running one, without `--force`."""
+        found: list[str] = []
+        for status in ("exited", "dead"):
+            code, out, _ = await self._run(
+                docker,
+                "ps",
+                "--all",
+                "--quiet",
+                "--filter",
+                f"label={PLUGIN_LABEL}={plugin}",
+                "--filter",
+                f"status={status}",
+            )
+            if code == 0:
+                found += [line for line in out.decode("ascii", "replace").split() if line.isalnum()]
+        if found:
+            await self._run(docker, "rm", *found)
 
     async def _oom_killed(
         self, docker: str, plugin: str, name: str, limits: ContainerLimits

@@ -541,6 +541,10 @@ if args[:2] == ["container", "inspect"]:
     for container in args[4:]:
         print(json.dumps(fake["labels"][container]))
     sys.exit(0)
+if args[:1] == ["ps"]:
+    status = next(a for a in args if a.startswith("status=")).split("=", 1)[1]
+    print("\\n".join(fake["leftovers"].get(status, [])))
+    sys.exit(0)
 if args[:1] == ["rm"]:
     sys.exit(0)
 if args[:1] == ["run"] and any(a.startswith("dev.horae.egress-proxy=") for a in args):
@@ -590,6 +594,7 @@ def _fake_docker(tmp_path: Path, **fake: Any) -> tuple[Path, Path]:
         "blocked": [],
         "oom": False,
         "mounts": None,
+        "leftovers": {},
         "mode": "normal",
         "proxy_networks": {
             f"horae-plugin-{name}": {"IPAddress": "192.168.155.2"} for name in ("raw", "jail")
@@ -1409,3 +1414,93 @@ def test_a_failed_sweep_quarantines_the_plugin_until_the_operator_clears_it(
             return await h.call("raw.ok", {}, None)
 
     assert asyncio.run(again()).data == {"ok": True}
+
+
+def test_leftover_stopped_containers_of_the_plugin_are_removed_never_running_ones(
+    tmp_path: Path,
+) -> None:
+    plugin = _plugin_dir(tmp_path)
+    cli, state = _fake_docker(tmp_path, leftovers={"exited": ["0123abcd"], "dead": ["4567ef01"]})
+
+    async def go() -> Any:
+        async with _host(tmp_path, plugin, docker=cli, state=state) as h:
+            return await h.call("raw.ok", {}, None)
+
+    assert asyncio.run(go()).data == {"ok": True}
+    calls = _calls(state)
+    listed = [call for call in calls if call[:1] == ["ps"]]
+    assert {next(a for a in call if a.startswith("status=")) for call in listed} == {
+        "status=exited",
+        "status=dead",
+    }
+    assert all("label=dev.horae.plugin=raw" in call for call in listed)
+    assert ["rm", "0123abcd", "4567ef01"] in calls  # no --force: a running one would refuse
+    assert not any(call[:1] == ["ps"] and "status=running" in call for call in calls)
+
+
+def test_a_run_whose_sweep_never_ran_quarantines_the_plugin(tmp_path: Path) -> None:
+    plugin = _plugin_dir(tmp_path)
+    cli, state = _fake_docker(tmp_path)
+    root, policy = _instance(tmp_path)
+    inbox = str(root / "vault" / "inbox")
+    (root / "state" / "quarantine").mkdir()
+    (root / "state" / "quarantine" / "raw.pending").touch()  # a Horae killed mid-run
+    error = _first_error(
+        tmp_path, plugin, docker=cli, state=state, paths={"write": [inbox]}, mounts=policy
+    )
+    assert error.kind == "runtime_unavailable"
+    assert "ended before its writable paths were checked" in error.message
+    assert not any(call[0] == "run" for call in _calls(state))
+
+
+def test_a_clean_sweep_removes_the_pending_marker(tmp_path: Path) -> None:
+    plugin = _plugin_dir(tmp_path)
+    cli, state = _fake_docker(tmp_path)
+    root, policy = _instance(tmp_path)
+    inbox = str(root / "vault" / "inbox")
+    pending = root / "state" / "quarantine" / "raw.pending"
+    seen: list[bool] = []
+
+    async def go() -> Any:
+        async with _host(
+            tmp_path, plugin, docker=cli, state=state, paths={"write": [inbox]}, mounts=policy
+        ) as h:
+            result = await h.call("raw.ok", {}, None)
+            seen.append(pending.exists())  # while it runs
+            return result
+
+    assert asyncio.run(go()).data == {"ok": True}
+    assert seen == [True]
+    assert not pending.exists()
+
+
+def test_a_quarantine_that_cannot_be_written_keeps_the_pending_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from horae.plugins.host import mounts as mounts_module
+
+    plugin = _plugin_dir(tmp_path)
+    cli, state = _fake_docker(tmp_path)
+    root, policy = _instance(tmp_path)
+    inbox = str(root / "vault" / "inbox")
+    quarantine = root / "state" / "quarantine"
+    monkeypatch.setattr(mounts_module, "NEW_LIMIT", -1)  # every sweep fails
+
+    async def go() -> Any:
+        async with _host(
+            tmp_path, plugin, docker=cli, state=state, paths={"write": [inbox]}, mounts=policy
+        ) as h:
+            first = await h.call("raw.ok", {}, None)
+            quarantine.chmod(0o500)  # its quarantine file cannot be written now
+            return first
+
+    try:
+        assert asyncio.run(go()).data == {"ok": True}
+    finally:
+        quarantine.chmod(0o700)
+    assert not (quarantine / "raw").exists()
+    assert (root / "state" / "quarantine" / "raw.pending").exists()
+    error = _first_error(
+        tmp_path, plugin, docker=cli, state=state, paths={"write": [inbox]}, mounts=policy
+    )
+    assert "ended before its writable paths were checked" in error.message

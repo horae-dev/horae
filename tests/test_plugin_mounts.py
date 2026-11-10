@@ -143,10 +143,51 @@ def test_the_instance_controls_are_never_mounted(instance: Path, name: str) -> N
 
 
 def test_a_path_containing_a_sensitive_one_is_refused(instance: Path, tmp_path: Path) -> None:
-    home = tmp_path / "home"
-    policy = _policy(instance, str(home.resolve()))
-    assert "which no plugin may see" in _refused(str(home.resolve()), policy)  # holds ~/.ssh
-    assert ".ssh" in _refused(str((home / ".ssh").resolve()), policy)
+    home = (tmp_path / "home").resolve()
+    (home / "Documents" / "vault").mkdir(parents=True)
+    policy = _policy(instance, str(home / "Documents"))
+    assert check_path("jail", str(home / "Documents" / "vault"), policy)
+    roots = MountPolicy(roots=(str(home),), sensitive=_policy(instance).sensitive, quarantine=None)
+    assert "which no plugin may see" in _refused(str(home), roots)  # holds ~/.ssh
+    assert ".ssh" in _refused(str(home / ".ssh"), roots)
+
+
+@pytest.mark.parametrize(
+    "name", [".bashrc", ".zshrc", ".profile", ".bash_profile", ".local", "Library/LaunchAgents"]
+)
+def test_shell_start_up_files_and_auto_start_folders_are_sensitive(
+    instance: Path, tmp_path: Path, name: str
+) -> None:
+    home = (tmp_path / "home").resolve()
+    roots = MountPolicy(roots=(str(home),), sensitive=_policy(instance).sensitive)
+    target = home / name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.mkdir() if name in (".local", "Library/LaunchAgents") else target.touch()
+    assert "which no plugin may see" in _refused(str(target), roots)
+
+
+@pytest.mark.parametrize("root", ["home", "parent-of-home"])
+def test_home_and_its_ancestors_are_refused_as_mount_roots(
+    instance: Path, tmp_path: Path, root: str
+) -> None:
+    home = (tmp_path / "home").resolve()
+    (home / "vault").mkdir(parents=True)
+    entry = str(home if root == "home" else home.parent)
+    policy = _policy(instance, entry)
+    assert policy.refused_roots == (entry,)
+    assert entry not in policy.roots
+    assert "is refused: it is `/` or holds Horae's home" in _refused(str(home / "vault"), policy)
+
+
+def test_a_writable_git_repository_is_refused(instance: Path) -> None:
+    vault = instance / "vault"
+    (vault / ".git").mkdir()
+    policy = _policy(instance)
+    with pytest.raises(PluginCallError, match="git repository"):
+        plan_mounts("jail", [], [str(vault)], policy)
+    with pytest.raises(PluginCallError, match="git repository"):
+        plan_mounts("jail", [], [str(vault / ".git")], policy)
+    assert plan_mounts("jail", [str(vault)], [], policy)  # read-only is fine
 
 
 def test_secrets_and_state_outside_the_instance_stay_sensitive(tmp_path: Path) -> None:
@@ -504,32 +545,22 @@ def test_the_sweep_checks_a_writable_mount_itself(
     assert len(swept.findings) == 1
 
 
-class _Entry:
-    """A directory entry whose `stat` reports another device."""
-
-    def __init__(self, path: str, device: int) -> None:
-        self.path = path
-        self._device = device
-
-    def stat(self, *, follow_symlinks: bool = True) -> Any:
-        values = list(os.lstat(self.path))
-        values[stat.ST_DEV] = self._device
-        return os.stat_result(values)
-
-
 def test_an_entry_on_another_device_fails_the_sweep_unless_it_is_a_mount_point(
     instance: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     inbox = instance / "vault" / "inbox"
     other = str(inbox / "deep")
-    real_scandir = os.scandir
+    real_stat = os.stat
 
-    def scandir(path: Any) -> Any:
-        if str(path) == str(inbox):
-            return iter([_Entry(other, os.lstat(inbox).st_dev + 1)])
-        return real_scandir(path)
+    def fake_stat(path: Any, *args: Any, **kwargs: Any) -> Any:
+        status = real_stat(path, *args, **kwargs)
+        if path == "deep" and kwargs.get("dir_fd") is not None:
+            values = list(status)
+            values[stat.ST_DEV] += 1
+            return os.stat_result(values)
+        return status
 
-    monkeypatch.setattr(os, "scandir", scandir)
+    monkeypatch.setattr(os, "stat", fake_stat)
     swept = sweep("jail", [_mount(inbox)], mounts.now(), points=frozenset())
     assert swept.failures == [f"{other!r} is on another device (not a mount)"]
     assert sweep("jail", [_mount(inbox)], mounts.now(), points=frozenset({other})).failures == []
@@ -716,3 +747,139 @@ def test_a_dotdot_through_an_old_linked_directory_is_removed(
     assert not os.path.lexists(inbox / "plain")
     assert os.path.islink(inbox / "linked")
     assert len(swept.findings) == 2
+
+
+# --- a concurrent writer cannot turn the sweep against other files (decision 78 C) -------------
+
+
+def _outside(instance: Path) -> Path:
+    outside = instance.parent / "outside"
+    outside.mkdir(exist_ok=True)
+    return outside
+
+
+def test_a_name_swapped_for_a_link_before_its_chmod_is_never_followed(
+    instance: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(mounts, "CTIME_SLACK_S", 0.05)  # coarse kernel timestamps
+    inbox, outside = instance / "vault" / "inbox", _outside(instance)
+    victim = outside / "victim"
+    victim.write_text("x", encoding="utf-8")
+    victim.chmod(0o640)
+    since = mounts.now()
+    tool = inbox / "tool"
+    tool.write_text("x", encoding="utf-8")
+    tool.chmod(0o4755)
+    real_open = os.open
+
+    def swapping_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        if path == "tool" and kwargs.get("dir_fd") is not None:
+            tool.unlink()
+            tool.symlink_to(victim)  # the concurrent writer's swap
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", swapping_open)
+    swept = sweep("jail", [_mount(inbox)], since)
+    assert stat.S_IMODE(victim.stat().st_mode) == 0o640  # never chmodded
+    assert swept.failures  # quarantined
+
+
+def _swap_parent_on_listing(monkeypatch: pytest.MonkeyPatch, sub: Path, outside: Path) -> None:
+    """When the sweep lists `sub` (by descriptor), move it away and put a link to `outside`
+    at its name, as a concurrent writer of its parent would."""
+    real_scandir = os.scandir
+    identity = (os.lstat(sub).st_dev, os.lstat(sub).st_ino)
+
+    def swapping_scandir(target: Any = ".") -> Any:
+        if isinstance(target, int) and (os.fstat(target).st_dev, os.fstat(target).st_ino) == (
+            identity
+        ):
+            os.rename(sub, sub.with_name("moved"))
+            sub.symlink_to(outside)
+        return real_scandir(target)
+
+    monkeypatch.setattr(os, "scandir", swapping_scandir)
+
+
+def test_a_parent_swapped_during_the_sweep_does_not_redirect_an_unlink(
+    instance: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(mounts, "CTIME_SLACK_S", 0.05)  # coarse kernel timestamps
+    inbox, outside = instance / "vault" / "inbox", _outside(instance)
+    (outside / "fifo").write_text("keep me", encoding="utf-8")
+    (outside / "tool").write_text("x", encoding="utf-8")
+    (outside / "tool").chmod(0o4755)
+    sub = inbox / "sub"
+    sub.mkdir()
+    since = mounts.now()
+    os.mkfifo(sub / "fifo")
+    (sub / "tool").write_text("x", encoding="utf-8")
+    (sub / "tool").chmod(0o4755)
+    _swap_parent_on_listing(monkeypatch, sub, outside)
+    sweep("jail", [_mount(inbox)], since)
+    assert (outside / "fifo").read_text(encoding="utf-8") == "keep me"  # not unlinked
+    assert (outside / "tool").stat().st_mode & stat.S_ISUID  # not chmodded
+    moved = inbox / "moved"
+    assert not os.path.lexists(moved / "fifo")  # the real one, through its descriptor
+    assert not (moved / "tool").stat().st_mode & stat.S_ISUID
+
+
+def test_a_directory_swapped_after_it_was_queued_is_not_walked(
+    instance: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(mounts, "CTIME_SLACK_S", 0.05)  # coarse kernel timestamps
+    inbox, outside = instance / "vault" / "inbox", _outside(instance)
+    since = mounts.now()
+    os.mkfifo(outside / "fifo")  # new, but outside: the sweep must never reach it
+    sub = inbox / "sub"
+    sub.mkdir()
+    real_open = os.open
+
+    def swapping_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        if path == "sub" and kwargs.get("dir_fd") is not None:
+            os.rename(sub, inbox / "moved")
+            sub.symlink_to(outside)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", swapping_open)
+    swept = sweep("jail", [_mount(inbox)], since)
+    assert stat.S_ISFIFO(os.lstat(outside / "fifo").st_mode)
+    assert any("could not open" in failure for failure in swept.failures)
+
+
+def test_two_container_plugins_never_write_the_same_tree(instance: Path) -> None:
+    vault, inbox = str(instance / "vault"), str(instance / "vault" / "inbox")
+    policy = _policy(instance)
+    for mine, theirs in ((vault, vault), (vault, inbox), (inbox, vault)):
+        with pytest.raises(PluginCallError, match="writer"):
+            plan_mounts("jail", [], [mine], policy, [("writer", theirs)])
+    assert plan_mounts("jail", [vault], [], policy, [("writer", vault)])  # reading is fine
+    archive = str(instance / "vault" / "archive")
+    assert plan_mounts("jail", [], [archive], policy, [("writer", inbox)])  # siblings
+
+
+def test_one_run_at_a_time_holds_a_plugins_writable_paths(instance: Path) -> None:
+    policy = _policy(instance)
+    first = mounts.lock_plugin("jail", policy)
+    with pytest.raises(PluginCallError, match="another run of it"):
+        mounts.lock_plugin("jail", policy)
+    other = mounts.lock_plugin("other", policy)
+    mounts.unlock_plugin(first)
+    again = mounts.lock_plugin("jail", policy)
+    mounts.unlock_plugin(again)
+    mounts.unlock_plugin(other)
+    with pytest.raises(PluginCallError, match="no state directory"):
+        mounts.lock_plugin("jail", MountPolicy(roots=(), sensitive=()))
+
+
+def test_the_pending_marker_is_exclusive_and_refuses_a_start(instance: Path) -> None:
+    policy = _policy(instance)
+    mounts.lock_plugin("jail", policy)  # creates the directory
+    mounts.check_pending("jail", policy)
+    mounts.mark_pending("jail", policy)
+    with pytest.raises(PluginCallError, match="ended before"):
+        mounts.check_pending("jail", policy)
+    with pytest.raises(PluginCallError, match="sweep marker cannot be written"):
+        mounts.mark_pending("jail", policy)  # O_EXCL
+    mounts.clear_pending("jail", policy)
+    mounts.check_pending("jail", policy)
