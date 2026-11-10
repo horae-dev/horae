@@ -1,0 +1,3 @@
+# A plugin runtime is `process` or `container` (schemas decision 74 A).
+plugins:
+  github: { runtime: vm }

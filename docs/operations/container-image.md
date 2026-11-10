@@ -92,6 +92,11 @@ The note lands in the volume's `vault/Daily/`. Compose equivalent: `read_only: t
 The image has no pip, no ensurepip and no compiler. It does carry **uv** and **git**, for
 `horae plugin add` only (see below).
 
+The image ships **no Docker CLI** and mounts no Docker socket, so plugins run as processes in
+it: `runtime: container` (#49) reports `runtime_unavailable`. Giving a containerised Horae
+access to an engine (a socket mount is host root) is a deliberate choice:
+[plugin-containers.md](plugin-containers.md#horae-inside-docker-coolify-compose).
+
 ### Installing plugins in the container
 
 [#169](https://github.com/horae-dev/horae/issues/169). Plugins run without uv: each installed

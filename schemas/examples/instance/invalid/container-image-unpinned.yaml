@@ -1,0 +1,2 @@
+# The plugin container image must be pinned by digest (schemas decision 74 G).
+container: { image: "python:3.12-slim-bookworm" }
