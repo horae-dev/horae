@@ -7,9 +7,10 @@ from typing import Any
 import pytest
 import yaml
 
+import horae_sdk
 from horae.config.documents import read_yaml, validate
 from horae.contracts import PluginManifest
-from horae_sdk import Permissions, Plugin, dump_manifest, manifest
+from horae_sdk import Permissions, Plugin, dump_manifest, free_text, manifest
 from horae_sdk.manifest import ManifestError, write_manifest
 from sdk_helpers import HELLO, TASKS_FILE, load_example, schema_errors
 
@@ -162,6 +163,10 @@ def test_personal_fields_reach_the_manifest_the_core_accepts() -> None:
         ({"ok.read": ["a", "a"]}, "twice"),
         ({"ok.read": ["a", "a.b"]}, "overlapping"),
         ({"ok.read": ["a.b", "a[]"]}, "shape"),
+        ({"ok.read": ["free_text:a..b"]}, "not a path"),
+        ({"ok.read": ["text:a"]}, "not a path"),
+        ({"ok.read": ["a", "free_text:a.b"]}, "overlapping"),
+        ({"ok.read": ["free_text:a.b", "a[]"]}, "shape"),
     ],
 )
 def test_bad_personal_fields_are_refused(declared: dict[str, Any], message: str) -> None:
@@ -172,3 +177,26 @@ def test_bad_personal_fields_are_refused(declared: dict[str, Any], message: str)
             provides={"sources": ["ok.read"]},
             personal_fields=declared,
         )
+
+
+def test_a_scan_only_field_reaches_the_manifest_the_core_accepts() -> None:
+    """horae-sdk 0.9 (#165): `free_text(path)` declares a free-text field scan-only."""
+    plugin = Plugin("mail", version="0.1.0")
+
+    @plugin.source("mail.inbox", personal_fields=["messages[].from", free_text("messages[].body")])
+    def inbox(call: Any) -> Any:  # pragma: no cover - never called
+        return {}
+
+    data = plugin.manifest(command=["python3", "-m", "mail"])
+    assert data["provides"]["personal_fields"] == {
+        "mail.inbox": ["messages[].from", "free_text:messages[].body"]
+    }
+    model = accepted(data)
+    assert model.provides.personal_fields["mail.inbox"] == [
+        "messages[].from",
+        "free_text:messages[].body",
+    ]
+
+
+def test_the_version_is_0_9_0() -> None:
+    assert horae_sdk.__version__ == "0.9.0"

@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Literal
 
 from horae.contracts.lockfile import LockedPlugin
-from horae.contracts.plugin import Permissions
+from horae.contracts.plugin import FREE_TEXT_FIELD, Permissions
 
 OLD_PREFIX = ".upgrade-old-"
 """In `plugins/`: the tree an upgrade replaced, deleted once the upgrade is committed. A killed
@@ -74,10 +74,19 @@ def _secrets(old: Permissions, new: Permissions) -> list[Change]:
     return changes
 
 
+def _personal_item(ref: str, path: str) -> str:
+    """One personal field as the diff shows it: a scan-only one (`free_text:`, #165) says it
+    is not de-identified as a value, so turning a field scan-only reads as a field dropped."""
+    if path.startswith(FREE_TEXT_FIELD):
+        bare = path.removeprefix(FREE_TEXT_FIELD)
+        return f"{ref}: {bare} (scan-only free text, not de-identified as a value)"
+    return f"{ref}: {path}"
+
+
 def _personal(old: dict[str, list[str]], new: dict[str, list[str]]) -> list[Change]:
     """A personal field dropped lowers the protection: it widens (decision 68)."""
-    before = {f"{ref}: {path}" for ref, paths in old.items() for path in paths}
-    after = {f"{ref}: {path}" for ref, paths in new.items() for path in paths}
+    before = {_personal_item(ref, path) for ref, paths in old.items() for path in paths}
+    after = {_personal_item(ref, path) for ref, paths in new.items() for path in paths}
     return [
         *(Change("personal_fields", item, "added", False) for item in sorted(after - before)),
         *(Change("personal_fields", item, "removed", True) for item in sorted(before - after)),

@@ -63,11 +63,14 @@ from horae.contracts.types import (
 
 _NAME = r"[A-Za-z_][A-Za-z0-9_-]*"
 _STEP = rf"({_NAME}|\[\])"
+VIEW_PATH_PATTERN = rf"{_STEP}(\.{_NAME}|\[\])*"
+"""The syntax of a view path, without anchors (shared with a plugin's `personal_fields`)."""
+MAX_VIEW_PATH = 256
 
 ViewPath = Annotated[
     str,
     Strict(),
-    StringConstraints(pattern=rf"^{_STEP}(\.{_NAME}|\[\])*$", max_length=256),
+    StringConstraints(pattern=rf"^{VIEW_PATH_PATTERN}$", max_length=MAX_VIEW_PATH),
 ]
 """One input view path, e.g. `tasks[].title` (see the module docstring)."""
 

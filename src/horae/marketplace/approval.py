@@ -22,7 +22,7 @@ from horae.contracts.instance import DEFAULT_MARKETPLACE
 from horae.contracts.intents import IntentType
 from horae.contracts.lockfile import LockedPlugin, UserGrants
 from horae.contracts.marketplace import Tier
-from horae.contracts.plugin import Permissions
+from horae.contracts.plugin import FREE_TEXT_FIELD, Permissions
 from horae.contracts.types import Hostname, LocalEndpoint
 from horae.marketplace.errors import InvalidReference, TierRefused
 
@@ -51,6 +51,10 @@ INTENT_MEANINGS: dict[IntentType, str] = {
 
 PERSONAL_NOTE = (
     "this plugin marks these fields as personal; they are de-identified before cloud models"
+)
+SCAN_ONLY_NOTE = (
+    "these free-text fields (`free_text:`) are scanned for the other personal values before "
+    "cloud models, but are not de-identified as values themselves"
 )
 
 _host: TypeAdapter[str] = TypeAdapter(Hostname)
@@ -159,12 +163,27 @@ def describe(
         lines.append("pipelines it installs (they run once the plugin is enabled in horae.yaml):")
         lines.extend(f"  {line}" for line in pipelines)
     if personal_fields:
-        lines.append("personal fields (information only, no approval needed):")
-        lines.append(f"  {PERSONAL_NOTE}:")
-        lines.extend(
-            f"    - {ref}: {', '.join(sorted(paths))}"
+        # #165: scan-only paths are listed apart, so a free-text field is never presented as
+        # de-identified.
+        personal = {
+            ref: sorted(path for path in paths if not path.startswith(FREE_TEXT_FIELD))
             for ref, paths in sorted(personal_fields.items())
-        )
+        }
+        scanned = {
+            ref: sorted(
+                path.removeprefix(FREE_TEXT_FIELD)
+                for path in paths
+                if path.startswith(FREE_TEXT_FIELD)
+            )
+            for ref, paths in sorted(personal_fields.items())
+        }
+        lines.append("personal fields (information only, no approval needed):")
+        for note, groups in ((PERSONAL_NOTE, personal), (SCAN_ONLY_NOTE, scanned)):
+            if any(groups.values()):
+                lines.append(f"  {note}:")
+                lines.extend(
+                    f"    - {ref}: {', '.join(paths)}" for ref, paths in groups.items() if paths
+                )
     return lines
 
 

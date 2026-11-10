@@ -46,8 +46,8 @@
           "patternProperties": {
             "^[a-z][a-z0-9-]*\\.[a-z][a-z0-9_]*$": {
               "items": {
-                "maxLength": 256,
-                "pattern": "^([A-Za-z_][A-Za-z0-9_-]*|\\[\\])(\\.[A-Za-z_][A-Za-z0-9_-]*|\\[\\])*$",
+                "maxLength": 266,
+                "pattern": "^(free_text:)?([A-Za-z_][A-Za-z0-9_-]*|\\[\\])(\\.[A-Za-z_][A-Za-z0-9_-]*|\\[\\])*$",
                 "type": "string"
               },
               "maxItems": 64,

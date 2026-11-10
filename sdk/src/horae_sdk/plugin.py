@@ -126,7 +126,8 @@ class Tool:
     Subclass `Source` or `Transform` with a `ref` and a `run(self, call, **params)` method,
     or pass `ref` and `fn`. `personal_fields` (horae-sdk 0.7, schemas decision 68) are the
     view paths of the tool's output that hold personal data (`children[].first_name`): the
-    manifest declares them and the core de-identifies them before any cloud model."""
+    manifest declares them and the core de-identifies them before any cloud model. A
+    free-text field is declared scan-only, `horae_sdk.free_text("messages[].body")` (0.9)."""
 
     role: ClassVar[ToolRole]
     ref: str

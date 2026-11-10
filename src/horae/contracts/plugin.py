@@ -1,13 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """Plugin manifest, `plugin.yaml` (PLAN.md §3.1, §3.3)."""
 
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from typing import Annotated, Literal, Self
 
 from pydantic import AfterValidator, Field, Strict, StringConstraints, model_validator
 
 from horae.contracts.intents import IntentType
-from horae.contracts.skill import ViewPath, outermost, view_paths_problem
+from horae.contracts.skill import (
+    MAX_VIEW_PATH,
+    VIEW_PATH_PATTERN,
+    outermost,
+    view_paths_problem,
+    view_steps,
+)
 from horae.contracts.types import (
     MAX_ITEMS,
     AbsolutePath,
@@ -53,22 +59,69 @@ tool the plugin lists in `tools/list` but may not provide (so no pipeline step c
 MAX_PERSONAL_FIELDS = 64
 """Most personal fields one tool declares (decision 68)."""
 
+FREE_TEXT_FIELD = "free_text:"
+"""The prefix of a **scan-only** personal field (#165, decision 68 J), e.g.
+`free_text:messages[].body`: free text that may mention personal data (a mail body). Its
+content is not a personal value (it is not classed `person`, nor looked for elsewhere, so a
+long body never makes a cloud step refuse); it is scanned for the other personal values and
+the vocabulary, and it marks the step as needing de-identification, like a skill's
+`free_text` class. A plain path is a personal field proper."""
+
+PersonalFieldPath = Annotated[
+    str,
+    Strict(),
+    StringConstraints(
+        pattern=rf"^({FREE_TEXT_FIELD})?{VIEW_PATH_PATTERN}$",
+        max_length=len(FREE_TEXT_FIELD) + MAX_VIEW_PATH,
+    ),
+]
+"""A view path, optionally prefixed by `free_text:` (scan-only)."""
+
+
+def split_personal(paths: Iterable[str]) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """`(personal, free_text)`: the plain view paths of a declaration and its scan-only ones
+    (without their prefix), each reduced to the outermost ones; a scan-only path at or under
+    a personal path is dropped (the personal path already covers it, and more strictly)."""
+    personal: list[str] = []
+    free_text: list[str] = []
+    for path in paths:
+        if path.startswith(FREE_TEXT_FIELD):
+            free_text.append(path.removeprefix(FREE_TEXT_FIELD))
+        else:
+            personal.append(path)
+    kept = outermost(personal)
+    outer = [view_steps(path) for path in kept]
+    text = tuple(
+        path
+        for path in outermost(free_text)
+        if not any(view_steps(path)[: len(steps)] == steps for steps in outer)
+    )
+    return kept, text
+
+
+def reduce_personal(paths: Iterable[str]) -> tuple[str, ...]:
+    """A declaration in force (`split_personal`), written back as a sorted list of paths
+    with the scan-only ones prefixed."""
+    personal, free_text = split_personal(paths)
+    return tuple(sorted([*personal, *(FREE_TEXT_FIELD + path for path in free_text)]))
+
 
 def _usable_paths(paths: list[str]) -> list[str]:
-    problem = view_paths_problem(paths)
+    problem = view_paths_problem(path.removeprefix(FREE_TEXT_FIELD) for path in paths)
     if problem is not None:
         raise ValueError(problem)
     return paths
 
 
 PersonalFieldPaths = Annotated[
-    UniqueList[ViewPath],
+    UniqueList[PersonalFieldPath],
     Field(min_length=1, max_length=MAX_PERSONAL_FIELDS),
     AfterValidator(_usable_paths),
 ]
 """The personal fields of one tool's output: 1 to `MAX_PERSONAL_FIELDS` view paths (the syntax
-of a skill's `input_view`, relative to the tool's output), none under another and none
-disagreeing with another on a value's shape (pydantic-only rules)."""
+of a skill's `input_view`, relative to the tool's output, a scan-only one prefixed by
+`free_text:`), none under another and none disagreeing with another on a value's shape,
+prefix or not (pydantic-only rules)."""
 
 PersonalFields = Annotated[dict[PluginRef, PersonalFieldPaths], Field(max_length=MAX_ITEMS)]
 """`{<source or transform ref>: [view paths]}` (decision 68)."""
@@ -79,13 +132,15 @@ def merge_personal_fields(
 ) -> dict[str, list[str]]:
     """The union of several `personal_fields` declarations (an installed manifest's and the
     lock's, decision 68 B), limited to `tools` (the refs the plugin provides), each tool's
-    paths reduced to the outermost ones. Never fewer fields than any one declaration."""
+    paths reduced to the outermost ones (`reduce_personal`: a field one declaration makes
+    personal and another scan-only stays personal). Never less protection than any one
+    declaration."""
     union: dict[str, list[str]] = {}
     for declared in declarations:
         for ref, paths in declared.items():
             if ref in tools:
                 union.setdefault(ref, []).extend(paths)
-    return {ref: list(outermost(paths)) for ref, paths in sorted(union.items())}
+    return {ref: list(reduce_personal(paths)) for ref, paths in sorted(union.items())}
 
 
 class Provides(Contract):
@@ -109,8 +164,9 @@ class Provides(Contract):
     tool ref, as view paths relative to that tool's output, e.g.
     `{school-fr.homework: ["children[].first_name", "homework[].teacher"]}`. Whenever that
     output reaches an `llm` step on a cloud model alias, the core de-identifies these fields
-    as `person` and looks for their values in every string, whatever the skill declares. Each
-    key must be one of `sources` or `transforms` (pydantic-only rule)."""
+    as `person` and looks for their values in every string, whatever the skill declares. A
+    path prefixed by `free_text:` is scan-only (`FREE_TEXT_FIELD`). Each key must be one of
+    `sources` or `transforms` (pydantic-only rule)."""
 
     @model_validator(mode="after")
     def _personal_fields_name_tools(self) -> Self:

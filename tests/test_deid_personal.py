@@ -121,7 +121,7 @@ def test_fold_never_returns_an_empty_symbol() -> None:
 
 
 def test_the_transforms_version_was_bumped() -> None:
-    assert DEID_VERSION == 3
+    assert DEID_VERSION == 4  # 4: #165 (scripts without spaces, personal numbers)
 
 
 # --- 2. contracts ------------------------------------------------------------------------------

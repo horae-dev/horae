@@ -228,8 +228,28 @@ records them, and whenever that output reaches an `llm` step on a **cloud** mode
 core replaces those values, and every other string that mentions one (accent- and
 case-folded, whole words), with `[PERSON_n]`, whatever the skill declares, and refuses the
 step if it cannot (schemas decision 68). A transform that moves such data must declare where
-its own output holds it. Limits: names of fewer than 3 letters in text, nicknames, initials
-and typos are not matched.
+its own output holds it. Limits: names of fewer than 3 letters in text (2 in Han, kana or
+Hangul), nicknames, initials and typos are not matched. A whole number of 6 digits or more
+under a declared path (a phone number, an identifier) is looked for in text and in other
+numbers too.
+
+**Free text (0.9).** A field whose whole content is not one personal value, but may mention
+one (a mail body, a note), is declared **scan-only** with `free_text(path)`:
+
+```python
+from horae_sdk import free_text
+
+
+@plugin.source("mail.inbox", personal_fields=["messages[].from", free_text("messages[].body")])
+def inbox(call: Call) -> Output: ...
+```
+
+It is written `free_text:messages[].body` in the manifest. The core then scans that field for
+the other personal values and the instance vocabulary, and requires de-identification before a
+cloud model, but does not treat the body itself as a name: a long body never makes the step
+refuse, as it would for a plain personal field (a value over 1 KiB or 48 words cannot be looked
+for in text, so the step fails closed). Declaring a field scan-only protects less than a plain
+path: use it only for free text.
 
 **The command.** The host starts the plugin with an empty working directory and a fixed
 `PATH` (`/usr/local/bin:/usr/bin:/bin`). A plugin installed with `horae plugin add` gets its

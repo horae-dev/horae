@@ -8,45 +8,64 @@ functions the engine and `horae eval` share:
 
 - `under`: a tool's path seen from the step input (`[].data.<path>` after a `collect`);
 - `values`: the personal values a tool's output holds at its declared paths (every string
-  leaf and object key below them), and the paths whose shape the output contradicts;
+  leaf and object key below them, and every whole number of at least `MIN_NUMBER_DIGITS`
+  digits), and the paths whose shape the output contradicts;
 - `merged_options`: a skill's input view options with the personal paths added as
-  `{class: person}`, so the core applies them whatever the skill declares.
+  `{class: person}`, and the scan-only ones (`free_text:`, #165) as `{class: free_text}`, so
+  the core applies them whatever the skill declares.
 """
 
+import math
 import unicodedata
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
-from horae.contracts.skill import outermost, view_steps
+from horae.contracts.plugin import FREE_TEXT_FIELD, reduce_personal, split_personal
+from horae.contracts.skill import view_steps
 
 COLLECT_ROOT = "[].data"
 """Where a source's output sits in a `collect` step's output (`[{source, params, data}]`)."""
 
+MIN_NUMBER_DIGITS = 6
+"""Shortest whole number under a personal path collected as a personal value (#165): a phone
+number, an identifier or an account number (6 digits and more) is then also looked for in
+text and in other numbers. Shorter ones are not: a year (`2026`), a postcode-sized count, a
+quantity or a day would match all over the input and replace ordinary numbers. A shorter
+number is still pseudonymized where it sits (the path is classed `person`)."""
+
 
 def under(root: str, path: str) -> str:
     """`path` (relative to a tool's output) seen from `root`: `under("[].data", "a[].b")` is
-    `[].data.a[].b`, `under("[].data", "[].b")` is `[].data[].b`; an empty root is `path`."""
+    `[].data.a[].b`, `under("[].data", "[].b")` is `[].data[].b`; an empty root is `path`.
+    A scan-only path keeps its `free_text:` prefix."""
+    if path.startswith(FREE_TEXT_FIELD):
+        return FREE_TEXT_FIELD + under(root, path.removeprefix(FREE_TEXT_FIELD))
     if not root:
         return path
     return f"{root}{path}" if path.startswith("[]") else f"{root}.{path}"
 
 
 def values(data: Any, paths: Sequence[str]) -> tuple[list[str], list[str]]:
-    """`(values, mismatched)`: every string leaf and object key at or below each path of
-    `data` (NFC, in document order, without duplicates or empty strings), and the paths at
+    """`(values, mismatched)`: every string leaf and object key at or below each personal
+    path of `data` (NFC, in document order, without duplicates or empty strings), each whole
+    number (an integral float too) of at least `MIN_NUMBER_DIGITS` digits there (its decimal
+    text), and the paths at
     which `data` holds a value of the wrong shape (an object where the path reads an array,
     a scalar where it reads either): such a field cannot be located, so a step that would
-    send it to a cloud model fails closed. An absent key, or `null`, is not a mismatch."""
+    send it to a cloud model fails closed. An absent key, or `null`, is not a mismatch. A
+    scan-only path (`free_text:`) is checked for its shape, but its content is not a value."""
     found: dict[str, None] = {}
     mismatched: list[str] = []
     for path in paths:
-        if _walk(data, view_steps(path), found):
+        text = path.startswith(FREE_TEXT_FIELD)
+        if _walk(data, view_steps(path.removeprefix(FREE_TEXT_FIELD)), found, collect=not text):
             mismatched.append(path)
     return list(found), mismatched
 
 
-def _walk(value: Any, steps: tuple[str, ...], found: dict[str, None]) -> bool:
-    """Collect the leaves under `steps`; whether a value had the wrong shape."""
+def _walk(value: Any, steps: tuple[str, ...], found: dict[str, None], *, collect: bool) -> bool:
+    """Collect the leaves under `steps` (with `collect`); whether a value had the wrong
+    shape."""
     level: list[Any] = [value]
     for step in steps:
         following: list[Any] = []
@@ -63,11 +82,17 @@ def _walk(value: Any, steps: tuple[str, ...], found: dict[str, None]) -> bool:
                 if step in item:
                     following.append(item[step])
         level = following
-    stack = list(reversed(level))
+    stack = list(reversed(level)) if collect else []
     while stack:
         item = stack.pop()
         if isinstance(item, str):
             _add(found, item)
+        elif (isinstance(item, int) and not isinstance(item, bool)) or (
+            isinstance(item, float) and math.isfinite(item) and item.is_integer()
+        ):
+            digits = str(abs(int(item)))
+            if len(digits) >= MIN_NUMBER_DIGITS:
+                found.setdefault(digits, None)
         elif isinstance(item, list):
             stack.extend(reversed(item))
         elif isinstance(item, dict):
@@ -91,11 +116,14 @@ def merged_options(
     `place`) or `amount`, at it or above it, is left to the skill's class; otherwise the
     skill's classes below the path are dropped (the path covers them) and a `free_text` class
     at or above it is dropped (it means the same as no class: the string is scanned), so no
-    classed path lies under another."""
+    classed path lies under another. A scan-only path (`free_text:`) is classed `free_text`
+    (scanned, and the step de-identified) unless a classed path lies at, above or below it
+    (the step is de-identified anyway, and every string is scanned)."""
     merged: dict[str, dict[str, Any]] = {
         path: dict(value) for path, value in options.items() if isinstance(value, Mapping)
     }
-    for path in outermost(personal):
+    paths, free_text = split_personal(personal)
+    for path in paths:
         steps = view_steps(path)
         classed = {
             other: value["class"]
@@ -112,7 +140,24 @@ def merged_options(
             if steps[: len(other_steps)] == other_steps or other_steps[: len(steps)] == steps:
                 merged[other] = {k: v for k, v in merged[other].items() if k != "class"}
         merged[path] = {**merged.get(path, {}), "class": "person"}
+    for path in free_text:
+        steps = view_steps(path)
+        if any(
+            steps[: len(other_steps)] == other_steps or other_steps[: len(steps)] == steps
+            for other, value in merged.items()
+            if isinstance(value.get("class"), str)
+            for other_steps in (view_steps(other),)
+        ):
+            continue
+        merged[path] = {**merged.get(path, {}), "class": "free_text"}
     return {path: value for path, value in sorted(merged.items()) if value}
 
 
-__all__ = ["COLLECT_ROOT", "merged_options", "outermost", "under", "values"]
+__all__ = [
+    "COLLECT_ROOT",
+    "MIN_NUMBER_DIGITS",
+    "merged_options",
+    "reduce_personal",
+    "under",
+    "values",
+]
