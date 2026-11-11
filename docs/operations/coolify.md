@@ -540,6 +540,34 @@ an SSO-free route for it (its body lists the pipelines and their schedules). Rel
 monitors for the runs, and on Coolify's health status (the image's `HEALTHCHECK`) for the
 process.
 
+## The one-click template (upstream)
+
+Besides the Docker Compose Empty template above, a **one-click service** for Coolify's own
+catalogue is prepared in [`deploy/coolify/upstream/horae.yaml`](../../deploy/coolify/upstream/horae.yaml)
+(#59), in Coolify's template format (metadata header comments, a generated domain through
+`SERVICE_FQDN_HORAE_8080`, a pinned image, a healthcheck). It differs from the template above
+on purpose, because a one-click service gets a Coolify-generated domain:
+
+- the domain is Coolify's (`SERVICE_FQDN_HORAE_8080`), not `HORAE_PUBLIC_HOST`, and
+  `HORAE_ALLOWED_HOSTS` is that domain;
+- the API has no authentication of its own, so SSO is **required**: `HORAE_SSO_FORWARD_AUTH_URL`
+  (your forwardAuth address) blocks the deployment until it is set, and a label-defined
+  `forwardauth` middleware (`trustForwardHeader=false`) is added to the routers Coolify
+  generates; `/act/` links are therefore behind SSO too (the exemption needs the hand-written
+  routers of this page's template);
+- same security defaults: no Docker socket (plugin containers need a Docker engine and are not
+  available, [plugin-containers.md](plugin-containers.md#horae-inside-docker-coolify-compose)),
+  read-only root filesystem, no capabilities, non-root user;
+- a test keeps it consistent with this page's template (same image, same required variables,
+  the header fields Coolify requires): `tests/test_deploy_templates.py`.
+
+The maintainer's steps to propose it to Coolify are in
+[`deploy/coolify/upstream/SUBMITTING.md`](../../deploy/coolify/upstream/SUBMITTING.md).
+
+!!! note "Upstream link"
+    The link to the template in Coolify's catalogue will be added here once the upstream pull
+    request is merged.
+
 ## Updates
 
 The image is pinned. The template writes it **once**, in `x-horae-image` at its top:
