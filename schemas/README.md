@@ -5157,7 +5157,7 @@ loosened later without breaking a valid file.
       first-party whose effective runtime is not `container` (the host will refuse it). The
       `tier` and `index` columns fall back to the lock's when there is no record. `remove`
       needs nothing new.
-    - **H, no build for a plugin that is not first-party (security review of this PR).** A
+    - **G, no build for a plugin that is not first-party (security review of this PR).** A
       build backend on the allow-list of decision 69 B still runs plugin code on the host as
       the Horae user (`setup.py` under setuptools, a hatch build hook, `pdm_build.py`): fine
       for first-party code, arbitrary code execution outside the container for anything else.
@@ -5182,7 +5182,7 @@ loosened later without breaking a valid file.
       before approval. The prompt says "installed without running its build". First-party
       plugins are built and installed as before. Tested with a setuptools `setup.py` and a
       hatch custom hook that would each write a marker: none is written.
-    - **I, trust classes never share uv's cache (independent review of this PR).** The review
+    - **H, trust classes never share uv's cache (independent review of this PR).** The review
       reproduced a poisoning: a third-party `uv.lock` lists `flit-core` under the real index
       but with its wheel URL on the attacker's host and the attacker's hash; uv fetched it and
       cached it under the index, and the next first-party build, whose backend uv resolves
@@ -5207,7 +5207,7 @@ loosened later without breaking a valid file.
       Horae-maintained, hashed set for the five allowed backends and their own dependencies,
       per Python version, is a follow-up. Until then a first-party build trusts the index
       over https for its backend, as decision 69 B already says.
-    - **G, what this does not do.** It does not make a container safe by itself: the guarantees
+    - **I, what this does not do.** It does not make a container safe by itself: the guarantees
       and gaps of decisions 74, 76 and 78 (egress through the proxy only, declared mounts, the
       limits, the Docker socket of T26) are what a third-party plugin is confined by. Horae in
       the published image still cannot start containers (decision 74 J): there a third-party
