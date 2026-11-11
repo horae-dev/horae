@@ -41,6 +41,19 @@ class Drift:
         return {"kind": self.kind, "message": self.message}
 
 
+def runtime_drift(name: str, first_party: bool, runtime: str) -> Drift | None:
+    """`runtime_not_container` (#191, decision 79 F) for a plugin that is not first-party whose
+    effective runtime is not `container`: the plugin host refuses to start it. Shared by
+    `horae plugin audit` and `horae doctor`; `None` when the plugin is fine."""
+    if first_party or runtime == "container":
+        return None
+    return Drift(
+        "runtime_not_container",
+        f"{name}: not first-party, but horae.yaml runs it with `runtime: {runtime}`; the "
+        f"plugin host refuses to start it: set `plugins.{name}.runtime: container`",
+    )
+
+
 def _read_small(path: Path, limit: int) -> bytes | None:
     """The bytes of the regular file `path` (opened without following a symlink), `None` when
     it is absent; `OSError` when it is a symlink, not a regular file, or larger than `limit`."""
@@ -152,4 +165,5 @@ __all__ = [
     "pipeline_drift",
     "read_record",
     "record_mismatch",
+    "runtime_drift",
 ]

@@ -39,7 +39,9 @@ from horae.llm.backends import FACTORIES, claude_cli, schema_problems
 from horae.llm.backends._shared import lan_address
 from horae.llm.deid import vocabulary_problem
 from horae.llm.validate import worker_problem
+from horae.marketplace.audit import runtime_drift
 from horae.plugins.host import HostRegistry, PluginCallError, RegistryError
+from horae.plugins.host.container import engine_problem
 from horae.plugins.host.host import resolve_command
 from horae.runner import LivePorts, open_ports
 from horae.skills import SKILLS_DIR, SkillError, load_skill
@@ -146,6 +148,31 @@ def _command_problems(registry: HostRegistry) -> list[Problem]:
             problems.append(
                 Problem(where, None, None, f"runtime.command: {exc.message} ({NOT_RELOCATABLE})")
             )
+    return problems
+
+
+def _runtime_problems(instance: Instance, registry: HostRegistry) -> list[Problem]:
+    """What the container-only policy needs (#194, schemas decision 79): an error for each
+    plugin that is not first-party (as the host decides it: `horae.lock`, never the manifest)
+    whose effective runtime is not `container` (the same check as `horae plugin audit`; the
+    host refuses to start it), and one error when a plugin runs with `runtime: container` but
+    there is no usable local Docker engine (`engine_problem`; nothing is started)."""
+    problems: list[Problem] = []
+    containers: list[str] = []
+    for installed in registry.plugins():
+        name = installed.manifest.name
+        runtime = instance.config.plugin_runtime(name)
+        if runtime == "container":
+            containers.append(name)
+        elif drift := runtime_drift(name, installed.first_party, runtime):
+            problems.append(Problem(CONFIG_FILE, None, None, drift.message))
+    if containers and (why := engine_problem(instance.config.container)):
+        names = ", ".join(sorted(containers))
+        message = (
+            f"{plural(len(containers), 'plugin')} ({names}) run with `runtime: container` but "
+            f"there is no usable local Docker engine: {why}"
+        )
+        problems.append(Problem(CONFIG_FILE, None, None, message))
     return problems
 
 
@@ -510,7 +537,9 @@ def instance_problems(instance: Instance) -> list[Problem]:
     warning; a warning too for a `usd` daily ceiling over such an unpriced alias), and,
     when the instance has a `plugins/` directory, the plugins are installed as the lock
     pins them (`check_plugins`), each command (its interpreter) exists and is executable,
-    and every skill an `llm` step uses loads (`horae.skills.load_skill`); with an `llm` step,
+    each plugin that is not first-party has `runtime: container`, a Docker engine is usable
+    when any plugin runs in a container (`_runtime_problems`, #194), and every skill an `llm`
+    step uses loads (`horae.skills.load_skill`); with an `llm` step,
     the output validator's worker runs (`horae.llm.validate.worker_problem`); the `/act`
     key, when set, is usable (`_act_problems`); a warning for each pipeline whose recent runs
     skipped intents (`_skipped_problems`, #149)."""
@@ -530,6 +559,7 @@ def instance_problems(instance: Instance) -> list[Problem]:
             problems.append(Problem(f"{PLUGINS_DIR}/", None, None, failed.message))
         else:
             problems.extend(_command_problems(registry))
+            problems.extend(_runtime_problems(instance, registry))
             problems.extend(_skill_problems(instance, registry))
     return problems
 

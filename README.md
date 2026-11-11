@@ -187,6 +187,14 @@ one, `horae doctor` reports the paths that no longer match (a lock path that doe
 an own `vault/` the lock does not write to, a plugin command that is not executable); fix
 the lock, or run `horae init` in the new place.
 
+`horae doctor` also checks the container-only policy for third-party plugins ([decision
+79](schemas/README.md)): an error for each installed plugin that is not first-party (its tier,
+as `horae.lock` records it) whose effective runtime is not `container` (the plugin host would
+refuse to start it; `horae plugin audit` reports the same as `runtime_not_container`), and an
+error when a plugin runs with `runtime: container` but no usable local Docker engine is
+available (the CLI is missing, `DOCKER_HOST` or the current context is not a local `unix://`
+socket, or the daemon does not answer). It starts and pulls nothing.
+
 **Exit codes**, the same for every command ([decision 37](schemas/README.md)):
 
 | Code | Meaning |
