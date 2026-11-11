@@ -31,7 +31,9 @@ is sent the viewed input unchanged.
   unclassed ones alike, decision 47 B) is scanned for the **known values**: the vocabulary's
   terms, the values of the token-class fields above and each of a person's name parts
   (`Bob` and `Martin` of `Bob Martin`, mapped to the same pseudonym), each replaced by its
-  pseudonym (reversible); a phone number's last nine digits whatever their separators; and
+  pseudonym (reversible); an unspaced Han, kana or Hangul name is also found by its given
+  name alone, and by a one-letter surname followed by a title (`小明` and `王老师` of
+  `王小明`, decision 68 N, #189); a phone number's last nine digits whatever their separators; and
   an amount's usual renderings (`1234.56`, `1 234,56`…), replaced by its bucket label (not
   reversible). Text already shaped like a pseudonym (`[PERSON_1]`) is neutralized to
   `(PERSON_1)` first, so it can never be put back as a real value.
@@ -97,7 +99,8 @@ also a common word (and folding makes `Zoe`, `Zoé` and `Zoë` one name); a valu
 `MIN_NAME_PART_LETTERS` letters (`Al` of `Al Martin`; `MIN_UNSPACED_NAME_PART_LETTERS` in a
 script without spaces); a name part maps to the whole name (privacy over meaning). A name
 glued to letters of its own script (`MarieZoé`) is not matched, and in a script without
-spaces a name over-matches inside a longer word (`山田` in `山田町`).
+spaces a name over-matches inside a longer word (`山田` in `山田町`, `小明` of `王小明` in
+`大小明显`); a title before a surname (`老王`) is not looked for.
 """
 
 import hashlib
@@ -121,7 +124,7 @@ from horae.engine.ports import DeidUnavailable
 from horae.secrets import SecretError, SecretResolver
 from horae.secrets.redact import current as current_redactor
 
-DEID_VERSION = 4
+DEID_VERSION = 5
 """The version of the transforms and of the pseudonym format: part of the LLM cache's stored
 key for a cloud alias (decision 47 F)."""
 
@@ -579,21 +582,130 @@ def _shortest_part(part: str) -> int:
     return MIN_NAME_PART_LETTERS
 
 
-def _name_parts(text: str) -> list[str]:
-    """The parts of a person's name matched on their own: letter (and apostrophe) parts of
-    at least `MIN_NAME_PART_LETTERS` letters, split at white space, hyphens and the
-    punctuation that sets names apart (`Dupont, Marie`, `Quillard/Lopez`), without the dots
-    and apostrophes at their ends (`Mme.`). A word that is an address or a URL is left out."""
+def _raw_parts(text: str) -> list[str]:
+    """The letter (and apostrophe) parts of a person's name, whatever their length: split at
+    white space, hyphens and the punctuation that sets names apart (`Dupont, Marie`,
+    `Quillard/Lopez`), without the dots and apostrophes at their ends (`Mme.`). A word that
+    is an address or a URL is left out."""
     cleaned = _clean(text)
     words = [word for word in cleaned.split() if "@" not in word and "://" not in word]
     parts = [part.strip(".'") for part in _PART_SEPARATORS.split(" ".join(words))]
     return [
         part
         for part in parts
-        if sum(char.isalpha() for char in part) >= _shortest_part(part)
+        if part
+        and any(char.isalpha() for char in part)
         and all(
             char.isalpha() or char == "'" or unicodedata.category(char) == "Mn" for char in part
         )
+    ]
+
+
+MAX_UNSPACED_NAME_LETTERS = 6
+"""Longest unspaced Han, kana or Hangul part split into a surname and a given name (#189):
+a full name has 2 to 5 letters (`長谷川一郎`), a longer part is not a name."""
+KOREAN_COMPOUND_SURNAMES = frozenset(
+    {"남궁", "황보", "제갈", "선우", "독고", "사공", "서문", "동방", "어금", "망절", "장곡"}
+)
+"""Korean surnames of two letters (`남궁민수` is `남궁` + `민수`, `남궁민` is `남궁` + `민`)."""
+HONORIFICS = (
+    # Chinese (simplified and traditional)
+    "老师", "老師", "先生", "女士", "小姐", "太太", "同学", "同學", "老板", "老闆", "经理",
+    "經理", "医生", "醫生", "大夫", "教授", "阿姨", "师傅", "師傅",
+    # Japanese
+    "さん", "さま", "様", "君", "くん", "ちゃん", "先輩", "氏", "殿",
+    # Korean
+    "씨", "님", "선생님", "선생", "교수님", "사장님", "선배", "군", "양",
+)  # fmt: skip
+"""Titles that follow a surname (#189): a one-letter surname is looked for only when one of
+these follows it, glued or after a space (`王老师`, `김 선생님`, `林さん`); alone, a single
+letter would match everywhere. A prefix (`老王`, `小王`) is not looked for."""
+
+
+def _cjk_name(part: str) -> str | None:
+    """`hangul` for a part written in Hangul syllables, `han` for one in Han letters with or
+    without kana (Chinese, Japanese), else `None`: kana alone is mostly a foreign name
+    (`マリー`), not a surname followed by a given name."""
+    kinds = set()
+    for char in part:
+        code = ord(char)
+        if 0xAC00 <= code <= 0xD7A3:
+            kinds.add("hangul")
+        elif 0x3040 <= code <= 0x30FF or 0x31F0 <= code <= 0x31FF:
+            kinds.add("kana")
+        elif (
+            0x3005 <= code <= 0x3007
+            or 0x3400 <= code <= 0x4DBF
+            or 0x4E00 <= code <= 0x9FFF
+            or 0xF900 <= code <= 0xFAFF
+            or 0x20000 <= code <= 0x3FFFF
+        ):
+            kinds.add("han")
+        else:
+            return None
+    if kinds == {"hangul"}:
+        return "hangul"
+    if "han" in kinds and kinds <= {"han", "kana"}:
+        return "han"
+    return None
+
+
+def _surname_lengths(part: str) -> list[int]:
+    """The lengths, in letters, a surname may have at the start of an unspaced Han, kana or
+    Hangul `part` (#189, decision 68 N); empty for any other part. Korean: one letter, two
+    for a compound surname (`남궁`), one or two for a longer name of four or more. Chinese
+    and Japanese (Han alone cannot tell them apart): one or two up to four letters (`王小明`,
+    `欧阳娜娜`, `山田花子`, `林花子`), one to three from five (`長谷川一郎`). Every length
+    is kept, so the split fails toward finding a name, not missing one."""
+    kind, letters = _cjk_name(part), len(part)
+    if kind is None or letters > MAX_UNSPACED_NAME_LETTERS:
+        return []
+    if letters <= 2:
+        return [1]
+    if kind == "hangul":
+        if part[:2] in KOREAN_COMPOUND_SURNAMES:
+            return [2]
+        return [1] if letters == 3 else [1, 2]
+    return [1, 2] if letters <= 4 else [1, 2, 3]
+
+
+def _name_parts(text: str) -> list[str]:
+    """The parts of a person's name matched on their own: the parts (`_raw_parts`) of at
+    least `MIN_NAME_PART_LETTERS` letters (2 in a script without spaces), and, of an unspaced
+    Han, kana or Hangul part, each surname and given name of at least 2 letters its possible
+    splits give (#189: `小明` of `王小明`, `민수` of `김민수`, `山田` and `花子` of
+    `山田花子`)."""
+    found: list[str] = []
+    for part in _raw_parts(text):
+        pieces = [part] if sum(char.isalpha() for char in part) >= _shortest_part(part) else []
+        for length in _surname_lengths(part):
+            pieces += [
+                piece
+                for piece in (part[:length], part[length:])
+                if len(piece) >= MIN_UNSPACED_NAME_PART_LETTERS
+            ]
+        found += [piece for piece in dict.fromkeys(pieces) if piece not in found]
+    return found
+
+
+def _titles(text: str) -> list[tuple[str, ...]]:
+    """The token symbols of a one-letter surname of a person's name followed by a title
+    (`HONORIFICS`), glued or after a space (#189): the surname of each one-letter Han or
+    Hangul part (`王` of `王 小明`), and of an unspaced part whose surname may be one letter
+    (`王` of `王小明`; of a two-letter part, only when it is the whole name: `王` of `王明`).
+    The scanner replaces the surname only, the title stays."""
+    parts = _raw_parts(text)
+    surnames: list[str] = []
+    for part in parts:
+        if 1 not in _surname_lengths(part) or (len(part) == 2 and len(parts) > 1):
+            continue
+        if part[0] not in surnames:
+            surnames.append(part[0])
+    return [
+        (fold(surname), *gap, *_symbols(title))
+        for surname in surnames
+        for title in HONORIFICS
+        for gap in ((), (" ",))
     ]
 
 
@@ -698,6 +810,14 @@ class _Known:
     text: str
 
 
+@dataclass(frozen=True)
+class _Titled:
+    """A one-letter surname of `known` followed by a title (`王老师`, #189): only its first
+    token is replaced, the title is sent as it is."""
+
+    known: _Known
+
+
 class _Assigner:
     """Pseudonyms per class, in order of first occurrence."""
 
@@ -722,14 +842,15 @@ _END = ""
 
 
 class _Trie:
-    """Known values by their token symbols: a `_Known` (a pseudonym) or a `str` (an amount's
-    bucket label). The first value inserted for a sequence wins."""
+    """Known values by their token symbols: a `_Known` (a pseudonym), a `_Titled` (a surname
+    and its title) or a `str` (an amount's bucket label). The first value inserted for a
+    sequence wins."""
 
     def __init__(self) -> None:
         self.root: dict[str, Any] = {}
         self.size = 0
 
-    def add(self, symbols: tuple[str, ...], value: "_Known | str") -> None:
+    def add(self, symbols: tuple[str, ...], value: "_Known | _Titled | str") -> None:
         if not symbols or len(symbols) > MAX_TERM_TOKENS:
             return
         node = self.root
@@ -739,7 +860,7 @@ class _Trie:
             node[_END] = value
             self.size += 1
 
-    def matches(self, symbols: list[str]) -> Iterator[tuple[int, int, "_Known | str"]]:
+    def matches(self, symbols: list[str]) -> Iterator[tuple[int, int, "_Known | _Titled | str"]]:
         """`(start, end, value)` of the leftmost-longest, non-overlapping matches. Linear in
         `symbols` times the longest known value (at most `MAX_TERM_TOKENS` tokens)."""
         count, start = len(symbols), 0
@@ -840,6 +961,8 @@ class _Pseudonymizer:
             if known.name == "person":
                 for part in _name_parts(known.text):
                     self.trie.add(_symbols(part), known)
+                for titled in _titles(known.text):
+                    self.trie.add(titled, _Titled(known))
         for value, bounds in self.amounts:
             label = bucket(value, bounds)
             for text in sorted(amount_renderings(value)):
@@ -929,7 +1052,9 @@ class _Pseudonymizer:
         if not self.trie.size:
             return False
         tokens = [_symbol(text[start:end]) for start, end in _spans(text)]
-        return any(isinstance(value, _Known) for _, _, value in self.trie.matches(tokens))
+        return any(
+            isinstance(value, (_Known, _Titled)) for _, _, value in self.trie.matches(tokens)
+        )
 
     def _terms(
         self, text: str, pieces: list[str], base: int, secrets: list[tuple[int, int, str]]
@@ -952,6 +1077,10 @@ class _Pseudonymizer:
             if isinstance(value, str):
                 pieces.append(value)
                 self.count(AMOUNT)
+            elif isinstance(value, _Titled):  # the surname only, the title stays (#189)
+                pieces.append(self.assigner.token(value.known))
+                pieces.extend(tokens[start + 1 : end])
+                self.count(FREE_TEXT)
             else:
                 pieces.append(self.assigner.token(value))
                 self.count(FREE_TEXT)
@@ -1079,6 +1208,8 @@ def _leaked(sent: Any, personal: Sequence[str]) -> bool:
             trie.add(_symbols(value), value)
             for part in _name_parts(value):
                 trie.add(_symbols(part), value)
+            for titled in _titles(value):
+                trie.add(titled, value)
     numbers = {value for value in personal if value.isascii() and value.isdecimal()}
     phones = {key for value in personal if (key := _phone_key(value, shaped=True)) is not None}
     if not (trie.size or phones):

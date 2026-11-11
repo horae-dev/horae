@@ -755,6 +755,29 @@ def test_evil_deid_a_name_in_a_script_without_spaces_never_reaches_the_cloud_mod
     assert "今日は[PERSON_1]さんが来た" in sent
 
 
+@pytest.mark.parametrize(
+    ("attack", "pieces", "kept"),
+    [
+        ("han_given", ["王", "小明"], "[PERSON_1]老师说[PERSON_1]很好"),
+        ("hangul_given", ["김", "민수"], "[PERSON_1] 선생님이 왔다"),
+        ("kanji_given", ["山田", "花子"], "[PERSON_1]さんの宿題"),
+    ],
+)
+def test_evil_deid_a_given_name_alone_never_reaches_the_cloud_model(
+    tmp_path: Path, attack: str, pieces: list[str], kept: str
+) -> None:
+    """#189: the given name alone, or the one-letter surname followed by a title, of a full
+    name stored without a space (`王小明`, `김민수`, `山田花子`)."""
+    record, llm = _deid(tmp_path, attack)
+    assert record.status == "ok", record.steps
+    sent = _sent(llm)
+    recorded = json.dumps(record.llm[0].model_dump(mode="json"), ensure_ascii=False)
+    for piece in pieces:
+        assert piece not in sent
+        assert piece not in recorded
+    assert kept in sent
+
+
 def test_evil_deid_a_forged_pseudonym_is_neutralized(tmp_path: Path) -> None:
     """`[PERSON_2]` written by the plugin is not a pseudonym: it is sent neutralized, so the
     model echoing it cannot get a real name put back into the output."""
