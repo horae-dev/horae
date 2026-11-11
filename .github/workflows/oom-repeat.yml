@@ -1,0 +1,86 @@
+# TEMPORARY (#188): measures the engine's OOMKilled flag and repeats the live memory-hog test.
+# Removed before the PR is ready.
+name: OOM repeat (temporary, #188)
+
+on:
+  push:
+    branches: [fix/188-oom-evidence]
+
+permissions:
+  contents: read
+
+env:
+  UV_LOCKED: "1"
+  UV_PYTHON_PREFERENCE: only-managed
+  UV_VERSION: 0.13.6
+
+jobs:
+  probe:
+    name: Engine OOMKilled probe
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Engine
+        run: |
+          docker version
+          docker info --format 'cgroup v{{.CgroupVersion}} driver={{.CgroupDriver}} kernel={{.KernelVersion}} os={{.OperatingSystem}}'
+      - name: Memory hog without Horae, 40 runs
+        run: |
+          set -u
+          image=python:3.12-slim-bookworm
+          docker pull --quiet "$image" >/dev/null
+          hog='import os,sys
+          if os.fork() == 0:
+              b = []
+              while True: b.append(bytearray(1 << 20))
+          _, st = os.waitpid(-1, 0)
+          print("events", open("/sys/fs/cgroup/memory.events").read().replace("\n", " "), flush=True)
+          os._exit(137 if os.WIFSIGNALED(st) else 1)'
+          missed=0
+          for i in $(seq 1 40); do
+            for mode in init-direct init-child; do
+              if [ "$mode" = init-direct ]; then
+                args=(-c 'b=[]
+          while True: b.append(bytearray(1<<20))')
+              else
+                args=(-c "$hog")
+              fi
+              docker run -d --name "hog-$i-$mode" --init --memory 64m --memory-swap 64m "$image" python3 "${args[@]}" >/dev/null
+              docker wait "hog-$i-$mode" >/dev/null
+              sleep 1
+              state=$(docker inspect --format '{{.State.OOMKilled}} {{.State.ExitCode}}' "hog-$i-$mode")
+              echo "$i $mode $state $(docker logs "hog-$i-$mode" 2>&1 | tr '\n' ' ')"
+              case "$state" in true*) ;; *) missed=$((missed + 1));; esac
+              docker rm -f "hog-$i-$mode" >/dev/null
+            done
+          done
+          echo "OOMKilled false after an OOM kill: $missed of 80"
+
+  repeat:
+    name: Live memory-hog test, 10 repeats
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: ${{ env.UV_VERSION }}
+          cache-python: true
+      - run: uv sync
+      - name: Repeat
+        run: |
+          set -u
+          failed=0
+          for i in $(seq 1 10); do
+            if uv run pytest -q -p no:cacheprovider \
+                "tests/test_malicious_plugins_container.py::test_evil_resources_memory_hog_is_killed_and_reported" \
+                "tests/test_plugin_container_live.py::test_a_memory_limit_kill_is_reported_as_oom_killed"; then
+              echo "run $i: passed"
+            else
+              echo "run $i: FAILED"; failed=$((failed + 1))
+            fi
+          done
+          echo "failed runs: $failed of 10"
+          test "$failed" -eq 0
