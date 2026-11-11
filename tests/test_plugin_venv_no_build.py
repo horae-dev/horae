@@ -60,6 +60,7 @@ def _site_packages(tree: Path) -> Path:
     return found
 
 
+@pytest.mark.malicious
 @needs_uv
 @pytest.mark.parametrize("build", [SETUPTOOLS, HATCHLING], ids=["setuptools", "hatchling"])
 def test_a_third_party_install_never_runs_the_build_backend(tmp_path: Path, build: str) -> None:
@@ -89,6 +90,7 @@ def test_without_a_src_directory_the_pth_names_the_tree_root(tmp_path: Path) -> 
     assert pth.read_text(encoding="utf-8") == f"{CONTAINER_ROOT}\n"
 
 
+@pytest.mark.malicious
 @needs_uv
 def test_a_local_path_dependency_is_refused_and_never_built(tmp_path: Path) -> None:
     """A dependency from the plugin's own tree (`tool.uv.sources` path) whose `setup.py` would

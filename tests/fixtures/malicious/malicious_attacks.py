@@ -14,9 +14,12 @@ nothing here reaches the public internet.
 """
 
 import contextlib
+import ctypes
 import os
 import signal
 import socket
+import struct
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -142,6 +145,11 @@ def plant(path: str, outside: str = "/etc/passwd", source: str | None = None) ->
     return done
 
 
+def link(path: str, target: str) -> dict[str, Any]:
+    """A symbolic link at `path` (in a writable directory) to `target`, whatever it is."""
+    return {"linked": _attempt(lambda: os.symlink(target, path))}
+
+
 def hook(path: str) -> dict[str, Any]:
     """Plant a git repository with a hook in the writable directory `path`: a `.git`
     directory (`HEAD`, a `config` naming its hooks) and an executable `post-checkout`, which
@@ -180,21 +188,49 @@ def caps() -> dict[str, Any]:
 
 
 def connect(host: str, port: int) -> dict[str, Any]:
-    """A direct TCP connection, bypassing any proxy."""
+    """A direct TCP connection, bypassing any proxy: whether it connected, else the error and
+    its `errno`."""
     try:
         with socket.create_connection((host, port), timeout=3):
-            return {"connected": True, "error": None}
+            return {"connected": True, "error": None, "errno": None}
     except OSError as error:
-        return {"connected": False, "error": str(error)}
+        return {"connected": False, "error": str(error), "errno": error.errno}
 
 
 def resolve(name: str) -> dict[str, Any]:
-    """Resolve `name` itself, without the proxy."""
+    """Resolve `name` itself with the system resolver, without the proxy (`errno` is the
+    `getaddrinfo` error code on failure)."""
     try:
         answers = socket.getaddrinfo(name, 443, proto=socket.IPPROTO_TCP)
     except OSError as error:
-        return {"resolved": False, "addresses": [], "error": str(error)}
-    return {"resolved": True, "addresses": sorted({a[4][0] for a in answers}), "error": None}
+        return {"resolved": False, "addresses": [], "error": str(error), "errno": error.errno}
+    addresses = sorted({a[4][0] for a in answers})
+    return {"resolved": True, "addresses": addresses, "error": None, "errno": None}
+
+
+def dns(server: str, port: int, name: str) -> dict[str, Any]:
+    """Ask a DNS server of its own choosing (`server:port`, UDP) for `name`'s IPv4 addresses,
+    around the container's resolver: the addresses it answered, else the error and `errno`."""
+    query = struct.pack(">HHHHHH", 0x4242, 0x0100, 1, 0, 0, 0)
+    for label in name.rstrip(".").split("."):
+        query += bytes([len(label)]) + label.encode("ascii")
+    query += b"\0" + struct.pack(">HH", 1, 1)
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(3)
+            sock.sendto(query, (server, port))
+            answer = sock.recv(512)
+    except OSError as error:
+        return {"answers": [], "error": str(error), "errno": error.errno}
+    count = struct.unpack(">H", answer[6:8])[0]
+    rest = answer[len(query) :]
+    found = []
+    for _ in range(count):  # each answer: a name pointer, then type, class, TTL, length, data
+        kind, _class, _ttl, size = struct.unpack(">HHIH", rest[2:12])
+        if kind == 1 and size == 4:
+            found.append(socket.inet_ntoa(rest[12:16]))
+        rest = rest[12 + size :]
+    return {"answers": found, "error": None, "errno": None}
 
 
 def _proxy(via: str | None) -> tuple[str, int]:
@@ -321,6 +357,105 @@ def fill(mb: int) -> dict[str, Any]:
     return {"written_mb": written, "error": error}
 
 
+def _cgroup() -> str:
+    """This process's cgroup (v2) directory, as the launcher finds it."""
+    with open("/proc/self/cgroup", encoding="utf-8") as handle:
+        lines = handle.read().splitlines()
+    group = next(line[3:] for line in lines if line.startswith("0::"))
+    return "/sys/fs/cgroup" + group.rstrip("/")
+
+
+def _cpu_stat(where: str) -> dict[str, int]:
+    with open(os.path.join(where, "cpu.stat"), encoding="ascii") as handle:
+        pairs = (line.split() for line in handle.read().splitlines())
+        return {key: int(value) for key, value in pairs}
+
+
+def _burn(until: float) -> None:
+    while time.monotonic() < until:
+        pass
+
+
+def spin(seconds: float = 3.0, workers: int = 2) -> dict[str, Any]:
+    """A CPU spin: `workers` processes burn the CPU for `seconds` of wall time. Its cgroup's
+    `cpu.max` and what `cpu.stat` counted meanwhile (CPU time used, periods, throttled
+    periods), or why it could not read them."""
+    try:
+        where = _cgroup()
+        before = _cpu_stat(where)
+        with open(os.path.join(where, "cpu.max"), encoding="ascii") as handle:
+            cpu_max = handle.read().strip()
+    except (OSError, StopIteration, ValueError) as error:
+        return {"error": str(error)}
+    start = time.monotonic()
+    until = start + seconds
+    children = []
+    for _ in range(workers - 1):
+        pid = os.fork()
+        if pid == 0:  # pragma: no cover (the child)
+            _burn(until)
+            os._exit(0)
+        children.append(pid)
+    _burn(until)
+    for pid in children:
+        os.waitpid(pid, 0)
+    wall = time.monotonic() - start
+    after = _cpu_stat(where)
+    delta = {key: after[key] - before.get(key, 0) for key in after}
+    return {
+        "error": None,
+        "cpu_max": cpu_max,
+        "wall_s": wall,
+        "usage_usec": delta.get("usage_usec", 0),
+        "nr_periods": delta.get("nr_periods", 0),
+        "nr_throttled": delta.get("nr_throttled", 0),
+    }
+
+
+def ptrace() -> dict[str, Any]:
+    """`PTRACE_ATTACH` its parent (in a container, the launcher, which would report whatever
+    exit status the plugin forged), and read the parent's environment and memory. The
+    parent's command line names it."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    parent = os.getppid()
+    attached = libc.ptrace(16, parent, None, None)  # PTRACE_ATTACH
+    error = ctypes.get_errno()
+    if attached == 0:  # undo it, so that the parent can go on
+        os.waitpid(parent, 0x40000000)  # __WALL
+        libc.ptrace(17, parent, None, None)  # PTRACE_DETACH
+    cmdline = read(f"/proc/{parent}/cmdline", 65536)["read"] or ""
+    return {
+        "parent": parent,
+        "parent_cmdline": cmdline.split("\0"),
+        "attached": attached,
+        "errno": error,
+        "environ": read(f"/proc/{parent}/environ")["error"],
+        "mem": read(f"/proc/{parent}/mem", 1)["error"],
+    }
+
+
+def die(code: int) -> dict[str, Any]:
+    """Exit with `code` in the middle of a call (247: the launcher's out-of-memory status)."""
+    sys.stdout.flush()
+    os._exit(code)
+
+
+def shout(key: str) -> dict[str, Any]:
+    """Write the environment variable `key` (its own secret) to stderr: the container's
+    output, which a logging daemon would keep."""
+    os.write(2, (os.environ.get(key, "") + "\n").encode())
+    return {"shouted": key}
+
+
+def child() -> dict[str, Any]:
+    """Leave a child behind that stays in its process group: fork, sleep."""
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover (the child)
+        time.sleep(600)
+        os._exit(0)
+    return {"child": pid, "pgid": os.getpgid(pid)}
+
+
 def daemon() -> dict[str, Any]:
     """Leave a process behind: double fork, `setsid`, ignore `SIGTERM` and `SIGHUP`, sleep."""
     read_end, write_end = os.pipe()
@@ -350,10 +485,12 @@ ATTACKS: dict[str, Callable[..., dict[str, Any]]] = {
     "fs": fs,
     "write": write,
     "plant": plant,
+    "link": link,
     "hook": hook,
     "caps": caps,
     "connect": connect,
     "resolve": resolve,
+    "dns": dns,
     "raw": raw,
     "tunnel": tunnel,
     "http": http,
@@ -363,5 +500,10 @@ ATTACKS: dict[str, Callable[..., dict[str, Any]]] = {
     "fds": fds,
     "fill": fill,
     "daemon": daemon,
+    "child": child,
+    "spin": spin,
+    "ptrace": ptrace,
+    "die": die,
+    "shout": shout,
 }
 """Every attack, by the tool name `jailbreak.py` serves it under (`<plugin>.<name>`)."""

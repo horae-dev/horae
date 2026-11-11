@@ -48,6 +48,10 @@ the secret values are written by the tests to a temporary secrets directory.
   with `malicious_attacks.py` into a venv the plugin image builds; the container fixtures
   (`evil-network`, `evil-secrets`, `evil-paths`, `evil-resources`) are its manifests.
 
+The install-time attacks of the suite (#191: a lock naming a foreign host, a build backend that
+would write a marker, a poisoned cache) build their plugin trees in the tests themselves:
+`tests/test_plugin_cache_isolation.py` and `tests/test_plugin_venv_no_build.py`.
+
 ## llm/anthropic/
 
 Recorded-response fixtures for the `anthropic` backend tests (#28,
