@@ -333,7 +333,7 @@ def _pack_pipeline_bytes(state: "_Loaded", path: Path) -> bytes | None:
     return raw
 
 
-def _load(root: Path) -> _Loaded:
+def _load(root: Path, *, installing: bool = False) -> _Loaded:
     state = _Loaded(root)
     if loaded := state.load(root / CONFIG_FILE, InstanceConfig):
         state.config, state.config_doc = loaded
@@ -371,11 +371,11 @@ def _load(root: Path) -> _Loaded:
         else:
             state.pipelines[pipeline.name] = (pipeline, doc)
 
-    _cross_check(state)
+    _cross_check(state, installing=installing)
     return state
 
 
-def _cross_check(state: _Loaded) -> None:
+def _cross_check(state: _Loaded, *, installing: bool = False) -> None:
     config, config_doc = state.config, state.config_doc
     if config is None or config_doc is None:
         return
@@ -385,7 +385,10 @@ def _cross_check(state: _Loaded) -> None:
         )
     # An invalid horae.lock is already a problem: do not report every plugin as missing too.
     locked = state.lock.plugins if state.lock is not None else {}
-    for name in config.plugins if not state.lock_invalid else ():
+    # `horae plugin add` (`installing`) reads an instance that may already configure the plugin
+    # it installs (`plugins.<name>.runtime: container` must be set first for a plugin that is
+    # not first-party, #191): a configured plugin that is not installed yet is not a problem.
+    for name in config.plugins if not state.lock_invalid and not installing else ():
         if name not in locked:
             state.problems.append(
                 config_doc.problem(
@@ -432,11 +435,13 @@ def _cross_check(state: _Loaded) -> None:
                 )
 
 
-def load_instance(root: Path) -> Instance:
+def load_instance(root: Path, *, installing: bool = False) -> Instance:
     """Load and check the instance in `root`, or raise `InstanceError` listing every problem.
+    `installing` (`horae plugin add`): a plugin configured in `horae.yaml` but not in
+    `horae.lock` yet is not a problem.
 
     Secrets are not resolved here: see `Instance.secret_resolver`."""
-    state = _load(root)
+    state = _load(root, installing=installing)
     if state.problems:
         raise InstanceError(sorted(state.problems, key=Problem.sort_key))
     return state.instance()

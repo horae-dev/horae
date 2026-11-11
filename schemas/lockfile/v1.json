@@ -93,6 +93,48 @@
           "description": "Where the plugin came from (decision 73 A, settling decision 71 E): `direct` for a direct\ninstall from a git URL (#48, no marketplace tier: `commit` is the pinned SHA and no tag was\nchecked); absent for a marketplace install, so a lock written before it reads the same.\n`horae plugin upgrade` reads it to apply the direct-install gate, and `--yes` compares it.",
           "title": "Source"
         },
+        "tier": {
+          "anyOf": [
+            {
+              "enum": [
+                "first-party",
+                "community"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "For a marketplace plugin the default Horae marketplace does not vouch for (#191, decision\n79): the tier its index claimed (`community`, or `first-party` claimed by another index).\nSet with `index`, never with `source: direct`. **Absent** for a first-party plugin of the\ndefault marketplace, so every lock written before stays byte-identical. A plugin with\n`source` or `tier` is not first-party: it installs and runs only with `runtime:\ncontainer`.",
+          "title": "Tier"
+        },
+        "index": {
+          "anyOf": [
+            {
+              "maxLength": 512,
+              "not": {
+                "anyOf": [
+                  {
+                    "pattern": "/\\.\\.?(/|$)"
+                  },
+                  {
+                    "pattern": "^https://([^/]*\\.)?localhost/"
+                  }
+                ]
+              },
+              "pattern": "^https://([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)*[a-z]([a-z0-9-]{0,61}[a-z0-9])?(/[A-Za-z0-9._-]+)+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The marketplace index that resolved a plugin with `tier` (set with it).",
+          "title": "Index"
+        },
         "user_grants": {
           "anyOf": [
             {

@@ -1,9 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Permission approval at install (#46, schemas decision 70).
 
-- `require_installable(name, tier, index)`: before M5 only `first-party` marketplace plugins install
-  (docs/security.md T04); a direct install from a git URL (#48) has no tier and passes `None`,
-  which is refused the same way while `DIRECT_INSTALLS` is `False`. One check for both.
+- `require_installable(name, tier, index, runtime=...)`: a `first-party` plugin of the default
+  marketplace installs under either runtime; any other plugin (another tier, `first-party`
+  claimed by an index the user added, or a direct install from a git URL, #48, which has no
+  tier and passes `None`) installs only when its effective runtime in `horae.yaml` is
+  `container` (#191, schemas decision 79, docs/security.md T04). One check for every source.
+- `origin(tier, index)`: what the `horae.lock` entry records of where a plugin came from
+  (`tier` and `index`, only for a plugin the default marketplace does not vouch for).
+- `describe_origin(...)`: the approval lines naming the source, the tier and the runtime.
 - `with_grants(asked, hosts, local)`: what the manifest asks for, plus the hosts and
   local-network endpoints the user adds at approval (`--allow-host`, `--allow-local`). A lock
   may grant more than a manifest declares (the plugin host refuses only less, decision 66);
@@ -18,20 +23,12 @@ from collections.abc import Sequence
 
 from pydantic import TypeAdapter, ValidationError
 
-from horae.contracts.instance import DEFAULT_MARKETPLACE
+from horae.contracts.instance import DEFAULT_MARKETPLACE, PluginRuntime
 from horae.contracts.intents import IntentType
-from horae.contracts.lockfile import LockedPlugin, UserGrants
-from horae.contracts.marketplace import Tier
+from horae.contracts.lockfile import LockedPlugin, Tier, UserGrants
 from horae.contracts.plugin import FREE_TEXT_FIELD, Permissions
 from horae.contracts.types import Hostname, LocalEndpoint
 from horae.marketplace.errors import InvalidReference, TierRefused
-
-DIRECT_INSTALLS = False
-"""Whether a direct install from a git URL (#48, no marketplace tier) may install. `False`
-before M5 (docs/security.md T04); lifting the gate is setting this to `True`."""
-
-INSTALLABLE_TIERS: frozenset[str] = frozenset({"first-party"})
-"""The tiers that install while plugins run as plain subprocesses (before M5)."""
 
 FIRST_PARTY_INDEXES: frozenset[str] = frozenset({DEFAULT_MARKETPLACE})
 """The indexes whose `tier: first-party` is believed. The tier is a claim in the index file,
@@ -61,24 +58,74 @@ _host: TypeAdapter[str] = TypeAdapter(Hostname)
 _local: TypeAdapter[str] = TypeAdapter(LocalEndpoint)
 
 
-def require_installable(name: str, tier: Tier | None, index: str | None) -> None:
-    """`TierRefused` unless `tier`, claimed by the index `index`, may be installed now. `None`
-    is a direct install (#48). `first-party` counts only from `FIRST_PARTY_INDEXES`."""
-    if tier in INSTALLABLE_TIERS and index in FIRST_PARTY_INDEXES:
-        return
-    if tier is None and DIRECT_INSTALLS:
-        return
+def first_party(tier: Tier | None, index: str | None) -> bool:
+    """Whether `tier`, claimed by the index `index`, is first-party: `first-party` counts only
+    from `FIRST_PARTY_INDEXES`. `None` is a direct install (#48), never first-party."""
+    return tier == "first-party" and index in FIRST_PARTY_INDEXES
+
+
+def origin(tier: Tier | None, index: str | None) -> tuple[Tier | None, str | None]:
+    """The `(tier, index)` a marketplace install records in `horae.lock`: both `None` for a
+    first-party plugin (so its entry is written exactly as before #191), else as resolved."""
+    if tier is None or index is None or first_party(tier, index):
+        return None, None
+    return tier, index
+
+
+def what_it_is(tier: Tier | None, index: str | None) -> str:
+    """A plugin's origin in words, for a refusal or the approval prompt."""
     if tier is None:
-        what = "a direct install (no marketplace tier)"
-    elif tier in INSTALLABLE_TIERS:
-        what = f"tier 'first-party' claimed by {index}, which is not the Horae marketplace"
-    else:
-        what = f"tier {tier!r}"
-    raise TierRefused(
-        f"refusing to install {name}: {what}. Until M5 plugins run as plain subprocesses with "
-        "your user's rights, so only first-party marketplace plugins can be installed "
-        "(docs/security.md T04); other plugins are planned with the M5 sandbox"
+        return "a direct install from a git URL (no marketplace tier)"
+    if tier == "first-party" and index not in FIRST_PARTY_INDEXES:
+        return f"tier 'first-party' claimed by {index}, which is not the Horae marketplace"
+    if first_party(tier, index):
+        return "a first-party plugin of the Horae marketplace"
+    return f"tier {tier!r} from {index}"
+
+
+def container_only(name: str) -> str:
+    """How to let a plugin that is not first-party install and run (one wording everywhere)."""
+    return (
+        f"it may only run in a container: set `plugins.{name}.runtime: container` (or "
+        "`plugin_defaults.runtime: container`) in horae.yaml and make sure Docker is available "
+        "(docs/operations/plugin-containers.md)"
     )
+
+
+def require_installable(
+    name: str, tier: Tier | None, index: str | None, *, runtime: PluginRuntime
+) -> None:
+    """`TierRefused` unless `tier`, claimed by the index `index`, may be installed with the
+    effective `runtime` of the plugin in `horae.yaml` (#191). `None` is a direct install
+    (#48). A first-party plugin installs under either runtime; anything else needs
+    `container` (the process runtime has no isolation, docs/security.md T04)."""
+    if first_party(tier, index) or runtime == "container":
+        return
+    raise TierRefused(
+        f"refusing to install {name}: {what_it_is(tier, index)} is not first-party, and "
+        f"horae.yaml runs it with `runtime: {runtime}`, which has no isolation "
+        f"(docs/security.md T04); {container_only(name)}"
+    )
+
+
+def describe_origin(
+    tier: Tier | None, index: str | None, repo: str, *, runtime: PluginRuntime
+) -> list[str]:
+    """The approval lines saying where a plugin comes from and how it will run."""
+    lines = [
+        f"source: {'direct install (pinned by its commit SHA)' if tier is None else 'marketplace'}"
+        f" {repo}"
+    ]
+    if tier is not None:
+        lines.append(f"tier: {tier} (index {index})")
+    if first_party(tier, index):
+        lines.append(f"runtime: {runtime} (first-party: either runtime is allowed)")
+    else:
+        lines.append(
+            "runs in a container (runtime: container): not first-party, so horae.yaml must keep "
+            "`runtime: container` for it; it is refused under the process runtime"
+        )
+    return lines
 
 
 def parse_grants(hosts: Sequence[str], local: Sequence[str]) -> tuple[list[str], list[str]]:
@@ -197,6 +244,8 @@ def lock_mismatch(existing: LockedPlugin | None, wanted: LockedPlugin) -> str | 
     if existing.source != wanted.source:
         have_source, want_source = existing.source or "marketplace", wanted.source or "marketplace"
         return f"horae.lock records a {have_source} install, not a {want_source} one"
+    if (existing.tier, existing.index) != (wanted.tier, wanted.index):
+        return "horae.lock records another tier or index for this plugin"
     if existing.version != wanted.version:
         return f"horae.lock pins version {existing.version}, not {wanted.version}"
     if existing.commit != wanted.commit:
@@ -220,14 +269,18 @@ def lock_mismatch(existing: LockedPlugin | None, wanted: LockedPlugin) -> str | 
 
 
 __all__ = [
-    "DIRECT_INSTALLS",
-    "INSTALLABLE_TIERS",
+    "FIRST_PARTY_INDEXES",
     "INTENT_MEANINGS",
     "PERSONAL_NOTE",
+    "container_only",
     "describe",
+    "describe_origin",
+    "first_party",
     "lock_mismatch",
+    "origin",
     "parse_grants",
     "recorded_grants",
     "require_installable",
+    "what_it_is",
     "with_grants",
 ]

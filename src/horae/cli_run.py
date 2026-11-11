@@ -113,6 +113,7 @@ PLUGIN_START_KINDS = frozenset(
     {
         "plugin_unavailable",
         "spawn_failed",
+        "runtime_refused",
         "runtime_unavailable",
         "startup_timeout",
         "handshake_failed",

@@ -61,13 +61,20 @@ uv run horae plugin remove github -i ~/horae-demo          # tree, venv, pack pi
 uv run horae eval daily-brief/rank-and-word --plugin-dir tests/fixtures/plugins  # golden cases, offline
 ```
 
-`horae plugin add` installs only `first-party` plugins before M5, shows the permissions the
-plugin declares and asks you to approve them before pinning it in `horae.lock`.
+`horae plugin add` shows the permissions the plugin declares and asks you to approve them
+before pinning it in `horae.lock`. First-party plugins of the Horae marketplace run under
+either runtime; any other plugin (a community tier, an index you added, a direct install)
+installs and runs **only in a container**: set `plugins.<name>.runtime: container` (or
+`plugin_defaults.runtime: container`) in `horae.yaml` first, with Docker available
+([decision 79](schemas/README.md#provisional-decisions-191-pending-maintainer-review); how-to
+in the [operator guide](docs/operations/plugin-containers.md#installing-third-party-plugins)).
 `--allow-host HOST` and `--allow-local HOST:PORT` grant more (your own Home Assistant, say);
 `--yes` re-installs, without asking, only what `horae.lock` already approves (a Docker build
 from a committed lock). Details: [schemas decision 70](schemas/README.md#decisions).
 A direct install without a marketplace, `horae plugin add https://<host>/<owner>/<repo>@<full
-commit SHA>`, has no tier and is refused before M5 ([decision 71](schemas/README.md#decisions)).
+commit SHA>`, has no tier, so it needs `runtime: container` too
+([decision 71](schemas/README.md#decisions)); `horae plugin upgrade <same URL>@<new SHA>`
+moves it to another commit its branches or tags reach.
 
 A **pipeline pack** (a plugin whose `plugin.yaml` lists `provides.pipelines`) also gets its
 pipelines installed: `pipelines/<name>.yaml` of the pack is validated and copied to
@@ -89,7 +96,8 @@ plugin still listed under `plugins:` in `horae.yaml`, then deletes its tree, ven
 and the pack pipelines that are still its own, and lists what it kept: secrets (unless
 `--delete-secrets`), the files it wrote and the run history. `horae plugin audit` lists every
 plugin with its version, source, tier, permissions and last run, and reports drift between
-`horae.lock` and the disk (exit 4)
+`horae.lock` and the disk (exit 4), including a plugin that is not first-party but would not
+run in a container
 ([schemas decision 73](schemas/README.md#provisional-decisions-47-pending-maintainer-review)).
 
 **Plugin containers** (M5, #49): with `runtime: container` in `horae.yaml`

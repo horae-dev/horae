@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Direct install from a git URL (#48), over local fixture repositories (no network).
 
-Before M5 a direct install has no marketplace tier and is refused (docs/security.md T04); the
-rest of the path is tested with the gate (`approval.DIRECT_INSTALLS`) opened by the test."""
+A direct install has no marketplace tier, so it is not first-party: it installs (and runs) only
+with `runtime: container` in horae.yaml (#191, docs/security.md T04). The rest of the path is
+tested with `plugins.demo.runtime: container`; the upgrade of a direct install to another
+commit is at the end."""
 
 import json
 import os
@@ -30,7 +32,7 @@ from horae.marketplace import git as git_module
 from horae.marketplace import install as install_module
 from horae.marketplace.direct import is_direct, parse_direct
 from horae.marketplace.install import INSTALL_RECORD
-from marketplace_fixtures import LocalInstaller, git, plugin_manifest, plugin_repo
+from marketplace_fixtures import LocalInstaller, git, plugin_manifest, plugin_repo, set_runtime
 
 runner = CliRunner()
 URL = "https://git.example.test/someone/plugin-demo"
@@ -115,9 +117,9 @@ def repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, str]:
 
 
 @pytest.fixture
-def gate_open(monkeypatch: pytest.MonkeyPatch) -> None:
-    """What lifting the gate in M5 is: `DIRECT_INSTALLS = True`."""
-    monkeypatch.setattr(approval, "DIRECT_INSTALLS", True)
+def gate_open(instance_dir: Path) -> None:
+    """#191: horae.yaml runs `demo` in a container, so its direct install may proceed."""
+    set_runtime(instance_dir, "container", "demo")
 
 
 def _add(instance: Path, *args: str, answer: str | None = None) -> tuple[int, str, str]:
@@ -139,12 +141,11 @@ def _nothing_installed(instance: Path) -> bool:
     return not plugins.exists() or not list(plugins.iterdir())
 
 
-def test_a_direct_install_is_refused_before_m5_before_anything_is_fetched(
+def test_a_direct_install_is_refused_under_the_process_runtime_before_anything_is_fetched(
     instance_dir: Path, repo: tuple[Path, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Threat model T04 (#14): no marketplace tier, so no install while plugins run as plain
-    subprocesses."""
-    assert approval.DIRECT_INSTALLS is False
+    """Threat model T04 (#191): no marketplace tier, so not first-party: no install while
+    horae.yaml runs every plugin as a plain subprocess, and nothing is fetched."""
 
     def never(where: Path) -> PluginInstaller:
         raise AssertionError("nothing may be fetched")
@@ -156,11 +157,46 @@ def test_a_direct_install_is_refused_before_m5_before_anything_is_fetched(
     error = _json(out)["error"]
     assert error["kind"] == "tier_refused"
     assert "direct install" in error["message"]
-    assert "M5" in error["message"]
+    assert "runtime: container" in error["message"]
+    assert "Docker" in error["message"]
     assert _nothing_installed(instance_dir)
     assert (instance_dir / "horae.lock").read_bytes() == before
     with pytest.raises(TierRefused, match="direct install"):
-        approval.require_installable(URL, None, None)
+        approval.require_installable("demo", None, None, runtime="process")
+    approval.require_installable("demo", None, None, runtime="container")
+
+
+def test_a_direct_install_whose_name_runs_as_a_process_is_refused_once_the_name_is_known(
+    instance_dir: Path, repo: tuple[Path, str]
+) -> None:
+    """Another plugin runs in a container, so the fetch happens; the commit's plugin.yaml names
+    `demo`, which horae.yaml runs as a process: refused before approval, nothing installed."""
+    set_runtime(instance_dir, "container", "other")
+    before = (instance_dir / "horae.lock").read_bytes()
+    code, out, _ = _add(instance_dir, f"{URL}@{repo[1]}", "--json", answer="y\n")
+    assert code == 3, out
+    error = _json(out)["error"]
+    assert error["kind"] == "tier_refused"
+    assert "plugins.demo.runtime: container" in error["message"]
+    assert "asks for these permissions" not in out
+    assert _nothing_installed(instance_dir)
+    assert (instance_dir / "horae.lock").read_bytes() == before
+
+
+def test_a_direct_install_under_the_default_container_runtime_is_installed(
+    instance_dir: Path, repo: tuple[Path, str]
+) -> None:
+    set_runtime(instance_dir, "container")  # plugin_defaults.runtime
+    code, out, err = _add(instance_dir, f"{URL}@{repo[1]}", "--json", answer="y\n")
+    assert code == 0, out
+    report = _json(out)
+    assert (report["runtime"], report["first_party"], report["enabled"]) == (
+        "container",
+        False,
+        False,
+    )
+    assert "runs in a container" in err
+    assert "source: direct install" in err
 
 
 @pytest.mark.parametrize(
@@ -208,13 +244,14 @@ def test_a_refused_url_is_never_repeated(ref: str) -> None:
     assert "s3cr3t" not in str(caught.value)
 
 
-def test_behind_the_gate_a_direct_install_is_approved_and_locked(
+def test_under_the_container_runtime_a_direct_install_is_approved_and_locked(
     instance_dir: Path, repo: tuple[Path, str], gate_open: None
 ) -> None:
     code, out, _ = _add(instance_dir, f"{URL}@{repo[1]}", answer="y\n")
     assert code == 0, out
     assert "demo@1.0.0 asks for these permissions:" in out
     assert "Approve these permissions and install demo?" in out
+    assert "runs in a container (runtime: container)" in out  # #191: shown at approval
     assert f"commit  {repo[1]} (direct install, pinned by its SHA)" in out
     assert "tier" not in out
     installed = instance_dir / "plugins" / "demo"
@@ -236,7 +273,7 @@ def test_behind_the_gate_a_direct_install_is_approved_and_locked(
     }
 
 
-def test_behind_the_gate_json_reports_no_tier(
+def test_under_the_container_runtime_json_reports_no_tier(
     instance_dir: Path, repo: tuple[Path, str], gate_open: None
 ) -> None:
     code, out, err = _add(instance_dir, f"{URL}@{repo[1]}", "--json", answer="y\n")
@@ -244,6 +281,11 @@ def test_behind_the_gate_json_reports_no_tier(
     report = _json(out)
     assert (report["name"], report["repo"], report["commit"]) == ("demo", URL, repo[1])
     assert (report["tier"], report["index"]) == (None, None)
+    assert (report["runtime"], report["first_party"], report["enabled"]) == (
+        "container",
+        False,
+        True,  # `plugins.demo` was configured before the install (#191)
+    )
     assert "asks for these permissions" in err
 
 
@@ -331,6 +373,108 @@ def test_a_direct_install_of_a_name_already_installed_is_refused_before_approval
     assert code == 3, out
     assert _json(out)["error"]["kind"] == "already_installed"
     assert "asks for these permissions" not in out
+
+
+# --- upgrading a direct install to another commit (#191) -------------------------------------
+
+
+def _upgrade(instance: Path, *args: str, answer: str | None = None) -> tuple[int, str, str]:
+    result = runner.invoke(app, ["plugin", "upgrade", *args, "-i", str(instance)], input=answer)
+    return result.exit_code, result.stdout, result.stderr
+
+
+def _installed_direct(instance: Path, repo: tuple[Path, str]) -> tuple[Path, str]:
+    """`demo` installed directly at the first commit, then a newer commit 1.1.0 on `main`."""
+    assert _add(instance, f"{URL}@{repo[1]}", answer="y\n")[0] == 0
+    return plugin_repo(repo[0], version="1.1.0", tag=None)
+
+
+def _state(instance: Path) -> tuple[bytes, str]:
+    record = (instance / "plugins" / "demo" / INSTALL_RECORD).read_text(encoding="utf-8")
+    return (instance / "horae.lock").read_bytes(), record
+
+
+def test_a_direct_install_is_upgraded_to_a_reachable_commit_under_the_container_runtime(
+    instance_dir: Path, repo: tuple[Path, str], gate_open: None
+) -> None:
+    _, second = _installed_direct(instance_dir, repo)
+    code, out, err = _upgrade(instance_dir, f"{URL}@{second}", "--yes", "--json")
+    assert code == 0, out
+    report = _json(out)
+    assert (report["upgraded"], report["tier"], report["to"]["commit"]) == (True, None, second)
+    assert "runs in a container" in err
+    entry = _lock(instance_dir)["plugins"]["demo"]
+    assert (entry["source"], entry["commit"], entry["version"]) == ("direct", second, "1.1.0")
+    record = json.loads(_state(instance_dir)[1])
+    assert (record["source"], record["commit"]) == ("direct", second)
+    # The same commit again: nothing to do.
+    code, out, _ = _upgrade(instance_dir, f"{URL}@{second}", "--yes", "--json")
+    assert (code, _json(out)["upgraded"]) == (0, False)
+
+
+def test_a_direct_upgrade_is_refused_once_horae_yaml_runs_it_as_a_process(
+    instance_dir: Path, repo: tuple[Path, str], gate_open: None
+) -> None:
+    _, second = _installed_direct(instance_dir, repo)
+    set_runtime(instance_dir, "process", "demo")
+    before = _state(instance_dir)
+    code, out, _ = _upgrade(instance_dir, f"{URL}@{second}", "--yes", "--json")
+    assert code == 3, out
+    error = _json(out)["error"]
+    assert error["kind"] == "tier_refused"
+    assert "plugins.demo.runtime: container" in error["message"]
+    assert _state(instance_dir) == before
+
+
+def test_a_direct_upgrade_to_a_commit_no_branch_or_tag_reaches_is_refused(
+    instance_dir: Path, repo: tuple[Path, str], gate_open: None
+) -> None:
+    _installed_direct(instance_dir, repo)
+    stray = _unreachable_commit(repo[0])
+    before = _state(instance_dir)
+    code, out, _ = _upgrade(instance_dir, f"{URL}@{stray}", "--yes", "--json")
+    assert code == 3, out
+    assert _json(out)["error"]["kind"] == "install_refused"
+    assert "not reachable from a branch or tag" in _json(out)["error"]["message"]
+    assert _state(instance_dir) == before
+
+
+def test_a_direct_upgrade_that_names_another_plugin_or_a_lower_version_is_refused(
+    instance_dir: Path, repo: tuple[Path, str], gate_open: None
+) -> None:
+    _installed_direct(instance_dir, repo)
+    _, other = plugin_repo(repo[0], name="other", version="2.0.0", tag=None)
+    _, lower = plugin_repo(repo[0], version="0.9.0", tag=None)
+    before = _state(instance_dir)
+    for sha, kind, why in (
+        (other, "install_refused", "names 'other', not 'demo'"),
+        (lower, "downgrade_refused", "--allow-downgrade"),
+    ):
+        code, out, _ = _upgrade(instance_dir, f"{URL}@{sha}", "--yes", "--json")
+        assert code == 3, out
+        error = _json(out)["error"]
+        assert (error["kind"], why in error["message"]) == (kind, True), error
+        assert _state(instance_dir) == before
+        assert sorted(p.name for p in (instance_dir / "plugins").iterdir()) == ["demo"]
+
+
+def test_a_direct_upgrade_needs_the_url_the_lock_records_and_a_name_upgrade_points_to_it(
+    instance_dir: Path, repo: tuple[Path, str], gate_open: None
+) -> None:
+    _, second = _installed_direct(instance_dir, repo)
+    code, out, _ = _upgrade(instance_dir, f"{OTHER_URL}@{second}", "--yes", "--json")
+    assert code == 3, out
+    error = _json(out)["error"]
+    assert error["kind"] == "not_installed"
+    assert OTHER_URL not in error["message"]  # decision 71 A: never repeated
+    code, out, _ = _upgrade(instance_dir, "demo", "--yes", "--json")
+    assert code == 3, out
+    error = _json(out)["error"]
+    assert error["kind"] == "install_refused"
+    assert "horae plugin upgrade URL@SHA" in error["message"]
+    for flag in ("--pre", "--offline"):
+        code, out, _ = _upgrade(instance_dir, f"{URL}@{second}", flag, "--json")
+        assert (code, _json(out)["error"]["kind"]) == (2, "usage")
 
 
 # --- the installer: the same hardening as #44 ------------------------------------------------

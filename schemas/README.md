@@ -4185,6 +4185,13 @@ loosened later without breaking a valid file.
       believed only from the default Horae marketplace (`FIRST_PARTY_INDEXES`): an index the
       user added cannot vouch for itself. `require_installable(name, tier, index)` is the one check;
       a direct install from a git URL (#48) passes `tier=None`, which is refused the same way.
+      *Provisional amendment (#191, decision 79).* "Before M5" is now "under the process
+      runtime": a plugin that is not first-party (another tier, `first-party` claimed by an
+      index the user added, a direct install) installs when its effective runtime in
+      `horae.yaml` is `container`, and only then; first-party plugins install under either
+      runtime. `require_installable(name, tier, index, runtime=...)` stays the one check, and
+      the lock records `tier` and `index` for such a plugin so the host can enforce it at run
+      time.
     - **F, at run.** `HostRegistry.from_directory` already refuses a manifest asking for more
       than the lock grants and a version other than the locked one. It now also reads the
       install record `plugins/<name>/.horae-install.json` (decision 62 F) when there is one: its
@@ -4213,6 +4220,10 @@ loosened later without breaking a valid file.
       instance are read and **before anything is fetched** (exit 3, `tier_refused`). The whole
       path behind the gate is implemented and tested with it open; lifting it in M5 is
       `approval.DIRECT_INSTALLS = True`.
+      *Provisional amendment (#191, decision 79).* `DIRECT_INSTALLS` is gone: the runtime is
+      the one switch. A direct install is refused before anything is fetched when `horae.yaml`
+      runs no plugin in a container, and once the commit's `plugin.yaml` names the plugin
+      (before approval) unless that name's effective runtime is `container`.
     - **C, the fetch** (`PluginInstaller.install_commit`). The commit is **never fetched by
       its id**: a forge may serve, through a repository's URL, objects that exist only in a
       fork or a pull request (GitHub does), and the approval and the lock would then name the
@@ -4239,7 +4250,8 @@ loosened later without breaking a valid file.
     - **E, open.** A lock entry does not say whether it came from a marketplace or a direct
       install (`LockedPlugin.commit` is documented as the commit the version's tag points to,
       which a direct install does not check). `upgrade` (#47) will need to tell them apart:
-      a `source` field, or "no index lists this repo", is left to it.
+      a `source` field, or "no index lists this repo", is left to it. (Settled by decision 73 A:
+      `source: direct`; #191 adds the upgrade of a direct install, decision 79 E.)
 
 ### Provisional decisions (#133, pending maintainer review)
 
@@ -4336,7 +4348,8 @@ loosened later without breaking a valid file.
       naming it) can be upgraded; a built-in or hand-copied plugin is `not_installed` (exit 3).
       A `source: direct` entry goes through `require_installable(name, None, None)`: refused
       before M5 (`tier_refused`), and behind the gate still refused, pointing to `remove` then
-      `add URL@SHA` (an upgrade resolves through a marketplace). The new version is resolved
+      `add URL@SHA` (an upgrade resolves through a marketplace). *Superseded by decision 79 E
+      (#191): `upgrade URL@SHA` upgrades a direct install.* The new version is resolved
       as `add` does (`marketplace_pins`, `--pre`) and the tier rule applies again (a plugin
       whose index no longer says `first-party` is refused). A lower version than the installed
       one is refused (`downgrade_refused`, exit 3) unless `--allow-downgrade`; a version the
@@ -4558,7 +4571,7 @@ loosened later without breaking a valid file.
       socket proxy narrows the API but not what `docker run` can do; rootless Docker or Podman
       on the host; a sidecar). Enabling one is a follow-up, and so is lifting the M5 tier gate
       (`approval.DIRECT_INSTALLS` and the `first-party` rule, decision 70 E), which needs #50,
-      #51 and #52 too.
+      #51 and #52 too. (Lifted for `runtime: container` only by decision 79, #191.)
     - **K, left to the sibling stories.** CPU, memory and PID limits and declared mounts are
       #51; the egress proxy is #50; the malicious-plugin suite is #52. The argument builder
       (`run_argv`) is the one place they add flags.
@@ -5066,3 +5079,81 @@ loosened later without breaking a valid file.
       write to a read-only path, an escaping link, a fork bomb, a memory hog. Threat rows T51
       to T53 of `docs/security.md`. `horae doctor` does not check mounts yet (a follow-up):
       the first run reports them.
+
+### Provisional decisions (#191, pending maintainer review)
+
+79. **Third-party and direct installs only under `runtime: container` (#191).** The maintainer
+    chose the policy: lift both gates of decisions 70 E and 71 B, but only for plugins that run
+    in a container (decisions 74, 76, 78). One additive schema change: `lockfile/v1.json` gains
+    `plugins.<name>.tier` and `plugins.<name>.index` (B). One new host error kind,
+    `runtime_refused` (C). Threat rows T04, T05 and T20 of `docs/security.md`.
+    - **A, the install gate.** "First-party" is unchanged: tier `first-party` claimed by an
+      index of `FIRST_PARTY_INDEXES` (the default Horae marketplace). A first-party plugin
+      installs and runs under either runtime. Anything else (a `community` tier, `first-party`
+      claimed by an index the user added, a direct install from a git URL) installs only when
+      its **effective runtime** in `horae.yaml` is `container`: `plugins.<name>.runtime`, else
+      `plugin_defaults.runtime` (`InstanceConfig.plugin_runtime`). Otherwise `tier_refused`
+      (exit 3), saying how to enable it: set `plugins.<name>.runtime: container` (or the
+      default) and make sure Docker is available. `require_installable(name, tier, index,
+      runtime=...)` is the one check for every source, and `approval.DIRECT_INSTALLS` is
+      removed (the runtime is the one switch, nothing can drift). A marketplace plugin is
+      checked before anything is fetched. A direct install's name is known only from its
+      `plugin.yaml`: it is refused before anything is fetched when `horae.yaml` runs no plugin
+      in a container, then checked again (the first `prepare` step, before the approval and
+      the venv) with the name. To make `plugins.<name>.runtime` settable before the install,
+      `horae plugin add` loads the instance with `installing=True`: a plugin configured in
+      `horae.yaml` but not in `horae.lock` yet is not a problem there (only there; every other
+      command still reports it). Configuring it also enables it, as for any plugin.
+    - **B, the lock records the trust.** `LockedPlugin.tier` and `LockedPlugin.index` are set,
+      together, for a marketplace plugin that is not first-party, and **absent** for a
+      first-party one, so every lock written before stays byte-identical and valid; a direct
+      install keeps `source: direct` and has neither (a validator refuses `tier` without
+      `index`, either without the other, and either with `source`). `LockedPlugin.first_party`
+      is "no `source` and no `tier`". The lock, not the install record, because it is what the
+      user reviews, commits and approves, and what `--yes` compares (`lock_mismatch` refuses a
+      different tier or index). Absent means first-party because, before this decision, the
+      tier gate let only first-party marketplace plugins write an entry without `source`.
+    - **C, the run-time gate.** `HostRegistry` marks each plugin first-party or not from its
+      lock entry, never from the manifest. The install record (`.horae-install.json`) can only
+      take first-party away: a record saying `source: direct`, or a tier and index that are
+      not first-party, makes the plugin not first-party whatever the lock says (a lock edited
+      or written by an older core); a record that says nothing (none, or written before it
+      recorded the tier) leaves the lock's answer. So a lock entry without the information and
+      without a record (the built-in plugins of `horae init`, a plugin copied by hand,
+      decision 70 F) is first-party: the operator put it there. `PluginHost` refuses to start
+      a plugin that is not first-party unless its effective runtime is `container`, as the
+      first thing of a start: before any secret is resolved for it or written, before any
+      process or container. The new host error kind is **`runtime_refused`** (a start
+      failure: the plugin is unavailable for the rest of the run, and a dry run with it as a
+      sink exits 1). This holds when `horae.yaml` is changed after the install. Never a
+      fallback.
+    - **D, approval.** The prompt starts with the plugin's source (marketplace or direct, with
+      the repository), its tier and index, and either "runs in a container (runtime:
+      container)" or, for a first-party plugin, the runtime it will use. `add --json` reports
+      `first_party`, `runtime` and `enabled` (a plugin configured before the install is
+      enabled at once).
+    - **E, upgrade.** The gate applies again with the instance's runtime: a plugin whose index
+      no longer says `first-party` needs `container`. The permission diff has a `tier` item
+      (`~ first-party (Horae marketplace) -> community (<index>)`) that widens when the new
+      entry is not first-party, so `--yes` refuses it. A direct install can now be upgraded:
+      `horae plugin upgrade https://<host>/<owner>/<repo>@<full sha>`. The URL must be the
+      `repo` of exactly one `source: direct` entry (compared as written; never repeated in a
+      message), the tree must hold a direct install's record, the gate must pass, and the
+      commit is fetched as `add` does (decision 71 C: reachable from the repository's own
+      branches or tags, never fetched by its id) and placed in a staging directory
+      (`install_commit(..., replace=NAME)`); its `plugin.yaml` must name the same plugin,
+      and a lower version needs `--allow-downgrade`. Then the same diff, approval, swap and
+      rollback as decision 73 F. `--pre` and `--offline` are usage errors with a URL; a name
+      given for a direct install points to `upgrade URL@SHA` or remove then add.
+    - **F, audit and remove.** `audit` reports `first_party` and `runtime` per plugin (as the
+      host decides them) and the new drift kind `runtime_not_container`: a plugin that is not
+      first-party whose effective runtime is not `container` (the host will refuse it). The
+      `tier` and `index` columns fall back to the lock's when there is no record. `remove`
+      needs nothing new.
+    - **G, what this does not do.** It does not make a container safe by itself: the guarantees
+      and gaps of decisions 74, 76 and 78 (egress through the proxy only, declared mounts, the
+      limits, the Docker socket of T26) are what a third-party plugin is confined by. Horae in
+      the published image still cannot start containers (decision 74 J): there a third-party
+      plugin installs once `horae.yaml` says `container`, but fails `runtime_unavailable` until
+      the operator gives Horae an engine. `horae doctor` does not
+      check the runtime of non-first-party plugins yet; `audit` does.

@@ -66,6 +66,44 @@ the plugin** with `runtime_unavailable` (it is not started, and never run as a p
 6. The plugin's command must run from its venv: `[python, -m, <module>]`, a console script of
    the venv, or a path inside the plugin directory. An absolute command (a host path) is refused.
 
+## Installing third-party plugins
+
+A plugin that is not **first-party** (a `community` plugin, a plugin of a marketplace you added
+to `marketplaces`, even if that index calls it `first-party`, or a direct install from a git
+URL) installs and runs **only with `runtime: container`**
+([decision 79](../../schemas/README.md#provisional-decisions-191-pending-maintainer-review)).
+First-party plugins of the Horae marketplace may use either runtime.
+
+1. Meet the prerequisites above (Docker, the pulled image, a non-root Horae).
+2. Set the plugin's runtime **before** installing it, by its name (`horae plugin add` accepts a
+   plugin configured in `horae.yaml` that is not in `horae.lock` yet; listing it also enables
+   it):
+
+   ```yaml
+   plugins:
+     weather:
+       runtime: container
+   ```
+
+   or `plugin_defaults.runtime: container` for every plugin (then keep the built-in ones on
+   `process`, as above).
+3. Install it: `horae plugin add weather`, or `horae plugin add
+   https://git.example.org/someone/plugin-weather@<full commit SHA>`. The approval prompt names
+   the source, the tier and index, and says it runs in a container. `horae.lock` records
+   `tier` and `index` (or `source: direct`) for it.
+
+Without step 2 the install is refused (`tier_refused`, exit 3) with what to set. A direct
+install is refused before anything is fetched when no plugin runs in a container, and once its
+`plugin.yaml` names it otherwise.
+
+**At run time** the plugin host reads the tier from `horae.lock` (never from the plugin's
+manifest): if `horae.yaml` is later changed so that such a plugin would run as a process, it is
+not started (`runtime_refused`), and `horae plugin audit` reports it (`runtime_not_container`,
+exit 4). `horae plugin upgrade NAME` applies the same rule to the new version (a plugin whose
+index stops calling it `first-party` needs a container, and the change is approved again); a
+direct install moves to another commit with `horae plugin upgrade <the same URL>@<new SHA>`,
+which must be reachable from the repository's own branches or tags.
+
 ## What a plugin container is
 
 `docker run --interactive --init` with:
@@ -425,7 +463,6 @@ start, not their footprint. Not measured on such a server itself; re-run the ben
 - **Egress limits** (decision 76 I): public hosts on port 443 only; IPv4 only out of
   `horae-egress`; loopback grants are not reachable from a container; a direct connection a
   plugin tries without the proxy fails but is not recorded (only refusals by the proxy are).
-- **The tier gate stays**: `horae plugin add` still refuses non-first-party and direct installs
-  before M5 (`horae.marketplace.approval`, `DIRECT_INSTALLS`). Lifting it needs #50, #51 and #52,
-  and should require `runtime: container` for such plugins.
+- **Non-first-party plugins** install and run only in a container (#191, above); `horae doctor`
+  does not report one configured for the process runtime yet (`horae plugin audit` does).
 - `horae doctor` does not check the container prerequisites yet; the first run reports them.

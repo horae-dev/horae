@@ -11,11 +11,11 @@ An index is untrusted data: the core validates every index it fetches with this 
 (strict, unknown keys rejected) before using any of it.
 """
 
-from typing import Annotated, Literal, Self
+from typing import Annotated, Self
 
 from pydantic import Field, model_validator
 
-from horae.contracts.lockfile import GitRepoUrl
+from horae.contracts.lockfile import GitRepoUrl, Tier
 from horae.contracts.types import CommitSha, Contract, PluginName, SemVer
 
 MAX_INDEX_PLUGINS = 1024
@@ -23,9 +23,6 @@ MAX_PLUGIN_VERSIONS = 512
 
 IndexCommit = CommitSha
 """The full commit id a released version is pinned to: 40 hex (SHA-1) or 64 hex (SHA-256)."""
-
-Tier = Literal["first-party", "community"]
-"""`first-party`: maintained in the horae-dev organization. `community`: anyone else."""
 
 
 class MarketplacePlugin(Contract):
