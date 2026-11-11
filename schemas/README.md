@@ -4083,13 +4083,13 @@ loosened later without breaking a valid file.
       build requirements, which are not in `uv.lock`). `uv_build` is recommended: uv carries
       it, nothing is fetched. Isolation is M5 (#51, #52); accepted for first-party plugins
       meanwhile (T04, `docs/security.md` T39).
-      *Provisional amendment (#191, decision 79 H).* A plugin that is not first-party is
+      *Provisional amendment (#191, decision 79 G).* A plugin that is not first-party is
       **never built**: `uv sync --locked --no-dev --no-install-project` installs only its
       dependencies (same hashed-wheel rule), `dynamic` metadata is refused (uv would run the
       backend for it), and a `.pth` makes the tree's sources importable inside its container.
       So the residual risk above is first-party only. Such an install also uses its own uv
       cache, never `<state_dir>/uv-cache`, and every lock's registry files must come from the
-      registry's own host (decision 79 I).
+      registry's own host (decision 79 H).
     - **C, the commands.** `uv venv --relocatable --no-project --python <python> .venv`, then
       `uv sync --locked --no-dev --no-editable --python .venv/bin/python
       --no-build-package=<name>` for every dependency of the lock, both with `--no-config`.

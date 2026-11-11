@@ -234,7 +234,7 @@ def _requirements(data: dict[str, Any], project: dict[str, Any]) -> list[Any]:
 
 def _check_nothing_to_build(data: dict[str, Any], project: dict[str, Any], plugin: str) -> None:
     """For a plugin that is not first-party (#191): refuse what would make uv build or call a
-    backend despite `--no-install-project --no-build` (decision 79 H)."""
+    backend despite `--no-install-project --no-build` (decision 79 G)."""
     refused = (
         f"plugin {plugin}: refused for a plugin that is not first-party (its code is never "
         "built on the host):"

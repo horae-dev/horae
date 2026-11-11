@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """A plugin that is not first-party can never poison what a first-party build imports (#191,
-schemas decision 79 I), after the review of PR #192.
+schemas decision 79 H), after the review of PR #192.
 
 The attack: a third-party `uv.lock` names a build backend (`flit-core` here) under the real
 index, but its wheel URL on another host with that host's hash. uv would fetch it and cache it

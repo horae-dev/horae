@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """A plugin that is not first-party is installed without building its project (#191,
-schemas decision 79 H): its build backend (`setup.py`, a hatch build hook) would run plugin
+schemas decision 79 G): its build backend (`setup.py`, a hatch build hook) would run plugin
 code on the host, outside its container. Local `file://` index, synthetic names, no network:
 uv never needs setuptools or hatchling here, which is itself the proof that no backend ran."""
 
