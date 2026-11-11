@@ -90,8 +90,9 @@ let a test compare the two.
       "<module>"]` (a console-script command is refused at install);
     - declare its `[project]` metadata statically (no `dynamic = [...]`: uv would run the
       build backend to compute it, so it is refused);
-    - take every dependency from a package index as a hashed wheel: no uv workspace, no
-      `tool.uv.sources` path, git or url entry, no `name @ ...` direct reference.
+    - take every dependency from PyPI (`https://pypi.org/simple`, uv's default index) as a
+      hashed wheel: no other index, no uv workspace, no `tool.uv.sources` path, git or url
+      entry, no `name @ ...` direct reference.
 
     See [plugin containers](operations/plugin-containers.md#installing-third-party-plugins).
 

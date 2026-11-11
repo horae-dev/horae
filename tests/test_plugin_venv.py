@@ -309,8 +309,13 @@ def test_an_sdist_only_dependency_is_refused_by_name(tmp_path: Path) -> None:
 def test_a_hashed_lock_passes_and_lists_what_is_never_built(tmp_path: Path) -> None:
     (tmp_path / "uv.lock").write_text(
         LOCK_HEAD + '[[package]]\nname = "x"\nsource = { registry = "https://pypi.org/simple" }\n'
-        'sdist = { url = "https://example.org/x.tar.gz", hash = "sha256:' + "a" * 64 + '" }\n'
-        'wheels = [{ url = "https://example.org/x.whl", hash = "sha256:' + "b" * 64 + '" }]\n'
+        'sdist = { url = "https://files.pythonhosted.org/packages/ab/cd/x.tar.gz", hash = "sha256:'
+        + "a"
+        * 64
+        + '" }\n'
+        'wheels = [{ url = "https://files.pythonhosted.org/packages/ab/cd/x.whl", hash = "sha256:'
+        + "b" * 64
+        + '" }]\n'
     )
     assert check_lock(tmp_path, "alpha", "alpha") == ["x"]
 

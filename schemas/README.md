@@ -4087,7 +4087,9 @@ loosened later without breaking a valid file.
       **never built**: `uv sync --locked --no-dev --no-install-project` installs only its
       dependencies (same hashed-wheel rule), `dynamic` metadata is refused (uv would run the
       backend for it), and a `.pth` makes the tree's sources importable inside its container.
-      So the residual risk above is first-party only.
+      So the residual risk above is first-party only. Such an install also uses its own uv
+      cache, never `<state_dir>/uv-cache`, and every lock's registry files must come from the
+      registry's own host (decision 79 I).
     - **C, the commands.** `uv venv --relocatable --no-project --python <python> .venv`, then
       `uv sync --locked --no-dev --no-editable --python .venv/bin/python
       --no-build-package=<name>` for every dependency of the lock, both with `--no-config`.
@@ -5180,6 +5182,31 @@ loosened later without breaking a valid file.
       before approval. The prompt says "installed without running its build". First-party
       plugins are built and installed as before. Tested with a setuptools `setup.py` and a
       hatch custom hook that would each write a marker: none is written.
+    - **I, trust classes never share uv's cache (independent review of this PR).** The review
+      reproduced a poisoning: a third-party `uv.lock` lists `flit-core` under the real index
+      but with its wheel URL on the attacker's host and the attacker's hash; uv fetched it and
+      cached it under the index, and the next first-party build, whose backend uv resolves
+      without hashes, imported it on the host. Fixed twice over:
+      (1) a plugin that is not first-party installs (and upgrades) with its own uv cache, inside
+      the install's temporary home and deleted with it; `<state_dir>/uv-cache` is for
+      first-party installs only. (2) `check_lock`, for **every** plugin, requires each file of
+      a registry package to be served by that registry's host over https (same host and
+      port), or by its known files host (`pypi.org` serves from
+      `files.pythonhosted.org/packages/...`), or to lie inside a local directory index: no
+      other host, no `http`, no credentials, query or fragment. For a plugin that is not
+      first-party the registry itself must be the default index (`https://pypi.org/simple`)
+      and a `url` source is refused, so a third-party lock cannot make the host fetch an
+      arbitrary URL (the review's SSRF finding). Existing first-party locks from PyPI pass
+      unchanged. A regression test serves a good and an evil `flit-core` wheel of the same
+      file name from two local HTTP servers, installs a third-party tree then builds a
+      first-party one on the same instance: with the host check removed, only the private
+      cache keeps the marker from being written (and without it, it is written).
+      (3) **Hash-pinned build requirements for first-party builds were not done**: `uv sync`
+      has no `--build-constraints` (only `uv pip` and `uv build` do), and
+      `tool.uv.build-constraint-dependencies` is plugin-controlled and takes no hashes; a
+      Horae-maintained, hashed set for the five allowed backends and their own dependencies,
+      per Python version, is a follow-up. Until then a first-party build trusts the index
+      over https for its backend, as decision 69 B already says.
     - **G, what this does not do.** It does not make a container safe by itself: the guarantees
       and gaps of decisions 74, 76 and 78 (egress through the proxy only, declared mounts, the
       limits, the Docker socket of T26) are what a third-party plugin is confined by. Horae in

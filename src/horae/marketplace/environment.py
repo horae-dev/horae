@@ -75,6 +75,17 @@ build hook, `pdm_build.py`) on the host, outside any container. Then:
   <module>]`, `python3` too): its console scripts are never generated (`check_module_command`,
   refused before approval otherwise).
 
+**Trust classes never share a cache (#191, review of PR #192)**: a plugin that is not
+first-party gets its own uv cache inside the install's temporary home, deleted with it; the
+persistent `cache_dir` serves first-party installs only. Otherwise a third-party lock naming a
+build backend's wheel (a `flit-core`, say) under the real index but on another host would put
+the attacker's wheel in the index's cache bucket, and the next first-party build, whose backend
+is resolved without hashes, would import it on the host. `check_lock` also requires every file
+of a registry package to come from that registry's own host over https (or `FILES_HOSTS`: PyPI
+serves from `files.pythonhosted.org/packages/`), or from inside a local directory index; for a
+plugin that is not first-party the registry must be `DEFAULT_INDEX` and a `url` source is
+refused (no fetch of any URL a third-party lock names).
+
 **Upgrade** (#47): a new version is a new tree, installed by the same `install(...,
 prepare=PluginEnvironment(...))` into its own scratch directory, so it gets a fresh venv built
 from its own lock; a venv is never upgraded in place.
@@ -94,6 +105,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 from horae.contracts.plugin import PluginManifest
 from horae.marketplace.cachefs import make_private_dirs
@@ -315,11 +327,72 @@ def _artifacts(package: dict[str, Any]) -> list[Any]:
     return found
 
 
-def check_lock(tree: Path, plugin: str, project: str) -> list[str]:
+DEFAULT_INDEX = "https://pypi.org/simple"
+"""uv's default index: the only registry a plugin that is not first-party may lock against
+(besides `PluginEnvironment.index_url`, tests only)."""
+FILES_HOSTS: dict[str, tuple[str, str]] = {"pypi.org": ("files.pythonhosted.org", "/packages/")}
+"""Per registry host, the one other host (and path prefix) its files may be served from."""
+
+
+def _index_key(index: str) -> str:
+    """`index` as uv.lock writes a registry: a `file://` index as its path, no trailing `/`."""
+    parts = urlsplit(index)
+    where = unquote(parts.path) if parts.scheme == "file" else index
+    return where.rstrip("/")
+
+
+def _artifact_problem(registry: str, artifact: dict[str, Any], test_index: str | None) -> str:
+    """Why a registry package's file may not be fetched (`""` when it may): it must be served
+    by its registry's own host (or its files host, `FILES_HOSTS`) over https, or lie inside a
+    local directory index. Anything else would make uv fetch any URL a lock names (#191)."""
+    url, path = artifact.get("url"), artifact.get("path")
+    if "://" not in registry:  # a local directory index (uv writes paths)
+        if not isinstance(path, str) or url is not None:
+            return "a file that is not in its local index"
+        base, where = posixpath.normpath(registry), posixpath.normpath(path)
+        return "" if where.startswith(base.rstrip("/") + "/") else "a file outside its index"
+    if not isinstance(url, str) or path is not None:
+        return "a file without a URL"
+    index, file = urlsplit(registry), urlsplit(url)
+    http_ok = test_index is not None and _index_key(registry) == _index_key(test_index)
+    if file.scheme != index.scheme or file.scheme not in (
+        {"https", "http"} if http_ok else {"https"}
+    ):
+        return f"a file served over {file.scheme or 'no scheme'} (https only)"
+    if file.username or file.password or file.query or file.fragment:
+        return "a file URL with credentials, a query or a fragment"
+    try:
+        same = (file.hostname, file.port) == (index.hostname, index.port)
+    except ValueError:
+        return "a file URL with an invalid port"
+    files = FILES_HOSTS.get(index.hostname or "")
+    if same or (
+        files is not None
+        and file.hostname == files[0]
+        and file.port is None
+        and file.path.startswith(files[1])
+    ):
+        return ""
+    return f"a file on host {file.hostname!r}, not its registry's"
+
+
+def check_lock(
+    tree: Path,
+    plugin: str,
+    project: str,
+    *,
+    trusted: bool = True,
+    index_url: str | None = None,
+) -> list[str]:
     """The names of the packages `<tree>/uv.lock` installs besides `project`, the plugin's own
     project; `InstallRefused` unless each comes from an index or URL with at least one wheel
     and a `sha256` hash on every file, and `project` itself is the tree (`.`). Only `project`
-    is ever built: the others are installed from their wheels (`--no-build-package`)."""
+    is ever built: the others are installed from their wheels (`--no-build-package`).
+
+    Every file of a registry package must be served by that registry (`_artifact_problem`).
+    `trusted=False` (a plugin that is not first-party, #191): the registry must be the default
+    index (or `index_url`), and a `url` source is refused."""
+    allowed = {_index_key(DEFAULT_INDEX)} | ({_index_key(index_url)} if index_url else set())
     data = _read_toml(tree / LOCK_FILE, plugin)
     packages = data.get("package", [])
     if not isinstance(packages, list) or not packages:
@@ -347,6 +420,24 @@ def check_lock(tree: Path, plugin: str, project: str) -> list[str]:
                 raise InstallRefused(
                     f"plugin {plugin}: {LOCK_FILE}: {name} has no wheel (an sdist only would "
                     "run its build backend at install): refused"
+                )
+            if kind == "registry":
+                if not isinstance(where, str):
+                    raise InstallRefused(f"plugin {plugin}: {LOCK_FILE}: {name} has no registry")
+                if not trusted and _index_key(where) not in allowed:
+                    raise InstallRefused(
+                        f"plugin {plugin}: {LOCK_FILE}: {name} comes from another index than "
+                        f"{DEFAULT_INDEX}, refused for a plugin that is not first-party"
+                    )
+                for artifact in artifacts:
+                    if why := _artifact_problem(where, artifact, index_url):
+                        raise InstallRefused(
+                            f"plugin {plugin}: {LOCK_FILE}: {name} lists {why}: refused"
+                        )
+            elif not trusted:
+                raise InstallRefused(
+                    f"plugin {plugin}: {LOCK_FILE}: {name} comes from a direct URL, refused for "
+                    "a plugin that is not first-party (index packages only)"
                 )
             dependencies.append(name)
         elif kind in _IN_TREE:
@@ -407,7 +498,8 @@ class PluginEnvironment:
     def prepare(self, tree: Path, plugin: str) -> Path:
         """Check the project and its lock, then build `<tree>/.venv`; returns it."""
         project = check_project(tree, plugin, builds=self.install_project)
-        dependencies = check_lock(tree, plugin, project)
+        trusted = self.install_project
+        dependencies = check_lock(tree, plugin, project, trusted=trusted, index_url=self.index_url)
         venv = tree / VENV_DIR
         if os.path.lexists(venv):
             raise InstallRefused(f"plugin {plugin}: the tree holds a {VENV_DIR}; it must not")
@@ -417,16 +509,20 @@ class PluginEnvironment:
                 f"cannot install the dependencies of {plugin}: uv is not installed "
                 "(it is needed to install a plugin, not to run one)"
             )
-        try:
-            make_private_dirs(self.cache_dir)
-        except OSError as exc:
-            raise InstallError(f"cannot write {self.cache_dir}: {exc.strerror}") from None
-        baseline = tree_bytes(self.cache_dir)
         with tempfile.TemporaryDirectory(prefix="horae-uv-") as home:
-            env = self.env(tree, Path(home))
+            # #191: a plugin that is not first-party never shares uv's cache: its own, inside
+            # the temporary home, deleted with it. What it fetched can never be reused by a
+            # first-party build (a build backend would import it on the host).
+            cache = self.cache_dir if trusted else Path(home) / "cache"
+            try:
+                make_private_dirs(cache)
+            except OSError as exc:
+                raise InstallError(f"cannot write {cache}: {exc.strerror}") from None
+            baseline = tree_bytes(cache)
+            env = self.env(tree, Path(home), cache)
             # The budget covers what this install writes: the venv, uv's temporary directory
-            # (sdist and build environments) and what it adds to the shared cache.
-            watch = _Budget((venv, Path(home), self.cache_dir), baseline)
+            # (sdist and build environments) and what it adds to the cache.
+            watch = _Budget((venv, Path(home), cache) if trusted else (venv, Path(home)), baseline)
             self._run(
                 plugin,
                 [uv, "venv", "--relocatable", "--no-project", "--python", self.python],
@@ -455,8 +551,8 @@ class PluginEnvironment:
                 write_pth(tree, venv, plugin)
         return venv
 
-    def env(self, tree: Path, home: Path) -> dict[str, str]:
-        """uv's environment (see the module docstring)."""
+    def env(self, tree: Path, home: Path, cache: Path | None = None) -> dict[str, str]:
+        """uv's environment (see the module docstring); `cache`: default `cache_dir`."""
         env = {key: value for key, value in os.environ.items() if key in PASSTHROUGH}
         env.update(
             PATH=BASE_PATH,
@@ -464,7 +560,7 @@ class PluginEnvironment:
             TMPDIR=str(home),
             LANG="C.UTF-8",
             UV_NO_CONFIG="1",
-            UV_CACHE_DIR=str(self.cache_dir),
+            UV_CACHE_DIR=str(self.cache_dir if cache is None else cache),
             UV_PYTHON_DOWNLOADS="never",
             UV_PROJECT_ENVIRONMENT=str(tree / VENV_DIR),
             UV_LINK_MODE="copy",
