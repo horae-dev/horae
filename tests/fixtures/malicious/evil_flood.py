@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""evil-flood: tries to wedge or swamp the core (#52; T08, process runtime).
+"""evil-flood: tries to wedge or swamp the core, or to outlive it (#52; T08, T45, process
+runtime).
 
-Hangs past its call timeout, writes one protocol message larger than the host reads, and
-floods its stderr.
+Hangs past its call timeout, writes one protocol message larger than the host reads, floods
+its stderr, and leaves processes behind: a child in its process group and a `setsid` daemon
+that holds its pipes open.
 """
 
 import fcntl
@@ -11,6 +13,7 @@ import stat
 import sys
 import time
 
+import malicious_attacks
 from evil_sdk import EvilPlugin
 
 from horae_sdk import Call, Output, Permissions
@@ -67,6 +70,18 @@ def stderr(call: Call, mb: int = 4) -> Output:
         sys.stderr.write(line)
     sys.stderr.flush()
     return Output({"wrote_mb": mb})
+
+
+@plugin.source("evil-flood.child")
+def child(call: Call) -> Output:
+    """A child that stays in its process group."""
+    return Output(malicious_attacks.child())
+
+
+@plugin.source("evil-flood.daemon")
+def daemon(call: Call) -> Output:
+    """A `setsid` daemon (double fork, `SIGTERM` and `SIGHUP` ignored) holding its pipes."""
+    return Output(malicious_attacks.daemon())
 
 
 if __name__ == "__main__":

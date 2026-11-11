@@ -5,16 +5,19 @@ Marked `malicious` and `container`; skipped when no Docker CLI on the base `PATH
 daemon or the plugin image cannot be pulled (`HORAE_SKIP_CONTAINER_TESTS=1` skips it anyway).
 Each fixture is `tests/fixtures/malicious/jailbreak.py` under its own manifest, listing only the
 attacks of its guarantee (`malicious_attacks.py`): `evil-network` (T05, T07, T42, T48),
-`evil-secrets` (T03, T09, T43, §7.3), `evil-paths` (T04, T51, T53), `evil-resources` (T08, T45,
-T52). Every test asserts *how* the attack failed: the proxy's status and the recorded
-`egress_blocked` violation with its reason, the error the kernel gave, the redaction marker and
-`secret_in_output`, the sweep's undoing, the quarantine, the error kind.
+`evil-secrets` (T03, T09, T43 from inside and from the host, §7.3), `evil-paths` (T04, T51,
+T53), `evil-resources` (T08, T45, T52 with a CPU spin, #193: `ptrace` of the launcher and a
+forged `OOM_EXIT`). Every test asserts *how* the attack failed: the proxy's status and the
+recorded `egress_blocked` violation with its reason, the error the kernel gave, the redaction
+marker and `secret_in_output`, the sweep's undoing, the quarantine, the cgroup's throttling, the
+error kind.
 
 Synthetic names only (`.test`, `.example`); addresses are a documentation one (192.0.2.1), the
 cloud metadata one (never reached: refused before any connection), the egress network's
-gateway, where a local HTTP server is published, and a container on the egress network whose
-alias stands for a public name that resolves to a private address (DNS rebinding). Nothing
-reaches the public internet.
+gateway and the default bridge network's gateway, where a local HTTP server (and on the latter
+a DNS server) is published so that the direct probes target something an open network reaches,
+and a container on the egress network whose alias stands for a public name that resolves to a
+private address (DNS rebinding). Nothing reaches the public internet.
 """
 
 import asyncio
@@ -27,6 +30,7 @@ import shutil
 import subprocess
 import time
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +45,7 @@ from horae.contracts.instance import (
 )
 from horae.plugins.host import HostRegistry, PluginCallError, PluginHost
 from horae.plugins.host import egress as egress_module
+from horae.plugins.host.container import OOM_EXIT
 from horae.plugins.host.env import BASE_PATH, PLUGIN_KEYS, PROXY_KEYS
 from horae.plugins.host.mounts import MountPolicy
 from horae.secrets import SecretResolver
@@ -227,7 +232,7 @@ def _rebinding() -> Iterator[None]:
 
 
 LAN_SERVER = """
-import http.server, sys
+import http.server, socket, sys, threading
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/redirect":
@@ -239,17 +244,45 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
     def log_message(self, *args):
         pass
-http.server.HTTPServer((sys.argv[1], int(sys.argv[2])), Handler).serve_forever()
+def dns(address, port):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind((address, port))
+    while True:
+        query, peer = sock.recvfrom(512)
+        head = query[:2] + bytes([0x81, 0x80]) + query[4:6] + bytes([0, 1, 0, 0, 0, 0])
+        record = bytes([0xC0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4]) + socket.inet_aton(sys.argv[4])
+        sock.sendto(head + query[12:] + record, peer)
+gateway, port, outside = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+threading.Thread(target=dns, args=(outside, port), daemon=True).start()
+serve = http.server.HTTPServer((outside, port), Handler).serve_forever
+threading.Thread(target=serve, daemon=True).start()
+http.server.HTTPServer((gateway, port), Handler).serve_forever()
 """
-"""A local server: `200` at `/`, a redirect to an undeclared host at `/redirect`."""
+"""A local server: `200` at `/`, a redirect to an undeclared host at `/redirect`; on the
+egress network's gateway (the grant) and on the default bridge's (`outside`: an address no
+grant names), where a DNS server on the same port (UDP) answers every name with `ANSWER`."""
+ANSWER = "192.0.2.10"
+
+
+@dataclass(frozen=True)
+class Lan:
+    gateway: str
+    """The egress network's gateway, where the granted endpoint listens."""
+    port: int
+    outside: str
+    """The default bridge network's gateway: the same server and a DNS server, reachable from
+    any container on an open network, granted to none."""
 
 
 @pytest.fixture(scope="module")
-def egress(engine: None) -> Iterator[tuple[str, int]]:
+def egress(engine: None) -> Iterator[Lan]:
     """A local HTTP server on the Docker host, bound to this module's egress network's
-    gateway only (the host's own address there), where the proxy reaches it (`gateway:port`)."""
+    gateway (the host's own address there), where the proxy reaches it (`gateway:port`), and
+    to the default bridge's gateway with a DNS server (`outside:port`)."""
     inspected = json.loads(_docker("network", "inspect", EGRESS).stdout)[0]
     gateway = inspected["IPAM"]["Config"][0]["Gateway"]
+    bridge = json.loads(_docker("network", "inspect", "bridge").stdout)[0]
+    outside = bridge["IPAM"]["Config"][0]["Gateway"]
     lan = f"horae-test-evil-lan-{SUFFIX}"
     port = 20000 + secrets.randbelow(20000)
     started = _docker(
@@ -266,26 +299,66 @@ def egress(engine: None) -> Iterator[tuple[str, int]]:
         LAN_SERVER,
         gateway,
         str(port),
+        outside,
+        ANSWER,
     )
     assert started.returncode == 0, started.stderr
     try:
         deadline = time.monotonic() + 30
-        probe = f"import socket; socket.create_connection(('{gateway}', {port}), timeout=1)"
+        probe = (
+            "import socket\n"
+            f"for host in ('{gateway}', '{outside}'):\n"
+            f"    socket.create_connection((host, {port}), timeout=1)"
+        )
         while _docker("exec", lan, "python", "-c", probe).returncode != 0:
             assert time.monotonic() < deadline, "the LAN server did not start"
             time.sleep(0.2)
-        yield gateway, port
+        yield Lan(gateway, port, outside)
     finally:
         _docker("rm", "--force", lan)
 
 
-NETWORK_TOOLS = ("env", "connect", "resolve", "raw", "tunnel", "http", "fetch")
+def _from_an_open_network(lan: Lan) -> dict[str, Any]:
+    """The positive control of the direct probes: the same attacks from a container on the
+    default bridge network (open, as a plugin's network would be without `--internal`)."""
+    code = (
+        "import json, sys\n"
+        "sys.path.insert(0, '/attacks')\n"
+        "import malicious_attacks as a\n"
+        f"print(json.dumps({{'connect': a.connect('{lan.outside}', {lan.port}), "
+        f"'dns': a.dns('{lan.outside}', {lan.port}, 'api.example.test')}}))"
+    )
+    done = _docker(
+        "run",
+        "--rm",
+        "--network",
+        "bridge",
+        "--user",
+        f"{os.getuid()}:{os.getgid()}",
+        "--mount",
+        f"type=bind,source={FIXTURES},target=/attacks,readonly",
+        DEFAULT_CONTAINER_IMAGE,
+        "python",
+        "-B",
+        "-c",
+        code,
+    )
+    assert done.returncode == 0, done.stderr
+    seen: dict[str, Any] = json.loads(done.stdout)
+    return seen
+
+
+NETWORK_TOOLS = ("env", "connect", "resolve", "dns", "raw", "tunnel", "http", "fetch")
+ENETUNREACH = 101
+EAI_AGAIN = -3
+"""Linux's `errno` for no route and glibc's `getaddrinfo` code for a temporary failure, as the
+image reports them (the host's own constants may differ: macOS)."""
 
 
 def test_evil_network_reaches_nothing_but_its_grants_and_every_attempt_is_recorded(
-    tmp_path: Path, plugin_dir: Path, egress: tuple[str, int]
+    tmp_path: Path, plugin_dir: Path, egress: Lan
 ) -> None:
-    gateway, port = egress
+    gateway, port, outside = egress.gateway, egress.port, egress.outside
     local = f"{gateway}:{port}"
     network = {"network": ["api.example.test", REBIND], "network_local": [local]}
     name = NETWORK
@@ -300,9 +373,12 @@ def test_evil_network_reaches_nothing_but_its_grants_and_every_attempt_is_record
             seen = {
                 # Positive control: the one grant works, through the proxy.
                 "granted": await tool("tunnel", host=gateway, port=port),
-                # Around the proxy: no route out of the internal network, no DNS.
+                # Around the proxy, to servers an open network reaches (the control below):
+                # no route out of the internal network, no DNS but Docker's, which does not
+                # forward from an internal network.
                 "direct_grant": await tool("connect", host=gateway, port=port),
-                "direct_out": await tool("connect", host="192.0.2.1", port=443),
+                "direct_out": await tool("connect", host=outside, port=port),
+                "own_dns": await tool("dns", server=outside, port=port, name="api.example.test"),
                 "resolve": await tool("resolve", name="api.example.test"),
                 # Through the proxy, outside the grants.
                 "undeclared": await tool("tunnel", host="undeclared.example.net", port=443),
@@ -340,9 +416,20 @@ def test_evil_network_reaches_nothing_but_its_grants_and_every_attempt_is_record
     assert granted.data["status"] == "HTTP/1.1 200 Connection established", granted.data
     assert granted.data["answer"].startswith("HTTP/1.0 200")
     assert granted.violations == ()
-    assert seen["direct_grant"].data["connected"] is False
-    assert seen["direct_out"].data["connected"] is False
+    # From an open network the same probes succeed, so their failure below is the
+    # plugin network's doing, not an unreachable target.
+    control = _from_an_open_network(egress)
+    assert control["connect"]["connected"] is True, control
+    assert control["dns"]["answers"] == [ANSWER], control
+    for key in ("direct_grant", "direct_out"):
+        assert seen[key].data["connected"] is False, key
+        assert seen[key].data["errno"] == ENETUNREACH, (key, seen[key].data)
+    assert seen["own_dns"].data["answers"] == []
+    assert seen["own_dns"].data["errno"] == ENETUNREACH, seen["own_dns"].data
     assert seen["resolve"].data["resolved"] is False
+    assert seen["resolve"].data["errno"] == EAI_AGAIN, seen["resolve"].data
+    for key in ("direct_grant", "direct_out", "own_dns", "resolve"):
+        assert seen[key].violations == (), key  # never reached the proxy: nothing to record
 
     def refused(key: str, status: str, host: str, port_: int, reason: str) -> None:
         result = seen[key]
@@ -377,11 +464,11 @@ def test_evil_network_reaches_nothing_but_its_grants_and_every_attempt_is_record
 
 
 def test_evil_network_cannot_borrow_a_sibling_plugins_proxy(
-    tmp_path: Path, plugin_dir: Path, egress: tuple[str, int]
+    tmp_path: Path, plugin_dir: Path, egress: Lan
 ) -> None:
     """Another plugin's proxy holds another allow-list: it is on that plugin's network only,
     so the attacker cannot even reach it (and it serves its own container only, T48)."""
-    gateway, port = egress
+    gateway, port = egress.gateway, egress.port
     evil = _manifest(NETWORK, NETWORK_TOOLS)
     sibling = _manifest(SIBLING, NETWORK_TOOLS, network={"network_local": [f"{gateway}:{port}"]})
 
@@ -464,6 +551,82 @@ def test_evil_secrets_finds_no_secret_it_did_not_declare(
     assert CORE_KEY not in json.dumps(seen["host_environ"].data)
 
 
+def _cli_processes(label: str) -> dict[int, str]:
+    """The host's processes whose command line holds `label`, by pid: the Docker CLI that
+    runs the container (and nothing else names its label)."""
+    listed = subprocess.run(
+        ["/bin/ps", "-ww", "-eo", "pid=,args="],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    found = {}
+    for line in listed.splitlines():
+        pid, _, args = line.strip().partition(" ")
+        if label in args:
+            found[int(pid)] = args
+    return found
+
+
+def test_evil_secrets_its_secret_is_in_no_host_side_view(tmp_path: Path, plugin_dir: Path) -> None:
+    """T43 from the host: while the plugin runs, having written its secret to its stderr,
+    the secret is in neither its container's nor its proxy's configuration (`docker
+    inspect`: `Env`, `Args`, `Cmd`, `Entrypoint`, `Labels`, anywhere), nor in any command line
+    on the host (`ps`), nor, on Linux, in the Docker CLI's environment; and the daemon kept no
+    log of the container's output (`--log-driver none`: `docker logs` has nothing to read). Its
+    stderr reached Horae alone, redacted."""
+    name = SECRETS
+    manifest = _manifest(name, ("env", "shout"), secret="EVIL_TOKEN")  # noqa: S106 (a name)
+
+    async def go() -> dict[str, Any]:
+        async with _host(tmp_path, plugin_dir, manifest) as h:
+            shouted = await h.call(f"{name}.shout", {"key": "EVIL_TOKEN"}, None)
+            label = f"dev.horae.plugin={name}"
+            (plugin,) = _docker("ps", "--quiet", "--filter", f"label={label}").stdout.split()
+            proxy = _docker("ps", "--quiet", "--filter", f"label=dev.horae.egress-proxy={name}")
+            clis = _cli_processes(label)
+            environs = {}
+            for pid in clis:
+                with contextlib.suppress(OSError):  # Linux only
+                    environs[pid] = Path(f"/proc/{pid}/environ").read_bytes()
+            return {
+                "shouted": shouted,
+                "inspect": _docker("inspect", plugin, *proxy.stdout.split()),
+                "logs": _docker("logs", plugin),
+                "ps": clis,
+                "environs": environs,
+            }
+
+    seen = asyncio.run(go())
+    inspect = seen["inspect"]
+    assert inspect.returncode == 0, inspect.stderr
+    assert EVIL_TOKEN not in inspect.stdout
+    containers = json.loads(inspect.stdout)
+    assert len(containers) == 2  # the plugin and its egress proxy
+    for container in containers:
+        config = container["Config"]
+        for value in (config["Env"], container["Args"], config["Cmd"], config["Labels"]):
+            assert "EVIL_TOKEN" not in json.dumps(value)
+        assert config["Entrypoint"] is None or EVIL_TOKEN not in json.dumps(config["Entrypoint"])
+    plugin = next(c for c in containers if c["Config"]["Labels"].get("dev.horae.plugin"))
+    assert plugin["HostConfig"]["LogConfig"]["Type"] == "none"
+    logs = seen["logs"]
+    assert logs.returncode != 0
+    assert "does not support reading" in logs.stderr, logs.stderr
+    assert EVIL_TOKEN not in logs.stdout + logs.stderr
+    clis = seen["ps"]
+    assert clis, "the Docker CLI running the plugin was not found"
+    assert all("--log-driver none" in args for args in clis.values()), clis
+    assert EVIL_TOKEN not in json.dumps(clis)
+    for environ in seen["environs"].values():
+        assert EVIL_TOKEN.encode() not in environ
+        assert b"EVIL_TOKEN" not in environ
+    shouted = seen["shouted"]
+    assert EVIL_TOKEN not in (shouted.stderr or "")
+    assert "[REDACTED:EVIL_TOKEN]" in (shouted.stderr or ""), shouted.stderr
+    _gone(f"dev.horae.plugin={name}")
+
+
 # --- paths: T04, T51, T53 -------------------------------------------------------------------------
 
 
@@ -487,7 +650,7 @@ def _instance(tmp_path: Path, secrets_in: bool = False) -> tuple[Path, MountPoli
     return root, policy
 
 
-PATH_TOOLS = ("env", "fs", "read", "write", "plant", "hook", "caps")
+PATH_TOOLS = ("env", "fs", "read", "write", "plant", "link", "hook", "caps")
 
 
 def test_evil_paths_sees_only_its_grants_and_its_traps_are_undone(
@@ -572,6 +735,70 @@ def test_evil_paths_sees_only_its_grants_and_its_traps_are_undone(
     _gone(f"dev.horae.plugin={name}")
 
 
+def test_evil_paths_a_link_into_a_read_only_grant_gains_nothing_and_is_swept(
+    tmp_path: Path, plugin_dir: Path
+) -> None:
+    """T53, a link planted in the writable grant that points into the read-only one (the
+    absolute path, `..`, the vault directory itself, and a chain whose first hop has no `..`).
+    Inside the container it is harmless: the plugin could read the vault anyway, and a write
+    through any of them meets the read-only mount. After the run the sweep removes each one,
+    since it resolves where the plugin may not write (a later reader on the host, a process
+    plugin or Obsidian, would otherwise follow it); a link inside the writable grant stays, and
+    nothing left resolves outside it."""
+    root, policy = _instance(tmp_path)
+    vault, inbox = root / "vault", root / "vault" / "inbox"
+    name = PATHS
+    manifest = _manifest(name, PATH_TOOLS, paths={"read": [str(vault)], "write": [str(inbox)]})
+    links = {
+        "absolute": str(vault / "note.md"),
+        "dotdot": "../note.md",
+        "directory": str(vault),
+        "chain": "hop",
+        "hop": "../note.md",
+        "inside": "data.md",  # control: stays in the writable grant
+    }
+
+    async def go() -> dict[str, Any]:
+        async with _host(tmp_path, plugin_dir, manifest, mounts=policy) as h:
+
+            async def tool(tool: str, **params: Any) -> Any:
+                return (await h.call(f"{name}.{tool}", params, None)).data
+
+            await tool("write", path=str(inbox / "data.md"), text="mine\n")
+            seen: dict[str, Any] = {
+                key: await tool("link", path=str(inbox / key), target=target)
+                for key, target in links.items()
+            }
+            seen["read"] = await tool("read", path=str(inbox / "absolute"))
+            for key in ("absolute", "dotdot", "chain"):
+                seen[f"write_{key}"] = await tool("write", path=str(inbox / key))
+            seen["write_directory"] = await tool("write", path=str(inbox / "directory" / "x.md"))
+            seen["write_inside"] = await tool("write", path=str(inbox / "inside"))
+            return seen
+
+    seen = asyncio.run(go())
+    for key in links:
+        assert seen[key] == {"linked": True}, key  # the kernel lets it make them
+    assert seen["read"]["read"] == "vault note\n"  # what its read grant already gives it
+    for key in ("absolute", "dotdot", "chain", "directory"):
+        assert seen[f"write_{key}"] == {"written": "Read-only file system"}, key
+    assert seen["write_inside"] == {"written": True}
+    assert (vault / "note.md").read_text(encoding="utf-8") == "vault note\n"
+    assert not (vault / "x.md").exists()
+    for key in ("absolute", "dotdot", "directory", "hop"):
+        assert not os.path.lexists(inbox / key), key  # swept
+    # The chain's first hop has no `..`: the sweep resolves it. Walked before `hop`, it
+    # resolves into the vault and goes; walked after, `hop` is gone and it names a missing
+    # file inside the writable grant, which is what it then is (scandir order decides).
+    # Either way nothing left resolves outside the writable grant.
+    for entry in os.scandir(inbox):
+        if entry.is_symlink():
+            assert Path(os.path.realpath(entry.path)).is_relative_to(inbox), entry.name
+    assert os.readlink(inbox / "inside") == "data.md"  # kept: it stays in the grant
+    assert not (root / "state" / "quarantine" / name).exists()  # a clean sweep
+    _gone(f"dev.horae.plugin={name}")
+
+
 @pytest.mark.parametrize(
     ("access", "target"),
     [
@@ -640,7 +867,7 @@ def test_evil_paths_planting_a_git_hook_quarantines_the_plugin(
 
 # --- resources: T08, T45, T52 ---------------------------------------------------------------------
 
-RESOURCE_TOOLS = ("env", "fork", "fds", "fill", "hog", "daemon")
+RESOURCE_TOOLS = ("env", "fork", "fds", "fill", "hog", "daemon", "spin", "ptrace", "die")
 
 
 def test_evil_resources_hits_every_limit_and_leaves_nothing_behind(
@@ -690,4 +917,71 @@ def test_evil_resources_memory_hog_is_killed_and_reported(tmp_path: Path, plugin
     error = asyncio.run(go())
     assert error.kind == "oom_killed", error
     assert "memory limit (64 MiB" in error.message
+    _gone(f"dev.horae.plugin={name}")
+
+
+def test_evil_resources_a_cpu_spin_is_throttled_to_its_cpus(
+    tmp_path: Path, plugin_dir: Path
+) -> None:
+    """T52: two processes spin for 3 s under `cpus: 0.25`. The kernel enforces the quota the
+    engine set (`cpu.max`, `NanoCpus`): it throttled the container (`cpu.stat`
+    `nr_throttled`), and the CPU time it got is within the quota (with slack for the period
+    boundaries; a busy runner only lowers it)."""
+    name = RESOURCES
+    manifest = _manifest(name, RESOURCE_TOOLS)
+    limits = ContainerLimits(cpus=0.25)
+
+    async def go() -> tuple[dict[str, Any], str, Any]:
+        async with _host(tmp_path, plugin_dir, manifest, limits=limits) as h:
+            spun = (await h.call(f"{name}.spin", {"seconds": 3.0, "workers": 2}, None)).data
+            label = f"label=dev.horae.plugin={name}"
+            (container,) = _docker("ps", "--quiet", "--filter", label).stdout.split()
+            nano = _docker("inspect", "--format", "{{.HostConfig.NanoCpus}}", container)
+            return spun, nano.stdout.strip(), (await h.call(f"{name}.env", {}, None)).data
+
+    spun, nano, alive = asyncio.run(go())
+    assert spun["error"] is None, spun
+    assert nano == "250000000"
+    assert spun["cpu_max"] == "25000 100000"
+    assert spun["nr_throttled"] > 0, spun
+    share = spun["usage_usec"] / (spun["wall_s"] * 1_000_000)
+    assert share <= 0.25 * 1.5, spun  # two spinning processes would take 2.0 unthrottled
+    assert "env" in alive  # it still answers
+    _gone(f"dev.horae.plugin={name}")
+
+
+def test_evil_resources_cannot_ptrace_its_launcher_nor_forge_an_oom_kill(
+    tmp_path: Path, plugin_dir: Path
+) -> None:
+    """#193, through the real host: the plugin's parent is the launcher, which is not dumpable,
+    so `PTRACE_ATTACH` fails with `EPERM` and its environment and memory cannot be read (the
+    live check of the launcher alone is `tests/test_plugin_container_live.py`
+    `test_the_plugin_cannot_ptrace_its_launcher`). A plugin that exits with the launcher's
+    own `OOM_EXIT` (247) is a crash: the launcher passes it on as 1, and only a real kill under
+    the memory limit is `oom_killed`; nor is a plain `exit(137)`, which only looks like a
+    `SIGKILL`."""
+    name = RESOURCES
+    manifest = _manifest(name, RESOURCE_TOOLS)
+
+    async def go() -> tuple[Any, list[PluginCallError]]:
+        async with _host(tmp_path, plugin_dir, manifest) as h:
+            traced = (await h.call(f"{name}.ptrace", {}, None)).data
+            crashes = []
+            for code in (OOM_EXIT, 137):  # the second start is the plugin's one restart
+                with pytest.raises(PluginCallError) as info:
+                    await h.call(f"{name}.die", {"code": code}, None)
+                crashes.append(info.value)
+            return traced, crashes
+
+    traced, crashes = asyncio.run(go())
+    assert "horae-launch: " in " ".join(traced["parent_cmdline"])  # the launcher, indeed
+    assert traced["attached"] == -1, traced
+    assert traced["errno"] == 1, traced  # EPERM
+    assert traced["environ"] == "Permission denied", traced
+    assert traced["mem"] == "Permission denied", traced
+    forged, killed = crashes
+    assert forged.kind == "plugin_crashed", forged
+    assert "exited with code 1" in forged.message, forged.message
+    assert killed.kind == "plugin_crashed", killed
+    assert "exited with code 137" in killed.message, killed.message
     _gone(f"dev.horae.plugin={name}")

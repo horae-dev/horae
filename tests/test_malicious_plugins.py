@@ -9,7 +9,8 @@ guarantee is the engine's, through `horae.engine.execute`:
 - `evil-intents` (T01 plugin proposals, T06, T30): undeclared, unknown, unroutable intents;
 - `evil-secrets` (T03, T09, T16): the environment, another plugin's secret file, its own
   secret through every channel back to the core;
-- `evil-flood` (T08): a hang, an oversized message, a stderr flood;
+- `evil-flood` (T08, T45): a hang, an oversized message, a stderr flood, a child left in its
+  process group and a `setsid` daemon (the process runtime's documented limit);
 - `evil-injection` (T01, T05): mail that steers the `llm` step, read by an obedient fake model;
 - `evil-deid` (T10): a personal name sent to a cloud model past de-identification;
 - the manifest of `evil-intents` asking for more than the lock (T20);
@@ -27,8 +28,12 @@ import base64
 import contextlib
 import importlib.util
 import json
+import os
 import re
+import signal
+import subprocess
 import sys
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -49,6 +54,7 @@ from horae.plugins.host import HostRegistry, PluginCallError, PluginHost
 from horae.plugins.host import host as host_module
 from horae.plugins.host.env import PLUGIN_KEYS
 from horae.plugins.host.host import RegistryError
+from horae.plugins.host.transport import GRACE_S
 from horae.secrets import SecretResolver
 from horae.skills import DirectorySkills
 from plugin_fixtures import lock_for, secrets_dir
@@ -446,6 +452,57 @@ def test_evil_flood_cannot_wedge_or_swamp_the_core(tmp_path: Path) -> None:
     assert noisy.stderr is not None
     assert len(noisy.stderr.encode()) <= 64 * 1024  # the rest is dropped
     assert big.kind == "output_too_large"
+
+
+def _alive(pid: int) -> bool:
+    """Whether `pid` is a running process (a zombie, killed but not yet reaped, is not)."""
+    ps = subprocess.run(  # noqa: S603 (fixed arguments)
+        ["/bin/ps", "-o", "stat=", "-p", str(pid)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    state = ps.stdout.strip()
+    return bool(state) and not state.startswith("Z")
+
+
+def test_evil_flood_a_setsid_daemon_is_the_process_runtimes_documented_limit(
+    tmp_path: Path,
+) -> None:
+    """T45 under the process runtime (first-party plugins only since #191; a plugin that is
+    not first-party never starts there, `runtime_refused`). Horae guarantees: the plugin's
+    process group dies with it (a child that stayed in it is gone), and the host's shutdown is
+    bounded although the daemon holds the plugin's stdin, stdout and stderr open. It does not
+    contain the daemon: `setsid` left the group, which is all the process runtime signals
+    (docs/security.md §6.9). `runtime: container` removes it with its container
+    (`test_evil_resources_hits_every_limit_and_leaves_nothing_behind`)."""
+    flood = fixture("evil_flood")
+
+    async def go() -> tuple[dict[str, Any], dict[str, Any], float]:
+        async with _host(tmp_path, flood) as host:
+            stayed = (await host.call("evil-flood.child", {}, None)).data
+            left = (await host.call("evil-flood.daemon", {}, None)).data
+            alive = (await host.call("evil-flood.hang", {"seconds": 0}, None)).data
+            assert alive == {"slept": 0}  # it still answers, the daemon started
+            closing = time.monotonic()
+        return stayed, left, time.monotonic() - closing
+
+    stayed, left, shutdown = asyncio.run(go())
+    daemon = left["daemon"]
+    try:
+        assert daemon > 0, left
+        # A session of its own (its double fork's middle process leads it), so out of the
+        # plugin's process group and of Horae's session.
+        assert left["sid"] not in (stayed["pgid"], os.getsid(0)), (left, stayed)
+        assert shutdown < 2 * GRACE_S + 3, shutdown  # the held pipes never wedge the host
+        deadline = time.monotonic() + 10
+        while _alive(stayed["child"]):
+            assert time.monotonic() < deadline, "a child in the plugin's group outlived it"
+            time.sleep(0.1)
+        assert _alive(daemon)  # the documented limit: nothing signals another session
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(daemon, signal.SIGKILL)
 
 
 # --- evil-injection: T01, T05 --------------------------------------------------------------------

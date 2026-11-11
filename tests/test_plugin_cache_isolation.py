@@ -6,12 +6,16 @@ The attack: a third-party `uv.lock` names a build backend (`flit-core` here) und
 index, but its wheel URL on another host with that host's hash. uv would fetch it and cache it
 under the index; a later first-party build resolves its backend from the index, unhashed, finds
 the same file name in the cache and imports the attacker's code on the host. Two local HTTP
-servers (the index and the "attacker"), synthetic names, no network."""
+servers (the index and the "attacker"), synthetic names, no network.
+
+Marked `malicious` (#185): each is an attack of the malicious-plugin suite at install time
+(docs/security.md §6.9), and they need uv, which the suite's CI job has."""
 
 import base64
 import functools
 import hashlib
 import http.server
+import json
 import re
 import subprocess
 import sys
@@ -19,15 +23,17 @@ import threading
 import zipfile
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
 from horae.marketplace import InstallRefused, PluginEnvironment
 from horae.marketplace import environment as environment_module
 from horae.marketplace.environment import check_lock
-from venv_fixtures import UV, pyproject
+from marketplace_fixtures import LocalInstaller, plugin_repo
+from venv_fixtures import UV, pyproject, venv_manifest
 
+pytestmark = pytest.mark.malicious
 needs_uv = pytest.mark.skipif(UV is None, reason="uv is not installed")
 WHEEL = "flit_core-3.9.0-py3-none-any.whl"
 
@@ -90,7 +96,16 @@ def _wheel(path: Path, backend: str) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+class _Server(http.server.ThreadingHTTPServer):
+    hits: list[str]
+    """Every path asked of it."""
+
+
 class _Quiet(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self) -> None:
+        cast(_Server, self.server).hits.append(self.path)
+        super().do_GET()
+
     def log_message(self, format: str, *args: Any) -> None:
         pass
 
@@ -106,7 +121,8 @@ def servers(tmp_path: Path) -> Iterator[dict[str, Any]]:
     running = []
     for root in (good_root, evil_root):
         handler = functools.partial(_Quiet, directory=str(root))
-        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        server = _Server(("127.0.0.1", 0), handler)
+        server.hits = []
         threading.Thread(target=server.serve_forever, daemon=True).start()
         running.append(server)
     index = f"http://127.0.0.1:{running[0].server_address[1]}/simple"
@@ -118,7 +134,13 @@ def servers(tmp_path: Path) -> Iterator[dict[str, Any]]:
         '<html><body><a href="flit-core/">flit-core</a></body></html>'
     )
     evil_url = f"http://127.0.0.1:{running[1].server_address[1]}/{WHEEL}"
-    yield {"index": index, "evil_url": evil_url, "evil_hash": evil, "marker": marker}
+    yield {
+        "index": index,
+        "evil_url": evil_url,
+        "evil_hash": evil,
+        "marker": marker,
+        "evil_hits": running[1].hits,
+    }
     for server in running:
         server.shutdown()
         server.server_close()
@@ -196,6 +218,29 @@ def test_a_lock_naming_another_host_for_an_index_package_is_refused(
             environment.cache_dir, index_url=servers["index"], install_project=False
         ).prepare(third, "beta")
     environment.prepare(first, "alpha")  # the first-party build uses the good backend
+    assert not servers["marker"].exists()
+
+
+@needs_uv
+def test_a_third_party_install_whose_lock_names_a_foreign_host_is_refused(
+    tmp_path: Path, servers: dict[str, Any]
+) -> None:
+    """The same lock, installed end to end as a plugin that is not first-party (a direct
+    install from a synthetic URL): refused before uv runs (`not its registry's`), so the
+    foreign host is never asked for anything, nothing is installed and no marker written."""
+    environment, third, _first = _scenario(tmp_path, servers)
+    manifest = json.dumps(venv_manifest("beta", "1.0.0"))
+    repo, sha = plugin_repo(third, name="beta", manifest=manifest, tag=None)
+    url = "https://git.example.test/someone/plugin-beta"
+    third_party = PluginEnvironment(
+        environment.cache_dir, index_url=servers["index"], install_project=False
+    )
+    with pytest.raises(InstallRefused, match="not its registry's"):
+        LocalInstaller(tmp_path / "plugins", {url: repo}).install_commit(
+            url, sha, prepare=third_party
+        )
+    assert servers["evil_hits"] == []
+    assert not (tmp_path / "plugins" / "beta").exists()
     assert not servers["marker"].exists()
 
 
