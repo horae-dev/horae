@@ -15,8 +15,8 @@ the same `Spawn` the process runtime builds, only for the Docker CLI:
   declared writable, after checks that refuse the plugin when one cannot be mounted safely;
 - within its CPU, memory (no swap), PID, `/tmp` and open-file limits (`plugin_defaults.limits`,
   `plugins.<name>.limits`); a plugin the memory limit kills fails its call with `oom_killed`
-  (`docker inspect`'s `.State.OOMKilled`), so the container is not `--rm`: it is removed once
-  inspected;
+  (the launcher's `OOM_EXIT`, from the cgroup's `memory.events`, or `docker inspect`'s
+  `.State.OOMKilled`), so the container is not `--rm`: it is removed once inspected;
 - on the plugin's own network, `horae-plugin-<name>` (`network_name`): `--internal` and no host
   address on the bridge (`inhibit_ipv4`), so the plugin reaches nothing, the host's services
   included, but **its own egress proxy** (`horae.plugins.host.egress`, #50, decision 76), the
@@ -29,7 +29,7 @@ the same `Spawn` the process runtime builds, only for the Docker CLI:
 - **secrets** never on a command line nor in the container's configuration: the plugin's
   environment (`horae.plugins.host.env.build_env`, with the container's paths) is the first line
   of the container's stdin (`preamble`), which `LAUNCHER`, run by the image's interpreter, reads
-  byte by byte before it `execve`s the plugin command with exactly that environment;
+  byte by byte before it runs the plugin command (its child) with exactly that environment;
 - the command runs from the plugin's venv only (`container_command`), and the venv must be one
   the image's interpreter can run (`check_venv`);
 - once the CLI is gone, `docker rm --force` removes the container whatever the plugin did; then
@@ -99,11 +99,15 @@ NETWORK_OPTIONS = {
 inter-container traffic is on, so the plugin reaches its proxy; only its own containers and its
 own proxy may be attached)."""
 ENGINE_TIMEOUT_S = 10.0
+"""Each Docker CLI call but `run` (inspect, create, rm) may take this long."""
 OOM_POLL_S = 1.0
 """How long a `SIGKILL` exit (137) with `OOMKilled` still false is re-inspected (#188)."""
 OOM_POLL_STEP_S = 0.05
 SIGKILLED = 137
-"""Each Docker CLI call but `run` (inspect, create, rm) may take this long."""
+OOM_EXIT = 247
+"""The launcher's exit status for a plugin its cgroup's memory limit killed (#188)."""
+CGROUP_ROOT = "/sys/fs/cgroup"
+PROC_CGROUP = "/proc/self/cgroup"
 MAX_PREAMBLE = 1024 * 1024
 """The longest environment line the launcher reads."""
 ENGINE_ENV_KEYS = (
@@ -125,14 +129,47 @@ _log = logging.getLogger("horae.plugins.host.container")
 
 
 def launcher_source(
-    home: str = CONTAINER_HOME, tmpdir: str = CONTAINER_TMPDIR, workdir: str = CONTAINER_WORKDIR
+    home: str = CONTAINER_HOME,
+    tmpdir: str = CONTAINER_TMPDIR,
+    workdir: str = CONTAINER_WORKDIR,
+    cgroup_root: str = CGROUP_ROOT,
+    proc_cgroup: str = PROC_CGROUP,
 ) -> str:
-    """The launcher's source, creating `home`, `tmpdir` and `workdir` (tests use other paths)."""
+    """The launcher's source, creating `home`, `tmpdir` and `workdir` (tests use other paths,
+    and another cgroup tree: `cgroup_root`, `proc_cgroup`).
+
+    It runs the plugin as its child (not `execve`), so that it is still there, in the
+    container's cgroup, when the plugin dies: a plugin killed by `SIGKILL` while the cgroup's
+    `memory.events` `oom_kill` count went up makes it exit `OOM_EXIT` (#188). Any other end is
+    passed on as the plugin's own status (`128 + signal` for a signal), but an exit with
+    `OOM_EXIT` itself, which becomes 1: only the launcher reports a memory kill. It makes
+    itself non-dumpable first (`prctl(PR_SET_DUMPABLE, 0)`), so that the plugin, its child with
+    the same uid, can neither ptrace it (and forge that status) nor read its memory; the
+    plugin's own `execve` makes it dumpable again, as before."""
     return f"""\
-import json, os, sys
+import json, os, signal, sys
+try:  # PR_SET_DUMPABLE 0: the plugin (same uid) cannot ptrace or read this process (#193)
+    import ctypes
+    ctypes.CDLL(None, use_errno=True).prctl(4, 0, 0, 0, 0)
+except (ImportError, OSError, AttributeError):
+    pass  # best effort: a start never fails for it (its execve makes the plugin dumpable)
 def fail(message):
     os.write(2, b"horae-launch: " + message.encode() + b"\\n")
     os._exit(70)
+def oom_kills():
+    try:
+        with open({proc_cgroup!r}, "rb") as handle:
+            lines = handle.read(65536).decode("utf-8", "replace").splitlines()
+        group = next(line[3:] for line in lines if line.startswith("0::"))
+        path = {cgroup_root!r} + group.rstrip("/") + "/memory.events"
+        with open(path, "rb") as handle:
+            for line in handle.read(65536).decode("ascii", "replace").splitlines():
+                key, _, value = line.partition(" ")
+                if key == "oom_kill":
+                    return int(value)
+    except (OSError, StopIteration, ValueError):
+        pass
+    return None
 line = bytearray()
 while not line.endswith(b"\\n"):
     if len(line) > {MAX_PREAMBLE}:
@@ -156,16 +193,49 @@ os.umask(0o077)
 for path in ({home!r}, {tmpdir!r}, {workdir!r}):
     os.makedirs(path, mode=0o700, exist_ok=True)
 os.chdir({workdir!r})
+before = oom_kills()
+forwarded = (
+    signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM, signal.SIGUSR1, signal.SIGUSR2
+)
+blocked = signal.pthread_sigmask(signal.SIG_BLOCK, forwarded)
 try:
-    os.execve(sys.argv[1], sys.argv[1:], env)
+    child = os.fork()
 except OSError as error:
-    fail("cannot run " + sys.argv[1] + ": " + str(error.strerror))
+    fail("cannot fork: " + str(error.strerror))
+if child == 0:
+    signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
+    try:
+        os.execve(sys.argv[1], sys.argv[1:], env)
+    except OSError as error:
+        fail("cannot run " + sys.argv[1] + ": " + str(error.strerror))
+env.clear()
+def forward(number, frame):
+    try:
+        os.kill(child, number)
+    except OSError:
+        pass
+for number in forwarded:
+    signal.signal(number, forward)
+signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
+null = os.open("/dev/null", os.O_RDWR)
+os.dup2(null, 0)
+os.dup2(null, 1)
+_, status = os.waitpid(child, 0)
+if os.WIFSIGNALED(status):
+    number = os.WTERMSIG(status)
+    after = oom_kills() if number == signal.SIGKILL else None
+    if before is not None and after is not None and after > before:
+        os._exit({OOM_EXIT})
+    os._exit(128 + number)
+code = os.WEXITSTATUS(status)
+os._exit(1 if code == {OOM_EXIT} else code)
 """
 
 
 LAUNCHER = launcher_source()
 """Run as `python3 -I -S -c LAUNCHER <command>` in the container (decision 74 E). Its source is
-visible in `docker inspect`; it holds no secret."""
+visible in `docker inspect`; it holds no secret (it drops its copy of the environment once the
+plugin runs)."""
 
 
 def _unavailable(plugin: str, message: str) -> PluginCallError:
@@ -583,15 +653,18 @@ class ContainerRuntime:
     async def _oom_killed(
         self, docker: str, plugin: str, name: str, limits: ContainerLimits
     ) -> tuple[HostErrorKind, str] | None:
-        """`oom_killed` if the kernel killed something in `name` for its memory limit (decision
+        """`oom_killed` if the kernel killed the plugin in `name` for its memory limit (decision
         78 E), else `None` (the plugin's failure stays what it was).
 
-        The engine sets `.State.OOMKilled` from the cgroup's OOM event, which can reach it after
-        the container's exit (#188): a process that died of `SIGKILL` (exit 137) with the flag
-        still unset is asked again, for `OOM_POLL_S` at most. Other exits are asked once. The
-        engine is the one source: the cgroup's `memory.events` goes away with the container, and
-        `docker events` carries the same OOM event the flag is built from. The caller never asks
-        for a container Horae stopped itself (a timeout or a stop kills with `SIGKILL` too)."""
+        Two sources, either is enough (#188). First, the launcher's exit status `OOM_EXIT`: it
+        outlives the plugin in the container's cgroup and reads that cgroup's `memory.events`
+        (`oom_kill`) once the plugin died of `SIGKILL`. Second, the engine's `.State.OOMKilled`,
+        for when the launcher cannot read it (cgroup v1, or the launcher itself killed): the
+        engine sets it from an OOM event its runtime can lose when the cgroup is removed before
+        the event is read (systemd's cgroup driver), or deliver after the exit, so a `SIGKILL`
+        exit (137) with the flag still unset is asked again for `OOM_POLL_S` at most. Other
+        exits are asked once. The caller never asks for a container Horae stopped itself (a
+        timeout or a stop kills with `SIGKILL` too)."""
         deadline = anyio.current_time() + OOM_POLL_S
         while True:
             code, out, _ = await self._run(
@@ -605,7 +678,7 @@ class ContainerRuntime:
             flag, _, exit_code = out.decode("ascii", "replace").strip().partition(" ")
             if code != 0 or flag not in ("true", "false"):
                 return None
-            if flag == "true":
+            if flag == "true" or exit_code == str(OOM_EXIT):
                 break
             if exit_code != str(SIGKILLED) or anyio.current_time() >= deadline:
                 return None
@@ -943,6 +1016,7 @@ __all__ = [
     "IMAGE_PYTHON",
     "LAUNCHER",
     "NETWORK_OPTIONS",
+    "OOM_EXIT",
     "PLUGIN_LABEL",
     "PLUGIN_MOUNT",
     "TMPFS",

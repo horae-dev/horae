@@ -33,6 +33,7 @@ from horae.contracts.instance import (
     PluginDefaults,
 )
 from horae.plugins.host import HostRegistry, PluginCallError, PluginHost
+from horae.plugins.host.container import LAUNCHER, OOM_EXIT, tmpfs_option
 from horae.plugins.host.env import BASE_PATH, PLUGIN_KEYS, PROXY_KEYS
 from horae.plugins.host.mounts import MountPolicy
 from horae.secrets import SecretResolver
@@ -627,3 +628,58 @@ def test_a_memory_limit_kill_is_reported_as_oom_killed(tmp_path: Path, plugin_di
     while _docker("ps", "--all", "--quiet", "--filter", f"label=dev.horae.plugin={name}").stdout:
         assert time.monotonic() < deadline, "the killed container was not removed"
         time.sleep(0.2)
+
+
+PTRACE_PROBE = """\
+import ctypes, json, os
+libc = ctypes.CDLL(None, use_errno=True)
+parent = os.getppid()
+attached = libc.ptrace(16, parent, None, None)  # PTRACE_ATTACH
+error = ctypes.get_errno()
+if attached == 0:  # undo it, so that the launcher can go on
+    os.waitpid(parent, 0x40000000)  # __WALL
+    libc.ptrace(17, parent, None, None)  # PTRACE_DETACH
+print(json.dumps({"attached": attached, "errno": error, "dumpable": libc.prctl(3, 0, 0, 0, 0)}))
+"""
+
+
+def _launched(engine: None, code: str) -> subprocess.CompletedProcess[str]:
+    """`code` run by the launcher in a container hardened as a plugin's (64 MiB, no swap)."""
+    name = f"horae-test-launcher-{secrets.token_hex(4)}"
+    try:
+        return subprocess.run(  # noqa: S603 (the Docker CLI, fixed arguments)
+            [
+                str(shutil.which("docker", path=BASE_PATH)),
+                *("run", "--interactive", "--init", "--name", name, "--network", "none"),
+                *("--memory=64m", "--memory-swap=64m", "--read-only"),
+                *("--tmpfs", tmpfs_option(8)),
+                *("--user", f"{os.getuid()}:{os.getgid()}", "--cap-drop", "ALL"),
+                *("--security-opt", "no-new-privileges"),
+                *("--entrypoint", "/usr/local/bin/python3", DEFAULT_CONTAINER_IMAGE),
+                *("-I", "-S", "-c", LAUNCHER, "/usr/local/bin/python3", "-I", "-c", code),
+            ],
+            input="{}\n",
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+    finally:
+        _docker("rm", "--force", name)
+
+
+def test_the_plugin_cannot_ptrace_its_launcher(engine: None) -> None:
+    """#193: the launcher is not dumpable, so its child (same uid) cannot attach to it (and
+    forge `OOM_EXIT`) whatever `ptrace_scope` is; the plugin itself is dumpable as before."""
+    done = _launched(engine, PTRACE_PROBE)
+    assert done.returncode == 0, done.stderr
+    seen = json.loads(done.stdout)
+    assert seen["attached"] == -1, seen
+    assert seen["errno"] == 1, seen  # EPERM
+    assert seen["dumpable"] == 1, seen
+
+
+def test_the_launcher_reports_a_memory_limit_kill_of_its_plugin(engine: None) -> None:
+    """#188: the launcher reads the cgroup's `oom_kill` count and exits `OOM_EXIT`."""
+    done = _launched(engine, "held = []\nwhile True: held.append(bytearray(1 << 20))")
+    assert done.returncode == OOM_EXIT, done.stderr

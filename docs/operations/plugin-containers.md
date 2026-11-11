@@ -233,8 +233,9 @@ environment (the same one the process runtime builds: the base variables, `UV_OF
 `PIP_NO_INDEX`, `VIRTUAL_ENV` and the declared secrets) as the **first line of the container's
 stdin**, one JSON object. A launcher (`python3 -I -S -c <source>`, a constant in
 `horae.plugins.host.container`, secret-free and visible in `docker inspect`) reads exactly that
-line, one byte at a time so nothing of the MCP stream is consumed, and `execve`s the plugin with
-exactly that environment. The values cross the CLI's connection to the Docker daemon (its local
+line, one byte at a time so nothing of the MCP stream is consumed, and runs the plugin as its
+child with exactly that environment (it passes `SIGTERM` and the other stop signals on, and
+drops its own copy of the environment). The values cross the CLI's connection to the Docker daemon (its local
 socket) and live in the plugin's process, where root on the host can read them as it can any
 process's environment. Horae zeroes the line's buffer once it is written, but that is **best
 effort**: the values also passed through Python strings (the resolved secret, the environment
@@ -389,7 +390,7 @@ plugins:
 | Field | Default | Bounds | What happens at the limit |
 |---|---|---|---|
 | `cpus` | 1.0 | 0.1 to 64 (and at most the host's CPU count: the engine refuses more) | the plugin is slowed, never stopped; a call may then hit its `call_timeout_s` |
-| `memory_mb` | 512 | 64 to 65 536 | the kernel kills it: the call fails with **`oom_killed`** (`plugin <name> (runtime container) was killed by its memory limit (512 MiB, ...)`), not a generic crash; it may restart once in the run like any failed plugin |
+| `memory_mb` | 512 | 64 to 65 536 | the kernel kills it: the call fails with **`oom_killed`** (`plugin <name> (runtime container) was killed by its memory limit (512 MiB, ...)`), not a generic crash; it may restart once in the run like any failed plugin. The launcher reads the container's cgroup `memory.events` (`oom_kill`) when the plugin dies of `SIGKILL` and exits with status 247; the engine's `OOMKilled` is a fallback only, since the engine can lose that event (#188) |
 | `pids` | 128 | 16 to 4096 | `fork` and new threads fail (`EAGAIN`); a fork loop stops there |
 | `tmp_mb` | 64 | 1 to 1024, less than `memory_mb` | writes to `/tmp` fail (`ENOSPC`) |
 | `nofile` | 1024 | 64 to 65 536 | `open` fails (`EMFILE`) |
