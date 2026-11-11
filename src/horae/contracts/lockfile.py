@@ -68,6 +68,11 @@ Host name only (no port, user info or IP literal); path segments of `A-Z a-z 0-9
 none of them `.` or `..`; no query or fragment."""
 
 
+Tier = Literal["first-party", "community"]
+"""A marketplace tier. `first-party`: maintained in the horae-dev organization. `community`:
+anyone else."""
+
+
 def _sorted_lists(value: Any) -> Any:
     if isinstance(value, dict):
         return {key: _sorted_lists(item) for key, item in value.items()}
@@ -128,6 +133,16 @@ class LockedPlugin(Contract):
     checked); absent for a marketplace install, so a lock written before it reads the same.
     `horae plugin upgrade` reads it to apply the direct-install gate, and `--yes` compares it."""
 
+    tier: Tier | None = None
+    """For a marketplace plugin the default Horae marketplace does not vouch for (#191, decision
+    79): the tier its index claimed (`community`, or `first-party` claimed by another index).
+    Set with `index`, never with `source: direct`. **Absent** for a first-party plugin of the
+    default marketplace, so every lock written before stays byte-identical. A plugin with
+    `source` or `tier` is not first-party: it installs and runs only with `runtime:
+    container`."""
+    index: GitRepoUrl | None = None
+    """The marketplace index that resolved a plugin with `tier` (set with it)."""
+
     user_grants: UserGrants | None = None
     """What the user added with `--allow-host` / `--allow-local` when `add` or `upgrade`
     approved this entry (decision 73 D, #175). `horae plugin upgrade` carries over only these
@@ -146,6 +161,20 @@ class LockedPlugin(Contract):
                     f"user_grants lists {sorted(extra)}, which permissions do not grant"
                 )
         return self
+
+    @model_validator(mode="after")
+    def _origin_is_consistent(self) -> Self:
+        if (self.tier is None) != (self.index is None):
+            raise ValueError("tier and index are recorded together")
+        if self.tier is not None and self.source is not None:
+            raise ValueError("a direct install (source: direct) has no tier or index")
+        return self
+
+    @property
+    def first_party(self) -> bool:
+        """Whether this entry is a first-party plugin of the default Horae marketplace (or a
+        built-in one): no `source` and no `tier`. Anything else runs only in a container."""
+        return self.source is None and self.tier is None
 
     @field_serializer("user_grants", mode="wrap")
     def _canonical_user_grants(
@@ -176,7 +205,7 @@ class LockedPlugin(Contract):
     def _omit_empty(self, handler: SerializerFunctionWrapHandler) -> Any:
         data = handler(self)
         if isinstance(data, dict):
-            for key in ("personal_fields", "pipelines", "source", "user_grants"):
+            for key in ("personal_fields", "pipelines", "source", "tier", "index", "user_grants"):
                 if not data.get(key):
                     data.pop(key, None)
         return data

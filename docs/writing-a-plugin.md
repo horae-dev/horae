@@ -79,6 +79,23 @@ runtime: { protocol: mcp-stdio, command: ["python", "-m", "horae_github"] }
 Generate it from the code (`plugin.manifest(...)`, `dump_manifest`) rather than by hand, and
 let a test compare the two.
 
+!!! note "Third-party plugins: a module command, static metadata, no build"
+    A plugin that is not first-party (any index but the Horae marketplace, or a direct install
+    from a git URL) runs only in a container, and Horae **never builds its project**: only the
+    dependencies of its `uv.lock` are installed, from hashed wheels, and its sources are
+    imported from its tree (`src/<module>` if it has a `src/` directory, else the tree root).
+    So `setup.py`, build hooks and console scripts never run or exist. Such a plugin must:
+
+    - start with the venv's interpreter running a module: `command: ["python", "-m",
+      "<module>"]` (a console-script command is refused at install);
+    - declare its `[project]` metadata statically (no `dynamic = [...]`: uv would run the
+      build backend to compute it, so it is refused);
+    - take every dependency from PyPI (`https://pypi.org/simple`, uv's default index) as a
+      hashed wheel: no other index, no uv workspace, no `tool.uv.sources` path, git or url
+      entry, no `name @ ...` direct reference.
+
+    See [plugin containers](operations/plugin-containers.md#installing-third-party-plugins).
+
 ## 4. SDK 0.6 APIs
 
 | API | Use |

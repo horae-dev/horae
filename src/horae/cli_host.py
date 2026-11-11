@@ -66,11 +66,12 @@ def uses_host(root: Path, vault: Path | None) -> bool:
     return vault is None and plugins_dir(root).is_dir()
 
 
-def load(root: Path) -> Instance:
+def load(root: Path, *, installing: bool = False) -> Instance:
     """The instance, or `CommandFailed(config_invalid)` listing its problems. Every secret
-    it names is resolved for redaction (`Instance.prime_redaction`, #53)."""
+    it names is resolved for redaction (`Instance.prime_redaction`, #53). `installing`: see
+    `load_instance` (`horae plugin add`)."""
     try:
-        instance = load_instance(root)
+        instance = load_instance(root, installing=installing)
     except InstanceError as exc:
         found = plural(len(exc.problems), "problem") + " found"
         message = "; ".join([*map(str, exc.problems), found])

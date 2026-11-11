@@ -7,6 +7,8 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 from horae.marketplace import MarketplaceClient, PluginInstaller
 
 _GIT_ENV = {
@@ -141,3 +143,17 @@ class LocalInstaller(PluginInstaller):
     def remote(self, url: str) -> str:
         where = self.remotes[url]
         return where.as_uri() if isinstance(where, Path) else where
+
+
+def set_runtime(instance: Path, runtime: str, plugin: str | None = None) -> None:
+    """Set `plugins.<plugin>.runtime` (or `plugin_defaults.runtime` when `plugin` is `None`) in
+    the instance's `horae.yaml` (#191: a plugin that is not first-party needs `container`)."""
+    path = instance / "horae.yaml"
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    if plugin is None:
+        data.setdefault("plugin_defaults", {})["runtime"] = runtime
+    else:
+        plugins = data.get("plugins") or {}
+        plugins.setdefault(plugin, {})["runtime"] = runtime
+        data["plugins"] = plugins
+    path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")

@@ -99,7 +99,10 @@ The **marketplace** is a git repository holding an index (`marketplace.json`) th
 plugin name and version to a repository and a full commit SHA, with a tier (`first-party` or
 `community`). Anyone can run their own index; `horae plugin search` reads the ones listed in
 `horae.yaml`, and `horae plugin resolve <name>@<version>` prints the repository and pinned
-commit ([ADR 0004](adr/0004-git-marketplace-with-sha-pinning.md)).
+commit ([ADR 0004](adr/0004-git-marketplace-with-sha-pinning.md)). Only the default Horae
+marketplace can vouch for `first-party`; any other plugin (and a direct install from a git URL)
+installs and runs only with `runtime: container`
+([plugin containers](operations/plugin-containers.md#installing-third-party-plugins)).
 
 !!! note "Proxy and custom CA"
     Git reads indexes and plugin repositories with a minimal environment. Only for those

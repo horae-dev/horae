@@ -7,7 +7,8 @@ schemas decision 73).
   `removed` or `changed` and whether it **widens** what the plugin may do. Widening: a new
   host, local endpoint, secret, intent or path (a path moved from read to write is a new write
   path); a new or changed pack pipeline (a changed digest is new code the core runs); a
-  personal field dropped (less protection, decision 68); a new repository or source. Not
+  personal field dropped (less protection, decision 68); a new repository or source; a tier or
+  index that is not first-party any more (#191). Not
   widening: anything removed, a secret moved between required and optional.
 - `user_grants(locked)`: the hosts and local endpoints the user recorded in the lock entry
   with `--allow-host` / `--allow-local`; an upgrade keeps them (they are already approved).
@@ -42,7 +43,7 @@ class Change:
 
     field: str
     """`repo`, `source`, `network`, `network_local`, `secrets`, `intents`, `paths.read`,
-    `paths.write`, `personal_fields` or `pipelines`."""
+    `paths.write`, `personal_fields`, `pipelines` or `tier`."""
     item: str
     change: ChangeKind
     widens: bool
@@ -112,6 +113,10 @@ def permission_diff(old: LockedPlugin, new: LockedPlugin) -> list[Change]:
     if old.source != new.source:
         before, after = old.source or "marketplace", new.source or "marketplace"
         changes.append(Change("source", f"{before} -> {after}", "changed", True))
+    elif (old.tier, old.index) != (new.tier, new.index):
+        # #191: a plugin the default marketplace no longer vouches for runs in a container only.
+        item = f"{_trust(old)} -> {_trust(new)}"
+        changes.append(Change("tier", item, "changed", not new.first_party))
     have, want = old.permissions, new.permissions
     changes += _sets("network", have.network, want.network)
     changes += _sets("network_local", have.network_local, want.network_local)
@@ -124,6 +129,12 @@ def permission_diff(old: LockedPlugin, new: LockedPlugin) -> list[Change]:
     return changes
 
 
+def _trust(entry: LockedPlugin) -> str:
+    if entry.tier is None:
+        return "first-party (Horae marketplace)"
+    return f"{entry.tier} ({entry.index})"
+
+
 def widens(changes: Sequence[Change]) -> bool:
     return any(change.widens for change in changes)
 
@@ -131,6 +142,7 @@ def widens(changes: Sequence[Change]) -> bool:
 _LABELS = {
     "repo": "repository",
     "source": "source",
+    "tier": "tier",
     "network": "network (https hosts)",
     "network_local": "local network (plain http allowed)",
     "secrets": "secrets",

@@ -1,0 +1,19 @@
+# Plugins that are not first-party (#191, decision 79): a community plugin of an index the user
+# added (`tier` and `index` recorded), and a direct install from a git URL (`source: direct`).
+# Both install and run only with `runtime: container` in horae.yaml.
+schema_version: 1
+plugins:
+  weather:
+    version: 0.2.0
+    repo: https://git.example.org/someone/plugin-weather
+    commit: 3f2c9e1a7b4d5c6e8f9012345678abcdef012345
+    tier: community
+    index: https://git.example.org/someone/marketplace
+    permissions:
+      network: [api.example.org]
+  calendar:
+    version: 1.0.0
+    repo: https://git.example.org/someone/plugin-calendar
+    commit: 0123456789abcdef0123456789abcdef01234567
+    source: direct
+    permissions: {}
