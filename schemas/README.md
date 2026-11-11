@@ -4080,12 +4080,25 @@ loosened later without breaking a valid file.
         part in any other script.
       A one-letter surname (a one-letter part, or the first letter of a part split after it;
       of a two-letter part only when it is the whole name, `王明`) is looked for only when a
-      title follows it, glued or after one space (`HONORIFICS`: `老师`, `先生`, `女士`,
-      `小姐`, `さん`, `様`, `君`, `ちゃん`, `씨`, `님`, `선생님`... simplified and traditional);
+      title follows it, glued or after one white-space run (`HONORIFICS`: `老师`, `先生`,
+      `女士`, `小姐`, `校长`, `さん`, `サン`, `様`, `君`, `ちゃん`, `씨`, `님`, `선생님`...
+      simplified and traditional; halfwidth kana reads as fullwidth);
       only the surname is replaced (`[PERSON_1]老师`), and re-identified as the whole name
       (`王小明老师`, privacy over meaning, as for any part). A single letter is still never
-      matched alone (`王是`, `国王`, `김가`). The scanner and the backstop (E) build their
-      parts and titles with the same functions (`_name_parts`, `_titles`). Names in scripts
+      matched alone (`王是`, `国王`, `김가`). Every title entry is added after every
+      person's name parts (in the scanner and the backstop), so a real part always wins
+      (`君` of `王君 Wang` is never taken as the title of `王` of `王小明`).
+      *Overlaps.* Matching is leftmost-longest without overlap, so a piece of one name could
+      end inside another known value and leave its rest in clear (`王小` of `王小红` in
+      `王小明`, `明` sent). A match that ends inside a run of letters of a script without
+      spaces is therefore replaced together with every known value that starts inside it
+      and ends past it, extended until none does, as one pseudonym (the first match's
+      person): `王小明` is `[PERSON_1]`, `양양민` for `양민` is `[PERSON_1]`; a title is kept
+      only when no other known value starts inside the match (`王 君华` for `王君华` is
+      `[PERSON_1]`, not `[PERSON_1] 君华`). Elsewhere a match ends at a word's edge and the
+      rest is unchanged. The scanner and the backstop (E) build their parts and titles with
+      the same functions (`_name_parts`, `_titles`), for every personal value whatever its
+      length (`王` with `王老师`). Names in scripts
       with spaces are split exactly as before; `MarieZoé` (glued within one script) stays a
       limit.
       *The tradeoff.* Two Han or Hangul letters are a common word as often as a name, so a
@@ -4095,7 +4108,9 @@ loosened later without breaking a valid file.
       pseudonymizes more text than the name, which can blur what the model reads (and, at
       worst, a sentence comes back with the whole name where only the word was), but it
       never sends a name in clear: the failure is toward refusing, the direction decision 47
-      chose. A title before the surname (`老王`, `小王`) is not looked for: `小` + surname
+      chose; an overlap union replaces a whole run of letters that held two names under the
+      first one's pseudonym. A title before the surname (`老王`, `小王`), or split from it by
+      a sign (`王・老师`) or inside itself (`王老 师`), is not looked for: `小` + surname
       would also hit common names and words (`小林`), and it leaks one letter at most.
 
 ### Provisional decisions (#45, pending maintainer review)

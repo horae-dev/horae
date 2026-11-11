@@ -650,3 +650,56 @@ def test_a_given_name_over_matches_inside_another_word() -> None:
     """The documented tradeoff: `小明` is also found inside `大小明显`. It pseudonymizes
     more than the name, it never sends the name."""
     assert _personal("大小明显", "王小明") == "大[PERSON_1]显"
+
+
+def _both(text: str, personal: tuple[str, ...], classed: tuple[str, ...]) -> str:
+    data: dict[str, Any] = {"t": text, **{f"n{i}": name for i, name in enumerate(classed)}}
+    options = {f"n{i}": {"class": "person"} for i in range(len(classed))}
+    return str(pseudonymize(data, options, None, personal).data["t"])
+
+
+@pytest.mark.parametrize(
+    ("text", "personal", "classed", "expected"),
+    [
+        # a title never takes another person's real name part (`君` of `王君 Wang`)
+        ("王君来了", ("王小明", "王君 Wang"), (), "[PERSON_1]来了"),
+        ("王君Wang来了", ("王小明", "王君 Wang"), (), "[PERSON_1][PERSON_1]来了"),
+        ("王君Wang来了", (), ("王小明", "王君 Wang"), "[PERSON_2][PERSON_2]来了"),
+        # overlapping names are replaced as one: no letter of either is left in clear
+        ("王小明今天来了", ("王小红", "小明"), (), "[PERSON_1]今天来了"),
+        ("王小明今天来了", (), ("王小红", "小明"), "[PERSON_1]今天来了"),
+        ("小明华来了", ("王小明", "明华"), (), "[PERSON_1]来了"),
+        ("양양민", ("양민",), (), "[PERSON_1]"),
+        ("양양민", (), ("양민",), "[PERSON_1]"),
+        ("양 양민수가 왔다", ("양민수",), (), "[PERSON_1]가 왔다"),
+        ("양 양민수가 왔다", (), ("양민수",), "[PERSON_1]가 왔다"),
+        # a one-letter title never eats the start of a spaced given name
+        ("王 君华来了", ("王君华",), (), "[PERSON_1]来了"),
+        ("王 君华来了", (), ("王君华",), "[PERSON_1]来了"),
+        ("김 양희", ("김양희",), (), "[PERSON_1]"),
+        ("김 양희", (), ("김양희",), "[PERSON_1]"),
+        # white space between surname and title, halfwidth kana, other titles
+        ("王　老师", ("王小明",), (), "[PERSON_1] 老师"),
+        ("王\t\n 老师", ("王小明",), (), "[PERSON_1]\t\n 老师"),
+        ("王ｻﾝ", ("王小明",), (), "[PERSON_1]サン"),
+        ("林サン", ("林花子",), (), "[PERSON_1]サン"),
+        ("王校长", ("王小明",), (), "[PERSON_1]校长"),
+        # not looked for (documented limits): a title before, or split, or after a dot
+        ("老王来了", ("王小明",), (), "老王来了"),
+        ("王・老师", ("王小明",), (), "王・老师"),
+        ("王老 师", ("王小明",), (), "王老 师"),
+    ],
+)
+def test_overlapping_names_and_titles_never_leave_a_name_letter_in_clear(
+    text: str, personal: tuple[str, ...], classed: tuple[str, ...], expected: str
+) -> None:
+    assert _both(text, personal, classed) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "value"),
+    [("王老师", "王"), ("王 先生", "王"), ("김씨", "김"), ("王君来了", "王君 Wang")],
+)
+def test_the_backstop_adds_parts_and_titles_as_the_scanner_does(text: str, value: str) -> None:
+    assert deid._leaked({"t": text}, [value])
+    assert not deid._leaked(pseudonymize({"t": text}, {}, None, [value]).data, [value])

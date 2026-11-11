@@ -611,9 +611,10 @@ KOREAN_COMPOUND_SURNAMES = frozenset(
 HONORIFICS = (
     # Chinese (simplified and traditional)
     "老师", "老師", "先生", "女士", "小姐", "太太", "同学", "同學", "老板", "老闆", "经理",
-    "經理", "医生", "醫生", "大夫", "教授", "阿姨", "师傅", "師傅",
+    "經理", "医生", "醫生", "大夫", "教授", "阿姨", "师傅", "師傅", "校长", "校長",
     # Japanese
-    "さん", "さま", "様", "君", "くん", "ちゃん", "先輩", "氏", "殿",
+    "さん", "さま", "様", "君", "くん", "ちゃん", "サン", "サマ", "クン", "チャン", "先輩",
+    "氏", "殿",
     # Korean
     "씨", "님", "선생님", "선생", "교수님", "사장님", "선배", "군", "양",
 )  # fmt: skip
@@ -860,26 +861,49 @@ class _Trie:
             node[_END] = value
             self.size += 1
 
+    def longest(
+        self, symbols: list[str], start: int
+    ) -> "tuple[int, _Known | _Titled | str] | None":
+        """`(end, value)` of the longest known value starting at `symbols[start]`, or `None`.
+        At most `MAX_TERM_TOKENS` steps."""
+        node = self.root.get(symbols[start])
+        best: tuple[int, Any] | None = None
+        index, count = start, len(symbols)
+        while node is not None:
+            if _END in node:
+                best = (index + 1, node[_END])
+            index += 1
+            if index >= count:
+                break
+            node = node.get(symbols[index])
+        return best
+
     def matches(self, symbols: list[str]) -> Iterator[tuple[int, int, "_Known | _Titled | str"]]:
         """`(start, end, value)` of the leftmost-longest, non-overlapping matches. Linear in
         `symbols` times the longest known value (at most `MAX_TERM_TOKENS` tokens)."""
         count, start = len(symbols), 0
         while start < count:
-            node = self.root.get(symbols[start])
-            best: tuple[int, Any] | None = None
-            index = start
-            while node is not None:
-                if _END in node:
-                    best = (index + 1, node[_END])
-                index += 1
-                if index >= count:
-                    break
-                node = node.get(symbols[index])
+            best = self.longest(symbols, start)
             if best is None:
                 start += 1
                 continue
             yield start, best[0], best[1]
             start = best[0]
+
+    def covers(self, symbols: list[str], start: int, end: int) -> tuple[int, bool]:
+        """The end of the union of `[start, end)` and every known value overlapping it that
+        starts inside it, extended until no such value ends past it (#189: a match of one
+        name must never leave the rest of another, overlapping, in clear: `王小` of `王小红`
+        in `王小明`), and whether a value starts inside it at all (then a title is replaced
+        with its surname). Each position is looked at once."""
+        inner, index = False, start + 1
+        while index < end:
+            best = self.longest(symbols, index)
+            if best is not None:
+                inner = True
+                end = max(end, best[0])
+            index += 1
+        return end, inner
 
 
 class _Pseudonymizer:
@@ -961,6 +985,8 @@ class _Pseudonymizer:
             if known.name == "person":
                 for part in _name_parts(known.text):
                     self.trie.add(_symbols(part), known)
+        for known in terms:  # after every name part: a real part wins over a title (#189)
+            if known.name == "person":
                 for titled in _titles(known.text):
                     self.trie.add(titled, _Titled(known))
         for value, bounds in self.amounts:
@@ -1068,23 +1094,36 @@ class _Pseudonymizer:
             return False
         spans = _spans(text)
         tokens = [text[start:end] for start, end in spans]
-        position, found = 0, False
-        for start, end, value in self.trie.matches([_symbol(token) for token in tokens]):
+        symbols = [_symbol(token) for token in tokens]
+        position, found, start = 0, False, 0
+        while start < len(symbols):
+            best = self.trie.longest(symbols, start)
+            if best is None:
+                start += 1
+                continue
+            matched, value = best
+            # a match that ends inside a run of letters of a script without spaces is
+            # replaced together with every known value overlapping it, as one (#189)
+            end, inner = matched, False
+            if _glued(tokens, matched):
+                end, inner = self.trie.covers(symbols, start, matched)
             first, last = base + spans[start][0], base + spans[end - 1][1]
             if _overlaps(first, last, secrets):
+                start = end
                 continue
             pieces.extend(tokens[position:start])
             if isinstance(value, str):
                 pieces.append(value)
                 self.count(AMOUNT)
-            elif isinstance(value, _Titled):  # the surname only, the title stays (#189)
+            elif isinstance(value, _Titled) and not inner:  # the title stays (#189)
                 pieces.append(self.assigner.token(value.known))
                 pieces.extend(tokens[start + 1 : end])
                 self.count(FREE_TEXT)
             else:
-                pieces.append(self.assigner.token(value))
+                known = value.known if isinstance(value, _Titled) else value
+                pieces.append(self.assigner.token(known))
                 self.count(FREE_TEXT)
-            position, found = end, True
+            position, found, start = end, True, end
         pieces.extend(tokens[position:])
         return found
 
@@ -1115,6 +1154,18 @@ class _Pseudonymizer:
                     start += 1
                 yield start, end, known
                 floor = end
+
+
+def _glued(tokens: list[str], end: int) -> bool:
+    """Whether `tokens[end - 1]` and `tokens[end]` are both letters of a script without
+    spaces: a match ending there ends inside a word, where another known value may go on
+    (#189). Elsewhere a match ends at a word's edge, and the next word is matched alone."""
+    if not 0 < end < len(tokens):
+        return False
+    return all(
+        token[0].isalpha() and _script(token[0]) == UNSPACED
+        for token in (tokens[end - 1], tokens[end])
+    )
 
 
 def _phone_matches(digits: str, keys: Collection[str]) -> Iterator[tuple[int, int]]:
@@ -1206,10 +1257,12 @@ def _leaked(sent: Any, personal: Sequence[str]) -> bool:
     for value in personal:
         if len(value) >= MIN_TERM_CHARS:
             trie.add(_symbols(value), value)
-            for part in _name_parts(value):
-                trie.add(_symbols(part), value)
-            for titled in _titles(value):
-                trie.add(titled, value)
+    for value in personal:  # name parts and titles as the scanner adds them (`build`)
+        for part in _name_parts(value):
+            trie.add(_symbols(part), value)
+    for value in personal:
+        for titled in _titles(value):
+            trie.add(titled, value)
     numbers = {value for value in personal if value.isascii() and value.isdecimal()}
     phones = {key for value in personal if (key := _phone_key(value, shaped=True)) is not None}
     if not (trie.size or phones):
