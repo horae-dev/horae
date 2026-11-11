@@ -4058,6 +4058,61 @@ loosened later without breaking a valid file.
       case that stands for a transform's output (no `source` elements) gets no declared
       fields; eval cases are synthetic.
 
+    **Amendment (#189, a follow-up of the review of #187).** `DEID_VERSION` is 5 (more text
+    is matched: older cloud cache entries are a miss once).
+    - **N, given names of unspaced CJK and Hangul names.** A full name stored without a
+      space (`王小明`, `김민수`, `山田花子`) had no name parts, so its given name alone
+      (`小明的作业`, `민수야`, `花子さん`) was sent in clear, and a one-letter surname is never
+      a part (`王老师` for `王 小明`). Now each name part written only in Han letters (with or
+      without kana) or only in Hangul syllables, of at most 6 letters
+      (`MAX_UNSPACED_NAME_LETTERS`), is also split into a surname and a given name at every
+      length its script allows (`horae.llm.deid._surname_lengths`), and each piece of at
+      least 2 letters is a name part of its own, mapped to the whole name:
+      - Korean: a surname of one letter (`김` + `민수`), of two for a compound surname of a
+        short known list (`KOREAN_COMPOUND_SURNAMES`: `남궁`, `황보`, `제갈`, `선우`...),
+        one or two for an unknown name of four letters or more;
+      - Chinese and Japanese (Han alone cannot tell them apart): one or two letters up to
+        four (`王` + `小明`, `欧阳` + `娜娜`, `山田` + `花子`, `林` + `花子`; a 3-letter
+        name also gives `王小`, a 4-letter one `田花子`), one to three from five (`長谷川` +
+        `一郎`). Every split is kept, so a wrong guess pseudonymizes more, never less; a
+        Chinese compound surname needs no list (the two-letter split covers it);
+      - kana alone is not split (mostly a foreign name, `マリー`), nor a longer part, nor a
+        part in any other script.
+      A one-letter surname (a one-letter part, or the first letter of a part split after it;
+      of a two-letter part only when it is the whole name, `王明`) is looked for only when a
+      title follows it, glued or after one white-space run (`HONORIFICS`: `老师`, `先生`,
+      `女士`, `小姐`, `校长`, `さん`, `サン`, `様`, `君`, `ちゃん`, `씨`, `님`, `선생님`...
+      simplified and traditional; halfwidth kana reads as fullwidth);
+      only the surname is replaced (`[PERSON_1]老师`), and re-identified as the whole name
+      (`王小明老师`, privacy over meaning, as for any part). A single letter is still never
+      matched alone (`王是`, `国王`, `김가`). Every title entry is added after every
+      person's name parts (in the scanner and the backstop), so a real part always wins
+      (`君` of `王君 Wang` is never taken as the title of `王` of `王小明`).
+      *Overlaps.* Matching is leftmost-longest without overlap, so a piece of one name could
+      end inside another known value and leave its rest in clear (`王小` of `王小红` in
+      `王小明`, `明` sent). A match that ends inside a run of letters of a script without
+      spaces is therefore replaced together with every known value that starts inside it
+      and ends past it, extended until none does, as one pseudonym (the first match's
+      person): `王小明` is `[PERSON_1]`, `양양민` for `양민` is `[PERSON_1]`; a title is kept
+      only when no other known value starts inside the match (`王 君华` for `王君华` is
+      `[PERSON_1]`, not `[PERSON_1] 君华`). Elsewhere a match ends at a word's edge and the
+      rest is unchanged. The scanner and the backstop (E) build their parts and titles with
+      the same functions (`_name_parts`, `_titles`), for every personal value whatever its
+      length (`王` with `王老师`). Names in scripts
+      with spaces are split exactly as before; `MarieZoé` (glued within one script) stays a
+      limit.
+      *The tradeoff.* Two Han or Hangul letters are a common word as often as a name, so a
+      given name over-matches: `小明` inside `大小明显`, `花子` in unrelated text, `민수`
+      inside `시민수업` (a civics class), and the extra splits (`王小`, `田花子`) do the
+      same. It
+      pseudonymizes more text than the name, which can blur what the model reads (and, at
+      worst, a sentence comes back with the whole name where only the word was), but it
+      never sends a name in clear: the failure is toward refusing, the direction decision 47
+      chose; an overlap union replaces a whole run of letters that held two names under the
+      first one's pseudonym. A title before the surname (`老王`, `小王`), or split from it by
+      a sign (`王・老师`) or inside itself (`王老 师`), is not looked for: `小` + surname
+      would also hit common names and words (`小林`), and it leaks one letter at most.
+
 ### Provisional decisions (#45, pending maintainer review)
 
 69. **Per-plugin virtual environments (#45).** No schema change. `horae plugin add` passes

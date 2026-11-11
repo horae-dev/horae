@@ -524,3 +524,182 @@ def test_the_upgrade_diff_shows_a_field_turned_scan_only_as_dropped() -> None:
     text = "\n".join(describe_diff(changes))
     assert f"- {MAIL}: body  (new: needs approval)" in text
     assert f"+ {MAIL}: body (scan-only free text, not de-identified as a value)" in text
+
+
+# --- 5. a given name alone, or a one-letter surname and a title (#189, decision 68 N) ----------
+
+
+@pytest.mark.parametrize(
+    ("text", "value", "expected"),
+    [
+        ("小明的作业", "王小明", "[PERSON_1]的作业"),
+        ("민수야", "김민수", "[PERSON_1]야"),
+        ("花子さん", "山田花子", "[PERSON_1]さん"),
+        ("王老师", "王 小明", "[PERSON_1]老师"),
+        ("山田さんが来た", "山田花子", "[PERSON_1]さんが来た"),  # the surname of a 2 + 2 name
+        ("娜娜来了", "欧阳娜娜", "[PERSON_1]来了"),  # a compound Chinese surname
+        ("欧阳老师", "欧阳娜娜", "[PERSON_1]老师"),
+        ("민수가 왔다", "남궁민수", "[PERSON_1]가 왔다"),  # a compound Korean surname
+        ("남궁 선배", "남궁민수", "[PERSON_1] 선배"),
+        ("一郎くん", "長谷川一郎", "[PERSON_1]くん"),  # 3 + 2
+        ("長谷川さん", "長谷川一郎", "[PERSON_1]さん"),
+        ("花子が来た", "林花子", "[PERSON_1]が来た"),  # 1 + 2 in Japanese
+    ],
+)
+def test_a_given_name_alone_of_an_unspaced_full_name_is_found(
+    text: str, value: str, expected: str
+) -> None:
+    assert _personal(text, value) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "value", "expected"),
+    [
+        ("王老师好", "王小明", "[PERSON_1]老师好"),
+        ("王先生", "王明", "[PERSON_1]先生"),  # a two-letter full name
+        ("王小姐", "王小明", "[PERSON_1]小姐"),
+        ("請問王老師", "王小明", "請問[PERSON_1]老師"),
+        ("林さん", "林 花子", "[PERSON_1]さん"),
+        ("林様へ", "林花子", "[PERSON_1]様へ"),
+        ("林ちゃん", "林花子", "[PERSON_1]ちゃん"),
+        ("김씨", "김민수", "[PERSON_1]씨"),
+        ("김 선생님", "김민수", "[PERSON_1] 선생님"),
+        ("김선생님께", "김 민수", "[PERSON_1]선생님께"),
+        ("김님", "김민수", "[PERSON_1]님"),
+    ],
+)
+def test_a_one_letter_surname_is_found_before_a_title(text: str, value: str, expected: str) -> None:
+    assert _personal(text, value) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "value"),
+    [
+        ("王是我的朋友", "王小明"),  # a single letter is never matched alone
+        ("国王", "王小明"),
+        ("김가 왔다", "김민수"),
+        ("林の中", "林花子"),
+        ("老王来了", "王小明"),  # a title before the surname is not looked for (a limit)
+        ("山さん", "山田 花子"),  # a two-letter surname is not cut further when spaced
+        ("小姐", "小明"),
+        ("マリさん", "マリー"),  # kana alone is not split
+    ],
+)
+def test_a_single_letter_is_never_matched_without_a_title(text: str, value: str) -> None:
+    assert _personal(text, value) == text
+
+
+@pytest.mark.parametrize(
+    ("text", "value"),
+    [
+        ("小明的作业", "王小明"),
+        ("민수야", "김민수"),
+        ("花子さん", "山田花子"),
+        ("王老师", "王 小明"),
+        ("김 선생님", "김민수"),
+    ],
+)
+def test_the_backstop_finds_a_given_name_alone_too(
+    text: str, value: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(deid._Pseudonymizer, "scan", lambda self, text: text)
+    with pytest.raises(DeidError, match="sent in clear"):
+        pseudonymize({"t": text}, {}, personal=[value])
+
+
+def test_the_name_parts_of_unspaced_names() -> None:
+    assert deid._name_parts("王小明") == ["王小明", "小明", "王小"]
+    assert deid._name_parts("김민수") == ["김민수", "민수"]
+    assert deid._name_parts("남궁민수") == ["남궁민수", "남궁", "민수"]
+    assert deid._name_parts("山田花子") == ["山田花子", "田花子", "山田", "花子"]
+    assert deid._name_parts("山田 花子") == ["山田", "花子"]  # spaced: unchanged
+    assert deid._name_parts("王明") == ["王明"]  # two one-letter parts: titles only
+    assert deid._titles("王明")[0] == ("王", "老", "师")
+
+
+@pytest.mark.parametrize(
+    ("value", "parts"),
+    [
+        ("Bob Martin", ["Bob", "Martin"]),
+        ("Иван Петров", ["Иван", "Петров"]),
+        ("Dupont, Marie-Zoé", ["Dupont", "Marie", "Zoé"]),
+        ("Al Martin", ["Martin"]),
+        ("MarieZoé", ["MarieZoé"]),  # same-script glued Latin: still a limit
+        ("マリー・デュポン", ["マリー", "デュポン"]),
+    ],
+)
+def test_names_in_scripts_with_spaces_are_split_as_before(value: str, parts: list[str]) -> None:
+    assert deid._name_parts(value) == parts
+    assert deid._titles(value) == []
+
+
+def test_latin_and_cyrillic_matching_is_unchanged() -> None:
+    assert _personal("MarieZoé est là", "Zoé") == "MarieZoé est là"
+    assert _personal("Петров пришёл", "Иван Петров") == "[PERSON_1] пришёл"
+    assert _personal("Mr Martin", "Bob Martin") == "Mr [PERSON_1]"
+    assert _personal("M Bob", "B Martin") == "M Bob"
+
+
+def test_a_surname_with_a_title_is_put_back_as_the_whole_name() -> None:
+    sent = pseudonymize({"name": "王小明", "t": "王老师说小明很好"}, {"name": {"class": "person"}})
+    assert sent.data["t"] == "[PERSON_1]老师说[PERSON_1]很好"
+    assert sent.reidentify("[PERSON_1]老师")[0] == "王小明老师"  # privacy over meaning
+
+
+def test_a_given_name_over_matches_inside_another_word() -> None:
+    """The documented tradeoff: `小明` is also found inside `大小明显`. It pseudonymizes
+    more than the name, it never sends the name."""
+    assert _personal("大小明显", "王小明") == "大[PERSON_1]显"
+
+
+def _both(text: str, personal: tuple[str, ...], classed: tuple[str, ...]) -> str:
+    data: dict[str, Any] = {"t": text, **{f"n{i}": name for i, name in enumerate(classed)}}
+    options = {f"n{i}": {"class": "person"} for i in range(len(classed))}
+    return str(pseudonymize(data, options, None, personal).data["t"])
+
+
+@pytest.mark.parametrize(
+    ("text", "personal", "classed", "expected"),
+    [
+        # a title never takes another person's real name part (`君` of `王君 Wang`)
+        ("王君来了", ("王小明", "王君 Wang"), (), "[PERSON_1]来了"),
+        ("王君Wang来了", ("王小明", "王君 Wang"), (), "[PERSON_1][PERSON_1]来了"),
+        ("王君Wang来了", (), ("王小明", "王君 Wang"), "[PERSON_2][PERSON_2]来了"),
+        # overlapping names are replaced as one: no letter of either is left in clear
+        ("王小明今天来了", ("王小红", "小明"), (), "[PERSON_1]今天来了"),
+        ("王小明今天来了", (), ("王小红", "小明"), "[PERSON_1]今天来了"),
+        ("小明华来了", ("王小明", "明华"), (), "[PERSON_1]来了"),
+        ("양양민", ("양민",), (), "[PERSON_1]"),
+        ("양양민", (), ("양민",), "[PERSON_1]"),
+        ("양 양민수가 왔다", ("양민수",), (), "[PERSON_1]가 왔다"),
+        ("양 양민수가 왔다", (), ("양민수",), "[PERSON_1]가 왔다"),
+        # a one-letter title never eats the start of a spaced given name
+        ("王 君华来了", ("王君华",), (), "[PERSON_1]来了"),
+        ("王 君华来了", (), ("王君华",), "[PERSON_1]来了"),
+        ("김 양희", ("김양희",), (), "[PERSON_1]"),
+        ("김 양희", (), ("김양희",), "[PERSON_1]"),
+        # white space between surname and title, halfwidth kana, other titles
+        ("王　老师", ("王小明",), (), "[PERSON_1] 老师"),
+        ("王\t\n 老师", ("王小明",), (), "[PERSON_1]\t\n 老师"),
+        ("王ｻﾝ", ("王小明",), (), "[PERSON_1]サン"),
+        ("林サン", ("林花子",), (), "[PERSON_1]サン"),
+        ("王校长", ("王小明",), (), "[PERSON_1]校长"),
+        # not looked for (documented limits): a title before, or split, or after a dot
+        ("老王来了", ("王小明",), (), "老王来了"),
+        ("王・老师", ("王小明",), (), "王・老师"),
+        ("王老 师", ("王小明",), (), "王老 师"),
+    ],
+)
+def test_overlapping_names_and_titles_never_leave_a_name_letter_in_clear(
+    text: str, personal: tuple[str, ...], classed: tuple[str, ...], expected: str
+) -> None:
+    assert _both(text, personal, classed) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "value"),
+    [("王老师", "王"), ("王 先生", "王"), ("김씨", "김"), ("王君来了", "王君 Wang")],
+)
+def test_the_backstop_adds_parts_and_titles_as_the_scanner_does(text: str, value: str) -> None:
+    assert deid._leaked({"t": text}, [value])
+    assert not deid._leaked(pseudonymize({"t": text}, {}, None, [value]).data, [value])

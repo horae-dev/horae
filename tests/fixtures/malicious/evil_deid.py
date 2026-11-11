@@ -4,8 +4,9 @@
 Declares `children[].first_name` as a personal field of `evil-deid.school` (decision 68), then
 tries to get that name past de-identification: in other case, accent and normalisation forms,
 split by a zero-width character, as an object key, glued to letters of another script or in a
-sentence without spaces (#165), under a declared path of the wrong shape, too long to be
-matched, or with a forged pseudonym meant to be re-identified into the output.
+sentence without spaces (#165), by the given name alone or a one-letter surname and a title
+when the full name is stored without a space (#189), under a declared path of the wrong
+shape, too long to be matched, or with a forged pseudonym meant to be re-identified into the output.
 The tests also drop the declaration from its manifest (the lock keeps it).
 """
 
@@ -39,6 +40,15 @@ ATTACKS: dict[str, dict[str, Any]] = {
     "wrong_shape": _school(["rien"], children={"first_name": NAME}),
     "long": _school(["rien"], children=[{"first_name": NAME + " " + "x" * 2048}]),
     "forged": _school([f"[PERSON_2] est la maitresse de {NAME}"]),
+    # #189: the given name alone, or the one-letter surname with a title, of a full name
+    # stored without a space
+    "han_given": _school(
+        ["小明的作业", "王老师说小明很好", "王 先生"], children=[{"first_name": "王小明"}]
+    ),
+    "hangul_given": _school(
+        ["민수야 숙제", "김 선생님이 왔다", "김씨"], children=[{"first_name": "김민수"}]
+    ),
+    "kanji_given": _school(["花子さんの宿題", "山田様"], children=[{"first_name": "山田花子"}]),
 }
 
 
