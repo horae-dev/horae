@@ -473,7 +473,9 @@ def _upgrade_locked(
             *steps,
             pipelines,
             approval,
-            cli_plugin.make_environment(loaded_instance.state_dir / cli_plugin.UV_CACHE_DIR),
+            cli_plugin.environment_for(
+                loaded_instance.state_dir / cli_plugin.UV_CACHE_DIR, target.tier, target.index
+            ),
         ),
     )
     staged = installed.path

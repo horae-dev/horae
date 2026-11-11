@@ -125,6 +125,11 @@ def describe_origin(
             "runs in a container (runtime: container): not first-party, so horae.yaml must keep "
             "`runtime: container` for it; it is refused under the process runtime"
         )
+        lines.append(
+            "installed without running its build: only its dependencies are installed, from "
+            "hashed wheels; its own project is never built (no setup.py, build hook or backend "
+            "runs), its sources are imported from its tree"
+        )
     return lines
 
 

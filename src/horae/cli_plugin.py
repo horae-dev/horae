@@ -37,6 +37,7 @@ is never rewritten. With `--json` the report carries `warnings`; an error is
 {schema_version, error}.
 """
 
+import dataclasses
 import shutil
 import sys
 from collections.abc import Callable
@@ -94,6 +95,7 @@ from horae.marketplace.approval import (
     container_only,
     describe,
     describe_origin,
+    first_party,
     lock_mismatch,
     origin,
     parse_grants,
@@ -102,6 +104,7 @@ from horae.marketplace.approval import (
     with_grants,
 )
 from horae.marketplace.direct import is_direct, parse_direct
+from horae.marketplace.environment import check_module_command
 from horae.marketplace.errors import DowngradeRefused, NotInstalled, PluginEnabled
 from horae.marketplace.lock import LOCK_FILE, guard, lock_is, read_lock, write_lock
 from horae.marketplace.pipelines import PackPipelines
@@ -169,6 +172,15 @@ def make_installer(directory: Path) -> PluginInstaller:
 def make_environment(cache_dir: Path) -> Prepare | None:
     """What builds the plugin's venv (#45). Tests replace this."""
     return PluginEnvironment(cache_dir)
+
+
+def environment_for(cache_dir: Path, tier: Tier | None, index: str | None) -> Prepare | None:
+    """`make_environment`, without the build of the plugin's own project for a plugin that is
+    not first-party (#191): its build backend would run plugin code on the host."""
+    environment = make_environment(cache_dir)
+    if isinstance(environment, PluginEnvironment) and not first_party(tier, index):
+        return dataclasses.replace(environment, install_project=False)
+    return environment
 
 
 PENDING = (
@@ -351,6 +363,8 @@ def runtime_gate(config: InstanceConfig, tier: Tier | None, index: str | None) -
     def check(_tree: Path, manifest: PluginManifest) -> None:
         name = manifest.name
         require_installable(name, tier, index, runtime=config.plugin_runtime(name))
+        if not first_party(tier, index):
+            check_module_command(manifest)  # installed without its build: no console script
 
     return check
 
@@ -415,7 +429,7 @@ def _install_and_lock(
                 runtime_gate(config, tier, index),  # before anything else reads the tree
                 pipelines,  # checked first: the approval shows what it found
                 approval,
-                make_environment(loaded_instance.state_dir / UV_CACHE_DIR),
+                environment_for(loaded_instance.state_dir / UV_CACHE_DIR, tier, index),
             ),
         )
         entry = approval.entry

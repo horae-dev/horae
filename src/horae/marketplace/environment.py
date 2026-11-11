@@ -54,6 +54,23 @@ writes, the venv plus uv's temporary directory plus what it adds to the cache, a
 every plugin child has `UV_OFFLINE=1`, `UV_PYTHON_DOWNLOADS=never` and `PIP_NO_INDEX=1`.
 Neither uv nor the network is needed to run a plugin.
 
+**Without the build (#191)**: a plugin that is not first-party gets `install_project=False`.
+Its own project is **never built**: a build backend runs plugin code (`setup.py`, a hatch
+build hook, `pdm_build.py`) on the host, outside any container. Then:
+
+- `check_project` also refuses `dynamic` in `[project]` (uv would call the backend for the
+  metadata, even with `--no-install-project`) and keeps refusing `backend-path`;
+- `uv sync --locked --no-dev --no-install-project --no-build-package=<each dependency>`: the
+  dependencies only, from their hashed wheels; the lock is still checked against a static
+  `pyproject.toml`;
+- Horae writes `site-packages/_horae_plugin.pth` (`PTH_FILE`) into the venv, naming the
+  project's source directory **as the container sees it** (`CONTAINER_ROOT`, the plugin's
+  mount): `/plugin/src` when the tree has a real `src/` directory (not a symlink), else
+  `/plugin`. Such a plugin only ever runs in a container (decision 79);
+- its `runtime.command` must be the venv's interpreter running a module (`[python, -m,
+  <module>]`, `python3` too): its console scripts are never generated (`check_module_command`,
+  refused before approval otherwise).
+
 **Upgrade** (#47): a new version is a new tree, installed by the same `install(...,
 prepare=PluginEnvironment(...))` into its own scratch directory, so it gets a fresh venv built
 from its own lock; a venv is never upgraded in place.
@@ -63,6 +80,7 @@ import os
 import posixpath
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -81,6 +99,13 @@ from horae.plugins.host.env import BASE_PATH, VENV_DIR
 
 PROJECT_FILE = "pyproject.toml"
 LOCK_FILE = "uv.lock"
+PTH_FILE = "_horae_plugin.pth"
+"""Written into the venv's `site-packages` for a plugin installed without its build (#191)."""
+CONTAINER_ROOT = "/plugin"
+"""Where the plugin's tree is mounted in its container (`horae.plugins.host.container.
+PLUGIN_MOUNT`, kept equal by a test; not imported, to keep this module free of the host)."""
+MODULE_COMMANDS = frozenset({"python", "python3"})
+"""The `runtime.command[0]` a plugin installed without its build may use (#191)."""
 UV_TIMEOUT_S = 600
 """Seconds one uv call may take (a sync downloads and may build)."""
 MAX_VENV_BYTES = 1024 * 1024 * 1024
@@ -137,13 +162,21 @@ def _table(data: dict[str, Any], key: str) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def check_project(tree: Path, plugin: str) -> str:
+def check_project(tree: Path, plugin: str, *, builds: bool = True) -> str:
     """The project name of `<tree>/pyproject.toml`; `InstallRefused` unless it builds with an
-    allowed backend and nothing else (see the module docstring)."""
+    allowed backend and nothing else (see the module docstring). `builds=False` (#191): also
+    refused when uv would still call the backend (`dynamic` metadata)."""
     data = _read_toml(tree / PROJECT_FILE, plugin)
-    name = _table(data, "project").get("name")
+    project = _table(data, "project")
+    name = project.get("name")
     if not isinstance(name, str) or not name:
         raise InstallRefused(f"plugin {plugin}: {PROJECT_FILE} has no [project] name")
+    if not builds and project.get("dynamic"):
+        raise InstallRefused(
+            f"plugin {plugin}: [project] dynamic metadata is refused for a plugin that is not "
+            "first-party: uv would run its build backend to compute it; declare every field "
+            "statically"
+        )
     if _table(_table(data, "tool"), "uv").get("package") is False:
         raise InstallRefused(
             f"plugin {plugin}: tool.uv.package = false (a virtual project) is not installable"
@@ -169,6 +202,49 @@ def check_project(tree: Path, plugin: str) -> str:
                 f"{', '.join(sorted(allowed_names))}, not {requirement!r}"
             )
     return name
+
+
+def check_module_command(manifest: PluginManifest) -> None:
+    """`InstallRefused` unless the plugin's command runs the venv's interpreter (`[python, -m,
+    <module>]`): installed without its build (#191), it has no console script."""
+    runtime = manifest.runtime
+    command = list(getattr(runtime, "command", None) or [])
+    if not command or command[0] not in MODULE_COMMANDS:
+        raise InstallRefused(
+            f"plugin {manifest.name}: a plugin that is not first-party is installed without "
+            "building its project, so it has no console script: its runtime.command must run "
+            "a module with the venv's interpreter, e.g. [python, -m, <module>]"
+        )
+
+
+def write_pth(tree: Path, venv: Path, plugin: str) -> str:
+    """Make the project importable without installing it (#191): `PTH_FILE` in the venv's
+    `site-packages`, naming `src/` (a real directory of the tree) or the tree's root, as the
+    container sees it. Returns the path written into it."""
+    try:
+        source = stat_is_dir(tree / "src")
+    except OSError:
+        source = False
+    target = posixpath.join(CONTAINER_ROOT, "src") if source else CONTAINER_ROOT
+    found = [
+        p
+        for p in sorted((venv / "lib").glob("python*/site-packages"))
+        if not p.is_symlink() and p.is_dir()
+    ]
+    if len(found) != 1:
+        raise InstallError(f"plugin {plugin}: the venv has no single site-packages directory")
+    pth = found[0] / PTH_FILE
+    if os.path.lexists(pth):
+        raise InstallRefused(f"plugin {plugin}: a dependency ships {PTH_FILE}; refused")
+    fd = os.open(pth, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(target + "\n")
+    return target
+
+
+def stat_is_dir(path: Path) -> bool:
+    """Whether `path` is a real directory (`lstat`: a symlink is not)."""
+    return stat.S_ISDIR(os.lstat(path).st_mode)
 
 
 def _in_tree(where: object) -> bool:
@@ -269,13 +345,18 @@ class PluginEnvironment:
     max_bytes: int = MAX_VENV_BYTES
     index_url: str | None = None
     """Replaces the default index (tests only: a local `file://` index). Never a setting."""
+    install_project: bool = True
+    """`False` for a plugin that is not first-party (#191): its project is never built, only
+    its dependencies are installed, and a `.pth` makes its sources importable."""
 
     def __call__(self, tree: Path, manifest: PluginManifest) -> None:
+        if not self.install_project:
+            check_module_command(manifest)
         self.prepare(tree, manifest.name)
 
     def prepare(self, tree: Path, plugin: str) -> Path:
         """Check the project and its lock, then build `<tree>/.venv`; returns it."""
-        project = check_project(tree, plugin)
+        project = check_project(tree, plugin, builds=self.install_project)
         dependencies = check_lock(tree, plugin, project)
         venv = tree / VENV_DIR
         if os.path.lexists(venv):
@@ -304,7 +385,8 @@ class PluginEnvironment:
                 env,
                 watch,
             )
-            sync = ["sync", "--locked", "--no-dev", "--no-editable"]
+            sync = ["sync", "--locked", "--no-dev"]
+            sync.append("--no-editable" if self.install_project else "--no-install-project")
             self._run(
                 plugin,
                 [uv, *sync, "--python", str(venv / "bin" / "python")],
@@ -314,6 +396,8 @@ class PluginEnvironment:
                 watch,
             )
             self._check_venv(venv, plugin, watch)
+            if not self.install_project:
+                write_pth(tree, venv, plugin)
         return venv
 
     def env(self, tree: Path, home: Path) -> dict[str, str]:
@@ -404,11 +488,16 @@ class PluginEnvironment:
 
 __all__ = [
     "BUILD_BACKENDS",
+    "CONTAINER_ROOT",
     "LOCK_FILE",
     "MAX_VENV_BYTES",
+    "MODULE_COMMANDS",
     "PROJECT_FILE",
+    "PTH_FILE",
     "UV_TIMEOUT_S",
     "PluginEnvironment",
     "check_lock",
+    "check_module_command",
     "check_project",
+    "write_pth",
 ]

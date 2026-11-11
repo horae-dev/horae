@@ -4083,6 +4083,11 @@ loosened later without breaking a valid file.
       build requirements, which are not in `uv.lock`). `uv_build` is recommended: uv carries
       it, nothing is fetched. Isolation is M5 (#51, #52); accepted for first-party plugins
       meanwhile (T04, `docs/security.md` T39).
+      *Provisional amendment (#191, decision 79 H).* A plugin that is not first-party is
+      **never built**: `uv sync --locked --no-dev --no-install-project` installs only its
+      dependencies (same hashed-wheel rule), `dynamic` metadata is refused (uv would run the
+      backend for it), and a `.pth` makes the tree's sources importable inside its container.
+      So the residual risk above is first-party only.
     - **C, the commands.** `uv venv --relocatable --no-project --python <python> .venv`, then
       `uv sync --locked --no-dev --no-editable --python .venv/bin/python
       --no-build-package=<name>` for every dependency of the lock, both with `--no-config`.
@@ -5150,6 +5155,27 @@ loosened later without breaking a valid file.
       first-party whose effective runtime is not `container` (the host will refuse it). The
       `tier` and `index` columns fall back to the lock's when there is no record. `remove`
       needs nothing new.
+    - **H, no build for a plugin that is not first-party (security review of this PR).** A
+      build backend on the allow-list of decision 69 B still runs plugin code on the host as
+      the Horae user (`setup.py` under setuptools, a hatch build hook, `pdm_build.py`): fine
+      for first-party code, arbitrary code execution outside the container for anything else.
+      So `PluginEnvironment(install_project=False)` (chosen by `cli_plugin.environment_for`
+      for every plugin that is not first-party, at `add` and `upgrade`): `uv sync --locked
+      --no-dev --no-install-project --no-build-package=<each dependency>` installs the
+      dependencies only, from their hashed wheels, and never builds the project.
+      `check_project` also refuses `[project] dynamic` (verified: with dynamic metadata uv
+      calls the backend even with `--no-install-project`); `backend-path` stays refused, and
+      the lock must still list no in-tree package but the project (no workspace member, no
+      path source). Horae then writes `site-packages/_horae_plugin.pth` (created exclusively,
+      a dependency shipping that name is refused) naming `/plugin/src` when the tree has a
+      real `src/` directory (`lstat`, never through a symlink), else `/plugin`: the path the
+      container sees (the plugin's mount, decision 74 C), which is the only place such a
+      plugin runs (C). Without an installed project there is no console script, so
+      `runtime.command[0]` must be the venv's `python` or `python3` (`[python, -m,
+      <module>]`); anything else is refused (`install_refused`) by the first `prepare` step,
+      before approval. The prompt says "installed without running its build". First-party
+      plugins are built and installed as before. Tested with a setuptools `setup.py` and a
+      hatch custom hook that would each write a marker: none is written.
     - **G, what this does not do.** It does not make a container safe by itself: the guarantees
       and gaps of decisions 74, 76 and 78 (egress through the proxy only, declared mounts, the
       limits, the Docker socket of T26) are what a third-party plugin is confined by. Horae in

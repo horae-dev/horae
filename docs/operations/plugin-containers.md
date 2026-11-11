@@ -90,7 +90,10 @@ First-party plugins of the Horae marketplace may use either runtime.
 3. Install it: `horae plugin add weather`, or `horae plugin add
    https://git.example.org/someone/plugin-weather@<full commit SHA>`. The approval prompt names
    the source, the tier and index, and says it runs in a container. `horae.lock` records
-   `tier` and `index` (or `source: direct`) for it.
+   `tier` and `index` (or `source: direct`) for it. Its project is **not built**: only the
+   dependencies of its `uv.lock` are installed (hashed wheels), and its sources are imported
+   from its tree inside the container. It must start with `[python, -m, <module>]` and
+   declare static `[project]` metadata ([writing a plugin](../writing-a-plugin.md)).
 
 Without step 2 the install is refused (`tier_refused`, exit 3) with what to set. A direct
 install is refused before anything is fetched when no plugin runs in a container, and once its
