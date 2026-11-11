@@ -18,8 +18,16 @@ jobs:
   probe:
     name: Engine OOMKilled probe
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: ${{ env.UV_VERSION }}
+          cache-python: true
+      - run: uv sync
       - name: Engine
         run: |
           docker version
@@ -56,8 +64,35 @@ jobs:
           done
           echo "OOMKilled false after an OOM kill: $missed of 80"
 
+      - name: Memory hog under Horae's launcher, 60 runs
+        run: |
+          uv run python - <<'PY'
+          import subprocess
+          from horae.contracts.instance import DEFAULT_CONTAINER_IMAGE as image
+          from horae.plugins.host.container import LAUNCHER, OOM_EXIT
+          hog = "b = []\nwhile True: b.append(bytearray(1 << 20))"
+          flag_missed = launcher_missed = 0
+          for i in range(60):
+              name = f"launch-{i}"
+              subprocess.run(["docker", "run", "-i", "--name", name, "--init", "--memory=64m",
+                  "--memory-swap=64m", "--read-only", "--tmpfs", "/tmp:rw,size=8m,mode=1777",
+                  "--user", "1001:1001", "--cap-drop", "ALL", "--security-opt",
+                  "no-new-privileges", "--entrypoint", "/usr/local/bin/python3", image, "-I",
+                  "-S", "-c", LAUNCHER, "/usr/local/bin/python3", "-c", hog],
+                  input=b"{}\n", capture_output=True, check=False)
+              state = subprocess.run(["docker", "inspect", "--format",
+                  "{{.State.OOMKilled}} {{.State.ExitCode}}", name],
+                  capture_output=True, text=True, check=False).stdout.split()
+              subprocess.run(["docker", "rm", "-f", name], capture_output=True, check=False)
+              flag_missed += state[0] != "true"
+              launcher_missed += state[1] != str(OOM_EXIT)
+              print(i, state)
+          print(f"OOMKilled false: {flag_missed} of 60; launcher exit not OOM_EXIT: {launcher_missed} of 60")
+          raise SystemExit(launcher_missed != 0)
+          PY
+
   repeat:
-    name: Live memory-hog test, 10 repeats
+    name: Live memory-hog tests, 20 repeats
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -73,7 +108,7 @@ jobs:
         run: |
           set -u
           failed=0
-          for i in $(seq 1 10); do
+          for i in $(seq 1 20); do
             if uv run pytest -q -p no:cacheprovider \
                 "tests/test_malicious_plugins_container.py::test_evil_resources_memory_hog_is_killed_and_reported" \
                 "tests/test_plugin_container_live.py::test_a_memory_limit_kill_is_reported_as_oom_killed"; then
@@ -82,5 +117,5 @@ jobs:
               echo "run $i: FAILED"; failed=$((failed + 1))
             fi
           done
-          echo "failed runs: $failed of 10"
+          echo "failed runs: $failed of 20"
           test "$failed" -eq 0
