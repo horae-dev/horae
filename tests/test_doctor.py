@@ -431,3 +431,119 @@ def test_doctor_warns_about_recent_intent_skipped_violations(with_secrets: Path)
     assert report["ok"] is True
     (warning,) = [p for p in report["problems"] if "skipped intents" in p["message"]]
     assert warning["severity"] == "warning"
+
+
+# --- container-only third-party plugins (#194, schemas decision 79) -------------------------------
+
+COMMUNITY = {"tier": "community", "index": "https://git.example.test/someone/marketplace"}
+
+
+def _community(root: Path, *plugins: str) -> None:
+    """Lock `plugins` as installed from a community index (not first-party)."""
+    path = root / "horae.lock"
+    lock = yaml.safe_load(path.read_text(encoding="utf-8"))
+    for name in plugins:
+        lock["plugins"][name].update(COMMUNITY)
+    path.write_text(yaml.safe_dump(lock, sort_keys=False), encoding="utf-8")
+
+
+def _engine(monkeypatch: pytest.MonkeyPatch, problem: str | None) -> list[object]:
+    """Replace the engine check (no Docker needed); returns the configs it was asked about."""
+    asked: list[object] = []
+
+    def fake(config: object, environ: object = None) -> str | None:
+        asked.append(config)
+        return problem
+
+    monkeypatch.setattr("horae.cli_host.engine_problem", fake)
+    return asked
+
+
+def test_doctor_flags_a_plugin_that_is_not_first_party_outside_a_container(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _created(tmp_path)
+    _community(root, "file-sink")
+    asked = _engine(monkeypatch, None)
+    code, report = _report(root)
+    assert code == cli.EXIT_PROBLEMS
+    (message,) = _messages(report)
+    assert message.startswith("horae.yaml: file-sink: not first-party, but horae.yaml runs it with")
+    assert "`runtime: process`" in message
+    assert "plugins.file-sink.runtime: container" in message
+    assert asked == []  # nothing runs in a container: the engine is not asked
+    problems = report["problems"]
+    assert isinstance(problems, list)
+    assert [p["severity"] for p in problems] == ["error"]
+
+
+def test_doctor_accepts_a_plugin_that_is_not_first_party_in_a_container(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from marketplace_fixtures import set_runtime
+
+    root = _created(tmp_path)
+    _community(root, "file-sink")
+    set_runtime(root, "container", "file-sink")
+    asked = _engine(monkeypatch, None)
+    code, report = _report(root)
+    assert code == 0, report
+    assert len(asked) == 1
+
+
+def test_doctor_does_not_flag_a_first_party_plugin_under_the_process_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _created(tmp_path)
+    asked = _engine(monkeypatch, "must not be asked")
+    assert _report(root)[0] == 0
+    assert asked == []
+
+
+def test_doctor_reads_the_tier_from_the_lock_not_the_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A direct install has no tier; the lock's `source: direct` is what the host reads."""
+    root = _created(tmp_path)
+    path = root / "horae.lock"
+    lock = yaml.safe_load(path.read_text(encoding="utf-8"))
+    lock["plugins"]["file-sink"]["source"] = "direct"
+    path.write_text(yaml.safe_dump(lock, sort_keys=False), encoding="utf-8")
+    _engine(monkeypatch, None)
+    code, report = _report(root)
+    assert code == cli.EXIT_PROBLEMS
+    (message,) = _messages(report)
+    assert "file-sink: not first-party" in message
+
+
+def test_doctor_flags_a_container_plugin_without_a_docker_engine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from marketplace_fixtures import set_runtime
+
+    root = _created(tmp_path)
+    set_runtime(root, "container")  # every plugin, first-party ones too
+    _engine(monkeypatch, "the Docker CLI is not installed")
+    code, report = _report(root)
+    assert code == cli.EXIT_PROBLEMS
+    (message,) = _messages(report)
+    assert message == (
+        "horae.yaml: 2 plugins (file-sink, fixture-source) run with `runtime: container` but "
+        "there is no usable local Docker engine: the Docker CLI is not installed"
+    )
+
+
+def test_doctor_reports_both_container_problems_together(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from marketplace_fixtures import set_runtime
+
+    root = _created(tmp_path)
+    _community(root, "file-sink")
+    set_runtime(root, "container", "fixture-source")
+    _engine(monkeypatch, "the Docker engine is unreachable: no daemon")
+    code, report = _report(root)
+    assert code == cli.EXIT_PROBLEMS
+    first, second = _messages(report)
+    assert "file-sink: not first-party" in first
+    assert "1 plugin (fixture-source) run with `runtime: container`" in second

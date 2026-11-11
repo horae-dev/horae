@@ -5215,5 +5215,14 @@ loosened later without breaking a valid file.
       limits, the Docker socket of T26) are what a third-party plugin is confined by. Horae in
       the published image still cannot start containers (decision 74 J): there a third-party
       plugin installs once `horae.yaml` says `container`, but fails `runtime_unavailable` until
-      the operator gives Horae an engine. `horae doctor` does not
-      check the runtime of non-first-party plugins yet; `audit` does.
+      the operator gives Horae an engine. `horae doctor` (#194) reports each plugin that is not
+      first-party (as the host decides it) whose effective runtime is not `container`, with
+      the same check as `audit` (`audit.runtime_drift`), and, when a plugin runs in a
+      container, a missing or unusable local Docker engine (`container.engine_problem`: the
+      CLI, a local `unix://` `DOCKER_HOST` and context, a daemon that answers; nothing is
+      started or pulled). Both are errors, as every doctor problem that makes a run fail.
+      An end-to-end test (`tests/test_plugin_nobuild_container.py`, marked `malicious`,
+      `container` and `live`) installs a synthetic third-party plugin without building it,
+      with its venv made inside the plugin image, and makes one real tool call under
+      `runtime: container`: the `.pth` makes `python -m <module>` importable at `/plugin/src`
+      and no `setup.py` or build hook runs.

@@ -82,6 +82,7 @@ from horae.marketplace.audit import (
     pipeline_drift,
     read_record,
     record_mismatch,
+    runtime_drift,
 )
 from horae.marketplace.direct import is_direct, parse_direct
 from horae.marketplace.errors import DowngradeRefused, NotInstalled, PluginEnabled
@@ -1060,14 +1061,8 @@ def _audit_plugin(
         )
     )
     runtime = config.plugin_runtime(name)
-    if entry is not None and not first_party and runtime != "container":
-        drift.append(
-            Drift(
-                "runtime_not_container",
-                f"{name}: not first-party, but horae.yaml runs it with `runtime: {runtime}`; the "
-                f"plugin host refuses to start it: set `plugins.{name}.runtime: container`",
-            )
-        )
+    if entry is not None and (found := runtime_drift(name, first_party, runtime)):
+        drift.append(found)
     row: dict[str, Any] = {
         "name": name,
         "version": entry.version if entry is not None else None,

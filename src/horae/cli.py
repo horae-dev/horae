@@ -180,7 +180,10 @@ def doctor(
     Also checks that every path of horae.lock exists, that the instance's own vault/ is the
     one horae.lock writes to (instances are not relocatable in v1: a copied or moved
     instance is reported), and, with a plugins/ directory, that the plugins are installed
-    as horae.lock pins them and their commands (interpreters) are executable. With an llm
+    as horae.lock pins them and their commands (interpreters) are executable, every plugin
+    that is not first-party runs with runtime: container (the plugin host refuses to start
+    it otherwise), and a local Docker engine is usable when any plugin runs in a container
+    (nothing is started or pulled). With an llm
     step, it also checks that the LLM output validator (a child process) runs.
 
     Warnings (e.g. a cloud model alias without a price, whose usd budget is then

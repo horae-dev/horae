@@ -330,6 +330,50 @@ def engine_env(environ: Mapping[str, str] | None = None) -> dict[str, str]:
     return env
 
 
+def engine_problem(config: ContainerConfig, environ: Mapping[str, str] | None = None) -> str | None:
+    """Why no usable local Docker engine is available, or `None` (`horae doctor`, #194).
+
+    The same conditions the runtime enforces before it starts anything: the Docker CLI is
+    installed, `DOCKER_HOST` and the CLI's current context are a local `unix://` socket
+    (decision 74 B), and the daemon answers. Starts nothing, pulls nothing; the image is not
+    checked here."""
+    env = engine_env(environ)
+    docker = config.docker or shutil.which("docker", path=BASE_PATH)
+    if docker is None or not os.path.isfile(docker) or not os.access(docker, os.X_OK):
+        return "the Docker CLI is not installed"
+    host = env.get("DOCKER_HOST")
+    if host is not None and not is_local_endpoint(host):
+        return f"DOCKER_HOST is not a local unix socket ({_scheme(host)})"
+
+    def run(*args: str) -> tuple[int, str]:
+        try:
+            done = subprocess.run(  # noqa: S603 (the Docker CLI, fixed arguments)
+                [docker, *args],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                env=env,
+                check=False,
+                timeout=ENGINE_TIMEOUT_S,
+                start_new_session=True,
+            )
+        except subprocess.TimeoutExpired:
+            return -1, "the container engine did not answer in time"
+        except OSError as error:
+            return -1, error.strerror or "cannot run the Docker CLI"
+        out = done.stdout if done.returncode == 0 else done.stderr
+        return done.returncode, _first_line(out[:_MAX_ENGINE_OUTPUT])
+
+    code, out = run("context", "inspect", "--format", "{{.Endpoints.docker.Host}}")
+    if code != 0:
+        return f"the Docker context cannot be inspected: {out}"
+    if not is_local_endpoint(out):
+        return f"the Docker engine is not a local unix socket ({_scheme(out)})"
+    code, out = run("version", "--format", "{{.Server.Version}}")
+    if code != 0:
+        return f"the Docker engine is unreachable: {out}"
+    return None
+
+
 def limit_options(limits: ContainerLimits) -> list[str]:
     """The resource limits' flags (decision 78 D): `--memory-swap` equal to `--memory`, so the
     container has no swap."""
@@ -1025,6 +1069,7 @@ __all__ = [
     "container_belongs",
     "container_command",
     "engine_env",
+    "engine_problem",
     "is_local_endpoint",
     "limit_options",
     "mount_source",

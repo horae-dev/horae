@@ -468,5 +468,9 @@ start, not their footprint. Not measured on such a server itself; re-run the ben
   `horae-egress`; loopback grants are not reachable from a container; a direct connection a
   plugin tries without the proxy fails but is not recorded (only refusals by the proxy are).
 - **Non-first-party plugins** install and run only in a container (#191, above); `horae doctor`
-  does not report one configured for the process runtime yet (`horae plugin audit` does).
-- `horae doctor` does not check the container prerequisites yet; the first run reports them.
+  reports one configured for the process runtime (#194), as `horae plugin audit` does
+  (`runtime_not_container`).
+- `horae doctor` checks that a local Docker engine is usable when a plugin runs in a container
+  (the CLI, a local `unix://` endpoint, a daemon that answers; nothing is started or pulled, and
+  the image is not checked). It does not check the image, the mounts or the egress network: the
+  first run reports them.
