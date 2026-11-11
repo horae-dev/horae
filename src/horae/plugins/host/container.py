@@ -142,9 +142,17 @@ def launcher_source(
     container's cgroup, when the plugin dies: a plugin killed by `SIGKILL` while the cgroup's
     `memory.events` `oom_kill` count went up makes it exit `OOM_EXIT` (#188). Any other end is
     passed on as the plugin's own status (`128 + signal` for a signal), but an exit with
-    `OOM_EXIT` itself, which becomes 1: only the launcher reports a memory kill."""
+    `OOM_EXIT` itself, which becomes 1: only the launcher reports a memory kill. It makes
+    itself non-dumpable first (`prctl(PR_SET_DUMPABLE, 0)`), so that the plugin, its child with
+    the same uid, can neither ptrace it (and forge that status) nor read its memory; the
+    plugin's own `execve` makes it dumpable again, as before."""
     return f"""\
 import json, os, signal, sys
+try:  # PR_SET_DUMPABLE 0: the plugin (same uid) cannot ptrace or read this process (#193)
+    import ctypes
+    ctypes.CDLL(None, use_errno=True).prctl(4, 0, 0, 0, 0)
+except (ImportError, OSError, AttributeError):
+    pass  # best effort: a start never fails for it (its execve makes the plugin dumpable)
 def fail(message):
     os.write(2, b"horae-launch: " + message.encode() + b"\\n")
     os._exit(70)
