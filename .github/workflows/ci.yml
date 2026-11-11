@@ -282,6 +282,27 @@ jobs:
             fi
             grep -q "required variable ${name} is missing a value" "${RUNNER_TEMP}/err.txt"
           done
+      # The template proposed upstream to Coolify (#59). Its consistency with the compose file
+      # above (same image, same required variables, the header fields Coolify requires) is
+      # tested by tests/test_deploy_templates.py.
+      - name: Coolify upstream template, with sample settings, and without each required one
+        working-directory: deploy/coolify/upstream
+        env:
+          HORAE_ANTHROPIC_API_KEY: placeholder-not-a-key
+          HORAE_MONITOR_DAILY_BRIEF_URL: https://kuma.example.test/api/push/placeholder1
+          HORAE_MONITOR_REMIND_URL: https://kuma.example.test/api/push/placeholder2
+          HORAE_SSO_FORWARD_AUTH_URL: http://sso.example.test:9000/auth/traefik
+        run: |
+          set -euo pipefail
+          docker compose -f horae.yaml config --quiet
+          for name in HORAE_ANTHROPIC_API_KEY HORAE_MONITOR_DAILY_BRIEF_URL \
+                      HORAE_MONITOR_REMIND_URL HORAE_SSO_FORWARD_AUTH_URL; do
+            if env -u "${name}" docker compose -f horae.yaml config --quiet 2> "${RUNNER_TEMP}/err.txt"; then
+              echo "::error::upstream template rendered without ${name}"
+              exit 1
+            fi
+            grep -q "required variable ${name} is missing a value" "${RUNNER_TEMP}/err.txt"
+          done
 
   # The docs site (mkdocs.yml). --strict fails on a broken link or anchor, and the CLI reference
   # is generated from the Typer app, so a command whose help cannot be rendered fails here too.

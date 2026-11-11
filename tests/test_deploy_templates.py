@@ -36,6 +36,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 COOLIFY = ROOT / "deploy" / "coolify" / "docker-compose.yaml"
+UPSTREAM = ROOT / "deploy" / "coolify" / "upstream" / "horae.yaml"
 COMPOSE = ROOT / "deploy" / "compose" / "docker-compose.yaml"
 TRAEFIK = ROOT / "deploy" / "compose" / "traefik.yaml"
 ENV_EXAMPLE = ROOT / "deploy" / "compose" / ".env.example"
@@ -860,6 +861,112 @@ def test_coolify_header_names_the_port() -> None:
     header = COOLIFY.read_text(encoding="utf-8").split("services:", 1)[0]
     assert "# port: 8080" in header
     assert "# documentation: " in header
+
+
+# --- the template proposed to Coolify (deploy/coolify/upstream/horae.yaml, #59) ---------------
+
+_REQUIRED = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*):\?\}")
+
+
+def _required_variables(path: Path) -> set[str]:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    code = "\n".join(line for line in lines if not line.lstrip().startswith("#"))
+    return set(_REQUIRED.findall(code))
+
+
+def _upstream_header() -> dict[str, str]:
+    header: dict[str, str] = {}
+    for line in UPSTREAM.read_text(encoding="utf-8").split("services:", 1)[0].splitlines():
+        match = re.fullmatch(r"# ([a-z]+): (.+)", line)
+        if match:
+            header[match.group(1)] = match.group(2).strip()
+    return header
+
+
+def test_upstream_header_has_the_fields_coolify_requires() -> None:
+    # Coolify's metadata (docs: "Add a new service template"): documentation, slogan, category,
+    # tags, logo, port. `minversion` is optional (its generator defaults it to 0.0.0).
+    header = _upstream_header()
+    for field in ("documentation", "slogan", "category", "tags", "logo", "port"):
+        assert header.get(field), field
+    assert header["documentation"].startswith("https://")
+    assert re.fullmatch(r"[a-z]+", header["category"]), "one broad word"
+    assert len([t for t in header["tags"].split(",") if t.strip()]) >= 2
+    assert header["logo"] == "svgs/horae.svg"  # the file name Coolify's repository expects
+    assert header["port"] == "8080"
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert "EXPOSE 8080" in dockerfile
+
+
+def test_upstream_uses_the_same_pinned_image_as_the_coolify_compose() -> None:
+    data = load(UPSTREAM)
+    default = re.fullmatch(
+        r"ghcr\.io/horae-dev/horae:\$\{HORAE_IMAGE_TAG:-([\w.-]+)\}", load(COOLIFY)["x-horae-image"]
+    )
+    assert default
+    expected = f"ghcr.io/horae-dev/horae:{default.group(1)}"
+    assert default.group(1) not in {"latest", "edge"}
+    for name, service in data["services"].items():
+        assert service["image"] == expected, name
+
+
+def test_upstream_keeps_the_required_variables_of_the_coolify_compose() -> None:
+    ours = _required_variables(COOLIFY)
+    theirs = _required_variables(UPSTREAM)
+    # The public host is Coolify's generated domain there (SERVICE_FQDN_HORAE_8080).
+    assert ours - {"HORAE_PUBLIC_HOST"} <= theirs, ours - theirs
+    # What the upstream template adds: the SSO address (the API has no authentication).
+    assert theirs - ours == {"HORAE_SSO_FORWARD_AUTH_URL"}, theirs - ours
+    # No required variable carries text after `:?` (Coolify would store it as the value).
+    assert not re.search(r"\$\{[A-Za-z_]+:\?[^}]", UPSTREAM.read_text(encoding="utf-8"))
+    # Every other variable Horae's service reads is still read, with the same default.
+    env_ours = env_of(load(COOLIFY)["services"]["horae"])
+    env_theirs = env_of(load(UPSTREAM)["services"]["horae"])
+    assert set(env_ours) - {"HORAE_ALLOWED_HOSTS"} <= set(env_theirs)
+    for key in set(env_ours) - {"HORAE_ALLOWED_HOSTS"}:
+        assert env_ours[key] == env_theirs[key], key
+    assert env_theirs["HORAE_ALLOWED_HOSTS"] == "${SERVICE_FQDN_HORAE}"
+    assert "SERVICE_FQDN_HORAE_8080" in env_theirs
+
+
+def test_upstream_keeps_the_security_defaults() -> None:
+    text = UPSTREAM.read_text(encoding="utf-8")
+    data = load(UPSTREAM)
+    assert "docker.sock" not in text.replace("Docker socket", "")
+    assert set(data["services"]) == {"horae-init", "horae"}
+    for name, service in data["services"].items():
+        for key in ("container_name", "ports", "networks", "privileged", "cap_add"):
+            assert key not in service, (name, key)
+        assert service["read_only"] is True, name
+        assert service["cap_drop"] == ["ALL"], name
+        assert "no-new-privileges:true" in service["security_opt"], name
+        assert str(service["user"]).split(":", 1)[0] not in {"0", "root", ""}, name
+        assert service["volumes"] == ["horae-instance:/instance"], name
+    horae = data["services"]["horae"]
+    assert "healthcheck" in horae
+    assert "/healthz" in " ".join(horae["healthcheck"]["test"])
+    assert data["services"]["horae-init"]["restart"] == "no"
+    # The API has no authentication of its own: SSO is the forwardAuth middleware by label.
+    labels = labels_of(horae)
+    prefix = "traefik.http.middlewares.horae-sso-${SERVICE_USER_HORAE}.forwardauth."
+    assert labels[prefix + "trustForwardHeader"] == "false"
+    assert labels[prefix + "address"] == "${HORAE_SSO_FORWARD_AUTH_URL:?}"  # unset: no deployment
+    assert "SERVICE_USER_HORAE" in env_of(horae)  # makes Coolify generate the per-service suffix
+    # Coolify attaches the name of every `traefik.http.middlewares.<name>.*` label to EVERY router
+    # it generates (http and https; bootstrap/helpers/docker.php, fqdnLabelsForTraefik). The
+    # template therefore declares no router of its own (one could be served without SSO), and
+    # exactly one middleware, the SSO one, so every router Coolify generates carries it.
+    names = {
+        m.group(1)
+        for label in labels
+        if (m := re.match(r"traefik\.http\.middlewares\.(.*?)(\.|$)", label))
+    }
+    assert names == {"horae-sso-${SERVICE_USER_HORAE}"}, names
+    assert not [label for label in labels if label.startswith("traefik.http.routers.")]
+    assert all(label.startswith("traefik.http.middlewares.") for label in labels)
+    assert "docs/operations/plugin-containers.md" in text  # the Docker-engine note
+    # Horae's service reads its configuration as the Coolify compose does.
+    assert env_of(horae)["HORAE_SCHEDULER"] == "${HORAE_SCHEDULER:-external}"
 
 
 # --- both files ------------------------------------------------------------------------------

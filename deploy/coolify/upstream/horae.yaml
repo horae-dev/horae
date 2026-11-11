@@ -1,0 +1,94 @@
+# documentation: https://github.com/horae-dev/horae/blob/main/docs/operations/coolify.md
+# slogan: Horae, a predictable self-hosted personal agent (scheduler and read-only HTTP API).
+# category: automation
+# tags: horae,agent,assistant,scheduler,automation,obsidian
+# logo: svgs/horae.svg
+# port: 8080
+#
+# Horae one-click service for Coolify (submitted from deploy/coolify/upstream/ of
+# https://github.com/horae-dev/horae; keep it in step with deploy/coolify/docker-compose.yaml,
+# which tests/test_deploy_templates.py checks). Install guide, prerequisites and what to verify:
+# the documentation link above.
+#
+#   - The API has NO authentication of its own and is read-only. Put it behind an SSO forwardAuth
+#     (HORAE_SSO_FORWARD_AUTH_URL, required: the deployment is blocked until it is set). Coolify
+#     attaches the name of EVERY traefik.http.middlewares.<name>.* label of the service to every
+#     router it generates for the domain (http and https; fqdnLabelsForTraefik in Coolify's
+#     bootstrap/helpers/docker.php), so the middleware below needs no router label of its own:
+#     this template declares none, and a router of Coolify's has no way to be served without it.
+#     Its name carries SERVICE_USER_HORAE (generated per service) so that two Horae stacks on one
+#     server never share or overwrite one. Do not remove it, and do not publish the domain
+#     without it.
+#   - Horae has no Docker socket here, on purpose: a socket mount makes a Horae compromise root
+#     on the server. Plugins that run in containers (`runtime: container`) need a Docker engine
+#     and are NOT available in this template; the options and their risks are in
+#     docs/operations/plugin-containers.md of the Horae repository (linked from the
+#     documentation page above).
+#   - Keep "Connect to predefined network" off: every container on a shared network can call
+#     port 8080 without SSO.
+#   - The one-off `horae-init` creates the example instance (`horae init`) in a new, empty
+#     volume, then exits. An instance already there is left alone.
+#   - Coolify injects every variable of the resource into every service, so `horae-init` receives
+#     the secrets too (same image and user; it runs only `horae init` and exits).
+
+services:
+  horae-init:
+    image: ghcr.io/horae-dev/horae:sha-aadf1e0
+    entrypoint: ["sh", "-c"]
+    command: ["test -e /instance/horae.yaml || exec horae init /instance"]
+    # A one-off: it must not be restarted, and stays out of the stack's health.
+    restart: "no"
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      - "/tmp:size=64m,noexec,nosuid,nodev"
+    pids_limit: 256
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
+    volumes:
+      - horae-instance:/instance
+
+  horae:
+    image: ghcr.io/horae-dev/horae:sha-aadf1e0
+    depends_on:
+      horae-init:
+        condition: service_completed_successfully
+    environment:
+      - SERVICE_FQDN_HORAE_8080
+      - SERVICE_USER_HORAE
+      - HORAE_ALLOWED_HOSTS=${SERVICE_FQDN_HORAE}
+      - HORAE_SCHEDULER=${HORAE_SCHEDULER:-external}
+      - HORAE_ANTHROPIC_API_KEY=${HORAE_ANTHROPIC_API_KEY:?}
+      - HORAE_MONITOR_DAILY_BRIEF_URL=${HORAE_MONITOR_DAILY_BRIEF_URL:?}
+      - HORAE_MONITOR_REMIND_URL=${HORAE_MONITOR_REMIND_URL:?}
+      - HORAE_SSO_FORWARD_AUTH_URL=${HORAE_SSO_FORWARD_AUTH_URL:?}
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      - "/tmp:size=64m,noexec,nosuid,nodev"
+    pids_limit: 256
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
+    stop_grace_period: 30s
+    volumes:
+      - horae-instance:/instance
+    labels:
+      - "traefik.http.middlewares.horae-sso-${SERVICE_USER_HORAE}.forwardauth.address=${HORAE_SSO_FORWARD_AUTH_URL:?}"
+      - "traefik.http.middlewares.horae-sso-${SERVICE_USER_HORAE}.forwardauth.trustForwardHeader=false"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request as u; u.build_opener(u.ProxyHandler({})).open('http://127.0.0.1:8080/healthz', timeout=5)"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  horae-instance:

@@ -208,7 +208,10 @@ urgent:
 
 1. Verify the signature of the new tag's digest (above).
 2. Replace the tag in both `x-horae-image` lines (the same value; once releases exist, the
-   release tag `X.Y.Z`).
+   release tag `X.Y.Z`), and in the two `image:` lines of
+   [`deploy/coolify/upstream/horae.yaml`](../../deploy/coolify/upstream/horae.yaml) (the template
+   proposed to Coolify; a test checks it names the same image). If it was already merged
+   upstream, a new upstream pull request carries the bump.
 3. `uv run pytest tests/test_deploy_templates.py` (it checks both files carry one, identical,
    default) and commit.
 
