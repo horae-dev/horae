@@ -89,6 +89,65 @@ def test_without_a_src_directory_the_pth_names_the_tree_root(tmp_path: Path) -> 
     assert pth.read_text(encoding="utf-8") == f"{CONTAINER_ROOT}\n"
 
 
+@needs_uv
+def test_a_local_path_dependency_is_refused_and_never_built(tmp_path: Path) -> None:
+    """A dependency from the plugin's own tree (`tool.uv.sources` path) whose `setup.py` would
+    write a marker: refused before uv runs, the marker never written."""
+    index = local_index(tmp_path / "index")
+    marker = tmp_path / "BUILT"
+    root = tmp_path / "repo"
+    files = venv_plugin_files("alpha", "1.0.0", "1.0.0")
+    files["pyproject.toml"] = pyproject("alpha", "1.0.0", ["localdep"], build=SETUPTOOLS) + (
+        '\n[tool.uv.sources]\nlocaldep = { path = "localdep" }\n'
+    )
+    files["localdep/pyproject.toml"] = pyproject("localdep", "1.0.0", [], build=SETUPTOOLS)
+    files["localdep/setup.py"] = f"open({str(marker)!r}, 'w').close()\n"
+    files["localdep/src/localdep/__init__.py"] = ""
+    root.mkdir()
+    for path, text in files.items():
+        (root / path).parent.mkdir(parents=True, exist_ok=True)
+        (root / path).write_text(text, encoding="utf-8")
+    lock(root, index, tmp_path / "lock-cache")
+    assert not marker.exists()
+    files["uv.lock"] = (root / "uv.lock").read_text(encoding="utf-8")
+    manifest = files.pop("plugin.yaml")
+    repo, sha = plugin_repo(root, name="alpha", manifest=manifest, files=files, tag=None)
+    environment = PluginEnvironment(tmp_path / "uv-cache", index_url=index, install_project=False)
+    with pytest.raises(InstallRefused, match=r"tool\.uv\.sources\.localdep"):
+        LocalInstaller(tmp_path / "plugins", {URL: repo}).install_commit(
+            URL, sha, prepare=environment
+        )
+    assert not marker.exists()
+    assert not (tmp_path / "plugins" / "alpha").exists()
+
+
+@pytest.mark.parametrize(
+    ("extra", "why"),
+    [
+        ('[tool.uv.workspace]\nmembers = ["pkg/*"]\n', "workspace"),
+        ('[tool.uv.sources]\ntinydep = { git = "https://git.example.test/t" }\n', "sources"),
+        ('[tool.uv.sources]\ntinydep = { url = "https://example.test/t.whl" }\n', "sources"),
+        ("[tool.uv.sources]\ntinydep = { workspace = true }\n", "sources"),
+        ('[dependency-groups]\nlocal = ["localdep @ file:///srv/localdep"]\n', "direct"),
+    ],
+)
+def test_whatever_uv_would_build_is_refused_for_a_third_party_plugin(
+    tmp_path: Path, extra: str, why: str
+) -> None:
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    text = pyproject("alpha", "1.0.0", ["tinydep==1.0.0"], build=SETUPTOOLS) + "\n" + extra
+    (tree / "pyproject.toml").write_text(text, encoding="utf-8")
+    with pytest.raises(InstallRefused, match=why):
+        check_project(tree, "alpha", builds=False)
+    assert check_project(tree, "alpha") == "alpha"  # first-party: checked as before
+    index_only = pyproject("alpha", "1.0.0", ["tinydep"], build=SETUPTOOLS)
+    (tree / "pyproject.toml").write_text(
+        index_only + '\n[tool.uv.sources]\ntinydep = { index = "mine" }\n', encoding="utf-8"
+    )
+    assert check_project(tree, "alpha", builds=False) == "alpha"
+
+
 def test_the_pth_names_the_container_mount() -> None:
     assert CONTAINER_ROOT == PLUGIN_MOUNT
 

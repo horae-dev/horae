@@ -60,9 +60,13 @@ build hook, `pdm_build.py`) on the host, outside any container. Then:
 
 - `check_project` also refuses `dynamic` in `[project]` (uv would call the backend for the
   metadata, even with `--no-install-project`) and keeps refusing `backend-path`;
-- `uv sync --locked --no-dev --no-install-project --no-build-package=<each dependency>`: the
-  dependencies only, from their hashed wheels; the lock is still checked against a static
-  `pyproject.toml`;
+- also refused: a uv workspace, a `tool.uv.sources` entry that is not an index (path, git,
+  url, workspace, editable), a direct reference (`name @ ...`) in the dependencies, optional
+  dependencies or dependency groups; and, as for every plugin, a lock entry that is not a
+  hashed index or URL package (path, git, directory, editable, virtual), but the root project;
+- `uv sync --locked --no-dev --no-install-project --no-build --no-build-package=<each
+  dependency>`: the dependencies only, from their hashed wheels, uv refusing to build anything
+  at all; the lock is still checked against a static `pyproject.toml`;
 - Horae writes `site-packages/_horae_plugin.pth` (`PTH_FILE`) into the venv, naming the
   project's source directory **as the container sees it** (`CONTAINER_ROOT`, the plugin's
   mount): `/plugin/src` when the tree has a real `src/` directory (not a symlink), else
@@ -171,12 +175,8 @@ def check_project(tree: Path, plugin: str, *, builds: bool = True) -> str:
     name = project.get("name")
     if not isinstance(name, str) or not name:
         raise InstallRefused(f"plugin {plugin}: {PROJECT_FILE} has no [project] name")
-    if not builds and project.get("dynamic"):
-        raise InstallRefused(
-            f"plugin {plugin}: [project] dynamic metadata is refused for a plugin that is not "
-            "first-party: uv would run its build backend to compute it; declare every field "
-            "statically"
-        )
+    if not builds:
+        _check_nothing_to_build(data, project, plugin)
     if _table(_table(data, "tool"), "uv").get("package") is False:
         raise InstallRefused(
             f"plugin {plugin}: tool.uv.package = false (a virtual project) is not installable"
@@ -202,6 +202,56 @@ def check_project(tree: Path, plugin: str, *, builds: bool = True) -> str:
                 f"{', '.join(sorted(allowed_names))}, not {requirement!r}"
             )
     return name
+
+
+_SOURCE_KEYS = frozenset({"index", "marker", "extra", "group"})
+"""What a `tool.uv.sources` entry may say for a plugin that is not first-party: which index,
+for which marker, extra or group. Never `path`, `git`, `url`, `workspace` or `editable`."""
+
+
+def _requirements(data: dict[str, Any], project: dict[str, Any]) -> list[Any]:
+    found: list[Any] = list(project.get("dependencies") or [])
+    optional = project.get("optional-dependencies")
+    for group in (optional or {}).values() if isinstance(optional, dict) else ():
+        found.extend(group if isinstance(group, list) else [group])
+    groups = data.get("dependency-groups")
+    for group in (groups or {}).values() if isinstance(groups, dict) else ():
+        found.extend(group if isinstance(group, list) else [group])
+    return found
+
+
+def _check_nothing_to_build(data: dict[str, Any], project: dict[str, Any], plugin: str) -> None:
+    """For a plugin that is not first-party (#191): refuse what would make uv build or call a
+    backend despite `--no-install-project --no-build` (decision 79 H)."""
+    refused = (
+        f"plugin {plugin}: refused for a plugin that is not first-party (its code is never "
+        "built on the host):"
+    )
+    if project.get("dynamic"):
+        raise InstallRefused(
+            f"{refused} [project] dynamic metadata (uv would run the build backend to compute "
+            "it); declare every field statically"
+        )
+    uv = _table(_table(data, "tool"), "uv")
+    if "workspace" in uv:
+        raise InstallRefused(f"{refused} a uv workspace (tool.uv.workspace)")
+    sources = uv.get("sources", {})
+    for name, entries in sources.items() if isinstance(sources, dict) else [("?", sources)]:
+        for entry in entries if isinstance(entries, list) else [entries]:
+            if not isinstance(entry, dict) or set(entry) - _SOURCE_KEYS:
+                raise InstallRefused(
+                    f"{refused} tool.uv.sources.{name} is not an index source (a path, git, url "
+                    "or workspace source would be built)"
+                )
+    for requirement in _requirements(data, project):
+        if isinstance(requirement, dict):
+            if set(requirement) != {"include-group"}:
+                raise InstallRefused(f"{refused} a dependency group entry {requirement!r}")
+        elif not isinstance(requirement, str) or "@" in requirement.split(";", 1)[0]:
+            raise InstallRefused(
+                f"{refused} the direct reference {requirement!r} (a local or remote project "
+                "would be built)"
+            )
 
 
 def check_module_command(manifest: PluginManifest) -> None:
@@ -386,7 +436,12 @@ class PluginEnvironment:
                 watch,
             )
             sync = ["sync", "--locked", "--no-dev"]
-            sync.append("--no-editable" if self.install_project else "--no-install-project")
+            # #191: nothing at all is built for a plugin that is not first-party.
+            sync += (
+                ["--no-editable"]
+                if self.install_project
+                else ["--no-install-project", "--no-build"]
+            )
             self._run(
                 plugin,
                 [uv, *sync, "--python", str(venv / "bin" / "python")],

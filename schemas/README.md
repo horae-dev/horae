@@ -5161,12 +5161,16 @@ loosened later without breaking a valid file.
       for first-party code, arbitrary code execution outside the container for anything else.
       So `PluginEnvironment(install_project=False)` (chosen by `cli_plugin.environment_for`
       for every plugin that is not first-party, at `add` and `upgrade`): `uv sync --locked
-      --no-dev --no-install-project --no-build-package=<each dependency>` installs the
-      dependencies only, from their hashed wheels, and never builds the project.
-      `check_project` also refuses `[project] dynamic` (verified: with dynamic metadata uv
-      calls the backend even with `--no-install-project`); `backend-path` stays refused, and
-      the lock must still list no in-tree package but the project (no workspace member, no
-      path source). Horae then writes `site-packages/_horae_plugin.pth` (created exclusively,
+      --no-dev --no-install-project --no-build --no-build-package=<each dependency>` installs
+      the dependencies only, from their hashed wheels, and uv refuses to build anything at all.
+      `check_project` also refuses, before uv runs, `[project] dynamic` (verified: with dynamic
+      metadata uv calls the backend even with `--no-install-project`), a `tool.uv.workspace`,
+      any `tool.uv.sources` entry that is not an index (path, git, url, workspace, editable),
+      and a direct reference (`name @ ...`) in the dependencies, optional dependencies or
+      dependency groups; `backend-path` stays refused, and the lock must still list nothing
+      but hashed index or URL packages besides the root project (`check_lock`: path, git,
+      directory, editable and virtual sources refused). Tested with a path dependency whose
+      `setup.py` would write a marker: refused, never written. Horae then writes `site-packages/_horae_plugin.pth` (created exclusively,
       a dependency shipping that name is refused) naming `/plugin/src` when the tree has a
       real `src/` directory (`lstat`, never through a symlink), else `/plugin`: the path the
       container sees (the plugin's mount, decision 74 C), which is the only place such a
