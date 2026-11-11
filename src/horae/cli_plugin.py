@@ -6,7 +6,8 @@
 All read the marketplace indexes of `horae.yaml` (`marketplaces`, highest priority first),
 refreshing each into the instance's cache (`<state_dir>/marketplaces`) unless `--offline`.
 When an index cannot be refreshed its cached copy is used, with a warning on stderr. `add`
-then refuses a plugin whose tier is not `first-party` (before M5), installs the resolved
+then refuses a plugin that is not first-party unless its effective runtime in `horae.yaml` is
+`container` (#191, schemas decision 79), installs the resolved
 commit into `<instance>/plugins/<name>` (`horae.marketplace.install`, schemas decision 62)
 with its own venv built from its committed `uv.lock` (`horae.marketplace.environment`,
 decision 69; uv's cache is `<state_dir>/uv-cache`), shows the permissions its manifest asks
@@ -17,8 +18,10 @@ pack's `pipelines/*.yaml` are then validated and copied to `<instance>/pipelines
 (`horae.marketplace.pipelines`, decision 72); any invalid file refuses the whole install.
 
 A direct install (a git URL pinned to a full commit SHA, `horae.marketplace.direct`) reads no
-marketplace and has no tier: before M5 it is refused before anything is fetched
-(`require_installable`, docs/security.md T04). Behind that gate it installs the commit only
+marketplace and has no tier, so it is not first-party: it installs only when `horae.yaml` runs
+it with `runtime: container` (`require_installable`, docs/security.md T04), refused before
+anything is fetched when no plugin can run in a container, and once its `plugin.yaml` names it
+otherwise. It installs the commit only
 when the repository's own branches or tags reach it (`PluginInstaller.install_commit`, the
 same hardening) and goes through the same approval, venv
 and `horae.lock` entry (its repo and commit), with `--yes` only for an identical entry.
@@ -34,6 +37,7 @@ is never rewritten. With `--json` the report carries `warnings`; an error is
 {schema_version, error}.
 """
 
+import dataclasses
 import shutil
 import sys
 from collections.abc import Callable
@@ -60,7 +64,8 @@ from horae.cli_output import (
     safe,
 )
 from horae.config import Instance
-from horae.contracts.lockfile import LockedPlugin, Lockfile
+from horae.contracts.instance import InstanceConfig
+from horae.contracts.lockfile import LockedPlugin, Lockfile, Tier
 from horae.contracts.plugin import PluginManifest
 from horae.marketplace import (
     AlreadyInstalled,
@@ -87,14 +92,19 @@ from horae.marketplace import (
     search,
 )
 from horae.marketplace.approval import (
+    container_only,
     describe,
+    describe_origin,
+    first_party,
     lock_mismatch,
+    origin,
     parse_grants,
     recorded_grants,
     require_installable,
     with_grants,
 )
 from horae.marketplace.direct import is_direct, parse_direct
+from horae.marketplace.environment import check_module_command
 from horae.marketplace.errors import DowngradeRefused, NotInstalled, PluginEnabled
 from horae.marketplace.lock import LOCK_FILE, guard, lock_is, read_lock, write_lock
 from horae.marketplace.pipelines import PackPipelines
@@ -162,6 +172,15 @@ def make_installer(directory: Path) -> PluginInstaller:
 def make_environment(cache_dir: Path) -> Prepare | None:
     """What builds the plugin's venv (#45). Tests replace this."""
     return PluginEnvironment(cache_dir)
+
+
+def environment_for(cache_dir: Path, tier: Tier | None, index: str | None) -> Prepare | None:
+    """`make_environment`, without the build of the plugin's own project for a plugin that is
+    not first-party (#191): its build backend would run plugin code on the host."""
+    environment = make_environment(cache_dir)
+    if isinstance(environment, PluginEnvironment) and not first_party(tier, index):
+        return dataclasses.replace(environment, install_project=False)
+    return environment
 
 
 PENDING = (
@@ -248,7 +267,8 @@ class _Approval:
     it approved (interactively, or by `--yes` against `horae.lock`), before the tree is moved
     into place. A refusal raises `ApprovalRefused`, so nothing is installed. The name and
     version are the manifest's (the installer has checked them against what was resolved);
-    `repo` and `sha` are what is being installed."""
+    `repo` and `sha` are what is being installed; `tier` and `index` what resolved it (`None`
+    for a direct install), shown with the runtime `config` gives the plugin (#191)."""
 
     def __init__(
         self,
@@ -259,11 +279,16 @@ class _Approval:
         *,
         yes: bool,
         json_output: bool,
+        config: InstanceConfig,
         pipelines: PackPipelines | None = None,
         source: str | None = None,
+        tier: Tier | None = None,
+        index: str | None = None,
     ) -> None:
         self.pipelines = pipelines
         self.source = source
+        self.config = config
+        self.tier, self.index = tier, index
         self.lock = lock
         self.repo = repo
         self.sha = sha
@@ -275,6 +300,8 @@ class _Approval:
     def __call__(self, _tree: Path, manifest: PluginManifest) -> None:
         name, version = manifest.name, manifest.version
         granted = with_grants(manifest.permissions, self.hosts, self.local)
+        direct = self.source == "direct"
+        tier, index = (None, None) if direct else origin(self.tier, self.index)
         wanted = LockedPlugin(
             version=version,
             repo=self.repo,
@@ -283,10 +310,15 @@ class _Approval:
             personal_fields=manifest.provides.personal_fields,
             pipelines=self.pipelines.digests if self.pipelines is not None else {},
             user_grants=recorded_grants(self.hosts, self.local),
-            source="direct" if self.source == "direct" else None,
+            source="direct" if direct else None,
+            tier=tier,
+            index=index,
         )
         existing = self.lock.plugins.get(name)
         err = self.json_output
+        runtime = self.config.plugin_runtime(name)
+        for line in describe_origin(self.tier, self.index, self.repo, runtime=runtime):
+            echo(safe(line), err=err)
         for line in describe(
             name,
             version,
@@ -323,6 +355,34 @@ class _Approval:
         self.entry = wanted
 
 
+def runtime_gate(config: InstanceConfig, tier: Tier | None, index: str | None) -> Prepare:
+    """A `prepare` step run first, once the verified manifest names the plugin: the install
+    gate (`require_installable`) with the runtime `horae.yaml` gives that name (#191). For a
+    direct install this is the first point the name is known."""
+
+    def check(_tree: Path, manifest: PluginManifest) -> None:
+        name = manifest.name
+        require_installable(name, tier, index, runtime=config.plugin_runtime(name))
+        if not first_party(tier, index):
+            check_module_command(manifest)  # installed without its build: no console script
+
+    return check
+
+
+def require_direct_possible(config: InstanceConfig) -> None:
+    """Before anything is fetched for a direct install (its name is not known yet): refuse
+    when `horae.yaml` runs no plugin in a container, since a direct install can only run
+    there (#191)."""
+    defaults = config.plugin_defaults.runtime
+    if defaults == "container" or any(p.runtime == "container" for p in config.plugins.values()):
+        return
+    raise TierRefused(
+        "refusing a direct install: it is not first-party (no marketplace tier), and horae.yaml "
+        "runs every plugin with the process runtime, which has no isolation (docs/security.md "
+        "T04); " + container_only("<its name>")
+    )
+
+
 Install = Callable[[PluginInstaller, Prepare], Installed]
 """How `add` installs, given the installer and the `prepare` chain: at a marketplace pin
 (`install`), or a direct commit (`install_commit`, #48)."""
@@ -339,9 +399,13 @@ def _install_and_lock(
     yes: bool,
     json_output: bool,
     source: str = "marketplace",
+    tier: Tier | None = None,
+    index: str | None = None,
 ) -> tuple[Installed, LockedPlugin, list[str]]:
-    """Under the lock guard: install with approval then the venv (`_chain`) as `prepare`,
-    and write the approved entry to `horae.lock`. Raises `MarketplaceError`."""
+    """Under the lock guard: install with the runtime gate, the approval then the venv
+    (`_chain`) as `prepare`, and write the approved entry to `horae.lock`. Raises
+    `MarketplaceError`."""
+    config = loaded_instance.config
     lock_path = instance / LOCK_FILE
     with guard(loaded_instance.state_dir):
         lock, header = read_lock(lock_path)
@@ -353,15 +417,19 @@ def _install_and_lock(
             grants,
             yes=yes,
             json_output=json_output,
+            config=config,
             pipelines=pipelines,
             source=source,
+            tier=tier,
+            index=index,
         )
         installed = install(
             make_installer(plugins_dir(instance)),
             _chain(
+                runtime_gate(config, tier, index),  # before anything else reads the tree
                 pipelines,  # checked first: the approval shows what it found
                 approval,
-                make_environment(loaded_instance.state_dir / UV_CACHE_DIR),
+                environment_for(loaded_instance.state_dir / UV_CACHE_DIR, tier, index),
             ),
         )
         entry = approval.entry
@@ -407,8 +475,11 @@ def _report(
     index: str | None,
     warnings: list[str],
     json_output: bool,
+    config: InstanceConfig,
 ) -> int:
     where = f"{PLUGINS_DIR}/{installed.name}"
+    runtime = config.plugin_runtime(installed.name)
+    enabled = installed.name in config.plugins
     if json_output:
         echo_json(
             {
@@ -416,11 +487,13 @@ def _report(
                 **installed.record(),
                 "tier": tier,
                 "index": index,
+                "first_party": entry.first_party,
+                "runtime": runtime,
                 "path": where,
                 "pipelines": paths,
                 "permissions": entry.model_dump(mode="json")["permissions"],
                 "approved": True,
-                "enabled": False,
+                "enabled": enabled,
                 "pending": [],
                 "warnings": warnings,
             }
@@ -432,7 +505,11 @@ def _report(
         echo(f"  commit  {installed.commit} (direct install, pinned by its SHA)")
     else:
         echo(f"  commit  {installed.commit} (tag v{installed.version} points to it)")
-        echo(f"  tier    {tier}")
+        echo(f"  tier    {tier}" + ("" if entry.first_party else f" (index {index})"))
+    if entry.first_party:
+        echo(f"  runtime {runtime}")
+    else:
+        echo(f"  runtime {runtime} (not first-party: it is refused under the process runtime)")
     for path in paths:
         echo(f"  pipeline  {path}")
     echo(PENDING)
@@ -466,11 +543,12 @@ def _add(
         raise _failed(exc) from None
     if direct:
         return _add_direct(instance, repo, sha, grants, yes=yes, json_output=json_output)
-    loaded_instance = load(instance)
+    loaded_instance = load(instance, installing=True)
     config, loaded = _load_indexes(loaded_instance, offline)
     try:
         found = resolve(ref, loaded.indexes, pins=config.marketplace_pins, allow_prerelease=pre)
-        require_installable(found.name, found.tier, found.index)
+        runtime = loaded_instance.config.plugin_runtime(found.name)
+        require_installable(found.name, found.tier, found.index, runtime=runtime)
         installed, entry, paths = _install_and_lock(
             loaded_instance,
             instance,
@@ -488,11 +566,20 @@ def _add(
             ),
             yes=yes,
             json_output=json_output,
+            tier=found.tier,
+            index=found.index,
         )
     except MarketplaceError as exc:
         raise _failed(exc) from None
     return _report(
-        installed, entry, paths, found.tier, found.index, list(loaded.warnings), json_output
+        installed,
+        entry,
+        paths,
+        found.tier,
+        found.index,
+        list(loaded.warnings),
+        json_output,
+        loaded_instance.config,
     )
 
 
@@ -505,12 +592,13 @@ def _add_direct(
     yes: bool,
     json_output: bool,
 ) -> int:
-    """A direct install from a git URL (#48): no marketplace is read. Refused before M5
-    (`require_installable` with no tier, docs/security.md T04) before anything is fetched;
-    otherwise the same approval, venv and `horae.lock` as a marketplace install."""
-    loaded_instance = load(instance)
+    """A direct install from a git URL (#48): no marketplace is read. Not first-party, so only
+    with `runtime: container` (#191): refused before anything is fetched when `horae.yaml` runs
+    no plugin in a container, and by `runtime_gate` once the manifest names it; otherwise the
+    same approval, venv and `horae.lock` as a marketplace install."""
+    loaded_instance = load(instance, installing=True)
     try:
-        require_installable(repo, None, None)
+        require_direct_possible(loaded_instance.config)
         installed, entry, paths = _install_and_lock(
             loaded_instance,
             instance,
@@ -524,7 +612,7 @@ def _add_direct(
         )
     except MarketplaceError as exc:
         raise _failed(exc) from None
-    return _report(installed, entry, paths, None, None, [], json_output)
+    return _report(installed, entry, paths, None, None, [], json_output, loaded_instance.config)
 
 
 def _search(instance: Path, query: str, offline: bool, json_output: bool) -> int:
@@ -588,7 +676,7 @@ def add_command(
         typer.Argument(
             metavar="NAME[@VERSION] | URL@SHA",
             help="Plugin to install: a marketplace name, or an https git URL pinned to a full "
-            "commit SHA (a direct install, refused before M5).",
+            "commit SHA (a direct install, only with runtime: container).",
         ),
     ],
     instance: InstanceOption = Path(),
@@ -627,9 +715,12 @@ def add_command(
     """Install a plugin at the commit its marketplace pins, approve its permissions, and pin
     it in horae.lock.
 
-    The name is resolved as `horae plugin resolve` does. Before M5 only first-party plugins
-    install. The repository is cloned over https and the pinned commit checked out; the install
-    is refused when the tag v<version> and the pinned commit disagree, or when plugin.yaml is
+    The name is resolved as `horae plugin resolve` does. A plugin that is not first-party (a
+    community tier, an index you added, or a direct install) installs only when horae.yaml runs
+    it in a container: `plugins.<name>.runtime: container` or `plugin_defaults.runtime:
+    container`, with Docker available. The repository is cloned over https and the pinned
+    commit checked out; the install is refused when the tag v<version> and the pinned commit
+    disagree, or when plugin.yaml is
     invalid or names another plugin or version. The permissions plugin.yaml asks for are then
     shown and must be approved: interactively, or with --yes when horae.lock already approves
     exactly this version, commit and permissions (without a terminal and without --yes, the
@@ -639,7 +730,7 @@ def add_command(
 
     A direct install, https://HOST/OWNER/REPO@SHA with the full commit SHA (no tag, branch or
     short SHA; no credentials, http, ssh or file URL), reads no marketplace (so --pre and
-    --offline do not apply) and is refused before M5 (no tier).
+    --offline do not apply) and, having no tier, needs runtime: container too.
 
     Exit codes: 0 installed and approved, 1 configuration problem, unreachable marketplace
     without cache, a repository that cannot be fetched, or an invalid horae.lock, 2 malformed

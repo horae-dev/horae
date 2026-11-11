@@ -33,6 +33,7 @@ from marketplace_fixtures import (
     plugin_manifest,
     plugin_repo,
     publish,
+    set_runtime,
 )
 
 runner = CliRunner()
@@ -363,16 +364,51 @@ def test_invalid_extra_grants_are_a_usage_error(
 # --- tier (threat model T04) -----------------------------------------------------------------
 
 
-def test_a_community_plugin_is_refused_before_m5(inst: Path, market: dict[str, str]) -> None:
+def test_a_community_plugin_is_refused_under_the_process_runtime(
+    inst: Path, market: dict[str, str]
+) -> None:
     before = (inst / "horae.lock").read_bytes()
     code, out, _ = _add(inst, "other", "--json", answer="y\n")
     assert code == 3
     error = _error(out)
     assert error["kind"] == "tier_refused"
     assert "'community'" in error["message"]
-    assert "M5" in error["message"]
+    assert "plugins.other.runtime: container" in error["message"]  # #191: how to enable it
+    assert "Docker" in error["message"]
     assert _nothing_installed(inst)
     assert (inst / "horae.lock").read_bytes() == before
+
+
+def test_a_community_plugin_installs_under_the_container_runtime_with_its_tier_locked(
+    inst: Path, market: dict[str, str]
+) -> None:
+    """#191: `plugins.other.runtime: container` set before the install (the loader accepts a
+    configured plugin that `add` is installing); the prompt says where it comes from and that
+    it runs in a container; the lock records its tier and index."""
+    set_runtime(inst, "container", "other")
+    code, out, err = _add(inst, "other", "--json", answer="y\n")
+    assert code == 0, out
+    for text in (
+        f"source: marketplace {COMMUNITY_URL}",
+        f"tier: community (index {A})",
+        "runs in a container (runtime: container)",
+    ):
+        assert text in err, text
+    report = _json(out)
+    assert (report["tier"], report["first_party"], report["runtime"]) == (
+        "community",
+        False,
+        "container",
+    )
+    entry_ = _lock(inst)["plugins"]["other"]
+    assert (entry_["tier"], entry_["index"]) == ("community", A)
+    assert "source" not in entry_
+    locked = Lockfile.model_validate(_lock(inst))
+    assert locked.plugins["other"].first_party is False
+    # A reproducible re-install with --yes against that entry.
+    shutil.rmtree(inst / "plugins" / "other")
+    code, out, _ = _add(inst, "other", "--yes", "--json")
+    assert code == 0, out
 
 
 def test_a_first_party_claim_of_an_untrusted_index_is_refused_before_any_clone(
@@ -385,24 +421,77 @@ def test_a_first_party_claim_of_an_untrusted_index_is_refused_before_any_clone(
     assert _error(out)["kind"] == "tier_refused"
     assert _nothing_installed(inst)
     assert (inst / "horae.lock").read_bytes() == before
+    # In a container it installs, recorded as not first-party.
+    set_runtime(inst, "container")
+    code, out, _ = _add(inst, "demo", "--json", answer="y\n")
+    assert code == 0, out
+    entry_ = _lock(inst)["plugins"]["demo"]
+    assert (entry_["tier"], entry_["index"]) == ("first-party", A)
 
 
-def test_the_tier_rule_is_shared_with_direct_installs() -> None:
-    require_installable("demo", "first-party", DEFAULT_MARKETPLACE)
-    with pytest.raises(TierRefused, match="M5"):
-        require_installable("demo", "community", DEFAULT_MARKETPLACE)
-    with pytest.raises(TierRefused, match="direct install"):
-        require_installable("demo", None, None)  # #48: a git URL has no tier
-    for tier in ("First-Party", "first-party ", "FIRST-PARTY", "unknown", ""):
+@pytest.mark.parametrize("runtime", ["process", "container"])
+def test_a_first_party_plugin_installs_under_either_runtime_and_its_entry_is_unchanged(
+    inst: Path, market: dict[str, str], runtime: str
+) -> None:
+    set_runtime(inst, runtime, "demo")
+    code, out, err = _add(inst, "demo@1.0.0", "--json", answer="y\n")
+    assert code == 0, out
+    assert f"runtime: {runtime} (first-party: either runtime is allowed)" in err
+    entry_ = _lock(inst)["plugins"]["demo"]
+    assert not {"tier", "index", "source"} & set(entry_)  # written exactly as before #191
+    assert _json(out)["first_party"] is True
+
+
+@pytest.mark.parametrize(
+    ("tier", "index", "first_party"),
+    [
+        ("first-party", DEFAULT_MARKETPLACE, True),
+        ("community", DEFAULT_MARKETPLACE, False),
+        ("first-party", "https://example.org/evil/market", False),  # an added index
+        ("first-party", None, False),
+        (None, None, False),  # #48: a direct install has no tier
+    ],
+)
+def test_the_install_gate_is_one_rule_for_every_source(
+    tier: Any, index: str | None, first_party: bool
+) -> None:
+    """#191: first-party installs under either runtime; anything else needs a container."""
+    require_installable("demo", tier, index, runtime="container")
+    if first_party:
+        require_installable("demo", tier, index, runtime="process")
+        assert approval.origin(tier, index) == (None, None)
+    else:
+        with pytest.raises(TierRefused, match=r"plugins\.demo\.runtime: container"):
+            require_installable("demo", tier, index, runtime="process")
+    for bad in ("First-Party", "first-party ", "FIRST-PARTY", "unknown", ""):
         with pytest.raises(TierRefused):
-            require_installable("demo", tier, DEFAULT_MARKETPLACE)  # type: ignore[arg-type]
+            require_installable("demo", bad, DEFAULT_MARKETPLACE, runtime="process")  # type: ignore[arg-type]
 
 
 def test_an_added_index_cannot_vouch_for_its_own_first_party_tier() -> None:
     with pytest.raises(TierRefused, match="not the Horae marketplace"):
-        require_installable("demo", "first-party", "https://example.org/evil/market")
-    with pytest.raises(TierRefused):
-        require_installable("demo", "first-party", None)
+        require_installable(
+            "demo", "first-party", "https://example.org/evil/market", runtime="process"
+        )
+    assert not hasattr(approval, "DIRECT_INSTALLS")  # one switch: the runtime (#191)
+
+
+def test_the_lock_records_tier_and_index_together_and_never_with_a_direct_source() -> None:
+    base = {
+        "version": "1.0.0",
+        "repo": PLUGIN_URL,
+        "commit": "0123456789abcdef0123456789abcdef01234567",
+        "permissions": {},
+    }
+    for extra in (
+        {"tier": "community"},
+        {"index": A},
+        {"tier": "community", "index": A, "source": "direct"},
+    ):
+        with pytest.raises(ValueError, match=r"tier|index"):
+            Lockfile.model_validate({"schema_version": 1, "plugins": {"demo": {**base, **extra}}})
+    lock = Lockfile.model_validate({"schema_version": 1, "plugins": {"demo": base}})
+    assert lock.plugins["demo"].first_party is True
 
 
 def test_every_intent_has_a_meaning() -> None:

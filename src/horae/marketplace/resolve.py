@@ -7,7 +7,8 @@ from dataclasses import dataclass
 
 from pydantic import TypeAdapter, ValidationError
 
-from horae.contracts.marketplace import MarketplacePlugin, Tier
+from horae.contracts.lockfile import Tier
+from horae.contracts.marketplace import MarketplacePlugin
 from horae.contracts.types import PluginName, SemVer
 from horae.marketplace.errors import (
     ConflictError,

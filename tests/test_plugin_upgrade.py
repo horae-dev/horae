@@ -15,7 +15,7 @@ from horae.contracts.lockfile import LockedPlugin, UserGrants
 from horae.contracts.plugin import PluginManifest
 from horae.marketplace import InstallError, approval
 from horae.marketplace.upgrade import Swap, permission_diff, user_grants, widens
-from marketplace_fixtures import PLUGIN_URL
+from marketplace_fixtures import PLUGIN_URL, A, set_runtime
 from upgrade_fixtures import (
     PERMISSIONS,
     PERSONAL,
@@ -368,8 +368,13 @@ def test_a_plugin_without_an_install_record_is_refused(
     assert "install record" in error["message"]
 
 
-def test_a_url_is_a_usage_error(inst: Path) -> None:  # noqa: F811
+def test_a_url_without_a_direct_install_in_the_lock_is_not_installed(inst: Path) -> None:  # noqa: F811
+    """#191: a URL upgrades a direct install (tested in test_plugin_direct.py); no direct
+    install from it in horae.lock is `not_installed`, and a malformed one stays a usage error."""
     code, out, _ = cli(inst, "upgrade", f"{PLUGIN_URL}@{'a' * 40}", "--json")
+    assert code == 3
+    assert as_json(out)["error"]["kind"] == "not_installed"
+    code, out, _ = cli(inst, "upgrade", f"{PLUGIN_URL}@v1.0.0", "--json")
     assert code == 2
     assert as_json(out)["error"]["kind"] == "usage"
 
@@ -382,31 +387,18 @@ def _make_direct(instance: Path) -> None:
     )
 
 
-def test_a_direct_install_stays_refused_before_m5(inst: Path, market: Market) -> None:  # noqa: F811
+def test_a_direct_install_is_not_upgraded_by_name(inst: Path, market: Market) -> None:  # noqa: F811
     add(inst)
     _make_direct(inst)
     market.release("1.1.0", manifest("1.1.0"))
     before = snapshot(inst)
     code, out, _ = cli(inst, "upgrade", "demo", "--yes", "--json")
     assert code == 3
-    assert as_json(out)["error"]["kind"] == "tier_refused"
-    assert snapshot(inst) == before
-
-
-def test_behind_the_gate_a_direct_install_is_replaced_not_upgraded(
-    inst: Path,  # noqa: F811
-    market: Market,  # noqa: F811
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(approval, "DIRECT_INSTALLS", True)
-    add(inst)
-    _make_direct(inst)
-    market.release("1.1.0", manifest("1.1.0"))
-    code, out, _ = cli(inst, "upgrade", "demo", "--yes", "--json")
-    assert code == 3
     error = as_json(out)["error"]
     assert error["kind"] == "install_refused"
+    assert "horae plugin upgrade URL@SHA" in error["message"]
     assert "horae plugin remove demo" in error["message"]
+    assert snapshot(inst) == before
 
 
 def test_a_plugin_whose_tier_is_no_longer_first_party_is_refused(
@@ -419,8 +411,35 @@ def test_a_plugin_whose_tier_is_no_longer_first_party_is_refused(
     before = snapshot(inst)
     code, out, _ = cli(inst, "upgrade", "demo", "--yes", "--json")
     assert code == 3
-    assert as_json(out)["error"]["kind"] == "tier_refused"
+    error = as_json(out)["error"]
+    assert error["kind"] == "tier_refused"
+    assert "plugins.demo.runtime: container" in error["message"]
     assert snapshot(inst) == before
+
+
+def test_under_the_container_runtime_a_tier_change_is_shown_and_approved(
+    inst: Path,  # noqa: F811
+    market: Market,  # noqa: F811
+) -> None:
+    """#191: the upgrade gate passes in a container; the tier leaving first-party widens (no
+    `--yes`), and the lock records the new tier and index."""
+    add(inst)
+    set_runtime(inst, "container")
+    market.tier = "community"
+    market.release("1.1.0", manifest("1.1.0"))
+    before = snapshot(inst)
+    code, out, _ = cli(inst, "upgrade", "demo", "--yes", "--json")
+    assert code == 3
+    error = as_json(out)["error"]
+    assert error["kind"] == "approval_refused"
+    assert "tier" in error["message"]
+    assert snapshot(inst) == before
+    code, out, err = cli(inst, "upgrade", "demo", "--json", answer="y\n")
+    assert code == 0, out
+    assert "~ first-party (Horae marketplace) -> community" in err
+    assert "runs in a container" in err
+    entry = lock(inst)["plugins"]["demo"]
+    assert (entry["version"], entry["tier"], entry["index"]) == ("1.1.0", "community", A)
 
 
 # --- atomicity and rollback --------------------------------------------------------------------

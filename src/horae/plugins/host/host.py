@@ -8,7 +8,12 @@ not ask for more than the user approved there (`network`, `secrets`, `paths`, `i
 has an install record (`.horae-install.json`, decision 62 F): its name, version, repo and
 commit must be the lock entry's, else the plugin is refused (an installed tree that is not
 the approved one, decision 70 D). A plugin without a record (the built-in ones `horae init`
-installs, a plugin copied by hand) is checked against the lock by its manifest only. A tool
+installs, a plugin copied by hand) is checked against the lock by its manifest only. Each
+plugin is also marked **first-party or not** from its lock entry (#191, schemas decision 79):
+an entry with `source` (a direct install) or `tier` (a marketplace plugin the default index
+does not vouch for) is not, and an install record saying so (a direct install, or a tier and
+index that are not first-party) makes it not first-party whatever the lock says; the
+manifest is never asked. A tool
 or skill resolves to the plugin whose manifest `provides` it (decision 11: the namespace need
 not be the plugin's name); two plugins
 providing the same ref is an error, and so is providing a sink operation name
@@ -36,6 +41,9 @@ run's `ToolCaller`:
   (`horae.plugins.host.transport`) with the environment of `horae.plugins.host.env` and an
   empty working directory, and the MCP handshake and
   `tools/list` must finish within the plugin's `startup_timeout_s` (`startup_timeout`);
+- **only in a container** (#191, decision 79): a plugin that is not first-party is refused
+  under the process runtime with `runtime_refused`, before any secret is resolved and before
+  anything is spawned, whatever `horae.yaml` was when it was installed. Never a fallback;
 - **runtime** (schemas decision 74): the plugin's effective `runtime` (`horae.yaml`) picks the
   spawn. `process` is the above; `container` starts the same MCP session in the plugin's own
   Docker container (`horae.plugins.host.container`: read-only, only its directory and its
@@ -131,6 +139,8 @@ from horae.contracts.plugin import (
 )
 from horae.contracts.run import Violation
 from horae.engine.ports import ResolvedPlugin, ToolResult, UnknownPlugin
+from horae.marketplace.approval import container_only
+from horae.marketplace.approval import first_party as first_party_tier
 from horae.marketplace.install import INSTALL_RECORD
 from horae.plugins.host import logs
 from horae.plugins.host.capture import StderrCapture
@@ -165,6 +175,9 @@ class InstalledPlugin:
     commit: str | None = None
     root: Path | None = None
     """The plugin's directory (relative commands are resolved against it)."""
+    first_party: bool = False
+    """From `horae.lock` (and the install record), never the manifest: whether the plugin may
+    run under the process runtime (#191). `False` unless the registry says so."""
 
     @property
     def resolved(self) -> ResolvedPlugin:
@@ -187,15 +200,33 @@ def _exceeds(asked: Permissions, approved: Permissions) -> list[str]:
 _MAX_RECORD_BYTES = 64 * 1024
 
 
-def check_install_record(name: str, locked: LockedPlugin, root: Path) -> None:
+def record_first_party(record: Mapping[str, Any] | None) -> bool | None:
+    """What an install record says about a plugin's origin (#191): `False` for a direct install
+    or a tier and index that are not first-party, `True` for a first-party one, `None` when it
+    does not say (no record, or one written before it recorded the tier)."""
+    if record is None:
+        return None
+    if record.get("source") == "direct":
+        return False
+    if record.get("source") == "marketplace" and "tier" in record:
+        index = record.get("index")
+        return (
+            record.get("tier") == "first-party"
+            and isinstance(index, str)
+            and first_party_tier("first-party", index)
+        )
+    return None
+
+
+def check_install_record(name: str, locked: LockedPlugin, root: Path) -> dict[str, Any] | None:
     """`RegistryError` when `<root>/.horae-install.json` exists and does not name the plugin,
-    version, repo and commit that `horae.lock` pins (decision 70 D). No record: nothing to
-    compare (a built-in or hand-copied plugin)."""
+    version, repo and commit that `horae.lock` pins (decision 70 D); else the record. No record:
+    nothing to compare (a built-in or hand-copied plugin), `None`."""
     path = root / INSTALL_RECORD
     try:
         status = os.lstat(path)
     except FileNotFoundError:
-        return
+        return None
     except OSError as exc:
         raise RegistryError(f"plugin {name}: cannot read {INSTALL_RECORD}: {exc}") from None
     if not stat.S_ISREG(status.st_mode) or status.st_size > _MAX_RECORD_BYTES:
@@ -220,6 +251,7 @@ def check_install_record(name: str, locked: LockedPlugin, root: Path) -> None:
             f"plugin {name}: installed with {found} but horae.lock pins {pinned} "
             "(the installed tree is not the approved one: reinstall it with `horae plugin add`)"
         )
+    return record
 
 
 class HostRegistry:
@@ -230,6 +262,7 @@ class HostRegistry:
         lock: Lockfile,
         manifests: Mapping[str, PluginManifest],
         roots: Mapping[str, Path] | None = None,
+        records: Mapping[str, Mapping[str, Any] | None] | None = None,
     ) -> None:
         self._plugins: dict[str, InstalledPlugin] = {}
         self._tools: dict[str, str] = {}
@@ -263,7 +296,12 @@ class HostRegistry:
                 }
             )
             root = (roots or {}).get(name)
-            self._plugins[name] = InstalledPlugin(effective, locked.commit, root)
+            # #191: the lock decides, and a record can only take first-party away.
+            trusted = locked.first_party and record_first_party((records or {}).get(name)) in (
+                None,
+                True,
+            )
+            self._plugins[name] = InstalledPlugin(effective, locked.commit, root, trusted)
             provides = manifest.provides
             for ref in (ref for kind in _PROVIDED for ref in getattr(provides, kind)):
                 self._claim(self._tools, ref, name)
@@ -292,12 +330,13 @@ class HostRegistry:
         the layout `horae plugin add` produces."""
         manifests: dict[str, PluginManifest] = {}
         roots: dict[str, Path] = {}
+        records: dict[str, dict[str, Any] | None] = {}
         for name in sorted(lock.plugins):
             root = directory / name
             manifests[name] = validate(read_yaml(root / MANIFEST_FILE), PluginManifest)
-            check_install_record(name, lock.plugins[name], root)
+            records[name] = check_install_record(name, lock.plugins[name], root)
             roots[name] = root
-        return cls(lock, manifests, roots)
+        return cls(lock, manifests, roots, records)
 
     def plugins(self) -> tuple[InstalledPlugin, ...]:
         """Every installed plugin, by name."""
@@ -704,6 +743,15 @@ class PluginHost:
     async def _start(self, entry: _Entry) -> PluginProcess:
         manifest = entry.installed.manifest
         name = manifest.name
+        settings = self._timeouts(name)
+        if not entry.installed.first_party and settings.runtime != "container":
+            # #191, fail closed: first thing, before any secret is resolved or written.
+            raise PluginCallError(
+                "runtime_refused",
+                f"plugin {name} is not first-party (horae.lock) and horae.yaml runs it with "
+                f"`runtime: {settings.runtime}`, which has no isolation: nothing started; "
+                + container_only(name),
+            )
         runtime = manifest.runtime
         if not isinstance(runtime, StdioRuntime):
             what = "no runtime" if runtime is None else f"runtime {runtime.protocol}"
@@ -723,7 +771,6 @@ class PluginHost:
                 continue  # absent from the environment: the plugin says so if a call needs it
         if self._run_dir is None or self._group is None:  # pragma: no cover (checked in _call)
             raise PluginCallError("host_error", "the plugin host is not open")
-        settings = self._timeouts(name)
         base = self._run_dir / f"{name}.{entry.starts}"
         cwd = base / "cwd"
         spawn: Spawn

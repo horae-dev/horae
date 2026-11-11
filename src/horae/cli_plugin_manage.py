@@ -6,7 +6,9 @@
   installs it through the same hardened path into a staging directory (with its own venv and
   pack pipelines), shows the permission diff against the `horae.lock` entry and needs a new
   approval for anything that widens; it then swaps the trees and writes the lock, undoing every
-  step on failure. A direct install (`source: direct`) stays refused before M5.
+  step on failure. A direct install (`source: direct`) is upgraded to another commit with
+  `horae plugin upgrade URL@SHA` (the same reachability check as `add`, #191). Either way the
+  install gate applies again: a plugin that is not first-party needs `runtime: container`.
 - **remove** refuses a plugin still listed under `plugins:` in `horae.yaml`, then removes its
   tree (and venv), the pack pipelines it recorded that are still its own, and its lock entry.
   Secrets are kept unless `--delete-secrets`; the files it wrote and the run history always.
@@ -21,6 +23,8 @@ drift found (audit); 5 another command is writing `horae.lock`; 70 internal erro
 
 import os
 import stat
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any, NoReturn
@@ -47,20 +51,25 @@ from horae.cli_output import (
 from horae.config import CONFIG_FILE, STORE_FILE, Instance, ProblemsError
 from horae.config.documents import read_yaml, validate
 from horae.contracts.instance import CORE_SECRET_NAMES, EnvSecretRef, InstanceConfig
-from horae.contracts.lockfile import LockedPlugin, Lockfile
+from horae.contracts.lockfile import LockedPlugin, Lockfile, Tier
 from horae.contracts.plugin import PluginManifest
 from horae.contracts.types import PluginName
 from horae.marketplace import (
     ApprovalRefused,
+    Installed,
     InstallRefused,
     InvalidReference,
     MarketplaceError,
+    PluginInstaller,
+    Prepare,
     parse_ref,
     resolve,
 )
 from horae.marketplace.approval import (
     describe,
+    describe_origin,
     lock_mismatch,
+    origin,
     parse_grants,
     recorded_grants,
     require_installable,
@@ -74,7 +83,7 @@ from horae.marketplace.audit import (
     read_record,
     record_mismatch,
 )
-from horae.marketplace.direct import is_direct
+from horae.marketplace.direct import is_direct, parse_direct
 from horae.marketplace.errors import DowngradeRefused, NotInstalled, PluginEnabled
 from horae.marketplace.install import MANIFEST_FILE
 from horae.marketplace.lock import LOCK_FILE, guard, lock_is, read_lock, write_lock
@@ -93,6 +102,7 @@ from horae.marketplace.upgrade import (
 )
 from horae.plugins.host import HostRegistry, RegistryError
 from horae.plugins.host.env import plugin_venv
+from horae.plugins.host.host import record_first_party
 from horae.store import Store, StoreError
 
 plugin_app = cli_plugin.plugin_app
@@ -159,16 +169,18 @@ class _UpgradeApproval:
         self,
         old: LockedPlugin,
         grants: tuple[list[str], list[str]],
-        repo: str,
-        sha: str,
+        target: "_Target",
         *,
         yes: bool,
         json_output: bool,
         pipelines: PackPipelines,
+        config: InstanceConfig,
     ) -> None:
         self.old = old
+        self.target = target
+        self.config = config
         self.hosts, self.local = grants
-        self.repo, self.sha = repo, sha
+        self.repo, self.sha = target.repo, target.sha
         self.yes = yes
         self.json_output = json_output
         self.pipelines = pipelines
@@ -178,6 +190,8 @@ class _UpgradeApproval:
     def __call__(self, _tree: Path, manifest: PluginManifest) -> None:
         name, version = manifest.name, manifest.version
         granted = with_grants(manifest.permissions, self.hosts, self.local)
+        direct = self.target.direct
+        tier, index = (None, None) if direct else origin(self.target.tier, self.target.index)
         wanted = LockedPlugin(
             version=version,
             repo=self.repo,
@@ -186,6 +200,9 @@ class _UpgradeApproval:
             personal_fields=manifest.provides.personal_fields,
             pipelines=self.pipelines.digests,
             user_grants=recorded_grants(self.hosts, self.local),
+            source="direct" if direct else None,
+            tier=tier,
+            index=index,
         )
         changes = permission_diff(self.old, wanted)
         err = self.json_output
@@ -193,6 +210,11 @@ class _UpgradeApproval:
             f"upgrade {name}: {self.old.version} ({self.old.commit}) -> {version} ({self.sha})",
             err=err,
         )
+        runtime = self.config.plugin_runtime(name)
+        for line in describe_origin(
+            self.target.tier, self.target.index, self.repo, runtime=runtime
+        ):
+            echo(safe(line), err=err)
         for line in describe_diff(changes):
             echo(safe(line), err=err)
         if self.old.user_grants is None:
@@ -239,6 +261,50 @@ class _UpgradeApproval:
         self.entry, self.changes = wanted, changes
 
 
+@dataclass(frozen=True)
+class _Target:
+    """What an upgrade installs: a marketplace release (`tier`, `index` from the index that
+    resolved it) or, for a direct install, another commit of the same repository (#191)."""
+
+    repo: str
+    sha: str
+    tier: Tier | None
+    index: str | None
+    install: Callable[[PluginInstaller, Prepare], Installed]
+    direct: bool = False
+
+
+def _direct_name(lock: Lockfile, repo: str) -> str:
+    """The plugin of `horae.lock` installed directly from `repo` (exact string, as `add`
+    recorded it). The URL is never repeated in a message (decision 71 A)."""
+    names = sorted(n for n, e in lock.plugins.items() if e.source == "direct" and e.repo == repo)
+    if not names:
+        raise NotInstalled(
+            "horae.lock has no direct install from that repository (compared as written): "
+            "install it with `horae plugin add URL@SHA`"
+        )
+    if len(names) > 1:
+        raise InstallRefused(
+            f"several plugins were installed directly from that repository ({', '.join(names)}): "
+            "replace one with `horae plugin remove` then `horae plugin add URL@SHA`"
+        )
+    return names[0]
+
+
+def _no_downgrade(installed: str, allow_downgrade: bool) -> Prepare:
+    """For a direct upgrade, whose version is known once the manifest is read: refuse a lower
+    one than `installed` unless `--allow-downgrade` (a `prepare` step)."""
+
+    def check(_tree: Path, manifest: PluginManifest) -> None:
+        if compare(manifest.version, installed) < 0 and not allow_downgrade:
+            raise DowngradeRefused(
+                f"{manifest.name}@{manifest.version} at that commit is lower than the installed "
+                f"{installed}: pass --allow-downgrade to install it anyway"
+            )
+
+    return check
+
+
 def _same_release(found_sha: str, record: dict[str, Any], version: str, name: str) -> None:
     """Refuse a version the marketplace now pins to another commit than the installed one."""
     if record["version"] == version and record["commit"] != found_sha:
@@ -259,13 +325,19 @@ def _upgrade(
     allow_local: list[str],
     allow_downgrade: bool,
 ) -> int:
+    direct: tuple[str, str] | None = None
     try:
         if is_direct(ref):
-            raise InvalidReference(
-                "upgrade takes a plugin name (name or name@version), not a git URL; a direct "
-                "install is replaced with `horae plugin remove` then `horae plugin add URL@SHA`"
-            )
-        name, _version = parse_ref(ref)
+            direct = parse_direct(ref)
+            if pre or offline:
+                flag = "--pre" if pre else "--offline"
+                raise InvalidReference(
+                    f"{flag} applies to marketplace names, not to a git URL (a direct upgrade "
+                    "reads no marketplace and must fetch the repository)"
+                )
+            name = ""
+        else:
+            name, _version = parse_ref(ref)
         grants = parse_grants(allow_host, allow_local)
     except MarketplaceError as exc:
         raise cli_plugin._failed(exc) from None
@@ -283,6 +355,7 @@ def _upgrade(
                 yes=yes,
                 json_output=json_output,
                 allow_downgrade=allow_downgrade,
+                direct=direct,
             )
     except MarketplaceError as exc:
         raise cli_plugin._failed(exc) from None
@@ -300,36 +373,79 @@ def _upgrade_locked(
     yes: bool,
     json_output: bool,
     allow_downgrade: bool,
+    direct: tuple[str, str] | None = None,
 ) -> int:
     lock_path = instance / LOCK_FILE
     lock, header = read_lock(lock_path)
+    config = loaded_instance.config
+    if direct is not None:
+        name = _direct_name(lock, direct[0])
     old = lock.plugins.get(name)
     if old is None:
         raise NotInstalled(f"plugin {name!r} is not in horae.lock: install it with `add`")
     root = plugins_dir(instance) / name
     record = _recorded(name, root)
-    if old.source == "direct" or record.get("source") == "direct":
-        require_installable(name, None, None)  # refused before M5 (docs/security.md T04)
-        raise InstallRefused(
-            f"{name} is a direct install: replace it with `horae plugin remove {name}` then "
-            "`horae plugin add URL@SHA` (an upgrade resolves through a marketplace)"
+    runtime = config.plugin_runtime(name)
+    warnings: list[str] = []
+    steps: list[Prepare] = []
+    if direct is not None:
+        if record.get("source") != "direct":
+            raise InstallRefused(f"{root} does not hold a direct install: refusing to upgrade it")
+        # Not first-party (#191): only with `runtime: container`, then the same fetch as `add`
+        # (the commit must be reachable from the repository's own branches or tags, #48).
+        require_installable(name, None, None, runtime=runtime)
+        repo, sha = direct
+        target = _Target(
+            repo,
+            sha,
+            None,
+            None,
+            lambda installer, prepare: installer.install_commit(
+                repo, sha, prepare=prepare, replace=name
+            ),
+            direct=True,
         )
-    config, loaded = cli_plugin._load_indexes(loaded_instance, offline)
-    found = resolve(ref, loaded.indexes, pins=config.marketplace_pins, allow_prerelease=pre)
-    require_installable(found.name, found.tier, found.index)
-    _same_release(found.sha, record, found.version, name)
-    if compare(found.version, record["version"]) < 0 and not allow_downgrade:
-        raise DowngradeRefused(
-            f"{name}@{found.version} is lower than the installed {record['version']}: pass "
-            "--allow-downgrade to install it anyway"
+        steps.append(_no_downgrade(record["version"], allow_downgrade))
+    else:
+        if old.source == "direct" or record.get("source") == "direct":
+            raise InstallRefused(
+                f"{name} is a direct install: upgrade it to another commit with `horae plugin "
+                f"upgrade URL@SHA`, or replace it with `horae plugin remove {name}` then `horae "
+                "plugin add` (an upgrade by name resolves through a marketplace)"
+            )
+        _config, loaded = cli_plugin._load_indexes(loaded_instance, offline)
+        warnings += loaded.warnings
+        found = resolve(ref, loaded.indexes, pins=config.marketplace_pins, allow_prerelease=pre)
+        require_installable(found.name, found.tier, found.index, runtime=runtime)
+        _same_release(found.sha, record, found.version, name)
+        if compare(found.version, record["version"]) < 0 and not allow_downgrade:
+            raise DowngradeRefused(
+                f"{name}@{found.version} is lower than the installed {record['version']}: pass "
+                "--allow-downgrade to install it anyway"
+            )
+        target = _Target(
+            found.repo,
+            found.sha,
+            found.tier,
+            found.index,
+            lambda installer, prepare: installer.install(
+                found.name,
+                found.version,
+                found.repo,
+                found.sha,
+                prepare=prepare,
+                tier=found.tier,
+                index=found.index,
+                replace=True,
+            ),
         )
     if (
-        (found.repo, found.sha) == (old.repo, old.commit)
+        (target.repo, target.sha) == (old.repo, old.commit)
         and not grants[0]
         and not grants[1]
         and not record_mismatch(record, name, old.version, old.repo, old.commit)
     ):
-        return _report_current(name, old, json_output, list(loaded.warnings))
+        return _report_current(name, old, json_output, warnings)
     kept_hosts, kept_local = user_grants(old)
     all_grants = (sorted({*kept_hosts, *grants[0]}), sorted({*kept_local, *grants[1]}))
     for host in kept_hosts:
@@ -344,25 +460,23 @@ def _upgrade_locked(
     approval = _UpgradeApproval(
         old,
         all_grants,
-        found.repo,
-        found.sha,
+        target,
         yes=yes,
         json_output=json_output,
         pipelines=pipelines,
+        config=config,
     )
-    installed = cli_plugin.make_installer(plugins_dir(instance)).install(
-        found.name,
-        found.version,
-        found.repo,
-        found.sha,
-        prepare=cli_plugin._chain(
+    installed = target.install(
+        cli_plugin.make_installer(plugins_dir(instance)),
+        cli_plugin._chain(
+            cli_plugin.runtime_gate(config, target.tier, target.index),
+            *steps,
             pipelines,
             approval,
-            cli_plugin.make_environment(loaded_instance.state_dir / cli_plugin.UV_CACHE_DIR),
+            cli_plugin.environment_for(
+                loaded_instance.state_dir / cli_plugin.UV_CACHE_DIR, target.tier, target.index
+            ),
         ),
-        tier=found.tier,
-        index=found.index,
-        replace=True,
     )
     staged = installed.path
     entry = approval.entry
@@ -376,7 +490,6 @@ def _upgrade_locked(
         raise ApprovalRefused("the staged plugin is not the one approved; nothing changed")
     swap = Swap()
     new_lock = Lockfile(schema_version=1, plugins={**lock.plugins, name: entry})
-    warnings = list(loaded.warnings)
     old_tree: Path | None = None
     writing = False
     interrupted: BaseException | None = None
@@ -407,8 +520,8 @@ def _upgrade_locked(
         old,
         entry,
         approval.changes,
-        found.tier,
-        found.index,
+        target.tier,
+        target.index,
         pipelines,
         warnings,
         json_output,
@@ -452,8 +565,8 @@ def _report_upgrade(
     old: LockedPlugin,
     entry: LockedPlugin,
     changes: list[Change],
-    tier: str,
-    index: str,
+    tier: str | None,
+    index: str | None,
     pipelines: PackPipelines,
     warnings: list[str],
     json_output: bool,
@@ -479,8 +592,11 @@ def _report_upgrade(
         return EXIT_OK
     echo(f"upgraded {name} from {old.version} to {entry.version}")
     echo(f"  repo    {entry.repo}")
-    echo(f"  commit  {entry.commit} (tag v{entry.version} points to it)")
-    echo(f"  tier    {tier}")
+    if tier is None:
+        echo(f"  commit  {entry.commit} (direct install, pinned by its SHA)")
+    else:
+        echo(f"  commit  {entry.commit} (tag v{entry.version} points to it)")
+        echo(f"  tier    {tier}" + ("" if entry.first_party else f" (index {index})"))
     for path in pipelines.paths:
         echo(f"  pipeline  {path}")
     echo("approved: horae.lock pins the new version with the permissions above.")
@@ -491,7 +607,11 @@ def _report_upgrade(
 def upgrade_command(
     ref: Annotated[
         str,
-        typer.Argument(metavar="NAME[@VERSION]", help="Installed plugin to upgrade."),
+        typer.Argument(
+            metavar="NAME[@VERSION] | URL@SHA",
+            help="Installed plugin to upgrade, or for a direct install the new commit of its "
+            "repository (an https git URL pinned to a full commit SHA).",
+        ),
     ],
     instance: cli_plugin.InstanceOption = Path(),
     offline: cli_plugin.OfflineOption = False,
@@ -526,13 +646,17 @@ def upgrade_command(
     """Upgrade an installed plugin, showing the permission diff and asking again for anything new.
 
     The version is resolved as `horae plugin add` does (highest release, --pre, or NAME@VERSION;
-    first-party only before M5). The new version is installed beside the old one with its own
+    the install gate of `add`). The new version is installed beside the old one with its own
     venv; what it asks for is compared with horae.lock: a new host, local endpoint, secret,
     intent, path or pack pipeline (or a changed one, or a dropped personal field) must be
     approved again. Hosts you added before are kept. Only after approval and a complete install
     are the trees swapped and horae.lock rewritten; on any failure the old version and the lock
-    are left as they were. A lower version is refused without --allow-downgrade; a direct install
-    is refused (before M5, and replaced by remove then add afterwards).
+    are left as they were. A lower version is refused without --allow-downgrade.
+
+    A direct install is upgraded with URL@SHA: the same repository URL as in horae.lock and the
+    full SHA of a commit its branches or tags reach. A plugin that is not first-party (a
+    community tier, an index you added, a direct install) is refused unless horae.yaml runs it
+    with runtime: container.
 
     Exit codes: 0 upgraded or already current, 1 configuration problem, unreachable marketplace
     or repository, or an invalid or unwritable horae.lock, 2 malformed reference or grant, 3
@@ -889,7 +1013,7 @@ def _host_problem(name: str, entry: LockedPlugin, directory: Path) -> str | None
 
 
 def _audit_plugin(
-    name: str, entry: LockedPlugin | None, instance: Path
+    name: str, entry: LockedPlugin | None, instance: Path, config: InstanceConfig
 ) -> tuple[dict[str, Any], list[Drift]]:
     directory = plugins_dir(instance)
     root = directory / name
@@ -925,13 +1049,34 @@ def _audit_plugin(
         if record is not None
         else ("direct" if entry is not None and entry.source == "direct" else "local")
     )
+    # #191: as the plugin host decides it (the lock, and a record can only take it away).
+    first_party = (
+        entry is not None
+        and entry.first_party
+        and record_first_party(record)
+        in (
+            None,
+            True,
+        )
+    )
+    runtime = config.plugin_runtime(name)
+    if entry is not None and not first_party and runtime != "container":
+        drift.append(
+            Drift(
+                "runtime_not_container",
+                f"{name}: not first-party, but horae.yaml runs it with `runtime: {runtime}`; the "
+                f"plugin host refuses to start it: set `plugins.{name}.runtime: container`",
+            )
+        )
     row: dict[str, Any] = {
         "name": name,
         "version": entry.version if entry is not None else None,
         "installed_version": record["version"] if record is not None else None,
         "source": source,
-        "tier": record.get("tier") if record is not None else None,
-        "index": record.get("index") if record is not None else None,
+        "tier": record.get("tier") if record is not None else (entry.tier if entry else None),
+        "index": record.get("index") if record is not None else (entry.index if entry else None),
+        "first_party": first_party,
+        "runtime": runtime,
         "repo": entry.repo if entry is not None else None,
         "commit": entry.commit if entry is not None else None,
         "permissions": entry.model_dump(mode="json")["permissions"] if entry else None,
@@ -989,7 +1134,7 @@ def _audit(instance: Path, json_output: bool) -> int:
     rows: list[dict[str, Any]] = []
     found: list[Drift] = []
     for name in names:
-        row, drift = _audit_plugin(name, lock.plugins.get(name), instance)
+        row, drift = _audit_plugin(name, lock.plugins.get(name), instance, config)
         used = activity.get(name)
         row["enabled"] = name in config.plugins
         row["last_activity"] = used.isoformat() if used is not None else None
@@ -1063,7 +1208,9 @@ def audit_command(
     permissions horae.lock grants it, its pipelines and its last activity (the latest stored run
     that used it). Drift is reported: a locked plugin not installed or installed but not
     locked, an install record or manifest that is not the locked one, a missing venv, a pack
-    pipeline missing, changed or not approved, and what an interrupted upgrade or remove left.
+    pipeline missing, changed or not approved, a plugin that is not first-party but does not
+    run with runtime: container (the host refuses to start it), and what an interrupted upgrade
+    or remove left.
 
     Exit codes: 0 no drift, 1 configuration problem or an invalid horae.lock, 4 drift found,
     70 internal."""

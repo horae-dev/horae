@@ -54,6 +54,38 @@ writes, the venv plus uv's temporary directory plus what it adds to the cache, a
 every plugin child has `UV_OFFLINE=1`, `UV_PYTHON_DOWNLOADS=never` and `PIP_NO_INDEX=1`.
 Neither uv nor the network is needed to run a plugin.
 
+**Without the build (#191)**: a plugin that is not first-party gets `install_project=False`.
+Its own project is **never built**: a build backend runs plugin code (`setup.py`, a hatch
+build hook, `pdm_build.py`) on the host, outside any container. Then:
+
+- `check_project` also refuses `dynamic` in `[project]` (uv would call the backend for the
+  metadata, even with `--no-install-project`) and keeps refusing `backend-path`;
+- also refused: a uv workspace, a `tool.uv.sources` entry that is not an index (path, git,
+  url, workspace, editable), a direct reference (`name @ ...`) in the dependencies, optional
+  dependencies or dependency groups; and, as for every plugin, a lock entry that is not a
+  hashed index or URL package (path, git, directory, editable, virtual), but the root project;
+- `uv sync --locked --no-dev --no-install-project --no-build --no-build-package=<each
+  dependency>`: the dependencies only, from their hashed wheels, uv refusing to build anything
+  at all; the lock is still checked against a static `pyproject.toml`;
+- Horae writes `site-packages/_horae_plugin.pth` (`PTH_FILE`) into the venv, naming the
+  project's source directory **as the container sees it** (`CONTAINER_ROOT`, the plugin's
+  mount): `/plugin/src` when the tree has a real `src/` directory (not a symlink), else
+  `/plugin`. Such a plugin only ever runs in a container (decision 79);
+- its `runtime.command` must be the venv's interpreter running a module (`[python, -m,
+  <module>]`, `python3` too): its console scripts are never generated (`check_module_command`,
+  refused before approval otherwise).
+
+**Trust classes never share a cache (#191, review of PR #192)**: a plugin that is not
+first-party gets its own uv cache inside the install's temporary home, deleted with it; the
+persistent `cache_dir` serves first-party installs only. Otherwise a third-party lock naming a
+build backend's wheel (a `flit-core`, say) under the real index but on another host would put
+the attacker's wheel in the index's cache bucket, and the next first-party build, whose backend
+is resolved without hashes, would import it on the host. `check_lock` also requires every file
+of a registry package to come from that registry's own host over https (or `FILES_HOSTS`: PyPI
+serves from `files.pythonhosted.org/packages/`), or from inside a local directory index; for a
+plugin that is not first-party the registry must be `DEFAULT_INDEX` and a `url` source is
+refused (no fetch of any URL a third-party lock names).
+
 **Upgrade** (#47): a new version is a new tree, installed by the same `install(...,
 prepare=PluginEnvironment(...))` into its own scratch directory, so it gets a fresh venv built
 from its own lock; a venv is never upgraded in place.
@@ -63,6 +95,7 @@ import os
 import posixpath
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -72,6 +105,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 from horae.contracts.plugin import PluginManifest
 from horae.marketplace.cachefs import make_private_dirs
@@ -81,6 +115,13 @@ from horae.plugins.host.env import BASE_PATH, VENV_DIR
 
 PROJECT_FILE = "pyproject.toml"
 LOCK_FILE = "uv.lock"
+PTH_FILE = "_horae_plugin.pth"
+"""Written into the venv's `site-packages` for a plugin installed without its build (#191)."""
+CONTAINER_ROOT = "/plugin"
+"""Where the plugin's tree is mounted in its container (`horae.plugins.host.container.
+PLUGIN_MOUNT`, kept equal by a test; not imported, to keep this module free of the host)."""
+MODULE_COMMANDS = frozenset({"python", "python3"})
+"""The `runtime.command[0]` a plugin installed without its build may use (#191)."""
 UV_TIMEOUT_S = 600
 """Seconds one uv call may take (a sync downloads and may build)."""
 MAX_VENV_BYTES = 1024 * 1024 * 1024
@@ -137,13 +178,17 @@ def _table(data: dict[str, Any], key: str) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def check_project(tree: Path, plugin: str) -> str:
+def check_project(tree: Path, plugin: str, *, builds: bool = True) -> str:
     """The project name of `<tree>/pyproject.toml`; `InstallRefused` unless it builds with an
-    allowed backend and nothing else (see the module docstring)."""
+    allowed backend and nothing else (see the module docstring). `builds=False` (#191): also
+    refused when uv would still call the backend (`dynamic` metadata)."""
     data = _read_toml(tree / PROJECT_FILE, plugin)
-    name = _table(data, "project").get("name")
+    project = _table(data, "project")
+    name = project.get("name")
     if not isinstance(name, str) or not name:
         raise InstallRefused(f"plugin {plugin}: {PROJECT_FILE} has no [project] name")
+    if not builds:
+        _check_nothing_to_build(data, project, plugin)
     if _table(_table(data, "tool"), "uv").get("package") is False:
         raise InstallRefused(
             f"plugin {plugin}: tool.uv.package = false (a virtual project) is not installable"
@@ -171,6 +216,99 @@ def check_project(tree: Path, plugin: str) -> str:
     return name
 
 
+_SOURCE_KEYS = frozenset({"index", "marker", "extra", "group"})
+"""What a `tool.uv.sources` entry may say for a plugin that is not first-party: which index,
+for which marker, extra or group. Never `path`, `git`, `url`, `workspace` or `editable`."""
+
+
+def _requirements(data: dict[str, Any], project: dict[str, Any]) -> list[Any]:
+    found: list[Any] = list(project.get("dependencies") or [])
+    optional = project.get("optional-dependencies")
+    for group in (optional or {}).values() if isinstance(optional, dict) else ():
+        found.extend(group if isinstance(group, list) else [group])
+    groups = data.get("dependency-groups")
+    for group in (groups or {}).values() if isinstance(groups, dict) else ():
+        found.extend(group if isinstance(group, list) else [group])
+    return found
+
+
+def _check_nothing_to_build(data: dict[str, Any], project: dict[str, Any], plugin: str) -> None:
+    """For a plugin that is not first-party (#191): refuse what would make uv build or call a
+    backend despite `--no-install-project --no-build` (decision 79 G)."""
+    refused = (
+        f"plugin {plugin}: refused for a plugin that is not first-party (its code is never "
+        "built on the host):"
+    )
+    if project.get("dynamic"):
+        raise InstallRefused(
+            f"{refused} [project] dynamic metadata (uv would run the build backend to compute "
+            "it); declare every field statically"
+        )
+    uv = _table(_table(data, "tool"), "uv")
+    if "workspace" in uv:
+        raise InstallRefused(f"{refused} a uv workspace (tool.uv.workspace)")
+    sources = uv.get("sources", {})
+    for name, entries in sources.items() if isinstance(sources, dict) else [("?", sources)]:
+        for entry in entries if isinstance(entries, list) else [entries]:
+            if not isinstance(entry, dict) or set(entry) - _SOURCE_KEYS:
+                raise InstallRefused(
+                    f"{refused} tool.uv.sources.{name} is not an index source (a path, git, url "
+                    "or workspace source would be built)"
+                )
+    for requirement in _requirements(data, project):
+        if isinstance(requirement, dict):
+            if set(requirement) != {"include-group"}:
+                raise InstallRefused(f"{refused} a dependency group entry {requirement!r}")
+        elif not isinstance(requirement, str) or "@" in requirement.split(";", 1)[0]:
+            raise InstallRefused(
+                f"{refused} the direct reference {requirement!r} (a local or remote project "
+                "would be built)"
+            )
+
+
+def check_module_command(manifest: PluginManifest) -> None:
+    """`InstallRefused` unless the plugin's command runs the venv's interpreter (`[python, -m,
+    <module>]`): installed without its build (#191), it has no console script."""
+    runtime = manifest.runtime
+    command = list(getattr(runtime, "command", None) or [])
+    if not command or command[0] not in MODULE_COMMANDS:
+        raise InstallRefused(
+            f"plugin {manifest.name}: a plugin that is not first-party is installed without "
+            "building its project, so it has no console script: its runtime.command must run "
+            "a module with the venv's interpreter, e.g. [python, -m, <module>]"
+        )
+
+
+def write_pth(tree: Path, venv: Path, plugin: str) -> str:
+    """Make the project importable without installing it (#191): `PTH_FILE` in the venv's
+    `site-packages`, naming `src/` (a real directory of the tree) or the tree's root, as the
+    container sees it. Returns the path written into it."""
+    try:
+        source = stat_is_dir(tree / "src")
+    except OSError:
+        source = False
+    target = posixpath.join(CONTAINER_ROOT, "src") if source else CONTAINER_ROOT
+    found = [
+        p
+        for p in sorted((venv / "lib").glob("python*/site-packages"))
+        if not p.is_symlink() and p.is_dir()
+    ]
+    if len(found) != 1:
+        raise InstallError(f"plugin {plugin}: the venv has no single site-packages directory")
+    pth = found[0] / PTH_FILE
+    if os.path.lexists(pth):
+        raise InstallRefused(f"plugin {plugin}: a dependency ships {PTH_FILE}; refused")
+    fd = os.open(pth, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(target + "\n")
+    return target
+
+
+def stat_is_dir(path: Path) -> bool:
+    """Whether `path` is a real directory (`lstat`: a symlink is not)."""
+    return stat.S_ISDIR(os.lstat(path).st_mode)
+
+
 def _in_tree(where: object) -> bool:
     if not isinstance(where, str) or not where or "\0" in where or "\\" in where:
         return False
@@ -189,11 +327,72 @@ def _artifacts(package: dict[str, Any]) -> list[Any]:
     return found
 
 
-def check_lock(tree: Path, plugin: str, project: str) -> list[str]:
+DEFAULT_INDEX = "https://pypi.org/simple"
+"""uv's default index: the only registry a plugin that is not first-party may lock against
+(besides `PluginEnvironment.index_url`, tests only)."""
+FILES_HOSTS: dict[str, tuple[str, str]] = {"pypi.org": ("files.pythonhosted.org", "/packages/")}
+"""Per registry host, the one other host (and path prefix) its files may be served from."""
+
+
+def _index_key(index: str) -> str:
+    """`index` as uv.lock writes a registry: a `file://` index as its path, no trailing `/`."""
+    parts = urlsplit(index)
+    where = unquote(parts.path) if parts.scheme == "file" else index
+    return where.rstrip("/")
+
+
+def _artifact_problem(registry: str, artifact: dict[str, Any], test_index: str | None) -> str:
+    """Why a registry package's file may not be fetched (`""` when it may): it must be served
+    by its registry's own host (or its files host, `FILES_HOSTS`) over https, or lie inside a
+    local directory index. Anything else would make uv fetch any URL a lock names (#191)."""
+    url, path = artifact.get("url"), artifact.get("path")
+    if "://" not in registry:  # a local directory index (uv writes paths)
+        if not isinstance(path, str) or url is not None:
+            return "a file that is not in its local index"
+        base, where = posixpath.normpath(registry), posixpath.normpath(path)
+        return "" if where.startswith(base.rstrip("/") + "/") else "a file outside its index"
+    if not isinstance(url, str) or path is not None:
+        return "a file without a URL"
+    index, file = urlsplit(registry), urlsplit(url)
+    http_ok = test_index is not None and _index_key(registry) == _index_key(test_index)
+    if file.scheme != index.scheme or file.scheme not in (
+        {"https", "http"} if http_ok else {"https"}
+    ):
+        return f"a file served over {file.scheme or 'no scheme'} (https only)"
+    if file.username or file.password or file.query or file.fragment:
+        return "a file URL with credentials, a query or a fragment"
+    try:
+        same = (file.hostname, file.port) == (index.hostname, index.port)
+    except ValueError:
+        return "a file URL with an invalid port"
+    files = FILES_HOSTS.get(index.hostname or "")
+    if same or (
+        files is not None
+        and file.hostname == files[0]
+        and file.port is None
+        and file.path.startswith(files[1])
+    ):
+        return ""
+    return f"a file on host {file.hostname!r}, not its registry's"
+
+
+def check_lock(
+    tree: Path,
+    plugin: str,
+    project: str,
+    *,
+    trusted: bool = True,
+    index_url: str | None = None,
+) -> list[str]:
     """The names of the packages `<tree>/uv.lock` installs besides `project`, the plugin's own
     project; `InstallRefused` unless each comes from an index or URL with at least one wheel
     and a `sha256` hash on every file, and `project` itself is the tree (`.`). Only `project`
-    is ever built: the others are installed from their wheels (`--no-build-package`)."""
+    is ever built: the others are installed from their wheels (`--no-build-package`).
+
+    Every file of a registry package must be served by that registry (`_artifact_problem`).
+    `trusted=False` (a plugin that is not first-party, #191): the registry must be the default
+    index (or `index_url`), and a `url` source is refused."""
+    allowed = {_index_key(DEFAULT_INDEX)} | ({_index_key(index_url)} if index_url else set())
     data = _read_toml(tree / LOCK_FILE, plugin)
     packages = data.get("package", [])
     if not isinstance(packages, list) or not packages:
@@ -221,6 +420,24 @@ def check_lock(tree: Path, plugin: str, project: str) -> list[str]:
                 raise InstallRefused(
                     f"plugin {plugin}: {LOCK_FILE}: {name} has no wheel (an sdist only would "
                     "run its build backend at install): refused"
+                )
+            if kind == "registry":
+                if not isinstance(where, str):
+                    raise InstallRefused(f"plugin {plugin}: {LOCK_FILE}: {name} has no registry")
+                if not trusted and _index_key(where) not in allowed:
+                    raise InstallRefused(
+                        f"plugin {plugin}: {LOCK_FILE}: {name} comes from another index than "
+                        f"{DEFAULT_INDEX}, refused for a plugin that is not first-party"
+                    )
+                for artifact in artifacts:
+                    if why := _artifact_problem(where, artifact, index_url):
+                        raise InstallRefused(
+                            f"plugin {plugin}: {LOCK_FILE}: {name} lists {why}: refused"
+                        )
+            elif not trusted:
+                raise InstallRefused(
+                    f"plugin {plugin}: {LOCK_FILE}: {name} comes from a direct URL, refused for "
+                    "a plugin that is not first-party (index packages only)"
                 )
             dependencies.append(name)
         elif kind in _IN_TREE:
@@ -269,14 +486,20 @@ class PluginEnvironment:
     max_bytes: int = MAX_VENV_BYTES
     index_url: str | None = None
     """Replaces the default index (tests only: a local `file://` index). Never a setting."""
+    install_project: bool = True
+    """`False` for a plugin that is not first-party (#191): its project is never built, only
+    its dependencies are installed, and a `.pth` makes its sources importable."""
 
     def __call__(self, tree: Path, manifest: PluginManifest) -> None:
+        if not self.install_project:
+            check_module_command(manifest)
         self.prepare(tree, manifest.name)
 
     def prepare(self, tree: Path, plugin: str) -> Path:
         """Check the project and its lock, then build `<tree>/.venv`; returns it."""
-        project = check_project(tree, plugin)
-        dependencies = check_lock(tree, plugin, project)
+        project = check_project(tree, plugin, builds=self.install_project)
+        trusted = self.install_project
+        dependencies = check_lock(tree, plugin, project, trusted=trusted, index_url=self.index_url)
         venv = tree / VENV_DIR
         if os.path.lexists(venv):
             raise InstallRefused(f"plugin {plugin}: the tree holds a {VENV_DIR}; it must not")
@@ -286,16 +509,20 @@ class PluginEnvironment:
                 f"cannot install the dependencies of {plugin}: uv is not installed "
                 "(it is needed to install a plugin, not to run one)"
             )
-        try:
-            make_private_dirs(self.cache_dir)
-        except OSError as exc:
-            raise InstallError(f"cannot write {self.cache_dir}: {exc.strerror}") from None
-        baseline = tree_bytes(self.cache_dir)
         with tempfile.TemporaryDirectory(prefix="horae-uv-") as home:
-            env = self.env(tree, Path(home))
+            # #191: a plugin that is not first-party never shares uv's cache: its own, inside
+            # the temporary home, deleted with it. What it fetched can never be reused by a
+            # first-party build (a build backend would import it on the host).
+            cache = self.cache_dir if trusted else Path(home) / "cache"
+            try:
+                make_private_dirs(cache)
+            except OSError as exc:
+                raise InstallError(f"cannot write {cache}: {exc.strerror}") from None
+            baseline = tree_bytes(cache)
+            env = self.env(tree, Path(home), cache)
             # The budget covers what this install writes: the venv, uv's temporary directory
-            # (sdist and build environments) and what it adds to the shared cache.
-            watch = _Budget((venv, Path(home), self.cache_dir), baseline)
+            # (sdist and build environments) and what it adds to the cache.
+            watch = _Budget((venv, Path(home), cache) if trusted else (venv, Path(home)), baseline)
             self._run(
                 plugin,
                 [uv, "venv", "--relocatable", "--no-project", "--python", self.python],
@@ -304,7 +531,13 @@ class PluginEnvironment:
                 env,
                 watch,
             )
-            sync = ["sync", "--locked", "--no-dev", "--no-editable"]
+            sync = ["sync", "--locked", "--no-dev"]
+            # #191: nothing at all is built for a plugin that is not first-party.
+            sync += (
+                ["--no-editable"]
+                if self.install_project
+                else ["--no-install-project", "--no-build"]
+            )
             self._run(
                 plugin,
                 [uv, *sync, "--python", str(venv / "bin" / "python")],
@@ -314,10 +547,12 @@ class PluginEnvironment:
                 watch,
             )
             self._check_venv(venv, plugin, watch)
+            if not self.install_project:
+                write_pth(tree, venv, plugin)
         return venv
 
-    def env(self, tree: Path, home: Path) -> dict[str, str]:
-        """uv's environment (see the module docstring)."""
+    def env(self, tree: Path, home: Path, cache: Path | None = None) -> dict[str, str]:
+        """uv's environment (see the module docstring); `cache`: default `cache_dir`."""
         env = {key: value for key, value in os.environ.items() if key in PASSTHROUGH}
         env.update(
             PATH=BASE_PATH,
@@ -325,7 +560,7 @@ class PluginEnvironment:
             TMPDIR=str(home),
             LANG="C.UTF-8",
             UV_NO_CONFIG="1",
-            UV_CACHE_DIR=str(self.cache_dir),
+            UV_CACHE_DIR=str(self.cache_dir if cache is None else cache),
             UV_PYTHON_DOWNLOADS="never",
             UV_PROJECT_ENVIRONMENT=str(tree / VENV_DIR),
             UV_LINK_MODE="copy",
@@ -404,11 +639,16 @@ class PluginEnvironment:
 
 __all__ = [
     "BUILD_BACKENDS",
+    "CONTAINER_ROOT",
     "LOCK_FILE",
     "MAX_VENV_BYTES",
+    "MODULE_COMMANDS",
     "PROJECT_FILE",
+    "PTH_FILE",
     "UV_TIMEOUT_S",
     "PluginEnvironment",
     "check_lock",
+    "check_module_command",
     "check_project",
+    "write_pth",
 ]

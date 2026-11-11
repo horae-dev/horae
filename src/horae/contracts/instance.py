@@ -817,9 +817,15 @@ class InstanceConfig(Contract):
             call_timeout_s=(
                 defaults.call_timeout_s if own.call_timeout_s is None else own.call_timeout_s
             ),
-            runtime=defaults.runtime if own.runtime is None else own.runtime,
+            runtime=self.plugin_runtime(plugin),
             limits=self.plugin_limits(plugin),
         )
+
+    def plugin_runtime(self, plugin: str) -> PluginRuntime:
+        """The effective runtime of `plugin`: `plugins.<plugin>.runtime`, else
+        `plugin_defaults.runtime`."""
+        own = self.plugins.get(plugin, PluginSettings()).runtime
+        return self.plugin_defaults.runtime if own is None else own
 
     def plugin_limits(self, plugin: str) -> ContainerLimits:
         """The effective container limits of `plugin`: each field of its own `limits` that is

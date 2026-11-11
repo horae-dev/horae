@@ -68,9 +68,10 @@ from typing import Any
 from pydantic import TypeAdapter, ValidationError
 
 from horae.config.documents import ProblemsError, read_yaml, validate
-from horae.contracts.lockfile import GitRepoUrl, LockedPlugin
+from horae.contracts.lockfile import GitRepoUrl, LockedPlugin, Tier
 from horae.contracts.plugin import Permissions, PluginManifest
 from horae.contracts.types import CommitSha, PluginName, SemVer
+from horae.marketplace.approval import origin as recorded_origin
 from horae.marketplace.errors import AlreadyInstalled, InstallError, InstallRefused
 from horae.marketplace.git import GIT_TIMEOUT_S, HTTPS, GitError, GitTooLarge, run_git
 
@@ -123,8 +124,9 @@ class Installed:
     manifest: PluginManifest
     source: str = "marketplace"
     """`marketplace` or `direct` (decision 73 A)."""
-    tier: str | None = None
-    """The marketplace tier that resolved it (information only)."""
+    tier: Tier | None = None
+    """The marketplace tier that resolved it (recorded in `horae.lock` when not first-party,
+    #191)."""
     index: str | None = None
     """The marketplace index that resolved it (information only)."""
 
@@ -146,7 +148,11 @@ class Installed:
         """The `horae.lock` entry of this plugin with the permissions the user approved
         (#46 writes it; until then the plugin host does not load the plugin). The manifest's
         `provides.personal_fields` are copied as they are: a declaration only adds protection,
-        so it needs no approval (decision 68)."""
+        so it needs no approval (decision 68). A marketplace plugin that is not first-party
+        records its `tier` and `index` (#191, `approval.origin`)."""
+        tier, index = (
+            recorded_origin(self.tier, self.index) if self.source == "marketplace" else (None, None)
+        )
         return LockedPlugin(
             version=self.version,
             repo=self.repo,
@@ -154,6 +160,8 @@ class Installed:
             permissions=permissions,
             personal_fields=self.manifest.provides.personal_fields,
             source="direct" if self.source == "direct" else None,
+            tier=tier,
+            index=index,
         )
 
 
@@ -179,6 +187,22 @@ def _escapes(path: str, target: str) -> bool:
         return True
     resolved = posixpath.normpath(posixpath.join(posixpath.dirname(path), target))
     return resolved == ".." or resolved.startswith("../")
+
+
+def _named(name: str, prepare: Prepare | None) -> Prepare:
+    """`prepare`, run only once the manifest is known to name `name` (an upgrade of a direct
+    install must not turn into another plugin)."""
+
+    def check(tree: Path, manifest: PluginManifest) -> None:
+        if manifest.name != name:
+            raise InstallRefused(
+                f"the commit's plugin.yaml names {manifest.name!r}, not {name!r}: refusing to "
+                "upgrade one plugin into another"
+            )
+        if prepare is not None:
+            prepare(tree, manifest)
+
+    return check
 
 
 class PluginInstaller:
@@ -213,7 +237,7 @@ class PluginInstaller:
         sha: str,
         *,
         prepare: Prepare | None = None,
-        tier: str | None = None,
+        tier: Tier | None = None,
         index: str | None = None,
         replace: bool = False,
     ) -> Installed:
@@ -244,19 +268,35 @@ class PluginInstaller:
         origin = ("marketplace", tier, index)
         return self._install(repo, sha, (name, version), prepare, origin, replace=replace)
 
-    def install_commit(self, repo: str, sha: str, *, prepare: Prepare | None = None) -> Installed:
+    def install_commit(
+        self,
+        repo: str,
+        sha: str,
+        *,
+        prepare: Prepare | None = None,
+        replace: str | None = None,
+    ) -> Installed:
         """A direct install from a git URL (#48): fetch the branches and tags of `repo`, require
         the commit `sha` to be reachable from one of them (no tag is compared: the full SHA is
         the pin) and install its tree as
         `plugins/<name>`, the name and version being those of its `plugin.yaml`. The same
         limits and checks as `install`; the name is checked against `plugins/` once the
-        manifest is read, before `prepare` runs."""
+        manifest is read, before `prepare` runs.
+
+        `replace=NAME` (the upgrade of a direct install, #191): `plugins/NAME` must be installed
+        already and the commit's `plugin.yaml` must name `NAME`; the tree is placed in a staging
+        directory as `install(..., replace=True)` does."""
         try:
             sha = _sha.validate_python(sha)
         except ValidationError:
             raise InstallRefused(f"{sha!r} is not a full commit SHA") from None
         self._check_repo(repo)
-        return self._install(repo, sha, None, prepare, ("direct", None, None))
+        if replace is not None:
+            if not os.path.isdir(self.plugins_dir / replace):
+                raise InstallRefused(f"plugin {replace!r} is not installed: nothing to upgrade")
+            prepare = _named(replace, prepare)
+        origin = ("direct", None, None)
+        return self._install(repo, sha, None, prepare, origin, replace=replace is not None)
 
     def _check_repo(self, repo: str) -> None:
         if self.allow_protocol == HTTPS:
@@ -271,7 +311,7 @@ class PluginInstaller:
         sha: str,
         expected: tuple[str, str] | None,
         prepare: Prepare | None,
-        origin: tuple[str, str | None, str | None],
+        origin: tuple[str, Tier | None, str | None],
         *,
         replace: bool = False,
     ) -> Installed:
@@ -298,7 +338,7 @@ class PluginInstaller:
             manifest = self._manifest(tree, expected)
             name, version = manifest.name, manifest.version
             target = self.plugins_dir / name
-            if expected is None and os.path.lexists(target):
+            if expected is None and not replace and os.path.lexists(target):
                 raise AlreadyInstalled(f"plugin {name!r} is already installed in {target}")
             source, tier, index = origin
             if replace:

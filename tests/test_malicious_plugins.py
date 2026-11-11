@@ -35,6 +35,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+import anyio
 import pytest
 
 from horae.contracts import Lockfile, PluginManifest, RunRecord
@@ -45,6 +46,7 @@ from horae.engine.ports import ToolResult
 from horae.engine.testing import FakeLlm, llm_response
 from horae.llm.deid import Deidentifier, fold
 from horae.plugins.host import HostRegistry, PluginCallError, PluginHost
+from horae.plugins.host import host as host_module
 from horae.plugins.host.env import PLUGIN_KEYS
 from horae.plugins.host.host import RegistryError
 from horae.secrets import SecretResolver
@@ -265,6 +267,60 @@ def test_a_manifest_asking_for_more_than_the_lock_is_refused(tmp_path: Path) -> 
     lock = lock_for({**manifest, "permissions": approved})
     with pytest.raises(RegistryError, match="permissions not approved"):
         HostRegistry(lock, {manifest["name"]: PluginManifest.model_validate(manifest)})
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        {"source": "direct"},
+        {"tier": "community", "index": "https://git.example.test/someone/marketplace"},
+    ],
+    ids=["direct", "community"],
+)
+def test_a_third_party_plugin_under_the_process_runtime_never_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, origin: dict[str, str]
+) -> None:
+    """T04 (#191): `evil-secrets`, recorded in horae.lock as not first-party, with horae.yaml
+    switched to the process runtime after its install: the host refuses it before anything is
+    spawned or any secret is handed over (`runtime_refused`), whatever its manifest says."""
+    evil = fixture("evil_secrets")
+    base = lock_for(evil, SIBLING)
+    locked = base.plugins["evil-secrets"].model_dump(mode="json")
+    lock = Lockfile.model_validate(
+        {
+            "schema_version": 1,
+            "plugins": {
+                **{n: e.model_dump(mode="json") for n, e in base.plugins.items()},
+                "evil-secrets": {**locked, **origin},
+            },
+        }
+    )
+    spawned: list[object] = []
+
+    async def no_process(*args: object, **kwargs: object) -> None:
+        spawned.append(args)
+        raise AssertionError("no process may be spawned")
+
+    monkeypatch.setattr(anyio, "open_process", no_process)
+    monkeypatch.setattr(host_module, "PluginProcess", lambda *a: spawned.append(a))
+
+    async def go() -> list[PluginCallError]:
+        failures: list[PluginCallError] = []
+        async with _host(tmp_path, evil, SIBLING, lock=lock) as host:
+            assert host.registry.installed("evil-secrets").first_party is False
+            for ref in ("evil-secrets.env", "evil-secrets.env"):  # no retry, no fallback
+                with pytest.raises(PluginCallError) as caught:
+                    await host.call(ref, {}, None)
+                failures.append(caught.value)
+        return failures
+
+    first, second = asyncio.run(go())
+    assert first.kind == "runtime_refused"
+    assert "not first-party" in first.message
+    assert "plugins.evil-secrets.runtime: container" in first.message
+    assert second.kind in {"runtime_refused", "plugin_unavailable"}
+    assert spawned == []
+    assert EVIL_TOKEN not in first.message
 
 
 # --- evil-secrets: T03, T09, T16 -----------------------------------------------------------------
