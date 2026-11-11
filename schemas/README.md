@@ -4513,8 +4513,9 @@ loosened later without breaking a valid file.
       the container's stdin, one JSON object; a launcher run by the image's interpreter (`python3
       -I -S -c`, its source is a constant of `horae.plugins.host.container`, visible in `docker
       inspect` and secret-free) reads exactly that line, byte by byte so nothing of the MCP
-      stream is consumed, sets `umask 077`, creates the directories, and `execve`s the plugin
-      command with exactly that environment. The values cross the CLI's connection to the daemon
+      stream is consumed, sets `umask 077`, creates the directories, and runs the plugin
+      command as its child with exactly that environment (#188: it stays, so that it can read
+      the cgroup's OOM count once the plugin is gone; it passes the stop signals on). The values cross the CLI's connection to the daemon
       (the local socket) and live in the plugin process inside the container, readable by root
       on the host as any process's environment is. The host zeroes the preamble's bytearray once
       written, **best effort only**: the values were also strings (`Secret.reveal()`, the
@@ -5050,8 +5051,10 @@ loosened later without breaking a valid file.
       for the merged limits of every `plugins.<name>`), `nofile` 64 to 65 536. A `cpus` above
       the host's CPU count is refused by the engine when the container starts.
     - **E, an out-of-memory kill is reported as such.** The plugin container is no longer
-      `--rm`: when its process dies during a call or its start, the host asks the engine
-      (`docker container inspect --format {{json .State.OOMKilled}}`) before removing it, and
+      `--rm`: when its process dies during a call or its start, the host reads the container's
+      exit status before removing it: the launcher exits 247 when the plugin died of `SIGKILL`
+      while the cgroup's `memory.events` `oom_kill` count went up (#188; the engine's
+      `{{json .State.OOMKilled}}` counts too, but the engine can lose that event), and
       a kill by the memory limit fails the call with the new host error kind **`oom_killed`**
       (`plugin <name> (runtime container) was killed by its memory limit (512 MiB, ...)`)
       instead of `plugin_crashed` or `handshake_failed`; the restart rule is unchanged (one

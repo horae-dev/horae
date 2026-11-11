@@ -34,6 +34,7 @@ from horae.plugins.host.container import (
     ENGINE_ENV_KEYS,
     LAUNCHER,
     NETWORK_OPTIONS,
+    OOM_EXIT,
     TMPFS,
     ContainerRuntime,
     check_venv,
@@ -353,17 +354,98 @@ def test_only_an_isolated_network_is_accepted() -> None:
 # --- the launcher -----------------------------------------------------------------------------
 
 
-def _launch(tmp_path: Path, stdin: bytes, *command: str) -> subprocess.CompletedProcess[bytes]:
+def _launcher(tmp_path: Path) -> list[str]:
+    """The launcher's command line, with its directories and a fake cgroup in `tmp_path`."""
     source = launcher_source(
-        home=str(tmp_path / "home"), tmpdir=str(tmp_path / "tmp"), workdir=str(tmp_path / "work")
+        home=str(tmp_path / "home"),
+        tmpdir=str(tmp_path / "tmp"),
+        workdir=str(tmp_path / "work"),
+        cgroup_root=str(tmp_path / "cgroup"),
+        proc_cgroup=str(tmp_path / "proc-cgroup"),
     )
+    return [sys.executable, "-I", "-S", "-c", source]
+
+
+def _launch(tmp_path: Path, stdin: bytes, *command: str) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(  # noqa: S603 (this interpreter, fixed arguments)
-        [sys.executable, "-I", "-S", "-c", source, *command],
+        [*_launcher(tmp_path), *command],
         input=stdin,
         capture_output=True,
         timeout=30,
         check=False,
     )
+
+
+def _cgroup(tmp_path: Path, oom_kill: int = 0) -> Path:
+    """A fake cgroup v2 tree: `/proc/self/cgroup` names `/ctr`, its `memory.events` file."""
+    (tmp_path / "proc-cgroup").write_text("0::/ctr\n", encoding="ascii")
+    events = tmp_path / "cgroup" / "ctr" / "memory.events"
+    events.parent.mkdir(parents=True, exist_ok=True)
+    events.write_text(f"low 0\nhigh 0\nmax 7\noom 1\noom_kill {oom_kill}\n", encoding="ascii")
+    return events
+
+
+def _dies(events: Path | None, signal_name: str) -> str:
+    """A plugin that (with `events`) counts one OOM kill in the cgroup, then dies of a signal."""
+    count = "" if events is None else f"open({str(events)!r}, 'w').write('oom_kill 1\\n'); "
+    return f"import os, signal; {count}os.kill(os.getpid(), signal.{signal_name})"
+
+
+def test_the_launcher_reports_a_sigkill_with_a_cgroup_oom_kill(tmp_path: Path) -> None:
+    """#188: the plugin died of `SIGKILL` and the cgroup's `oom_kill` count went up."""
+    events = _cgroup(tmp_path)
+    done = _launch(tmp_path, b"{}\n", sys.executable, "-c", _dies(events, "SIGKILL"))
+    assert done.returncode == OOM_EXIT, done.stderr
+
+
+@pytest.mark.parametrize(
+    ("counted", "signal_name", "status"),
+    [
+        (False, "SIGKILL", 137),  # killed, but not by the memory limit
+        (True, "SIGTERM", 143),  # an OOM kill elsewhere in the cgroup, the plugin was stopped
+        (None, "SIGKILL", 137),  # no cgroup v2 file to read (cgroup v1): no evidence
+    ],
+)
+def test_the_launcher_reports_no_oom_kill_without_both_proofs(
+    tmp_path: Path, counted: bool | None, signal_name: str, status: int
+) -> None:
+    events = None if counted is None else _cgroup(tmp_path)
+    code = _dies(events if counted else None, signal_name)
+    done = _launch(tmp_path, b"{}\n", sys.executable, "-c", code)
+    assert done.returncode == status, done.stderr
+
+
+def test_the_launcher_passes_the_plugins_exit_status_on_but_its_own(tmp_path: Path) -> None:
+    _cgroup(tmp_path)
+    for code, status in ((0, 0), (3, 3), (OOM_EXIT, 1)):  # only the launcher reports OOM_EXIT
+        done = _launch(tmp_path, b"{}\n", sys.executable, "-c", f"raise SystemExit({code})")
+        assert done.returncode == status, done.stderr
+
+
+def test_the_launcher_passes_a_stop_signal_on_and_keeps_no_stdout(tmp_path: Path) -> None:
+    import signal
+
+    plugin = (
+        "import os, signal, sys, time\n"
+        "signal.signal(signal.SIGTERM, lambda *_: os._exit(42))\n"
+        "print('ready', flush=True)\n"
+        "os.close(1)\n"
+        "time.sleep(30)\n"
+    )
+    with subprocess.Popen(  # noqa: S603 (this interpreter, fixed arguments)
+        [*_launcher(tmp_path), sys.executable, "-c", plugin],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+    ) as process:
+        assert process.stdin is not None
+        assert process.stdout is not None
+        process.stdin.write(b"{}\n")
+        process.stdin.flush()
+        assert process.stdout.readline() == b"ready\n"
+        assert process.stdout.read() == b""  # the plugin closed it: the launcher keeps no copy
+        assert process.poll() is None
+        process.send_signal(signal.SIGTERM)
+        assert process.wait(timeout=10) == 42
 
 
 def test_the_launcher_reads_one_line_and_execs_with_exactly_that_environment(
@@ -1336,6 +1418,17 @@ def test_a_sigkill_exit_without_an_oom_flag_is_asked_again_for_a_bounded_time(
     error = _first_error(tmp_path, plugin, docker=cli, state=state)
     assert error.kind == "handshake_failed"
     assert 2 <= _inspects(state) < 40
+
+
+def test_the_launchers_oom_exit_is_reported_as_oom_killed_without_the_flag(
+    tmp_path: Path,
+) -> None:
+    """#188: the engine lost its OOM event; the launcher's `OOM_EXIT` is enough, asked once."""
+    plugin = _plugin_dir(tmp_path)
+    cli, state = _fake_docker(tmp_path, exit_code=OOM_EXIT, mode="exit")
+    error = _first_error(tmp_path, plugin, docker=cli, state=state)
+    assert error.kind == "oom_killed"
+    assert _inspects(state) == 1
 
 
 def test_an_exit_other_than_sigkill_is_asked_once(tmp_path: Path) -> None:
