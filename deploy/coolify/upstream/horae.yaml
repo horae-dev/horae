@@ -11,9 +11,14 @@
 # the documentation link above.
 #
 #   - The API has NO authentication of its own and is read-only. Put it behind an SSO forwardAuth
-#     (HORAE_SSO_FORWARD_AUTH_URL, required: the deployment is blocked until it is set). The
-#     middleware defined by the labels below is added by Coolify to the routers it generates for
-#     the domain. Do not remove it, and do not publish the domain without it.
+#     (HORAE_SSO_FORWARD_AUTH_URL, required: the deployment is blocked until it is set). Coolify
+#     attaches the name of EVERY traefik.http.middlewares.<name>.* label of the service to every
+#     router it generates for the domain (http and https; fqdnLabelsForTraefik in Coolify's
+#     bootstrap/helpers/docker.php), so the middleware below needs no router label of its own:
+#     this template declares none, and a router of Coolify's has no way to be served without it.
+#     Its name carries SERVICE_USER_HORAE (generated per service) so that two Horae stacks on one
+#     server never share or overwrite one. Do not remove it, and do not publish the domain
+#     without it.
 #   - Horae has no Docker socket here, on purpose: a socket mount makes a Horae compromise root
 #     on the server. Plugins that run in containers (`runtime: container`) need a Docker engine
 #     and are NOT available in this template; the options and their risks are in
@@ -52,6 +57,7 @@ services:
         condition: service_completed_successfully
     environment:
       - SERVICE_FQDN_HORAE_8080
+      - SERVICE_USER_HORAE
       - HORAE_ALLOWED_HOSTS=${SERVICE_FQDN_HORAE}
       - HORAE_SCHEDULER=${HORAE_SCHEDULER:-external}
       - HORAE_ANTHROPIC_API_KEY=${HORAE_ANTHROPIC_API_KEY:?}
@@ -71,8 +77,8 @@ services:
     volumes:
       - horae-instance:/instance
     labels:
-      - "traefik.http.middlewares.horae-sso.forwardauth.address=${HORAE_SSO_FORWARD_AUTH_URL:?}"
-      - "traefik.http.middlewares.horae-sso.forwardauth.trustForwardHeader=false"
+      - "traefik.http.middlewares.horae-sso-${SERVICE_USER_HORAE}.forwardauth.address=${HORAE_SSO_FORWARD_AUTH_URL:?}"
+      - "traefik.http.middlewares.horae-sso-${SERVICE_USER_HORAE}.forwardauth.trustForwardHeader=false"
     healthcheck:
       test:
         - CMD

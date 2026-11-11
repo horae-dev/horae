@@ -552,8 +552,9 @@ on purpose, because a one-click service gets a Coolify-generated domain:
   `HORAE_ALLOWED_HOSTS` is that domain;
 - the API has no authentication of its own, so SSO is **required**: `HORAE_SSO_FORWARD_AUTH_URL`
   (your forwardAuth address) blocks the deployment until it is set, and a label-defined
-  `forwardauth` middleware (`trustForwardHeader=false`) is added to the routers Coolify
-  generates; `/act/` links are therefore behind SSO too (the exemption needs the hand-written
+  `forwardauth` middleware (`trustForwardHeader=false`, named with a per-service generated
+  suffix) is attached by Coolify to every router it generates (the template declares no router
+  of its own); `/act/` links are therefore behind SSO too (the exemption needs the hand-written
   routers of this page's template);
 - same security defaults: no Docker socket (plugin containers need a Docker engine and are not
   available, [plugin-containers.md](plugin-containers.md#horae-inside-docker-coolify-compose)),

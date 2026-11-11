@@ -107,9 +107,11 @@ satisfies the contributor agreement; a staging server is fine for a first run):
 7. Redeploy: the volume is kept, `horae-init` leaves the existing `horae.yaml` alone.
 8. Write down what you saw: this is the "Testing" section of the pull request.
 
-If step 5 shows the middleware is not attached to the generated routers, tell reviewers and
-adjust the labels (Coolify's custom-middleware documentation describes how label-defined
-middlewares are added); keep SSO required either way.
+Coolify's source attaches the name of every `traefik.http.middlewares.<name>.*` label to each
+router it generates (http and https), which is why the template has no router labels of its
+own. Confirm it on the real proxy: `docker inspect` of the `horae` container, then the proxy's
+dashboard or `/data/coolify/proxy` logs, must show `horae-sso-<suffix>` on every Horae router.
+If it is not attached, do not submit: SSO is required either way.
 
 ## Pull request title
 
