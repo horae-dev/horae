@@ -48,6 +48,11 @@ writes, the venv plus uv's temporary directory plus what it adds to the cache, a
 `max_bytes` (`MAX_VENV_BYTES`, measured while uv runs: it is killed past it);
 `pyproject.toml` and `uv.lock` at most `MAX_PROJECT_BYTES` each.
 
+**A plugin without a runtime** (a pipeline pack: `provides.pipelines` / `provides.skills`
+only, decision 18) is never started, so it gets **no venv** (#200): `__call__` returns at once,
+whatever its `pyproject.toml` and `uv.lock` say (a pack's are for its own tests), and uv never
+runs. `horae plugin audit` does not expect a venv for it either.
+
 **At run time** the host starts the plugin from that venv (`horae.plugins.host.env`): a bare
 `runtime.command[0]` (`python`, `python3`, a console script) is looked up in
 `<plugin>/.venv/bin` first, the child's `PATH` starts with it, `VIRTUAL_ENV` names it, and
@@ -491,6 +496,10 @@ class PluginEnvironment:
     its dependencies are installed, and a `.pth` makes its sources importable."""
 
     def __call__(self, tree: Path, manifest: PluginManifest) -> None:
+        if manifest.runtime is None:
+            # A pack (#200): files only (pipelines, skills), never started, so it gets no venv
+            # and nothing of its tree is checked, resolved or built: no uv, no build backend.
+            return
         if not self.install_project:
             check_module_command(manifest)
         self.prepare(tree, manifest.name)

@@ -7,6 +7,7 @@ plugins build with `uv_build`, which uv carries: no test touches the network.
 """
 
 import asyncio
+import json
 import os
 import shutil
 from pathlib import Path
@@ -22,7 +23,7 @@ from horae.plugins.host import HostRegistry, PluginHost
 from horae.plugins.host.env import BASE_PATH, OFFLINE_ENV, build_env, plugin_venv
 from horae.plugins.host.host import resolve_command
 from horae.secrets import SecretResolver
-from marketplace_fixtures import PLUGIN_URL, LocalInstaller, plugin_repo
+from marketplace_fixtures import PLUGIN_URL, LocalInstaller, plugin_manifest, plugin_repo
 from plugin_fixtures import lock_for
 from venv_fixtures import (
     UV,
@@ -164,6 +165,30 @@ def test_a_plugin_without_a_pyproject_is_refused(tmp_path: Path) -> None:
             "demo", "1.0.0", PLUGIN_URL, sha, prepare=PluginEnvironment(tmp_path / "cache")
         )
     assert _left(plugins) == []
+
+
+def test_a_plugin_without_a_runtime_gets_no_venv_and_runs_no_uv(tmp_path: Path) -> None:
+    """A pipeline pack (#200) is never started: no venv, and its own dev `pyproject.toml` (a
+    virtual project) and an unusable `uv.lock` are never read. `uv` points nowhere, so any
+    call to it would fail the install."""
+    data = json.loads(plugin_manifest("demo"))
+    data.update(provides={"pipelines": ["nightly"]}, permissions={})
+    del data["runtime"]
+    files = {
+        "pyproject.toml": '[project]\nname = "demo-pack"\nversion = "1.0.0"\n'
+        "[tool.uv]\npackage = false\n",
+        "uv.lock": "not a lock\n",
+        "pipelines/nightly.yaml": "name: nightly\n",
+    }
+    repo, sha = plugin_repo(tmp_path / "repo", manifest=json.dumps(data), files=files)
+    plugins = tmp_path / "plugins"
+    environment = PluginEnvironment(tmp_path / "cache", uv=str(tmp_path / "no-uv"))
+    LocalInstaller(plugins, {PLUGIN_URL: repo}).install(
+        "demo", "1.0.0", PLUGIN_URL, sha, prepare=environment
+    )
+    assert (plugins / "demo" / "plugin.yaml").is_file()
+    assert not (plugins / "demo" / ".venv").exists()
+    assert not (tmp_path / "cache").exists()
 
 
 @needs_uv

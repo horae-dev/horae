@@ -1003,6 +1003,15 @@ def _activity(store_path: Path, warnings: list[str]) -> dict[str, datetime]:
         return {}
 
 
+def _has_runtime(root: Path) -> bool:
+    """Whether the installed manifest declares a runtime, so the plugin needs a venv. A pack
+    has none (#200). An unreadable manifest counts as one: the venv is then still expected."""
+    try:
+        return validate(read_yaml(root / MANIFEST_FILE), PluginManifest).runtime is not None
+    except (ProblemsError, OSError, ValueError):
+        return True
+
+
 def _host_problem(name: str, entry: LockedPlugin, directory: Path) -> str | None:
     try:
         HostRegistry.from_directory(Lockfile(schema_version=1, plugins={name: entry}), directory)
@@ -1041,7 +1050,7 @@ def _audit_plugin(
             drift.append(Drift("record_mismatch", f"{name}: {differs}"))
         elif problem := _host_problem(name, entry, directory):
             drift.append(Drift("host_refuses", f"{name}: {problem}"))
-    if record is not None and info is not None and plugin_venv(root) is None:
+    if record is not None and info is not None and _has_runtime(root) and plugin_venv(root) is None:
         drift.append(Drift("venv_missing", f"{name}: {root}/.venv is missing or incomplete"))
     if entry is not None and entry.pipelines:
         drift += pipeline_drift(name, dict(entry.pipelines), instance / PIPELINES_DIR / name)
