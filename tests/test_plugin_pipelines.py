@@ -20,6 +20,7 @@ from horae.contracts.lockfile import LockedPlugin
 from horae.contracts.plugin import PluginManifest
 from horae.marketplace import approval
 from horae.marketplace.approval import lock_mismatch
+from horae.marketplace.environment import PluginEnvironment
 from horae.marketplace.errors import InstallRefused
 from horae.marketplace.install import INSTALL_RECORD
 from horae.marketplace.pipelines import PackPipelines
@@ -584,3 +585,31 @@ def test_a_fallback_move_that_fails_partway_puts_every_file_back(
     assert (src / "a.yaml").read_text(encoding="utf-8") == "a.yaml"
     assert not (tmp_path / "target").exists()
     assert bystander.read_text(encoding="utf-8") == "mine"
+
+
+def test_a_pack_installs_through_the_real_environment_and_audits_clean(
+    inst: Path, pack: dict[str, Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """#200: `plugin add` builds no venv for a pack (no runtime), even with its own dev-only
+    `pyproject.toml`, runs no uv, and `plugin audit` expects no venv for it."""
+    monkeypatch.setattr(
+        cli_plugin,
+        "make_environment",
+        lambda cache_dir: PluginEnvironment(cache_dir, uv=str(tmp_path / "no-uv")),
+    )
+    dev_project = '[project]\nname = "demo-pack"\nversion = "1.0.0"\n[tool.uv]\npackage = false\n'
+    pack["publish"](
+        _manifest(sorted(n for n in ("weekly-review", "nightly-check"))),
+        {
+            **GOOD,
+            "pyproject.toml": dev_project,
+        },
+    )
+    code, out = _add(inst)
+    assert code == 0, out
+    assert not (inst / "plugins" / "demo-pack" / ".venv").exists()
+    _enable(inst)
+    result = runner.invoke(app, ["plugin", "audit", "--json", "-i", str(inst)])
+    report = json.loads(result.stdout)
+    (ours,) = [p for p in report["plugins"] if p["name"] == "demo-pack"]
+    assert ours["drift"] == [], ours  # no venv_missing: a pack needs no venv
