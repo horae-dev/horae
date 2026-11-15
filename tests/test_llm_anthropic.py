@@ -633,6 +633,39 @@ def test_tool_content_is_output_invalid(secrets: SecretResolver) -> None:
     assert "tool_use content" in error.message
 
 
+@pytest.mark.parametrize("kind", ["thinking", "redacted_thinking"])
+def test_reasoning_blocks_are_skipped_and_never_read(secrets: SecretResolver, kind: str) -> None:
+    """#202: a current model thinks by default; its reasoning block is not the output."""
+
+    def thinking(request: httpx2.Request) -> httpx2.Response:
+        _, body = fixture("success")
+        hidden = '{"items": ["from the thinking"]}'
+        block = (
+            {"type": "thinking", "thinking": hidden, "signature": "sig"}
+            if kind == "thinking"
+            else {"type": "redacted_thinking", "data": hidden}
+        )
+        body["content"] = [block, *body["content"], {**block}]
+        return httpx2.Response(200, json=body)
+
+    response = complete(backends(secrets, Recorder(thinking)))
+    assert response.output == {"items": ["Review PR 42"], "summary": "One review is waiting."}
+
+
+def test_a_tool_call_after_a_thinking_block_is_still_output_invalid(
+    secrets: SecretResolver,
+) -> None:
+    def thinking_then_tool(request: httpx2.Request) -> httpx2.Response:
+        _, body = fixture("tool_use")
+        body["stop_reason"] = "end_turn"
+        body["content"] = [{"type": "thinking", "thinking": "", "signature": "s"}, *body["content"]]
+        return httpx2.Response(200, json=body)
+
+    error = fails(backends(secrets, Recorder(thinking_then_tool)))
+    assert error.kind == "output_invalid"
+    assert "tool_use content" in error.message
+
+
 def test_non_finite_json_is_output_invalid(secrets: SecretResolver) -> None:
     def nan(request: httpx2.Request) -> httpx2.Response:
         _, body = fixture("success")

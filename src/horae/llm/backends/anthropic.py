@@ -140,6 +140,11 @@ SENT_HEADERS = (
 PAYLOAD_KEYS = frozenset({"model", "max_tokens", "system", "messages", "output_config"})
 """The keys of a rendered payload: no `tools`, `tool_choice`, `thinking` or anything else."""
 
+REASONING_BLOCKS = frozenset({"thinking", "redacted_thinking"})
+"""Response blocks skipped, never read (#202): current models think when the request does not
+say otherwise and some cannot be told not to. Only `text` blocks make the output; any other
+block (a tool call, a server tool, an unknown type) still fails the step."""
+
 SDK_LOGGERS = ("anthropic", "httpx2", "httpcore2")
 """Loggers pinned to `WARNING` (with their children): at `DEBUG` they log request bodies."""
 
@@ -422,8 +427,9 @@ class AnthropicBackend:
         if not isinstance(content, list):
             raise invalid("the response has no content")
         for block in blocks:
-            if _get(block, "type") != "text":
-                kind = token(_get(block, "type")) or "unknown"
+            kind = _get(block, "type")
+            if kind != "text" and kind not in REASONING_BLOCKS:
+                kind = token(kind) or "unknown"
                 raise invalid(f"the response has {kind} content (no tools are allowed)")
         output = parse(text)
         if output is INVALID:
