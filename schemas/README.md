@@ -2693,7 +2693,7 @@ loosened later without breaking a valid file.
 50. **The plugin SDK: Tasks-safe task titles and fingerprints (#42, review findings).**
     Numbering: 49 is #39's, on its unmerged branch, so this takes 50. The SDK (`sdk/`,
     `horae-sdk`) is not a contract of the core, but its escaping is the T02 control
-    ([`docs/security.md`](../docs/security.md)), so its rules are recorded here:
+    ([`docs/security.md`](https://horae-dev.github.io/docs/security/threat-model/)), so its rules are recorded here:
     - **(A) the intent's title is the Tasks-safe form.** `horae_sdk.intents.task_create`
       escapes the title (`horae_sdk.tasks.escape_title`), as the acceptance criterion of #42
       asks ("intent builders escape"), and the 500-character cut of the `Title` contract
@@ -3540,7 +3540,7 @@ loosened later without breaking a valid file.
       `uv-cache`) is `0700`, ancestors included; one that already existed is not changed. Each
       index clone is written under an exclusive `flock` on `<cache_dir>/<hash>.lock` (waiting
       up to 150 s); past that, `LockBusy`: exit 5, kind `lock_busy`, as the `horae.lock` guard.
-    - **H, trust.** An index is untrusted data ([security.md](../docs/security.md), B6): it can
+    - **H, trust.** An index is untrusted data ([security.md](https://horae-dev.github.io/docs/security/threat-model/), B6): it can
       only point to a repository and a SHA. #44 re-verifies the tag and the SHA, #46 shows the
       permissions.
 
@@ -4550,7 +4550,7 @@ loosened later without breaking a valid file.
 74. **A per-plugin container runtime (#49).** One additive schema change to `instance/v1.json`:
     `plugin_defaults.runtime`, `plugins.<name>.runtime` and a `container` section (A, G). Code in
     `horae.plugins.host.container`; operator guide in
-    [docs/operations/plugin-containers.md](../docs/operations/plugin-containers.md).
+    [docs/operations/plugin-containers.md](https://horae-dev.github.io/docs/security/plugin-containers/).
     - **A, where it is chosen.** `runtime: process | container`, in `horae.yaml`:
       `plugin_defaults.runtime` (default `process`, the behaviour before #49) and
       `plugins.<name>.runtime`, which wins. The operator chooses, never the plugin: the manifest
@@ -4741,7 +4741,7 @@ loosened later without breaking a valid file.
     attempts use the existing `egress_blocked` violation kind of the run record. The code is in
     `horae.plugins.host.egress_proxy` (the proxy, standard library only) and
     `horae.plugins.host.egress` (starting it, reading its reports). The operator guide is
-    [docs/operations/plugin-containers.md](../docs/operations/plugin-containers.md#egress-the-allow-list-proxy).
+    [docs/operations/plugin-containers.md](https://horae-dev.github.io/docs/security/plugin-containers/#egress-the-allow-list-proxy).
     Only `runtime: container` (decision 74) has a proxy. The process runtime is unchanged (it
     has no isolation, T05).
     - **A, implementation: a small asyncio proxy in Horae, run in its own container.** It is
@@ -4973,7 +4973,7 @@ loosened later without breaking a valid file.
     `horae.plugins.host.mounts` (the mount plan and the sweep) and `run_argv`
     (`horae.plugins.host.container`, still the one place container flags are built); operator
     guide in
-    [docs/operations/plugin-containers.md](../docs/operations/plugin-containers.md#declared-paths).
+    [docs/operations/plugin-containers.md](https://horae-dev.github.io/docs/security/plugin-containers/#declared-paths).
     Only `runtime: container` (decision 74) changes; the process runtime is unchanged (T04).
     - **A, the same path inside.** Each path of the plugin's **locked**
       `permissions.paths` (decision 70: what the user approved, never the manifest's own) is

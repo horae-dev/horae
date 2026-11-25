@@ -2,7 +2,7 @@
 
 - **Issue:** [#29](https://github.com/horae-dev/horae/issues/29) (M2, Human-led), epic
   [#3 Bounded LLM step](https://github.com/horae-dev/horae/issues/3); threat **T11** in
-  [docs/security.md](../security.md#b3-core--llm-backend).
+  [docs/security.md](https://horae-dev.github.io/docs/security/threat-model/#b3-core-llm-backend).
 - **Status:** Draft, for maintainer review. No code until the questions below are answered.
 - **Sources:** [ADR 0005](../adr/0005-claude-cli-backend-and-its-terms.md),
   [PLAN §3.4](../PLAN.md#34-llm-step-and-backends), [§10](../PLAN.md#10-risks-honest),
