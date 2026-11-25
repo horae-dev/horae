@@ -256,7 +256,9 @@ def notify_push(
     """`notify.push`: `body` (at most 4096 characters), an optional one-line `title` and an
     optional `https://` or `obsidian://` `link` (the core also checks it against the
     pipeline's trusted `link_prefix`). An optional stable `key` (`A-Za-z0-9._:-`, 1 to 128)
-    makes the core send this notification once per local day, however many runs propose it."""
+    makes the core send this notification once, however many runs propose it: the core
+    dedupes it on (pipeline, entry, key), with no date, and never forgets a sent key. For
+    "once a day", put the day in the key."""
     if not _matches(_ANY, body, MAX_BODY):
         raise IntentError(f"body must be 1 to {MAX_BODY} characters")
     intent: Intent = {"type": "notify.push", "body": body}
