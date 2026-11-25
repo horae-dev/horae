@@ -145,7 +145,7 @@
             }
           ],
           "default": null,
-          "description": "What the user added with `--allow-host` / `--allow-local` when `add` or `upgrade`\napproved this entry (decision 73 D, #175). `horae plugin upgrade` carries over only these\n(never what it infers from the installed manifest, which is not verified). Always a subset\nof `permissions` (the loader refuses a lock that lists a grant it does not give). Left out\nwhen empty, so a lock without any, or written before it, is written exactly as before."
+          "description": "What the user added with `--allow-host` / `--allow-local` / `--allow-path` /\n`--allow-read-path` when `add` or `upgrade` approved this entry (decision 73 D, #175,\n#205). `horae plugin upgrade` carries over only these (never what it infers from the\ninstalled manifest, which is not verified). Always a subset of `permissions` (the loader\nrefuses a lock that lists a grant it does not give). Left out when empty, so a lock without\nany, or written before it, is written exactly as before."
         }
       },
       "required": [
@@ -288,7 +288,7 @@
     },
     "UserGrants": {
       "additionalProperties": false,
-      "description": "The hosts and local endpoints the user added with `--allow-host` / `--allow-local`\n(decision 73 D), as opposed to the ones the manifest declares.",
+      "description": "The hosts, local endpoints and paths the user added with `--allow-host` /\n`--allow-local` / `--allow-path` / `--allow-read-path` (decision 73 D, #205), as opposed to\nthe ones the manifest declares.",
       "properties": {
         "network": {
           "description": "Hosts added with `--allow-host` (sorted when written).",
@@ -317,6 +317,10 @@
           "maxItems": 256,
           "title": "Network Local",
           "type": "array"
+        },
+        "paths": {
+          "$ref": "#/$defs/PathPermissions",
+          "description": "Paths added with `--allow-read-path` (`read`) and `--allow-path` (`write`, read and\nwrite), e.g. the vault of a sink whose manifest asks for none (#205). Sorted when written;\nleft out when empty, so a record written before it reads the same."
         }
       },
       "title": "UserGrants",

@@ -65,7 +65,7 @@ from horae.cli_output import (
 )
 from horae.config import Instance
 from horae.contracts.instance import InstanceConfig
-from horae.contracts.lockfile import LockedPlugin, Lockfile, Tier
+from horae.contracts.lockfile import LockedPlugin, Lockfile, Tier, UserGrants
 from horae.contracts.plugin import PluginManifest
 from horae.marketplace import (
     AlreadyInstalled,
@@ -94,7 +94,9 @@ from horae.marketplace import (
 from horae.marketplace.approval import (
     container_only,
     describe,
+    describe_dropped,
     describe_origin,
+    dropped_grants,
     first_party,
     lock_mismatch,
     origin,
@@ -138,6 +140,23 @@ OfflineOption = Annotated[
     typer.Option("--offline", help="Do not fetch: use the cached copy of every marketplace."),
 ]
 JsonOption = Annotated[bool, typer.Option("--json", help="Print the result as JSON.")]
+AllowPathOption = Annotated[
+    list[str] | None,
+    typer.Option(
+        "--allow-path",
+        metavar="PATH",
+        help="Also grant read and write access to this absolute path (repeatable), beyond what "
+        "the plugin declares, e.g. the vault of a sink: /srv/horae/vault.",
+    ),
+]
+AllowReadPathOption = Annotated[
+    list[str] | None,
+    typer.Option(
+        "--allow-read-path",
+        metavar="PATH",
+        help="Also grant read-only access to this absolute path (repeatable).",
+    ),
+]
 
 _KINDS: tuple[tuple[type[MarketplaceError], int, str], ...] = (
     (AlreadyInstalled, EXIT_REFUSED, "already_installed"),
@@ -275,7 +294,7 @@ class _Approval:
         lock: Lockfile,
         repo: str,
         sha: str,
-        grants: tuple[list[str], list[str]],
+        grants: UserGrants,
         *,
         yes: bool,
         json_output: bool,
@@ -292,14 +311,14 @@ class _Approval:
         self.lock = lock
         self.repo = repo
         self.sha = sha
-        self.hosts, self.local = grants
+        self.grants = grants
         self.yes = yes
         self.json_output = json_output
         self.entry: LockedPlugin | None = None
 
     def __call__(self, _tree: Path, manifest: PluginManifest) -> None:
         name, version = manifest.name, manifest.version
-        granted = with_grants(manifest.permissions, self.hosts, self.local)
+        granted = with_grants(manifest.permissions, self.grants)
         direct = self.source == "direct"
         tier, index = (None, None) if direct else origin(self.tier, self.index)
         wanted = LockedPlugin(
@@ -309,7 +328,7 @@ class _Approval:
             permissions=granted,
             personal_fields=manifest.provides.personal_fields,
             pipelines=self.pipelines.digests if self.pipelines is not None else {},
-            user_grants=recorded_grants(self.hosts, self.local),
+            user_grants=recorded_grants(self.grants),
             source="direct" if direct else None,
             tier=tier,
             index=index,
@@ -344,6 +363,15 @@ class _Approval:
                     f"({existing.version} at {existing.commit})",
                     err=err,
                 )
+                # #205: a re-install keeps only what the manifest and the flags grant; say what
+                # the current entry grants beyond that (e.g. a vault path set by hand).
+                if dropped := dropped_grants(existing, granted):
+                    echo(
+                        "note: the new entry drops what the current one grants beyond this "
+                        "request; to keep it, answer no and run again with "
+                        f"{safe(describe_dropped(dropped))}",
+                        err=err,
+                    )
             try:
                 approved = typer.confirm(
                     f"Approve these permissions and install {name}?", default=False, err=err
@@ -393,7 +421,7 @@ def _install_and_lock(
     instance: Path,
     repo: str,
     sha: str,
-    grants: tuple[list[str], list[str]],
+    grants: UserGrants,
     install: Install,
     *,
     yes: bool,
@@ -527,10 +555,12 @@ def _add(
     yes: bool,
     allow_host: list[str],
     allow_local: list[str],
+    allow_path: list[str],
+    allow_read_path: list[str],
 ) -> int:
     direct = is_direct(ref)
     try:
-        grants = parse_grants(allow_host, allow_local)
+        grants = parse_grants(allow_host, allow_local, allow_path, allow_read_path)
         if direct:
             repo, sha = parse_direct(ref)
             if pre or offline:
@@ -587,7 +617,7 @@ def _add_direct(
     instance: Path,
     repo: str,
     sha: str,
-    grants: tuple[list[str], list[str]],
+    grants: UserGrants,
     *,
     yes: bool,
     json_output: bool,
@@ -710,6 +740,8 @@ def add_command(
             "e.g. 192.168.1.10:8123.",
         ),
     ] = None,
+    allow_path: AllowPathOption = None,
+    allow_read_path: AllowReadPathOption = None,
     json_output: JsonOption = False,
 ) -> None:
     """Install a plugin at the commit its marketplace pins, approve its permissions, and pin
@@ -724,8 +756,10 @@ def add_command(
     invalid or names another plugin or version. The permissions plugin.yaml asks for are then
     shown and must be approved: interactively, or with --yes when horae.lock already approves
     exactly this version, commit and permissions (without a terminal and without --yes, the
-    install is refused). --allow-host and --allow-local add grants beyond the manifest (written
-    to horae.lock; give them again with --yes). Nothing is half-installed. Once approved, its
+    install is refused). --allow-host, --allow-local, --allow-path and --allow-read-path add
+    grants beyond the manifest (written to horae.lock and kept by `upgrade`; give them again
+    with --yes). --allow-path grants read and write access to an absolute path, such as the
+    vault of a sink whose manifest asks for no path. Nothing is half-installed. Once approved, its
     dependencies are installed in its own venv.
 
     A direct install, https://HOST/OWNER/REPO@SHA with the full commit SHA (no tag, branch or
@@ -749,6 +783,8 @@ def add_command(
             yes,
             list(allow_host or ()),
             list(allow_local or ()),
+            list(allow_path or ()),
+            list(allow_read_path or ()),
         ),
     )
 

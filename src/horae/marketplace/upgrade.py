@@ -10,8 +10,9 @@ schemas decision 73).
   personal field dropped (less protection, decision 68); a new repository or source; a tier or
   index that is not first-party any more (#191). Not
   widening: anything removed, a secret moved between required and optional.
-- `user_grants(locked)`: the hosts and local endpoints the user recorded in the lock entry
-  with `--allow-host` / `--allow-local`; an upgrade keeps them (they are already approved).
+- `user_grants(locked)`: the hosts, local endpoints and paths the user recorded in the lock
+  entry with `--allow-host` / `--allow-local` / `--allow-path` / `--allow-read-path`; an
+  upgrade keeps them (they are already approved, #205 for paths).
 - `Swap`: the renames that put an upgrade in place (old tree aside, new tree in), undone in
   reverse order on failure, so the old tree is left exactly where it was.
 """
@@ -24,7 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from horae.contracts.lockfile import LockedPlugin
+from horae.contracts.lockfile import LockedPlugin, UserGrants
 from horae.contracts.plugin import FREE_TEXT_FIELD, Permissions
 
 OLD_PREFIX = ".upgrade-old-"
@@ -173,15 +174,22 @@ def describe_diff(changes: Sequence[Change]) -> list[str]:
     return lines
 
 
-def user_grants(locked: LockedPlugin) -> tuple[list[str], list[str]]:
-    """The hosts and local endpoints the user recorded when `locked` was approved
+def user_grants(locked: LockedPlugin) -> UserGrants:
+    """The hosts, local endpoints and paths the user recorded when `locked` was approved
     (`LockedPlugin.user_grants`), still granted by it. Nothing for an entry without a record:
     what the user added is never inferred from the installed manifest, which is not verified."""
-    if locked.user_grants is None:
-        return [], []
-    return (
-        sorted(set(locked.user_grants.network) & set(locked.permissions.network)),
-        sorted(set(locked.user_grants.network_local) & set(locked.permissions.network_local)),
+    mine, given = locked.user_grants, locked.permissions
+    if mine is None:
+        return UserGrants()
+    return UserGrants.model_validate(
+        {
+            "network": sorted(set(mine.network) & set(given.network)),
+            "network_local": sorted(set(mine.network_local) & set(given.network_local)),
+            "paths": {
+                "read": sorted(set(mine.paths.read) & set(given.paths.read)),
+                "write": sorted(set(mine.paths.write) & set(given.paths.write)),
+            },
+        }
     )
 
 

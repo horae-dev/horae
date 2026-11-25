@@ -556,11 +556,13 @@ def test_the_diff_of_pipelines_and_repository() -> None:
 
 def test_user_grants_are_only_what_the_lock_records() -> None:
     plain = _entry(network=["a.example.org", "b.example.org"], network_local=["10.0.0.1:80"])
-    assert user_grants(plain) == ([], [])  # no record: nothing is inferred
+    assert user_grants(plain) == UserGrants()  # no record: nothing is inferred
     recorded = plain.model_copy(
         update={"user_grants": UserGrants(network=["b.example.org"], network_local=["10.0.0.1:80"])}
     )
-    assert user_grants(recorded) == (["b.example.org"], ["10.0.0.1:80"])
+    assert user_grants(recorded) == UserGrants(
+        network=["b.example.org"], network_local=["10.0.0.1:80"]
+    )
 
 
 def test_a_lock_cannot_record_a_grant_it_does_not_give() -> None:

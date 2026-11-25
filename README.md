@@ -68,7 +68,11 @@ installs and runs **only in a container**: set `plugins.<name>.runtime: containe
 `plugin_defaults.runtime: container`) in `horae.yaml` first, with Docker available
 ([decision 79](schemas/README.md#provisional-decisions-191-pending-maintainer-review); how-to
 in the [operator guide](docs/operations/plugin-containers.md#installing-third-party-plugins)).
-`--allow-host HOST` and `--allow-local HOST:PORT` grant more (your own Home Assistant, say);
+`--allow-host HOST` and `--allow-local HOST:PORT` grant more (your own Home Assistant, say),
+and `--allow-path PATH` (read and write) or `--allow-read-path PATH` (read only) grant an
+absolute path the manifest does not ask for, such as the vault of an Obsidian plugin
+(`horae plugin add obsidian --allow-path /srv/horae/vault`); each is repeatable, recorded in
+`horae.lock` as yours, and kept by `upgrade`.
 `--yes` re-installs, without asking, only what `horae.lock` already approves (a Docker build
 from a committed lock). Details: [schemas decision 70](schemas/README.md#decisions).
 A direct install without a marketplace, `horae plugin add https://<host>/<owner>/<repo>@<full
@@ -89,7 +93,11 @@ prompt lists each pipeline (trigger, tools, skills; a warning for tools of other
 `horae plugin upgrade NAME[@VERSION]` resolves the new version like `add`, installs it next to
 the old one with its own venv, and shows what changes against `horae.lock`: a new host, local
 endpoint, secret, intent, path or pack pipeline (or a changed one, or a dropped personal field)
-must be approved again, and `--yes` passes only when nothing widens. Hosts you added are kept.
+must be approved again, and `--yes` passes only when nothing widens. The hosts, endpoints and
+paths you added with `--allow-*` are kept; anything else the new version no longer asks for is
+dropped and shown in the diff. A grant `horae.lock` does not record as yours (a path set there
+by hand, say) is dropped with a note naming the flag that keeps it: run
+`horae plugin upgrade NAME --allow-path PATH` (also at the installed version, to record it).
 The trees are swapped and the lock rewritten only after approval; on any failure the old
 version stays. A lower version needs `--allow-downgrade`. `horae plugin remove NAME` refuses a
 plugin still listed under `plugins:` in `horae.yaml`, then deletes its tree, venv, lock entry

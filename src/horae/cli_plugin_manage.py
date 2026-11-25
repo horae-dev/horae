@@ -51,7 +51,7 @@ from horae.cli_output import (
 from horae.config import CONFIG_FILE, STORE_FILE, Instance, ProblemsError
 from horae.config.documents import read_yaml, validate
 from horae.contracts.instance import CORE_SECRET_NAMES, EnvSecretRef, InstanceConfig
-from horae.contracts.lockfile import LockedPlugin, Lockfile, Tier
+from horae.contracts.lockfile import LockedPlugin, Lockfile, Tier, UserGrants
 from horae.contracts.plugin import PluginManifest
 from horae.contracts.types import PluginName
 from horae.marketplace import (
@@ -67,8 +67,11 @@ from horae.marketplace import (
 )
 from horae.marketplace.approval import (
     describe,
+    describe_dropped,
     describe_origin,
+    dropped_grants,
     lock_mismatch,
+    merge_grants,
     origin,
     parse_grants,
     recorded_grants,
@@ -169,7 +172,7 @@ class _UpgradeApproval:
     def __init__(
         self,
         old: LockedPlugin,
-        grants: tuple[list[str], list[str]],
+        grants: UserGrants,
         target: "_Target",
         *,
         yes: bool,
@@ -180,7 +183,7 @@ class _UpgradeApproval:
         self.old = old
         self.target = target
         self.config = config
-        self.hosts, self.local = grants
+        self.grants = grants
         self.repo, self.sha = target.repo, target.sha
         self.yes = yes
         self.json_output = json_output
@@ -190,7 +193,7 @@ class _UpgradeApproval:
 
     def __call__(self, _tree: Path, manifest: PluginManifest) -> None:
         name, version = manifest.name, manifest.version
-        granted = with_grants(manifest.permissions, self.hosts, self.local)
+        granted = with_grants(manifest.permissions, self.grants)
         direct = self.target.direct
         tier, index = (None, None) if direct else origin(self.target.tier, self.target.index)
         wanted = LockedPlugin(
@@ -200,7 +203,7 @@ class _UpgradeApproval:
             permissions=granted,
             personal_fields=manifest.provides.personal_fields,
             pipelines=self.pipelines.digests,
-            user_grants=recorded_grants(self.hosts, self.local),
+            user_grants=recorded_grants(self.grants),
             source="direct" if direct else None,
             tier=tier,
             index=index,
@@ -218,19 +221,29 @@ class _UpgradeApproval:
             echo(safe(line), err=err)
         for line in describe_diff(changes):
             echo(safe(line), err=err)
-        if self.old.user_grants is None:
-            dropped = sorted(
-                {*self.old.permissions.network, *self.old.permissions.network_local}
-                - {*granted.network, *granted.network_local}
+        dropped = dropped_grants(self.old, granted)
+        hosts = [(v, f) for v, f in dropped if f in {"--allow-host", "--allow-local"}]
+        if self.old.user_grants is None and hosts:
+            echo(
+                "note: horae.lock records no host you added with --allow-host / "
+                "--allow-local for this plugin (installed before it did, or none added), "
+                f"so none is carried over; dropped: {', '.join(safe(v) for v, _ in hosts)}. If "
+                "you added one of them, run the upgrade again with --allow-host / --allow-local",
+                err=err,
             )
-            if dropped:
-                echo(
-                    "note: horae.lock records no host you added with --allow-host / "
-                    "--allow-local for this plugin (installed before it did, or none added), "
-                    f"so none is carried over; dropped: {', '.join(map(safe, dropped))}. If you "
-                    "added one of them, run the upgrade again with --allow-host / --allow-local",
-                    err=err,
-                )
+        # #205: a path the lock grants but does not record as yours (set by hand, or granted
+        # before --allow-path existed) is never inferred, so never carried over: say so, and
+        # how to keep it, before the approval.
+        if paths := [(v, f) for v, f in dropped if f.endswith("-path")]:
+            echo(
+                "note: horae.lock records no path you granted with --allow-path / "
+                "--allow-read-path for these, and the new version does not ask for them, so "
+                f"they are dropped: {', '.join(safe(v) for v, _ in paths)}. To keep them, "
+                "run the upgrade with "
+                f"{safe(describe_dropped(paths))} (answer no to this one; after --yes, run it "
+                "again with them and approve)",
+                err=err,
+            )
         if widens(changes):
             # The full request, so what is new is read in context (pipelines with their calls).
             for line in describe(
@@ -324,6 +337,8 @@ def _upgrade(
     yes: bool,
     allow_host: list[str],
     allow_local: list[str],
+    allow_path: list[str],
+    allow_read_path: list[str],
     allow_downgrade: bool,
 ) -> int:
     direct: tuple[str, str] | None = None
@@ -339,7 +354,7 @@ def _upgrade(
             name = ""
         else:
             name, _version = parse_ref(ref)
-        grants = parse_grants(allow_host, allow_local)
+        grants = parse_grants(allow_host, allow_local, allow_path, allow_read_path)
     except MarketplaceError as exc:
         raise cli_plugin._failed(exc) from None
     loaded_instance = load(instance)
@@ -367,7 +382,7 @@ def _upgrade_locked(
     instance: Path,
     name: str,
     ref: str,
-    grants: tuple[list[str], list[str]],
+    grants: UserGrants,
     *,
     offline: bool,
     pre: bool,
@@ -442,17 +457,20 @@ def _upgrade_locked(
         )
     if (
         (target.repo, target.sha) == (old.repo, old.commit)
-        and not grants[0]
-        and not grants[1]
+        and not grants
         and not record_mismatch(record, name, old.version, old.repo, old.commit)
     ):
         return _report_current(name, old, json_output, warnings)
-    kept_hosts, kept_local = user_grants(old)
-    all_grants = (sorted({*kept_hosts, *grants[0]}), sorted({*kept_local, *grants[1]}))
-    for host in kept_hosts:
-        echo(f"keeping the host you added: {host}", err=json_output)
-    for endpoint in kept_local:
-        echo(f"keeping the local endpoint you added: {endpoint}", err=json_output)
+    kept = user_grants(old)
+    all_grants = merge_grants(kept, grants)
+    for what, values in (
+        ("host", kept.network),
+        ("local endpoint", kept.network_local),
+        ("read and write path", kept.paths.write),
+        ("read path", kept.paths.read),
+    ):
+        for value in values:
+            echo(f"keeping the {what} you added: {safe(value)}", err=json_output)
     # Only a pack's own directory is replaced; a plugin that installed no pipeline never
     # touches `pipelines/<name>/` (a directory there is the user's, refused like at `add`).
     pipelines = PackPipelines(
@@ -638,6 +656,8 @@ def upgrade_command(
             "--allow-local", metavar="HOST:PORT", help="Also grant this local-network endpoint."
         ),
     ] = None,
+    allow_path: cli_plugin.AllowPathOption = None,
+    allow_read_path: cli_plugin.AllowReadPathOption = None,
     allow_downgrade: Annotated[
         bool,
         typer.Option("--allow-downgrade", help="Allow installing a lower version."),
@@ -650,9 +670,13 @@ def upgrade_command(
     the install gate of `add`). The new version is installed beside the old one with its own
     venv; what it asks for is compared with horae.lock: a new host, local endpoint, secret,
     intent, path or pack pipeline (or a changed one, or a dropped personal field) must be
-    approved again. Hosts you added before are kept. Only after approval and a complete install
-    are the trees swapped and horae.lock rewritten; on any failure the old version and the lock
-    are left as they were. A lower version is refused without --allow-downgrade.
+    approved again. The hosts, endpoints and paths you added before (--allow-host, --allow-local,
+    --allow-path, --allow-read-path, recorded in horae.lock) are kept; anything else the new
+    version no longer asks for is dropped and shown in the diff. Passing a grant flag at the
+    installed version records it (a path set by hand in horae.lock, for instance). Only after
+    approval and a complete install are the trees swapped and horae.lock rewritten; on any
+    failure the old version and the lock are left as they were. A lower version is refused
+    without --allow-downgrade.
 
     A direct install is upgraded with URL@SHA: the same repository URL as in horae.lock and the
     full SHA of a commit its branches or tags reach. A plugin that is not first-party (a
@@ -675,6 +699,8 @@ def upgrade_command(
             yes,
             list(allow_host or ()),
             list(allow_local or ()),
+            list(allow_path or ()),
+            list(allow_read_path or ()),
             allow_downgrade,
         ),
     )

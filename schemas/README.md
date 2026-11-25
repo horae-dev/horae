@@ -4450,6 +4450,21 @@ loosened later without breaking a valid file.
       upgrade prints a note naming the old hosts and endpoints the new version drops and
       asks to pass `--allow-host` / `--allow-local` again if the user added them; the next
       upgrade records them.
+      *Amendment (#205): paths.* A plugin whose manifest asks for no path (a vault is the
+      user's choice) could only get one by editing `horae.lock` by hand, and an upgrade then
+      dropped it (nothing recorded it as the user's). `add` and `upgrade` gain `--allow-path
+      PATH` (read and write) and `--allow-read-path PATH` (read only), validated as
+      `AbsolutePath` (a usage error otherwise, exit 2) and repeatable; a path given with both
+      is granted read and write. They are recorded in `user_grants.paths` (`read`, `write`,
+      left out when empty, so every lock written before is byte-identical; `lockfile/v1.json`
+      gains the optional property, additive) and carried over like the hosts, subject to the
+      same subset rule. A new one widens (approval needed; `--yes` refuses it unless the lock
+      already grants it). A path the lock grants without a record is never inferred: the
+      upgrade drops it, shows it in the diff and prints a note naming
+      `--allow-path PATH` / `--allow-read-path PATH`; passing the flag at the installed version
+      re-approves the same commit and records it. `add` over an existing entry (a fresh
+      checkout) does not carry grants over either: `--yes` refuses a lock that grants more, and
+      the interactive prompt names what it drops and the flags that keep it.
     - **E, approval.** Interactive confirmation, default no. `--yes` passes only when nothing
       widens, which includes a lock that already approves the target (a lock committed from
       another machine: the diff is then empty). Without a terminal and without `--yes`, refused.
