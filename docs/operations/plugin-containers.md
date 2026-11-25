@@ -258,7 +258,12 @@ stopped containers (`docker rm`, never a running one). List leftovers with `dock
 
 A plugin that declares `permissions.paths` (a vault to write notes to, files to read) gets
 exactly the paths **approved in `horae.lock`** (what you accepted at `horae plugin add`, never
-the manifest's own list), each **mounted at the same path** in its container:
+the manifest's own list), each **mounted at the same path** in its container. A path the
+manifest does not ask for, such as where your vault is, is granted with `horae plugin add NAME
+--allow-path /srv/horae/vault` (read and write) or `--allow-read-path PATH` (read only);
+`horae.lock` records it as yours (`user_grants.paths`) and `horae plugin upgrade` keeps it
+(#205). For a grant set by hand in `horae.lock`, run `horae plugin upgrade NAME --allow-path
+PATH` once to record it.
 
 - a `read` path is mounted read-only; a `write` path read-write (a path in both is writable);
 - nested paths behave as declared: a writable `vault/inbox` under a read-only `vault` is

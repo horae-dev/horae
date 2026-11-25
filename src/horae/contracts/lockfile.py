@@ -22,7 +22,7 @@ from pydantic import (
     model_validator,
 )
 
-from horae.contracts.plugin import Permissions, PersonalFields
+from horae.contracts.plugin import PathPermissions, Permissions, PersonalFields
 from horae.contracts.types import (
     HOST,
     MAX_ITEMS,
@@ -82,8 +82,9 @@ def _sorted_lists(value: Any) -> Any:
 
 
 class UserGrants(Contract):
-    """The hosts and local endpoints the user added with `--allow-host` / `--allow-local`
-    (decision 73 D), as opposed to the ones the manifest declares."""
+    """The hosts, local endpoints and paths the user added with `--allow-host` /
+    `--allow-local` / `--allow-path` / `--allow-read-path` (decision 73 D, #205), as opposed to
+    the ones the manifest declares."""
 
     network: Annotated[list[Hostname], Field(max_length=MAX_ITEMS)] = Field(default_factory=list)
     """Hosts added with `--allow-host` (sorted when written)."""
@@ -91,9 +92,13 @@ class UserGrants(Contract):
         default_factory=list
     )
     """Endpoints added with `--allow-local` (sorted when written)."""
+    paths: PathPermissions = Field(default_factory=PathPermissions)
+    """Paths added with `--allow-read-path` (`read`) and `--allow-path` (`write`, read and
+    write), e.g. the vault of a sink whose manifest asks for none (#205). Sorted when written;
+    left out when empty, so a record written before it reads the same."""
 
     def __bool__(self) -> bool:
-        return bool(self.network or self.network_local)
+        return bool(self.network or self.network_local or self.paths.read or self.paths.write)
 
 
 class LockedPlugin(Contract):
@@ -144,17 +149,22 @@ class LockedPlugin(Contract):
     """The marketplace index that resolved a plugin with `tier` (set with it)."""
 
     user_grants: UserGrants | None = None
-    """What the user added with `--allow-host` / `--allow-local` when `add` or `upgrade`
-    approved this entry (decision 73 D, #175). `horae plugin upgrade` carries over only these
-    (never what it infers from the installed manifest, which is not verified). Always a subset
-    of `permissions` (the loader refuses a lock that lists a grant it does not give). Left out
-    when empty, so a lock without any, or written before it, is written exactly as before."""
+    """What the user added with `--allow-host` / `--allow-local` / `--allow-path` /
+    `--allow-read-path` when `add` or `upgrade` approved this entry (decision 73 D, #175,
+    #205). `horae plugin upgrade` carries over only these (never what it infers from the
+    installed manifest, which is not verified). Always a subset of `permissions` (the loader
+    refuses a lock that lists a grant it does not give). Left out when empty, so a lock without
+    any, or written before it, is written exactly as before."""
 
     @model_validator(mode="after")
     def _grants_are_granted(self) -> Self:
         if self.user_grants is not None:
-            extra = (set(self.user_grants.network) - set(self.permissions.network)) | (
-                set(self.user_grants.network_local) - set(self.permissions.network_local)
+            mine, given = self.user_grants, self.permissions
+            extra = (
+                (set(mine.network) - set(given.network))
+                | (set(mine.network_local) - set(given.network_local))
+                | (set(mine.paths.read) - set(given.paths.read))
+                | (set(mine.paths.write) - set(given.paths.write))
             )
             if extra:
                 raise ValueError(
@@ -182,7 +192,11 @@ class LockedPlugin(Contract):
     ) -> Any:
         data = handler(value)
         if isinstance(data, dict):
-            data = {key: sorted(items) for key, items in data.items() if items}
+            # Empty lists, and an empty `paths`, are left out (a record written before #205
+            # stays byte-identical).
+            if isinstance(data.get("paths"), dict):
+                data["paths"] = {key: items for key, items in data["paths"].items() if items}
+            data = {key: _sorted_lists(items) for key, items in data.items() if items}
         return data
 
     @field_serializer("permissions", mode="wrap")

@@ -9,10 +9,13 @@
 - `origin(tier, index)`: what the `horae.lock` entry records of where a plugin came from
   (`tier` and `index`, only for a plugin the default marketplace does not vouch for).
 - `describe_origin(...)`: the approval lines naming the source, the tier and the runtime.
-- `with_grants(asked, hosts, local)`: what the manifest asks for, plus the hosts and
-  local-network endpoints the user adds at approval (`--allow-host`, `--allow-local`). A lock
-  may grant more than a manifest declares (the plugin host refuses only less, decision 66);
-  this is how a user approves their own school or Home Assistant host.
+- `parse_grants(...)`: the `--allow-host`, `--allow-local`, `--allow-path` and
+  `--allow-read-path` values, validated, as a `UserGrants`.
+- `with_grants(asked, grants)`: what the manifest asks for, plus the hosts, local-network
+  endpoints and paths the user adds at approval. A lock may grant more than a manifest
+  declares (the plugin host refuses only less, decision 66); this is how a user approves their
+  own school or Home Assistant host, or the vault of a sink whose manifest asks for no path
+  (#205).
 - `describe(...)`: the approval text, grouped and labelled plainly.
 - `lock_mismatch(existing, wanted)`: why `--yes` cannot approve `wanted` from the lock entry
   already there, or `None` when the entry is for the same source, repository, version and
@@ -27,7 +30,7 @@ from horae.contracts.instance import DEFAULT_MARKETPLACE, PluginRuntime
 from horae.contracts.intents import IntentType
 from horae.contracts.lockfile import LockedPlugin, Tier, UserGrants
 from horae.contracts.plugin import FREE_TEXT_FIELD, Permissions
-from horae.contracts.types import Hostname, LocalEndpoint
+from horae.contracts.types import AbsolutePath, Hostname, LocalEndpoint
 from horae.marketplace.errors import InvalidReference, TierRefused
 
 FIRST_PARTY_INDEXES: frozenset[str] = frozenset({DEFAULT_MARKETPLACE})
@@ -56,6 +59,7 @@ SCAN_ONLY_NOTE = (
 
 _host: TypeAdapter[str] = TypeAdapter(Hostname)
 _local: TypeAdapter[str] = TypeAdapter(LocalEndpoint)
+_path: TypeAdapter[str] = TypeAdapter(AbsolutePath)
 
 
 def first_party(tier: Tier | None, index: str | None) -> bool:
@@ -133,9 +137,19 @@ def describe_origin(
     return lines
 
 
-def parse_grants(hosts: Sequence[str], local: Sequence[str]) -> tuple[list[str], list[str]]:
-    """Validate `--allow-host` values as `Hostname` and `--allow-local` values as
-    `LocalEndpoint` (`host:port`), or raise `InvalidReference` (a usage error)."""
+_PATH_SHAPE = "a normalised absolute path such as /srv/vault (no `.`, `..`, `//` or trailing /)"
+
+
+def parse_grants(
+    hosts: Sequence[str],
+    local: Sequence[str],
+    paths: Sequence[str] = (),
+    read_paths: Sequence[str] = (),
+) -> UserGrants:
+    """Validate `--allow-host` values as `Hostname`, `--allow-local` values as
+    `LocalEndpoint` (`host:port`) and `--allow-path` (read and write) / `--allow-read-path`
+    (read only) values as `AbsolutePath`, or raise `InvalidReference` (a usage error). A path
+    given with both flags is granted read and write."""
     for value, adapter, flag, shape in (
         *(
             (v, _host, "--allow-host", "a lowercase DNS name such as api.example.org")
@@ -145,30 +159,81 @@ def parse_grants(hosts: Sequence[str], local: Sequence[str]) -> tuple[list[str],
             (v, _local, "--allow-local", "host:port on the local network, e.g. 192.168.1.10:8123")
             for v in local
         ),
+        *((v, _path, "--allow-path", _PATH_SHAPE) for v in paths),
+        *((v, _path, "--allow-read-path", _PATH_SHAPE) for v in read_paths),
     ):
         try:
             adapter.validate_python(value)
         except ValidationError:
             raise InvalidReference(f"{flag} {value!r}: expected {shape}") from None
-    return sorted(set(hosts)), sorted(set(local))
-
-
-def with_grants(asked: Permissions, hosts: Sequence[str], local: Sequence[str]) -> Permissions:
-    """`asked` plus the extra hosts and local endpoints (validated, no duplicates)."""
-    return Permissions.model_validate(
+    return UserGrants.model_validate(
         {
-            **asked.model_dump(mode="json"),
-            "network": sorted({*asked.network, *hosts}),
-            "network_local": sorted({*asked.network_local, *local}),
+            "network": sorted(set(hosts)),
+            "network_local": sorted(set(local)),
+            "paths": {
+                "read": sorted(set(read_paths) - set(paths)),
+                "write": sorted(set(paths)),
+            },
         }
     )
 
 
-def recorded_grants(hosts: Sequence[str], local: Sequence[str]) -> UserGrants | None:
-    """The `--allow-host` / `--allow-local` values as the lock entry records them (`None` when
-    there are none, so the field is left out of the lock)."""
-    grants = UserGrants(network=sorted(set(hosts)), network_local=sorted(set(local)))
-    return grants or None
+def with_grants(asked: Permissions, grants: UserGrants) -> Permissions:
+    """`asked` plus the extra hosts, local endpoints and paths (validated, no duplicates)."""
+    return Permissions.model_validate(
+        {
+            **asked.model_dump(mode="json"),
+            "network": sorted({*asked.network, *grants.network}),
+            "network_local": sorted({*asked.network_local, *grants.network_local}),
+            "paths": {
+                "read": sorted({*asked.paths.read, *grants.paths.read}),
+                "write": sorted({*asked.paths.write, *grants.paths.write}),
+            },
+        }
+    )
+
+
+def merge_grants(first: UserGrants, second: UserGrants) -> UserGrants:
+    """Both sets of grants (an upgrade: what the lock records plus the new flags)."""
+    return UserGrants.model_validate(
+        {
+            "network": sorted({*first.network, *second.network}),
+            "network_local": sorted({*first.network_local, *second.network_local}),
+            "paths": {
+                "read": sorted({*first.paths.read, *second.paths.read}),
+                "write": sorted({*first.paths.write, *second.paths.write}),
+            },
+        }
+    )
+
+
+def recorded_grants(grants: UserGrants) -> UserGrants | None:
+    """The grants as the lock entry records them (`None` when there are none, so the field is
+    left out of the lock)."""
+    return grants if grants else None
+
+
+def dropped_grants(existing: LockedPlugin, granted: Permissions) -> list[tuple[str, str]]:
+    """The hosts, local endpoints and paths `existing` grants that `granted` does not, each with
+    the flag that grants it again (a path dropped from `write` but kept in `read` counts)."""
+    have, want = existing.permissions, granted
+    return sorted(
+        [
+            *((h, "--allow-host") for h in set(have.network) - set(want.network)),
+            *((e, "--allow-local") for e in set(have.network_local) - set(want.network_local)),
+            *((p, "--allow-path") for p in set(have.paths.write) - set(want.paths.write)),
+            *(
+                (p, "--allow-read-path")
+                for p in set(have.paths.read) - set(want.paths.read) - set(want.paths.write)
+            ),
+        ]
+    )
+
+
+def describe_dropped(dropped: Sequence[tuple[str, str]]) -> str:
+    """The flags that would grant `dropped` again, for a note (values are paths, hosts and
+    endpoints already validated by the lock, never secrets)."""
+    return " ".join(f"{flag} {value}" for value, flag in dropped)
 
 
 def _group(lines: list[str], label: str, values: Sequence[str], added: set[str]) -> None:
@@ -207,8 +272,15 @@ def describe(
         lines.extend(
             f"    - {intent}: {INTENT_MEANINGS[intent]}" for intent in sorted(granted.intents)
         )
-    _group(lines, "paths (read)", granted.paths.read, set())
-    _group(lines, "paths (read and write)", granted.paths.write, set())
+    _group(
+        lines, "paths (read)", granted.paths.read, set(granted.paths.read) - set(asked.paths.read)
+    )
+    _group(
+        lines,
+        "paths (read and write)",
+        granted.paths.write,
+        set(granted.paths.write) - set(asked.paths.write),
+    )
     if len(lines) == 1:
         lines.append("  nothing: no network, secret, intent or path")
     if pipelines:
@@ -279,9 +351,12 @@ __all__ = [
     "PERSONAL_NOTE",
     "container_only",
     "describe",
+    "describe_dropped",
     "describe_origin",
+    "dropped_grants",
     "first_party",
     "lock_mismatch",
+    "merge_grants",
     "origin",
     "parse_grants",
     "recorded_grants",
