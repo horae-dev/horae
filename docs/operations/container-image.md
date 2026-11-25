@@ -121,6 +121,14 @@ volume: the plugin tree and its `.venv` in `plugins/<name>`, uv's cache in `stat
 repository, and the package index named in the plugin's `uv.lock`); running does not, and
 `--network none` still works for everything but `plugin add`.
 
+uv runs with `--no-config` and an environment built from scratch: no `uv.toml`, user or system
+uv config and no `UV_*` variable of the container changes what a plugin install resolves or
+fetches. That also ignores the uv settings of the plugin's own `[tool.uv]`, so `plugin add`
+refuses a plugin that sets one (`exclude-newer`, `index-url`, `resolution`, ...) with a message
+naming the key, before uv runs ([#199](https://github.com/horae-dev/horae/issues/199)); the fix
+belongs in the plugin (remove the key, `uv lock`, release), not in the instance's uv config,
+which is never read. [What `[tool.uv]` may hold](../writing-a-plugin.md#3-declare-the-least-you-need).
+
 ```
 docker compose exec horae horae plugin add obsidian    # compose; Coolify: the Terminal, or docker exec
 ```

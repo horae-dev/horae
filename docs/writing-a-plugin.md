@@ -96,6 +96,26 @@ let a test compare the two.
 
     See [plugin containers](operations/plugin-containers.md#installing-third-party-plugins).
 
+!!! note "`[tool.uv]`: no uv settings"
+    `horae plugin add` builds the plugin's venv with `uv --no-config sync --locked`, so no uv
+    configuration outside the pinned plugin tree (user, system or environment) can change what
+    it installs. `--no-config` also ignores every uv **setting** of the plugin's own
+    `pyproject.toml`, so the install refuses one by name, before uv runs
+    ([#199](https://github.com/horae-dev/horae/issues/199)): for example `exclude-newer`
+    (`uv lock` records it in `uv.lock`, which then no longer matches), `exclude-newer-package`,
+    `resolution`, `prerelease`, `fork-strategy`, `index-url`, `extra-index-url`, `find-links`,
+    `no-binary`, `cache-keys` or a `[tool.uv.pip]` table. Remove the key, run `uv lock` and
+    commit `uv.lock`. For a cooldown on new releases, use Renovate's `minimumReleaseAge`.
+
+    What `[tool.uv]` may hold is what uv reads as project metadata even under `--no-config`:
+    `sources`, `index` (each one `explicit = true`, used only by the `sources` entries that
+    name it), `dev-dependencies`, `default-groups`, `dependency-groups`, `conflicts`,
+    `environments`, `required-environments`, `override-dependencies`,
+    `constraint-dependencies`, `build-constraint-dependencies`, `exclude-dependencies`,
+    `workspace`, `build-backend`, `package` and `managed` (neither `false`), plus
+    `required-version`, which changes nothing installed. Depend on `horae-sdk` from PyPI
+    (`horae-sdk>=0.9,<0.10`): a `git` source is refused at install.
+
 ## 4. SDK 0.6 APIs
 
 | API | Use |

@@ -13,6 +13,14 @@ plugin's lock file pins.
   `BUILD_BACKENDS` (hatchling, setuptools, uv_build, flit_core, pdm-backend), whose `requires`
   names only that backend's distribution (and `wheel` for setuptools), without a direct URL,
   and without `backend-path` (an in-tree backend); not `tool.uv.package = false`;
+- a `[tool.uv]` table holding only what uv still reads under `--no-config` (`UV_PROJECT_KEYS`,
+  project metadata such as `sources` or `dev-dependencies`) or what changes nothing installed
+  (`UV_INERT_KEYS`: `required-version`). A uv **setting** (`exclude-newer`, `index-url`,
+  `resolution`, `prerelease`, `[tool.uv.pip]`, ...) is refused by name (#199): uv runs with
+  `--no-config`, which ignores it, so it would either change how the lock was resolved without
+  changing the install (`uv sync --locked` then fails) or be lost silently. A
+  `[[tool.uv.index]]` must be `explicit = true`: uv reads it under `--no-config` only for the
+  `tool.uv.sources` entries that name it, never as a default or extra index;
 - `uv.lock`, committed, in which every package but the plugin's own project comes from an
   index or a URL, has at least one **wheel**, and carries a `sha256` hash for each of its files
   (an sdist-only package, a `git` source, another in-tree package are refused, by name). The
@@ -35,11 +43,14 @@ plugin's lock file pins.
 
 **The uv environment** is built from scratch, nothing inherited but the proxy and CA settings
 (`PASSTHROUGH`): `PATH` is `BASE_PATH`, `HOME` and `TMPDIR` an empty directory removed after,
-`UV_NO_CONFIG=1` (and `--no-config`: no `uv.toml` or user config), `UV_CACHE_DIR` the
-instance's cache (`<state_dir>/uv-cache` from the CLI), `UV_LINK_MODE=copy` (the venv does not
-depend on the cache), `UV_PROJECT_ENVIRONMENT=<tree>/.venv`. No `UV_*` or `PIP_*` index
-setting of the caller's reaches uv: the index is uv's default (PyPI) or the plugin's own
-`pyproject.toml`; the hashes pin the bytes either way. `index_url` replaces the default index
+`UV_NO_CONFIG=1` (and `--no-config`: no `uv.toml`, no user or system config, and no uv
+setting of the plugin's own `[tool.uv]` either, hence `check_project`'s refusal), `UV_CACHE_DIR`
+the instance's cache (`<state_dir>/uv-cache` from the CLI), `UV_LINK_MODE=copy` (the venv does
+not depend on the cache), `UV_PROJECT_ENVIRONMENT=<tree>/.venv`. No `UV_*` or `PIP_*` index
+setting of the caller's reaches uv: the index is uv's default (PyPI), or, for the packages a
+`tool.uv.sources` entry pins to it, an explicit `[[tool.uv.index]]` of the plugin's own
+`pyproject.toml` (a first-party plugin only: `check_lock` holds a third-party lock to the
+default index); the hashes pin the bytes either way. `index_url` replaces the default index
 and is a constructor argument only, never a setting of `horae.yaml` (tests pass a local
 `file://` index).
 
@@ -183,21 +194,88 @@ def _table(data: dict[str, Any], key: str) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+UV_PROJECT_KEYS = frozenset(
+    {
+        "build-backend",
+        "build-constraint-dependencies",
+        "conflicts",
+        "constraint-dependencies",
+        "default-groups",
+        "dependency-groups",
+        "dev-dependencies",
+        "environments",
+        "exclude-dependencies",
+        "index",
+        "managed",
+        "override-dependencies",
+        "package",
+        "required-environments",
+        "sources",
+        "workspace",
+    }
+)
+"""The `[tool.uv]` keys uv reads as project metadata, with the workspace, so `--no-config` keeps
+them (#199): what they change is in `uv.lock`, which `--locked` checks. `index` only as
+`explicit = true` (`_check_uv_table`)."""
+UV_INERT_KEYS = frozenset({"required-version"})
+"""`[tool.uv]` keys `--no-config` ignores but that change nothing installed: a floor on the uv
+version the plugin's developers use."""
+
+
+def _check_uv_table(data: dict[str, Any], plugin: str) -> None:
+    """`InstallRefused`, naming the key, for a `[tool.uv]` key the install would ignore (#199):
+    uv runs with `--no-config`, which drops every uv *setting* of `pyproject.toml`, the
+    plugin's own included. One that shaped the lock (`exclude-newer`, `resolution`,
+    `prerelease`, `fork-strategy`) would make `uv sync --locked` fail; the others (an index URL,
+    `no-binary`, `[tool.uv.pip]`, ...) would be lost silently. Refusing keeps the property that
+    nothing but the pinned tree and Horae's own flags decides what uv installs (T22)."""
+    uv = _table(data, "tool").get("uv", {})
+    if not isinstance(uv, dict):
+        raise InstallRefused(f"plugin {plugin}: {PROJECT_FILE}: tool.uv is not a table")
+    for key in sorted(set(uv) - UV_PROJECT_KEYS - UV_INERT_KEYS):
+        hint = (
+            " (for a cooldown on new releases, use Renovate's minimumReleaseAge instead)"
+            if key.startswith("exclude-newer")
+            else ""
+        )
+        raise InstallRefused(
+            f"plugin {plugin}: {PROJECT_FILE} sets tool.uv.{key}, a uv setting that Horae "
+            "does not apply: it installs with `uv --no-config`, which reads no uv setting, the "
+            f"plugin's own included. Remove tool.uv.{key}, then run `uv lock` and commit "
+            f"uv.lock{hint}"
+        )
+    for package_key in ("package", "managed"):
+        if uv.get(package_key) is False:
+            raise InstallRefused(
+                f"plugin {plugin}: tool.uv.{package_key} = false is not installable "
+                "(uv would not install the project)"
+            )
+    indexes = uv.get("index", [])
+    for index in indexes if isinstance(indexes, list) else [indexes]:
+        if not isinstance(index, dict) or index.get("explicit") is not True:
+            name = index.get("name", "?") if isinstance(index, dict) else "?"
+            raise InstallRefused(
+                f"plugin {plugin}: {PROJECT_FILE}: tool.uv.index {name!r} is not "
+                "`explicit = true`; Horae installs with `uv --no-config`, which uses a "
+                "plugin's index only for the tool.uv.sources entries that name it, never as a "
+                "default or extra index. Mark it explicit and name it in tool.uv.sources, or "
+                "remove it; then run `uv lock` and commit uv.lock"
+            )
+
+
 def check_project(tree: Path, plugin: str, *, builds: bool = True) -> str:
     """The project name of `<tree>/pyproject.toml`; `InstallRefused` unless it builds with an
-    allowed backend and nothing else (see the module docstring). `builds=False` (#191): also
-    refused when uv would still call the backend (`dynamic` metadata)."""
+    allowed backend and nothing else, and its `[tool.uv]` holds no uv setting `--no-config`
+    would drop (see the module docstring). `builds=False` (#191): also refused when uv would
+    still call the backend (`dynamic` metadata)."""
     data = _read_toml(tree / PROJECT_FILE, plugin)
     project = _table(data, "project")
     name = project.get("name")
     if not isinstance(name, str) or not name:
         raise InstallRefused(f"plugin {plugin}: {PROJECT_FILE} has no [project] name")
+    _check_uv_table(data, plugin)
     if not builds:
         _check_nothing_to_build(data, project, plugin)
-    if _table(_table(data, "tool"), "uv").get("package") is False:
-        raise InstallRefused(
-            f"plugin {plugin}: tool.uv.package = false (a virtual project) is not installable"
-        )
     build = _table(data, "build-system")
     backend = build.get("build-backend")
     if not isinstance(backend, str) or backend not in BUILD_BACKENDS:
@@ -223,7 +301,9 @@ def check_project(tree: Path, plugin: str, *, builds: bool = True) -> str:
 
 _SOURCE_KEYS = frozenset({"index", "marker", "extra", "group"})
 """What a `tool.uv.sources` entry may say for a plugin that is not first-party: which index,
-for which marker, extra or group. Never `path`, `git`, `url`, `workspace` or `editable`."""
+for which marker, extra or group. Never `path`, `git`, `url`, `workspace` or `editable`. uv
+reads `tool.uv.sources` (and the explicit index it names) under `--no-config` (#199); for such a
+plugin `check_lock` still requires every registry to be the default index."""
 
 
 def _requirements(data: dict[str, Any], project: dict[str, Any]) -> list[Any]:
@@ -654,6 +734,8 @@ __all__ = [
     "MODULE_COMMANDS",
     "PROJECT_FILE",
     "PTH_FILE",
+    "UV_INERT_KEYS",
+    "UV_PROJECT_KEYS",
     "UV_TIMEOUT_S",
     "PluginEnvironment",
     "check_lock",

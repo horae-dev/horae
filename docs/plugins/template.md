@@ -48,16 +48,15 @@ Commits carry Graft trailers (`git commit --trailer ...`). Work done in one repo
 issue of another, such as this page for a template issue, writes the task as
 `Graft-Task: <owner>/<repo>#<n>` (for example `horae-dev/template-plugin#2`) rather than `#<n>`.
 
-## horae-sdk before PyPI
+## horae-sdk from PyPI
 
-Until `horae-sdk` is published, the template takes it from this repository's `main` branch
-in `[tool.uv.sources]` (`branch = "main"`, `subdirectory = "sdk"`), and its `uv.lock` pins the
-exact commit, so CI's `uv lock --check` and every install use the same SDK until the lock
-changes. Renovate's weekly lock file maintenance moves the lock to the latest `main` (a git
-commit has no release date, so the 7-day age cannot apply: review that pull request like any
-dependency bump). Installing from git clones this repository, so it must stay public. After
-the first `Release SDK` run (`sdk-v<version>` tag), remove the git source from the template so
-the requirement resolves from PyPI.
+The template depends on `horae-sdk` from PyPI (`horae-sdk>=0.9,<0.10`), locked with its
+hashed wheels: `horae plugin add` refuses a `git` source in `uv.lock`. Its `[tool.uv]` holds
+only `required-version`: no uv setting such as `exclude-newer`, which the install's
+`uv --no-config` would ignore, so `horae plugin add` would refuse the plugin
+([#199](https://github.com/horae-dev/horae/issues/199),
+[what `[tool.uv]` may hold](../writing-a-plugin.md#3-declare-the-least-you-need)). The
+7-day cooldown on new releases is Renovate's `minimumReleaseAge`.
 
 Nothing here checks the template against an SDK change yet: before changing the SDK's public
 API, run the template's tests against it by hand (in a template checkout, point
