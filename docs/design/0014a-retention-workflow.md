@@ -1,9 +1,9 @@
 # Design note: retention workflow (to revisit)
 
 - **Issue:** follows [#14](https://github.com/horae-dev/horae/issues/14); threat T28 in
-  [docs/security.md](../security.md#b7-horae--host).
+  [docs/security.md](https://horae-dev.github.io/docs/security/threat-model/#b7-horae-host).
 - **Status:** Open, deferred. The maintainer chose operator documentation first (PR #84):
-  [operations/retention-and-backups.md](../operations/retention-and-backups.md). This note records
+  [operations/retention-and-backups.md](https://horae-dev.github.io/docs/operate/retention-and-backups/). This note records
   what a proper workflow would decide, so it can be picked up later as a story.
 - **Revisit:** before M8 (public v0.1, the docs promise of [PLAN §9](../PLAN.md#9-quality-and-security-practice)),
   or earlier if the reference instance's store or backups grow uncomfortable.

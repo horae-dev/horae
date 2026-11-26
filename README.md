@@ -4,7 +4,10 @@
 
 Core runtime, CLI, HTTP API, MCP server, SDK and docs for Horae, a predictable self-hosted personal agent.
 
-> 🚧 **Planned.** Nothing to install yet. Follow progress on the [Horae roadmap project](https://github.com/orgs/horae-dev/projects/1).
+> 🚧 **Pre-release.** Horae runs from a checkout of `main` or the container image, and installs
+> plugins from the marketplace (`horae plugin add`, `upgrade`, `remove`, `audit`), but there is no
+> tagged v0.1 yet and interfaces may still change. Documentation: **<https://horae-dev.github.io/docs/>**.
+> Progress: the [Horae roadmap project](https://github.com/orgs/horae-dev/projects/1).
 
 ## What Horae is
 
@@ -17,7 +20,7 @@ Horae is a **predictable, self-hosted personal agent**:
 - **A git marketplace**: plugins pinned to a commit in `horae.lock`; nothing updates itself.
 - **Bring your own model**: Anthropic API, your own `claude -p`, OpenAI-compatible endpoints or Ollama.
 
-Read the [plan](docs/PLAN.md), the [roadmap](docs/ROADMAP.md) and the [estimation](docs/ESTIMATION.md).
+Read the [documentation](https://horae-dev.github.io/docs/), the [plan](docs/PLAN.md), the [roadmap](https://horae-dev.github.io/docs/project/roadmap/) and the [estimation](docs/ESTIMATION.md).
 
 ## Planned work
 
@@ -37,7 +40,7 @@ Stories, estimates and acceptance criteria are in this repository's [issues](../
 
 ## Getting started
 
-From a checkout (`uv sync`; nothing is published yet), the M1 walking skeleton in a new
+From a checkout (`uv sync`; no runtime release is tagged yet), the M1 walking skeleton in a new
 directory: a pipeline that reads synthetic data and writes today's owned note in the
 instance's own `vault/`, through the two built-in plugins. No LLM, no secret, no network.
 
@@ -67,7 +70,7 @@ either runtime; any other plugin (a community tier, an index you added, a direct
 installs and runs **only in a container**: set `plugins.<name>.runtime: container` (or
 `plugin_defaults.runtime: container`) in `horae.yaml` first, with Docker available
 ([decision 79](schemas/README.md#provisional-decisions-191-pending-maintainer-review); how-to
-in the [operator guide](docs/operations/plugin-containers.md#installing-third-party-plugins)).
+in the [operator guide](https://horae-dev.github.io/docs/security/plugin-containers/#installing-third-party-plugins)).
 `--allow-host HOST` and `--allow-local HOST:PORT` grant more (your own Home Assistant, say),
 and `--allow-path PATH` (read and write) or `--allow-read-path PATH` (read only) grant an
 absolute path the manifest does not ask for, such as the vault of an Obsidian plugin
@@ -118,7 +121,7 @@ its command line or `docker inspect`. If the container cannot start (no Docker, 
 pulled, a venv the image cannot run), the plugin fails with `runtime_unavailable`: it never
 falls back to a process. Prerequisites, the Horae-in-Docker options (the published image mounts
 no Docker socket), and measured latency (about 0.25 s more per plugin start, the same per call):
-[docs/operations/plugin-containers.md](docs/operations/plugin-containers.md),
+[Plugin containers](https://horae-dev.github.io/docs/security/plugin-containers/),
 [schemas decision 74](schemas/README.md#provisional-decisions-49-pending-maintainer-review).
 
 `-i` defaults to the current directory (or `HORAE_INSTANCE`). Every command takes `--json`
@@ -183,7 +186,7 @@ only path the reverse proxy exempts from SSO (the #41 templates match the link's
 shape and turn Traefik's access log off for it). Requests are rate limited (10 a minute per
 client, an IPv6 client by its /64; 60 a minute overall for links whose signature verifies).
 In the reference deployment (Cloudflare tunnel, then Traefik) no entry point may trust
-forwarded headers ([operations/coolify.md](docs/operations/coolify.md#forwarded-headers)), so
+forwarded headers ([Coolify guide](https://horae-dev.github.io/docs/operate/coolify/#forwarded-headers)), so
 Traefik replaces `X-Forwarded-For` with cloudflared's address and every phone shares one
 bucket (still limited); `http.trusted_proxies` only helps behind a proxy chain that passes the
 client's address on safely.
@@ -228,12 +231,12 @@ with `horae mcp token create NAME` (shown once, stored hashed), connect with
 `pipeline.run`) only makes a dry run and returns an approval id; nothing is applied until you
 run `horae approval approve <id>` yourself on the instance's terminal, which shows the changes
 and asks you to retype a short code (#55; friction, not a barrier against an agent that also
-has a shell as you). Setup, the tool schemas and the manual check are in [docs/mcp.md](docs/mcp.md).
+has a shell as you). Setup, the tool schemas and the manual check are in [MCP server guide](https://horae-dev.github.io/docs/operate/mcp/).
 
 ## Deployment
 
 The container image is `ghcr.io/horae-dev/horae`
-([docs/operations/container-image.md](docs/operations/container-image.md): tags, signatures,
+([Container image](https://horae-dev.github.io/docs/operate/container-image/): tags, signatures,
 the runtime contract). Two ready deployments (#41), both on a named volume for `/instance`, with
 a read-only root filesystem and a one-off `horae init` on a new volume:
 
@@ -244,10 +247,10 @@ a read-only root filesystem and a one-off `horae init` on a new volume:
   the resource's own network (shared only with Coolify's proxy); only `/act/` is exempt from SSO. Required variables block
   the deployment until they are set; Scheduled Tasks run `horae run daily-brief` and `horae run
   remind`, each with an Uptime Kuma push monitor. Guide (prerequisites, the tunnel's public host
-  name, what to verify on the server): [docs/operations/coolify.md](docs/operations/coolify.md).
+  name, what to verify on the server): [Coolify guide](https://horae-dev.github.io/docs/operate/coolify/).
 - **Plain Docker Compose**: [`deploy/compose/`](deploy/compose/), on `127.0.0.1` only, with an
   optional Traefik and SSO override; built-in scheduler or host cron. Guide:
-  [docs/operations/compose.md](docs/operations/compose.md).
+  [Docker Compose guide](https://horae-dev.github.io/docs/operate/compose/).
 
 Both pull `ghcr.io/horae-dev/horae` without credentials, which needs the GHCR package to be
 public: check first (the guides give the one-line check and the registry login otherwise).

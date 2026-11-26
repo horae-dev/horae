@@ -1,8 +1,8 @@
 # Design note: signed single-use action links (`/act`)
 
 - **Issue:** [#38](https://github.com/horae-dev/horae/issues/38) (Human-led, security, M3). Threats
-  **T13, T14, T16** (and T15 with #41) in [docs/security.md](../security.md#b4-phone--act); asset
-  A3; story updates in [§10](../security.md#10-story-updates-requested).
+  **T13, T14, T16** (and T15 with #41) in [docs/security.md](https://horae-dev.github.io/docs/security/threat-model/#b4-phone-act); asset
+  A3; story updates in [§10](https://horae-dev.github.io/docs/security/threat-model/#10-story-updates-requested).
 - **Status:** Accepted: the maintainer accepted all ten recommendations (PR #115). Implemented
   on the same branch; [schemas decision 54](../../schemas/README.md#decisions) records the
   result and what the implementation decided beyond this note.

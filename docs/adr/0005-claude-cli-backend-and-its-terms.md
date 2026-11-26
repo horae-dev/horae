@@ -73,7 +73,7 @@ alias resolved to, `skill_version`, `cached`, `attempt` and `usage`. The pipelin
 ### Open questions
 
 - ⚠️ The terms-of-service position must be re-checked against Anthropic's current policy before
-  v0.1 (tracked as a Burning point in [ROADMAP.md](../ROADMAP.md#burning-points) and as [risk
+  v0.1 (tracked as a Burning point in [ROADMAP.md](https://horae-dev.github.io/docs/project/roadmap/#burning-points) and as [risk
   #70, Claude terms for the claude-cli backend](https://github.com/horae-dev/horae/issues/70)).
 - How `CLAUDE_CODE_OAUTH_TOKEN` is stored and injected (secrets handling) is for the M2 backend
   story ([#29, claude-cli backend with
@@ -96,7 +96,7 @@ alias resolved to, `skill_version`, `cached`, `attempt` and `usage`. The pipelin
 - [PLAN.md §1](../PLAN.md#1-why-horae-the-gap), [§3.4](../PLAN.md#34-llm-step-and-backends),
   [§7](../PLAN.md#7-reference-deployment-coolify), [§10](../PLAN.md#10-risks-honest),
   [M2](../PLAN.md#m2--the-llm-step-45-days)
-- [ROADMAP.md: Burning points](../ROADMAP.md#burning-points)
+- [ROADMAP.md: Burning points](https://horae-dev.github.io/docs/project/roadmap/#burning-points)
 - Issues: [#29, claude-cli backend with isolation](https://github.com/horae-dev/horae/issues/29);
   [#70, Claude terms for the claude-cli backend](https://github.com/horae-dev/horae/issues/70)
 - [`schemas/run-record/v1.json`](../../schemas/run-record/v1.json),
